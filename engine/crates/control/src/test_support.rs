@@ -32,7 +32,7 @@ impl GpuUploader for StubGpu {
         _hierarchy: &saffron_geometry::PortableVirtualHierarchy,
         _skin: &[VertexSkin],
         _morph: Option<&saffron_geometry::MorphData>,
-        _sdf_bake: Option<&saffron_rendering::SdfBake>,
+        _sdf: saffron_rendering::SdfSource<'_>,
     ) -> saffron_rendering::Result<Arc<GpuMesh>> {
         unreachable!("an empty catalog never reaches the stub uploader")
     }
@@ -72,6 +72,12 @@ fn resolved_tier(name: &str) -> Option<saffron_rendering::RenderQuality> {
 /// defaults `false`, matching a software device, so the RT-gated handlers take their
 /// unsupported branch unless a test flips it.
 pub struct StubRenderer {
+    /// Each view class's pinned hierarchy cut.
+    pub cut: [u32; saffron_rendering::SCENE_VIEW_CLASSES],
+    /// Missing-page requests one view class may raise per frame.
+    pub page_request_budget: u32,
+    /// The resident-population budgets the vegetation breach reporter measures against.
+    pub budgets: saffron_assets::VegetationBudgets,
     pub clustered: bool,
     pub depth_prepass: bool,
     pub shadows: bool,
@@ -148,6 +154,9 @@ pub struct StubRenderer {
 impl Default for StubRenderer {
     fn default() -> Self {
         Self {
+            budgets: saffron_assets::VegetationBudgets::default(),
+            cut: [saffron_rendering::SCENE_CUT_AUTO; saffron_rendering::SCENE_VIEW_CLASSES],
+            page_request_budget: saffron_rendering::PAGE_REQUEST_CAPACITY,
             clustered: true,
             depth_prepass: false,
             shadows: true,
@@ -243,12 +252,40 @@ impl ControlRenderer for StubRenderer {
         0
     }
 
-    fn visibility_counters(&self) -> [u32; 16] {
-        [0; 16]
+    fn visibility_counters(
+        &self,
+    ) -> [u32; saffron_rendering::SCENE_VISIBILITY_COUNTER_WORDS as usize] {
+        [0; saffron_rendering::SCENE_VISIBILITY_COUNTER_WORDS as usize]
+    }
+
+    fn gi_visibility_counters(
+        &self,
+    ) -> [u32; saffron_rendering::SCENE_VISIBILITY_COUNTER_WORDS as usize] {
+        [0; saffron_rendering::SCENE_VISIBILITY_COUNTER_WORDS as usize]
+    }
+
+    fn wind_interaction_resets(&self) -> u64 {
+        0
+    }
+
+    fn vegetation_budgets(&self) -> saffron_assets::VegetationBudgets {
+        self.budgets
+    }
+
+    fn set_vegetation_budgets(&mut self, budgets: saffron_assets::VegetationBudgets) {
+        self.budgets = budgets;
     }
 
     fn gpu_scene_mirror_stats(&self) -> saffron_assets::GpuSceneMirrorStats {
         saffron_assets::GpuSceneMirrorStats::default()
+    }
+
+    fn capture_plant_wind_record(
+        &self,
+        _cell: saffron_spatial::WorldCellKey,
+        _plant: saffron_vegetation::PlantId,
+    ) -> std::result::Result<Option<crate::registry::PlantWindRecord>, String> {
+        Ok(None)
     }
 
     fn submit_interaction_impulse(&mut self, _impulse: saffron_rendering::InteractionImpulse) {}
@@ -435,7 +472,88 @@ impl ControlRenderer for StubRenderer {
     fn set_rt_reflections(&mut self, enabled: bool) {
         self.rt_reflections = enabled;
     }
+    fn mesh_shader_supported(&self) -> bool {
+        false
+    }
+    fn mesh_executor_active(&self) -> bool {
+        false
+    }
+    fn sdf_instances_dropped(&self) -> u32 {
+        0
+    }
+    fn rt_instances_culled(&self) -> u32 {
+        0
+    }
+    fn sdf_instances_culled(&self) -> u32 {
+        0
+    }
+    fn rt_omm_supported(&self) -> bool {
+        false
+    }
     fn rt_blas_count(&self) -> u32 {
+        0
+    }
+    fn rt_skinned_blas_count(&self) -> u32 {
+        0
+    }
+    fn rt_tessellated_blas_count(&self) -> u32 {
+        0
+    }
+    fn cluster_as_supported(&self) -> bool {
+        false
+    }
+    fn rt_cluster_blas_count(&self) -> u32 {
+        0
+    }
+    fn rt_clas_count(&self) -> u32 {
+        0
+    }
+    fn ptlas_supported(&self) -> bool {
+        false
+    }
+    fn rt_ptlas_ops(&self) -> (u32, u32, u32) {
+        (0, 0, 0)
+    }
+    fn view_history_invalidation(&self) -> &'static str {
+        "new-view"
+    }
+    fn vsm_page_budget(&self) -> u32 {
+        64
+    }
+    fn set_vsm_page_budget(&mut self, _pages: u32) {}
+    fn page_request_budget(&self) -> u32 {
+        self.page_request_budget
+    }
+    fn set_page_request_budget(&mut self, entries: u32) {
+        self.page_request_budget = entries.clamp(1, saffron_rendering::PAGE_REQUEST_CAPACITY);
+    }
+    fn rt_accel_build_us(&self) -> u64 {
+        0
+    }
+    fn cut_override(&self, view: saffron_rendering::SceneViewClass) -> u32 {
+        self.cut[view.ordinal() as usize]
+    }
+
+    fn set_cut_override(&mut self, view: saffron_rendering::SceneViewClass, cut: u32) {
+        self.cut[view.ordinal() as usize] = cut;
+    }
+
+    fn rt_omm_micromaps(&self) -> u32 {
+        0
+    }
+    fn rt_omm_classes(&self) -> (u64, u64, u64) {
+        (0, 0, 0)
+    }
+    fn rt_blas_bytes(&self) -> u64 {
+        0
+    }
+    fn rt_blas_built_bytes(&self) -> u64 {
+        0
+    }
+    fn rt_tlas_bytes(&self) -> u64 {
+        0
+    }
+    fn rt_scratch_bytes(&self) -> u64 {
         0
     }
 
