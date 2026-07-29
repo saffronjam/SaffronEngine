@@ -37,8 +37,10 @@ export interface AssetPreviewContextValue {
   ready: boolean;
   /// The previewed catalog asset id (the workspace's subject).
   assetId: string;
-  /// The subject's vegetation domain when it is a plant/biome/map (else `null`);
-  /// vegetation subjects have no 3D preview surface.
+  /// The subject's vegetation domain when it is a plant/biome/map (else `null`).
+  ///
+  /// A PLANT does drive the live preview surface — only biome and vegetation-map subjects
+  /// short-circuit to a summary, because neither has a single renderable form to show.
   vegetationType: VegetationAssetType | null;
   /// The previewed material's id when the subject is a material (else `null`) — pins the
   /// Material panel's sidebar to this subject.

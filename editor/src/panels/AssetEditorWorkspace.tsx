@@ -249,6 +249,27 @@ export function AssetEditorWorkspace({ assetId, active }: { assetId: string; act
     } else {
       closePanel("biomeGraph");
     }
+    // A plant's structure panel. It homes to the same dock leaf as `skeleton`, which the rig branch
+    // above closes for a rigless subject — and a plant grown from a botanical graph is rigless, so
+    // this must open AFTER that close or the leaf collapses with the panel in it.
+    if (vegetationType === "plant") {
+      openPanel("plantGraph");
+      // The wind and interaction surface. It shares the same leaf for the same reason, and it opens
+      // only for a plant because only a plant answers a field: pushing wind at a biome or a
+      // vegetation map moves nothing an author can see.
+      openPanel("plantWind");
+      openPanel("plantAtlas");
+      openPanel("plantHierarchy");
+      openPanel("plantSeason");
+      openPanel("plantProxies");
+    } else {
+      closePanel("plantGraph");
+      closePanel("plantWind");
+      closePanel("plantAtlas");
+      closePanel("plantHierarchy");
+      closePanel("plantSeason");
+      closePanel("plantProxies");
+    }
   }, [ready, hasRig, hasClips, isMaterial, vegetationType]);
 
   // Space = play/pause while THIS tab is active (the workspace stays mounted-but-hidden when parked, so
