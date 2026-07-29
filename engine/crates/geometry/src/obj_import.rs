@@ -46,9 +46,6 @@ pub fn import_obj_model(path: impl AsRef<Path>) -> Result<ImportedModel> {
     let materials = materials_result.unwrap_or_default();
 
     let mut mesh = Mesh::default();
-    // De-duplicate (position, normal, texcoord) index triples into unique vertices.
-    // BTreeMap (an ordered tree) emits vertices deterministically across runs.
-    let mut unique_vertices: BTreeMap<[i32; 3], u32> = BTreeMap::new();
 
     // Faces are grouped into slots in first-seen material order. `slot_to_obj_material`
     // maps a slot to its tobj material index (`-1` == no material); `indices_by_slot`
@@ -56,6 +53,13 @@ pub fn import_obj_model(path: impl AsRef<Path>) -> Result<ImportedModel> {
     let mut slots = SlotMap::default();
 
     for model in &models {
+        // De-duplicate (position, normal, texcoord) index triples into unique vertices.
+        // BTreeMap (an ordered tree) emits vertices deterministically across runs.
+        //
+        // The map is PER MODEL because tobj re-indexes each object and each `usemtl` run against
+        // its own arrays: two models both start at triple (0, 0, 0) while meaning different
+        // vertices, so one shared map folds every later object onto the first one's geometry.
+        let mut unique_vertices: BTreeMap<[i32; 3], u32> = BTreeMap::new();
         let m = &model.mesh;
         // tobj splits a `usemtl` change mid-object into a fresh `Model`, so every
         // model is a run of faces sharing one `material_id`; grouping by that id lands
@@ -354,5 +358,51 @@ mod tests {
         assert_eq!(mesh_of(&first).indices, mesh_of(&second).indices);
         assert_eq!(mesh_of(&first).submeshes, mesh_of(&second).submeshes);
         assert_eq!(first, second);
+    }
+
+    /// Every object in a multi-object file keeps its own vertices.
+    ///
+    /// tobj re-indexes each object and each `usemtl` run against its own arrays, so two objects
+    /// both start at the triple `(0, 0, 0)` while meaning different vertices. Deduplicating across
+    /// models folds every later object onto the first one's geometry: the index count stays right,
+    /// the vertex array is short, and the later objects draw on top of the first — present in every
+    /// counter and absent from the picture.
+    #[test]
+    fn each_object_in_a_multi_object_obj_keeps_its_own_vertices() {
+        let dir = std::env::temp_dir().join(format!("saffron-obj-multi-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("scratch");
+        let path = dir.join("pair.obj");
+        // Two triangles that share no position, with the same texcoord and normal indices — the
+        // arrangement whose per-model triples collide.
+        std::fs::write(
+            &path,
+            concat!(
+                "o First\nv -1 0 0\nv 1 0 0\nv 0 1 0\n",
+                "vt 0 0\nvt 1 0\nvt 0.5 1\nvn 0 0 1\n",
+                "f 1/1/1 2/2/1 3/3/1\n",
+                "o Second\nv -1 2 0\nv 1 2 0\nv 0 3 0\n",
+                "f 4/1/1 5/2/1 6/3/1\n",
+            ),
+        )
+        .expect("write obj");
+        let model = import_obj_model(&path).expect("import");
+        let mesh = mesh_of(&model);
+        assert_eq!(mesh.indices.len(), 6, "both triangles survive");
+        assert_eq!(
+            mesh.vertices.len(),
+            6,
+            "and neither borrows the other's vertices"
+        );
+        // The second triangle must sit where the file put it, two units up.
+        let top = mesh
+            .vertices
+            .iter()
+            .map(|vertex| vertex.position.y)
+            .fold(f32::MIN, f32::max);
+        assert!(
+            (top - 3.0).abs() < 1e-5,
+            "second object collapsed onto the first: top {top}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
