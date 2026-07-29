@@ -81,6 +81,106 @@ pub(crate) fn register_runtime_vegetation_commands(reg: &mut CommandRegistry) {
             Ok(result)
         },
     );
+    reg.register::<saffron_protocol::UsdSkeletonsParams, saffron_protocol::UsdSkeletonsResult>(
+        "vegetation-usd-skeletons",
+        "vegetation-usd-skeletons {path} — the UsdSkel skeletons a USD stage declares",
+        |_ctx, params| {
+            let text = std::fs::read_to_string(&params.path)
+                .map_err(|error| Error::command(error.to_string()))?;
+            let (skeletons, unsupported) = saffron_vegetation::read_usd_skeletons(&text)
+                .map_err(|error| Error::command(error.to_string()))?;
+            Ok(saffron_protocol::UsdSkeletonsResult {
+                skeletons: skeletons
+                    .into_iter()
+                    .map(|skeleton| saffron_protocol::UsdSkeletonDto {
+                        name: skeleton.name,
+                        skel_root: skeleton.skel_root,
+                        joints: skeleton
+                            .joints
+                            .into_iter()
+                            .map(|joint| saffron_protocol::UsdJointDto {
+                                path: joint.path,
+                                parent: joint.parent.and_then(|index| u32::try_from(index).ok()),
+                                rest: joint.rest.to_vec(),
+                                bind: joint.bind.to_vec(),
+                            })
+                            .collect(),
+                    })
+                    .collect(),
+                unsupported,
+            })
+        },
+    );
+    reg.register::<
+        saffron_protocol::VegetationWindRecordParams,
+        saffron_protocol::VegetationWindRecordResult,
+    >(
+        "vegetation-wind-record",
+        "vegetation-wind-record {cell, plant} — one plant's GPU wind prepass record",
+        |ctx, params| {
+            let cell = parse_cell(&params.cell)?;
+            let plant = PlantId::from_str(&params.plant.0)
+                .map_err(|error| Error::command(error.to_string()))?;
+            let captured = ctx
+                .renderer
+                .capture_plant_wind_record(cell, plant)
+                .map_err(Error::command)?
+                .ok_or_else(|| {
+                    Error::command("the plant is not mirrored, or no frame has run yet")
+                })?;
+            let record = captured.record;
+            Ok(saffron_protocol::VegetationWindRecordResult {
+                slot: captured.slot,
+                sway_current_m: record.sway_current,
+                sway_previous_m: record.sway_previous,
+                interaction_current_m: record.interaction_current,
+                interaction_previous_m: record.interaction_previous,
+                interaction_reset: record.interaction_reset != 0.0,
+                branch_quadrature: record.branch_quadrature,
+                branch_amplitude_m: record.branch_amplitude,
+                flutter_amplitude_m: record.flutter_amplitude,
+                height_scale: record.height_scale,
+                bounds_inflation_m: record.bounds_inflation,
+                mechanics: (captured.mechanics != [0; 4]).then(|| {
+                    saffron_protocol::VegetationMechanicsDto {
+                        stiffness: captured.mechanics[0] as i32 as f32 / 65_536.0,
+                        drag: captured.mechanics[1] as i32 as f32 / 65_536.0,
+                        flutter: captured.mechanics[2] as i32 as f32 / 65_536.0,
+                        damping: (captured.mechanics[3] & 0xffff) as f32 / 65_535.0,
+                        bend_limit: (captured.mechanics[3] >> 16) as f32 / 65_535.0,
+                    }
+                }),
+            })
+        },
+    );
+    reg.register::<
+        saffron_protocol::VegetationBudgetsParams,
+        saffron_protocol::VegetationBudgetsResult,
+    >(
+        "vegetation-budgets",
+        "vegetation-budgets {cellPlants?, familyInstances?, familyMicroPredicted?} — resident-population budgets (omit to read)",
+        |ctx, params| {
+            let mut budgets = ctx.renderer.vegetation_budgets();
+            if let Some(value) = params.cell_plants {
+                budgets.cell_plants = value;
+            }
+            if let Some(value) = params.family_instances {
+                budgets.family_instances = value;
+            }
+            if let Some(value) = params.family_micro_predicted {
+                budgets.family_micro_predicted = value
+                    .parse::<u64>()
+                    .map_err(|_| Error::command("familyMicroPredicted must be a u64 string"))?;
+            }
+            ctx.renderer.set_vegetation_budgets(budgets);
+            Ok(saffron_protocol::VegetationBudgetsResult {
+                cell_plants: budgets.cell_plants,
+                family_instances: budgets.family_instances,
+                family_micro_predicted: budgets.family_micro_predicted.to_string(),
+            })
+        },
+    );
+
     reg.register::<saffron_protocol::VegetationVerifyParams, saffron_protocol::VegetationVerifyResult>(
         "vegetation-verify-artifacts",
         "rehash every artifact the current generations name, optionally removing corrupt ones",
