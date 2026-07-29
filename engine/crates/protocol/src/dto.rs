@@ -537,6 +537,9 @@ pub struct RenderStatsDto {
     pub vsm: VsmStatsDto,
     /// Instances published into the active frame TLAS.
     pub rt_instances: i32,
+    /// TLAS instances placed through the aggregate-representation structure — a family
+    /// packed as one coarse instance instead of its per-use expansion.
+    pub rt_aggregate_instances: i32,
     pub frame_ms: f32,
     pub fps: f32,
     pub gpu_ms: f32,
@@ -587,7 +590,86 @@ pub struct RenderStatsDto {
     pub restir: bool,
     pub ssr: bool,
     pub rt_reflections: bool,
+    /// Whether `VK_EXT_mesh_shader` is enabled, i.e. whether the mesh executor is a reachable
+    /// second execution path on this device. MoltenVK reports false and runs the indexed
+    /// executor at full quality.
+    pub mesh_shader: bool,
+    /// Whether the shaded executor is currently running through the mesh stage, from
+    /// `SAFFRON_MESH_EXECUTOR`. Requires `meshShader`; the mesh path is opt-in because it is
+    /// an optional second executor, not a replacement.
+    pub mesh_executor: bool,
+    /// Whether `VK_EXT_opacity_micromap` is enabled: the device can attach opacity micromaps
+    /// to triangle geometry, so a ray can resolve coverage on micro-triangles known to be
+    /// wholly covered or wholly cut out without invoking the any-hit classifier.
+    /// Occluders dropped from this frame's SDF list for want of capacity. The list is gathered
+    /// by an unculled scan, so past the cap occluders vanish from GI with no hierarchy to
+    /// coarsen into; nonzero means the global-illumination inputs are incomplete.
+    pub sdf_instances_dropped: i32,
+    /// Occluders the distance-field cascade window excluded this frame. These provably cannot
+    /// affect any march — unlike `sdfInstancesDropped`, which is geometry silently lost to the
+    /// list's capacity. A rising figure here is the cull working.
+    pub sdf_instances_culled: i32,
+    /// Ray instances excluded because they sit outside the window a GI or reflection ray reaches.
+    ///
+    /// Named apart from a drop deliberately: culling is a claim about reach and is sound, while an
+    /// instance lost to capacity is geometry silently missing from reflections.
+    pub rt_instances_culled: i32,
+    pub omm_supported: bool,
     pub blas_count: i32,
+    /// Skinned refit structures active this frame — the representation a deforming instance
+    /// selects, as opposed to the static build `blas_count` covers.
+    pub skinned_blas_count: i32,
+    /// Tessellated full-rebuild structures active this frame: variable topology forbids the
+    /// in-place update a refit needs, so these rebuild instead.
+    pub tessellated_blas_count: i32,
+    /// Whether `VK_NV_cluster_acceleration_structure` is enabled: an assembly prototype's
+    /// bottom-level structure then composes from its cooked triangle clusters.
+    pub cluster_as_supported: bool,
+    /// Distinct cluster-composed bottom-level structures referenced this frame,
+    /// deduplicated by device address so shared structures are counted once.
+    pub cluster_blas_count: i32,
+    /// Cluster acceleration structures those bottom levels compose.
+    pub clas_count: i32,
+    /// Whether the top-level structure is partitioned: instances live in partitions and a
+    /// frame rewrites only what changed, rather than the table being rebuilt whole.
+    pub ptlas_supported: bool,
+    /// Partitions this frame's instances occupy. Zero where the top level is the KHR TLAS.
+    pub ptlas_partitions: i32,
+    /// Instances the frame placed whole — appeared, or moved.
+    pub ptlas_writes: i32,
+    /// Instances whose structure address changed under an unmoved placement, which is the
+    /// cheaper op. `ptlasWrites + ptlasUpdates` far below `rtInstances` is the partitioning
+    /// paying for itself; equal to it means every instance was rewritten.
+    pub ptlas_updates: i32,
+    /// Cumulative GPU microseconds in acceleration-structure builds that run OUTSIDE the render
+    /// graph — the initial static build and its compaction, on the uploader's private pool.
+    ///
+    /// A session total rather than a per-frame figure, because that is what the work is: structures
+    /// are built when content arrives, not every frame. The per-frame refits and the TLAS build are
+    /// separate named scopes in the pass timings.
+    pub accel_build_us: String,
+    /// Distinct opacity micromaps this frame's structures reference, deduplicated by handle so
+    /// a micromap shared across instances is charged once.
+    pub omm_micromaps: i32,
+    /// Micro-triangles a derivation proved wholly covered, so traversal commits without the
+    /// coverage classifier.
+    pub omm_opaque: String,
+    /// Micro-triangles proved wholly cut out, so traversal rejects without the classifier.
+    pub omm_transparent: String,
+    /// Micro-triangles left unresolved, where the classifier still runs. This is the operational
+    /// number: micromaps present with everything unknown removed no work at all.
+    pub omm_unknown: String,
+    /// AS-storage bytes the distinct bottom-level structures occupy, deduplicated by device
+    /// address so shared structures are charged once.
+    pub blas_bytes: String,
+    /// What those structures would occupy had none been compacted; the difference against
+    /// `blasBytes` is the saving compaction realized.
+    pub blas_built_bytes: String,
+    /// AS-storage bytes this frame's top-level structure occupies.
+    pub tlas_bytes: String,
+    /// Build-scratch bytes held for this frame's structure builds. Scratch is grow-only and
+    /// shared, so it is reported apart from the structures themselves.
+    pub rt_scratch_bytes: String,
     pub pipelines: i32,
     pub bindless_textures: i32,
     pub bindless_free: i32,
@@ -629,6 +711,12 @@ pub struct RenderStatsDto {
 #[serde(rename_all = "camelCase")]
 #[ts(export)]
 pub struct GpuSceneMirrorStatsDto {
+    /// Why the active view's temporal history was last invalidated.
+    ///
+    /// A frame that re-converges is visible as a soft image and says nothing about its cause; this
+    /// separates a camera cut from a wind edit from a scene rebuild, which otherwise look identical
+    /// from outside.
+    pub history_invalidation: String,
     /// Mirrored mesh assets (prototypes).
     pub meshes: u32,
     /// Interned resolved material variants.
@@ -684,6 +772,41 @@ pub struct SceneVisibilityStatsDto {
     /// Emitted triangles whose whole record projects under one 2×2 quad — the
     /// quad-utilization pressure the rasterizer pays for sub-quad geometry.
     pub sub_quad_triangles: u32,
+    /// Hierarchy nodes the traversal reached with a resolved assembly use.
+    pub visited_nodes: u32,
+    /// Executor buckets that received a record — the indirect draws the frame issues.
+    pub bins: u32,
+    /// Deformed instances the view composed bounds for.
+    pub deformed: u32,
+    /// Deformed instances the interaction field's re-centring scroll has reset SINCE BOOT,
+    /// not this frame. The field follows the camera and zeroes every texel that scrolls in,
+    /// so an instance whose covering cascade changed reads a displacement that jumped rather
+    /// than moved and is marked reactive for the frame. Reported as a running total because
+    /// a reset is an event: any one frame's count is almost always zero, and the frame a
+    /// caller happens to sample is not the frame the camera crossed a cascade edge.
+    pub interaction_resets: u64,
+    /// Samples the geometry fragment shaders actually covered, counted only while the profiler is
+    /// armed (zero otherwise, which is the honest value for a frame that measured nothing).
+    ///
+    /// Against `fragmentInvocations` from the same capture this gives QUAD UTILIZATION — the
+    /// fraction of each shaded 2x2 quad that was not wasted. Helper lanes are counted by the
+    /// pipeline statistic and discarded by the atomic, which is exactly what makes the ratio mean
+    /// something. Foliage is the case that destroys it: a canopy of slivers shades four lanes to
+    /// cover one.
+    pub covered_samples: u32,
+    /// Hierarchy nodes rejected on their swept world bounds, each dropping the whole
+    /// subtree beneath it — the sub-instance cull the instance sphere cannot express.
+    pub culled_nodes: u32,
+    /// Instances the global-illumination reach view kept: those inside the window a
+    /// march or a reflection ray can read, whether or not the camera can see them.
+    ///
+    /// Zero while the distance field is off, which is what a view that did not run has
+    /// to report. Against `giReachCulled` it is the fraction of the scene a gather is
+    /// charged for, and the pair is the whole observable of the reach cull.
+    pub gi_reach_visible: u32,
+    /// Instances the reach view rejected — outside that window, so no gather can be
+    /// missing them.
+    pub gi_reach_culled: u32,
     /// List overflow flags (visible/retest).
     pub overflow_flags: u32,
     /// Record-stream and draw-bucket pressure flags.
@@ -715,6 +838,19 @@ pub struct PageResidencyStatsDto {
     pub faults: u64,
     /// Microseconds those faults took, summed; over `faults` it is the mean fault latency.
     pub fault_latency_us: u64,
+    /// Missing-page requests the GPU raised that no request region had room for, summed
+    /// SINCE BOOT rather than per frame. Overflow is bursty — a camera sweeping into
+    /// dense geometry raises a spike and then subsides — so the frame a caller happens to
+    /// sample is not the frame the buffer filled.
+    ///
+    /// A dropped request is not lost geometry: the page faults again next frame. It is
+    /// latency nobody asked for, and it is invisible without this number.
+    pub requests_dropped: u64,
+    /// Bit per view class whose request region has filled since boot (camera 1, shadow 2,
+    /// GI 4). The regions are separate, so a class's drops are caused by its own volume
+    /// and nothing else — which is what makes this worth reading. The camera's bit is a
+    /// stall in the image; the GI bit is a slightly thinner gather.
+    pub request_overflow_classes: u32,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema, TS)]
@@ -832,6 +968,46 @@ pub struct CaptureStartParams {
 pub struct CaptureStartResult {
     pub capture_id: u32,
     pub ack: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct VsmPageBudgetParams {
+    /// Shadow pages a frame may render; clamped to at least one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pages: Option<u32>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct VsmPageBudgetResult {
+    /// The budget now in force.
+    pub pages: u32,
+}
+
+/// Params of `page-request-budget`: how many missing-page requests one view class may
+/// raise in a frame.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct PageRequestBudgetParams {
+    /// The per-class budget to set, clamped to a usable region. Omit to read.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub entries: Option<u32>,
+}
+
+/// Reply of `page-request-budget`: the budget now in force and the region it sits in.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct PageRequestBudgetResult {
+    /// Requests one class may raise per frame.
+    pub entries: u32,
+    /// The allocated per-class region, which the budget may be lowered below but never
+    /// raised above.
+    pub capacity: u32,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema, TS)]
@@ -986,6 +1162,8 @@ pub struct AlarmEventDto {
     pub fingerprint: String,
     pub metric: String,
     pub pass: String,
+    /// What the breach belongs to; see [`ActiveAlarmDto::owner`].
+    pub owner: String,
     pub severity: AlarmSeverityDto,
     pub state: AlarmStateDto,
     pub value: f32,
@@ -1386,6 +1564,9 @@ pub struct ActiveAlarmDto {
     pub fingerprint: String,
     pub metric: String,
     pub pass: String,
+    /// What the breach belongs to — a vegetation cell and the family that filled it, or empty for
+    /// a whole-frame alarm. This is what turns "a budget broke" into "this content broke it".
+    pub owner: String,
     pub severity: AlarmSeverityDto,
     pub value: f32,
     pub threshold: f32,
@@ -4493,4 +4674,59 @@ mod coerce_tests {
             serde_json::from_value(serde_json::json!({ "entity": "rig", "playing": 1 })).unwrap();
         assert!(p.playing);
     }
+}
+
+/// Which hierarchy cut a view draws.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema, TS)]
+#[serde(rename_all = "kebab-case")]
+#[ts(export)]
+pub enum HierarchyCutDto {
+    /// Projected appearance error chooses the cut, which is what a shipped frame does.
+    Auto,
+    /// Never refine: the coarsest cut, aggregate voxels.
+    Coarse,
+    /// Always refine: the finest cut, triangle clusters.
+    Fine,
+}
+
+/// Which view's hierarchy cut a `set-hierarchy-cut` call addresses.
+///
+/// The views read the same scene for different ends and each carries its own pin, so a
+/// comparison run that pins one leaves the others where they were.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema, TS)]
+#[serde(rename_all = "kebab-case")]
+#[ts(export)]
+pub enum HierarchyCutViewDto {
+    /// The camera, whose cut is the image.
+    #[default]
+    Camera,
+    /// The shadow-atlas page views.
+    Shadow,
+    /// The global-illumination reach view.
+    Gi,
+}
+
+/// Params of `set-hierarchy-cut`: pin one view's cut, or return it to following
+/// projected error.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema, TS)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[ts(export)]
+pub struct SetHierarchyCutParams {
+    /// The cut to pin. Omit to read the current one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cut: Option<HierarchyCutDto>,
+    /// The view to address. Omit for the camera.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub view: Option<HierarchyCutViewDto>,
+}
+
+/// Reply of `set-hierarchy-cut`: the cut the addressed view now draws.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema, TS)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[ts(export)]
+pub struct HierarchyCutResult {
+    /// The view the cut belongs to.
+    pub view: HierarchyCutViewDto,
+    /// The cut that view now draws.
+    pub cut: HierarchyCutDto,
 }
