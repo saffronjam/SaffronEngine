@@ -24,7 +24,7 @@ const INITIAL_UPLOAD_BYTES: u64 = 256 * 1024;
 const GPU_COPY_ALIGNMENT: u64 = 4;
 
 /// Version of the byte-locked Rust/Slang global GPU data ABI.
-pub const GLOBAL_GPU_DATA_ABI_VERSION: u32 = 1;
+pub const GLOBAL_GPU_DATA_ABI_VERSION: u32 = 2;
 /// PSO-bin shift for geometry representation.
 pub const GPU_PSO_REPRESENTATION_SHIFT: u32 = 0;
 /// PSO-bin shift for the pass-independent material class.
@@ -545,6 +545,12 @@ struct RetiredBuffer {
 }
 
 /// Device-local growable arena that preserves superseded allocations for in-flight frames.
+///
+/// Every addressable byte reads as zero until a staged write covers it: creation fills the
+/// fresh buffer, and a growth op zero-fills the tail beyond the preserved prefix. Without
+/// that, a capacity-wide dispatch scanning slot headers reads whatever the recycled device
+/// memory last held — garbage occupancy words whose record contents become wild device
+/// addresses.
 pub struct GlobalGpuArena<K> {
     buffer: Buffer,
     element_stride: u64,
@@ -581,6 +587,15 @@ impl<K> GlobalGpuArena<K> {
             ..Default::default()
         };
         let buffer = Buffer::new(device.resources(), bytes, usage, &allocation)?;
+        // The freshly allocated device memory holds whatever it last held; fill it before any
+        // address escapes, so unstaged bytes read as zero. Synchronous, but only at arena
+        // creation (renderer init and first use of a world).
+        let handle = buffer.handle();
+        device.one_shot_transfer(|raw, cmd| {
+            // SAFETY: the ash seam. The buffer was just created with TRANSFER_DST and nothing
+            // references it yet.
+            unsafe { raw.cmd_fill_buffer(cmd, handle, 0, vk::WHOLE_SIZE, 0) };
+        })?;
         Ok(Self {
             buffer,
             element_stride,
@@ -675,7 +690,8 @@ impl<K> GlobalGpuArena<K> {
         self.ranges.retire(range)
     }
 
-    /// Grows the physical buffer and returns the graph-owned copy that preserves its live prefix.
+    /// Grows the physical buffer and returns the graph-owned op that preserves its live prefix
+    /// and zero-fills everything beyond it.
     pub fn prepare_growth(&mut self, device: &Device) -> Result<Option<GpuArenaGrowth>> {
         let required_elements = self.ranges.required_capacity();
         if required_elements <= self.capacity {
@@ -797,7 +813,9 @@ pub struct GpuArenaGrowth {
 }
 
 impl GpuArenaGrowth {
-    /// Enqueues the preservation copy as a fully declared render-graph transfer pass.
+    /// Enqueues the preservation copy and the zero-fill of the fresh tail beyond it as one
+    /// fully declared render-graph transfer pass. The two ranges are disjoint, so the pass
+    /// needs no intra-pass hazard ordering.
     pub fn enqueue(self, graph: &mut RenderGraph, device: &Device, name: impl Into<String>) {
         let source = graph.register_buffer(RgBufferResource {
             buffer: self.source,
@@ -813,8 +831,8 @@ impl GpuArenaGrowth {
         });
         let source_range =
             RgBufferRange::new(0, self.size).expect("validated global arena growth copy range");
-        let destination_range =
-            RgBufferRange::new(0, self.size).expect("validated global arena growth copy range");
+        let destination_range = RgBufferRange::new(0, self.destination_size)
+            .expect("validated global arena growth destination range");
         let resources = Arc::clone(device.resources());
         let copy = vk::BufferCopy::default().size(self.size);
         graph.add_pass(
@@ -831,6 +849,15 @@ impl GpuArenaGrowth {
                             self.destination,
                             &[copy],
                         );
+                        if self.destination_size > self.size {
+                            resources.device().cmd_fill_buffer(
+                                command_buffer,
+                                self.destination,
+                                self.size,
+                                self.destination_size - self.size,
+                                0,
+                            );
+                        }
                     }
                 }),
         );
@@ -1389,8 +1416,10 @@ pub struct GpuWindInstanceRecord {
     pub bounds_inflation: f32,
     /// World interaction-field displacement at the root, current frame.
     pub interaction_current: [f32; 3],
-    /// Reserved ABI word.
-    pub reserved0: f32,
+    /// `1.0` when the interaction cascade covering this instance changed since the
+    /// previous frame: the stored displacement jumped rather than moved, so the
+    /// reactive-coverage pass marks the instance instead of letting TAA reproject it.
+    pub interaction_reset: f32,
     /// The previous frame's interaction displacement (the field is stateful, so the
     /// prepass carries it forward from the record rather than recomputing).
     pub interaction_previous: [f32; 3],
@@ -1531,7 +1560,7 @@ pub struct GpuSubmeshRecord {
 }
 
 /// Immutable bindless material-table record.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Pod, Zeroable)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Pod, Zeroable)]
 #[repr(C, align(8))]
 pub struct GpuMaterialTableRecord {
     /// Base-color texture table handle.
@@ -1549,6 +1578,41 @@ pub struct GpuMaterialTableRecord {
     pub shader_index: u32,
     /// [`GPU_MATERIAL_TABLE_FLAG_TESSELLATED`] and future material flags.
     pub flags: u32,
+    /// The resolved base color's rgb packed 8:8:8 unorm (low to high), for the GI
+    /// occluder's proxy albedo — the lite albedo cache the DDGI trace reads wants a
+    /// color, not a texture fetch. High byte reserved.
+    pub proxy_albedo: u32,
+    /// Aggregate occupancy the distance-field consumers march this matter with:
+    /// `1.0` solid; below one, thin-sheet parity occupancy (porous matter never
+    /// hardens the field, it extinguishes through it).
+    pub occupancy: f32,
+}
+
+/// Device form of one baked signed distance field: everything a shader needs to sample
+/// the field's brick atlas and to place its local grid in an instance's frame.
+///
+/// One mesh bakes a LIST of these — one tight field per primitive and per spatial chunk
+/// of an oversized primitive — and the tightness is the point: small fields cull
+/// independently where one enclosing field would keep the whole mesh resident in every
+/// march. The occluder scatter reads this record to compose an [`crate::SdfInstance`]
+/// per visible instance per field.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Pod, Zeroable)]
+#[repr(C, align(16))]
+pub struct GpuSdfTableRecord {
+    /// The padded grid lower corner in local (rest) space; `w` is the `R16_SNORM`
+    /// distance normalization clamp (a sampled `+1.0` denormalizes to this many local
+    /// units).
+    pub local_min: [f32; 4],
+    /// The padded grid upper corner in local space; `w` reserved.
+    pub local_max: [f32; 4],
+    /// `xyz` the fine voxel count per axis; `w` the shared bindless SDF slot (atlas
+    /// binding 1 + indirection binding 2 + coverage binding 3).
+    pub voxel_dims: [u32; 4],
+    /// `xyz` the brick indirection-volume dims (bricks per axis); `w` the prefiltered
+    /// atlas mip count.
+    pub indirection_dims: [u32; 4],
+    /// `xyz` the atlas tiling (occupied bricks per axis); `w` reserved.
+    pub atlas_bricks: [u32; 4],
 }
 
 /// The executor shader registry: gives [`GpuMaterialTableRecord::shader_index`] its
@@ -1806,8 +1870,12 @@ pub struct GpuScenePrototypeGpuRecord {
     pub material_range: GpuArenaRange,
     /// Packed scene deformation handle or [`GpuHandle::INVALID`].
     pub deformation: GpuHandle,
-    /// Packed scene SDF handle or [`GpuHandle::INVALID`].
-    pub sdf: GpuHandle,
+    /// Range of packed scene-SDF handles in [`GlobalGpuData::prototype_sdfs`] — one
+    /// per baked field of the prototype's mesh, empty when it baked none. A range
+    /// rather than a handle because the fields are many and tight on purpose: each
+    /// culls independently where one enclosing field would keep the whole mesh in
+    /// every march.
+    pub sdf_range: GpuArenaRange,
     /// Packed scene page handle of the guaranteed-resident root.
     pub root_page: GpuHandle,
     /// Source generation of the mirrored asset.
@@ -1816,8 +1884,12 @@ pub struct GpuScenePrototypeGpuRecord {
     pub flags: u32,
     /// Conservative object-space bounding sphere (16-byte aligned for storage-pointer loads).
     pub bounds: [f32; 4],
-    /// Reserved ABI words.
-    pub reserved: [u32; 4],
+    /// The prototype's authored mechanical response, in the authored integer forms so the
+    /// GPU reads exactly what was cooked: `[0..3]` are Q15.16 stiffness, drag, and flutter;
+    /// `[3]` packs the `[0, 1]` damping in the low half and bend limit in the high half.
+    /// All zero when the prototype is not a plant family, which the wind prepass reads as
+    /// "derive the response from the plant's height alone".
+    pub mechanics: [u32; 4],
 }
 
 /// Device form of one GPU-scene reference slot (material, deformation, or SDF): a
@@ -1862,8 +1934,9 @@ pub struct GpuSceneInstanceGpuRecord {
     pub prototype: GpuHandle,
     /// Packed scene deformation handle or [`GpuHandle::INVALID`].
     pub deformation: GpuHandle,
-    /// Packed scene SDF handle or [`GpuHandle::INVALID`].
-    pub sdf: GpuHandle,
+    /// Alignment padding keeping the transform payload 16-byte aligned. Occluders are
+    /// a prototype property, so the instance record carries no SDF reference.
+    pub reserved_pad: [u32; 2],
     /// Range of [`GpuSceneOverrideGpuRecord`] elements in the override arena.
     pub material_overrides: GpuArenaRange,
     /// [`GPU_SCENE_TRANSFORM_STATIC`] or [`GPU_SCENE_TRANSFORM_DYNAMIC`].
@@ -2222,6 +2295,8 @@ pub enum DeformationProviderArena {}
 pub enum DeformationParameterArena {}
 /// Marker for per-prototype material handles.
 pub enum PrototypeMaterialArena {}
+/// Marker for per-prototype SDF-reference handles.
+pub enum PrototypeSdfArena {}
 /// Marker for immutable byte-locked material parameters.
 pub enum MaterialParameterArena {}
 /// Marker for the prototype table.
@@ -2236,6 +2311,8 @@ pub enum TextureTable {}
 pub enum CoverageTable {}
 /// Marker for the skeleton table.
 pub enum SkeletonTable {}
+/// Marker for the SDF table.
+pub enum SdfTable {}
 /// Marker for the page table.
 pub enum PageTable {}
 /// Marker for the geometry submesh-record arena.
@@ -2272,6 +2349,8 @@ pub enum GlobalGpuTableKind {
     Coverage,
     /// [`GlobalGpuData::skeletons`].
     Skeleton,
+    /// [`GlobalGpuData::sdfs`].
+    Sdf,
     /// [`GlobalGpuData::page_table`].
     Page,
 }
@@ -2306,6 +2385,8 @@ pub struct GlobalGpuTableDescriptors {
     pub coverage: GpuTableDescriptor,
     /// Skeleton records.
     pub skeletons: GpuTableDescriptor,
+    /// Baked signed-distance-field records.
+    pub sdfs: GpuTableDescriptor,
     /// Resident-page records.
     pub pages: GpuTableDescriptor,
 }
@@ -2351,6 +2432,10 @@ pub struct GlobalGpuData {
     pub deformation_parameters: GlobalGpuArena<DeformationParameterArena>,
     /// Material handles addressed by [`GpuPrototypeRecord::material_range`].
     pub prototype_materials: GlobalGpuArena<PrototypeMaterialArena>,
+    /// Packed scene-SDF handles addressed by
+    /// [`GpuScenePrototypeGpuRecord::sdf_range`] — one per baked field of the
+    /// prototype's mesh, empty for a mesh that baked none.
+    pub prototype_sdfs: GlobalGpuArena<PrototypeSdfArena>,
     /// Immutable parameters addressed by [`GpuMaterialTableRecord::parameter_index`].
     pub material_parameters: GlobalGpuArena<MaterialParameterArena>,
     /// Geometry submesh records referenced by [`GpuGeometryRecord::submeshes`].
@@ -2369,6 +2454,9 @@ pub struct GlobalGpuData {
     pub coverage: ResidentGpuTable<GpuCoverageRecord, CoverageTable>,
     /// Skeleton records.
     pub skeletons: ResidentGpuTable<GpuSkeletonRecord, SkeletonTable>,
+    /// Baked signed-distance-field records — the resident target the scene SDF
+    /// references resolve to, and the occluder scatter's source of grid placement.
+    pub sdfs: ResidentGpuTable<GpuSdfTableRecord, SdfTable>,
     /// Page-table records.
     pub page_table: ResidentGpuTable<GpuPageRecord, PageTable>,
     /// Frame-safe staging uploads.
@@ -2436,6 +2524,11 @@ impl GlobalGpuData {
                 std::mem::size_of::<GpuHandle>() as u64,
                 16_384,
             )?,
+            prototype_sdfs: GlobalGpuArena::new(
+                device,
+                std::mem::size_of::<GpuHandle>() as u64,
+                4_096,
+            )?,
             material_parameters: GlobalGpuArena::new(
                 device,
                 std::mem::size_of::<MaterialParamsData>() as u64,
@@ -2453,6 +2546,7 @@ impl GlobalGpuData {
             textures: ResidentGpuTable::new(device, 4_096)?,
             coverage: ResidentGpuTable::new(device, 4_096)?,
             skeletons: ResidentGpuTable::new(device, 1_024)?,
+            sdfs: ResidentGpuTable::new(device, 4_096)?,
             page_table: ResidentGpuTable::new(device, 4_096)?,
             uploads: FrameUploadRing::new(device, INITIAL_UPLOAD_BYTES)?,
         })
@@ -2476,6 +2570,7 @@ impl GlobalGpuData {
         self.deformation_parameters
             .begin_frame(completed_frame_slot)?;
         self.prototype_materials.begin_frame(completed_frame_slot)?;
+        self.prototype_sdfs.begin_frame(completed_frame_slot)?;
         self.material_parameters.begin_frame(completed_frame_slot)?;
         self.submesh_table.begin_frame(completed_frame_slot)?;
         self.prototypes.begin_frame(completed_frame_slot)?;
@@ -2484,6 +2579,7 @@ impl GlobalGpuData {
         self.textures.begin_frame(completed_frame_slot)?;
         self.coverage.begin_frame(completed_frame_slot)?;
         self.skeletons.begin_frame(completed_frame_slot)?;
+        self.sdfs.begin_frame(completed_frame_slot)?;
         self.page_table.begin_frame(completed_frame_slot)?;
         self.uploads.begin_frame(completed_frame_slot)
     }
@@ -2498,6 +2594,7 @@ impl GlobalGpuData {
             textures: self.textures.descriptor(device),
             coverage: self.coverage.descriptor(device),
             skeletons: self.skeletons.descriptor(device),
+            sdfs: self.sdfs.descriptor(device),
             pages: self.page_table.descriptor(device),
         }
     }
@@ -2770,7 +2867,7 @@ mod tests {
                 size_of::<GpuMaterialTableRecord>(),
                 align_of::<GpuMaterialTableRecord>()
             ),
-            (40, 8)
+            (48, 8)
         );
         assert_eq!(offset_of!(GpuMaterialTableRecord, base_color_texture), 0);
         assert_eq!(offset_of!(GpuMaterialTableRecord, normal_texture), 8);
@@ -2778,6 +2875,8 @@ mod tests {
         assert_eq!(offset_of!(GpuMaterialTableRecord, parameter_index), 24);
         assert_eq!(offset_of!(GpuMaterialTableRecord, material_class), 28);
         assert_eq!(offset_of!(GpuMaterialTableRecord, shader_index), 32);
+        assert_eq!(offset_of!(GpuMaterialTableRecord, proxy_albedo), 40);
+        assert_eq!(offset_of!(GpuMaterialTableRecord, occupancy), 44);
         assert_eq!(offset_of!(GpuMaterialTableRecord, flags), 36);
         assert_eq!(
             (
@@ -2927,11 +3026,15 @@ mod tests {
             ),
             (
                 "GpuMaterialTableRecord",
-                "public GpuHandle baseColorTexture; public GpuHandle normalTexture; public GpuHandle coverage; public uint parameterIndex; public uint materialClass; public uint shaderIndex; public uint flags;",
+                "public GpuHandle baseColorTexture; public GpuHandle normalTexture; public GpuHandle coverage; public uint parameterIndex; public uint materialClass; public uint shaderIndex; public uint flags; public uint proxyAlbedo; public float occupancy;",
+            ),
+            (
+                "GpuSdfTableRecord",
+                "public float4 localMin; public float4 localMax; public uint4 voxelDims; public uint4 indirectionDims; public uint4 atlasBricks;",
             ),
             (
                 "GpuTextureTableRecord",
-                "public uint descriptorIndex; public uint width; public uint height; public uint mipCount; public uint flags; public uint3 reserved;",
+                "public uint descriptorIndex; public uint width; public uint height; public uint mipCount; public uint flags; public uint reserved0; public uint reserved1; public uint reserved2;",
             ),
             (
                 "GpuCoverageRecord",

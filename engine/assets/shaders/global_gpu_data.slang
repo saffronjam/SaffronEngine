@@ -2,7 +2,7 @@
 
 import coverage;
 
-public static const uint GLOBAL_GPU_DATA_ABI_VERSION = 1u;
+public static const uint GLOBAL_GPU_DATA_ABI_VERSION = 2u;
 
 public static const uint GPU_PSO_REPRESENTATION_SHIFT = 0u;
 public static const uint GPU_PSO_MATERIAL_SHIFT = 2u;
@@ -115,13 +115,19 @@ public struct GpuAssemblyPrototypeRecord
 
 // One assembly use: the prototype it places and rows 0-2 of its row-major family-local
 // transform (the implicit last row is [0, 0, 0, 1]).
+// Reserved words are three scalars rather than a `uint3`: this record is read through a buffer
+// device address, and std430 requires a three-component vector to start on a 16-byte boundary.
+// The reserved block begins at offset 52, so a `uint3` there makes every module reaching this
+// path fail spirv-val. The bytes and the 64-byte size are identical either way.
 public struct GpuAssemblyUseRecord
 {
     public float4 row0;
     public float4 row1;
     public float4 row2;
     public uint prototype;
-    public uint3 reserved;
+    public uint reserved0;
+    public uint reserved1;
+    public uint reserved2;
 };
 
 public static const uint GPU_ASSEMBLY_PROTOTYPE_RECORD_SIZE = 16u;
@@ -253,6 +259,10 @@ public float3 gpuSceneAssemblyTransformVector(GpuAssemblyUseRecord use, float3 l
         dot(use.row0.xyz, local), dot(use.row1.xyz, local), dot(use.row2.xyz, local));
 }
 
+// `proxyAlbedo` is the resolved base-color rgb packed 8:8:8 unorm (low to high) —
+// the GI occluder's proxy color; high byte reserved. `occupancy` is the aggregate
+// density the distance-field consumers march this matter with: 1 solid, fractional
+// thin-sheet parity occupancy.
 public struct GpuMaterialTableRecord
 {
     public GpuHandle baseColorTexture;
@@ -262,12 +272,24 @@ public struct GpuMaterialTableRecord
     public uint materialClass;
     public uint shaderIndex;
     public uint flags;
+    public uint proxyAlbedo;
+    public float occupancy;
 };
+
+public float3 gpuMaterialProxyAlbedo(GpuMaterialTableRecord material)
+{
+    return float3(
+        float(material.proxyAlbedo & 0xffu),
+        float((material.proxyAlbedo >> 8u) & 0xffu),
+        float((material.proxyAlbedo >> 16u) & 0xffu)) / 255.0;
+}
 
 // The material displaces real geometry: the traversal skips its records while the
 // tessellation seam draws the amplified transient geometry.
 public static const uint GPU_MATERIAL_TABLE_FLAG_TESSELLATED = 1u;
 
+// Reserved words are scalars, not a `uint3` — see `GpuAssemblyUseRecord`; the block starts at
+// offset 20, which is not 16-byte aligned.
 public struct GpuTextureTableRecord
 {
     public uint descriptorIndex;
@@ -275,7 +297,9 @@ public struct GpuTextureTableRecord
     public uint height;
     public uint mipCount;
     public uint flags;
-    public uint3 reserved;
+    public uint reserved0;
+    public uint reserved1;
+    public uint reserved2;
 };
 
 public struct GpuCoverageRecord
@@ -367,13 +391,45 @@ public struct GpuScenePrototypeGpuRecord
     public GpuHandle geometry;
     public GpuArenaRange materialRange;
     public GpuHandle deformation;
-    public GpuHandle sdf;
+    // Range of packed scene-SDF handles in the prototype-SDF arena — one per baked
+    // field of the prototype's mesh, empty when it baked none. Many tight fields
+    // rather than one enclosing field, so each culls independently.
+    public GpuArenaRange sdfRange;
     public GpuHandle rootPage;
     public uint sourceGeneration;
     public uint flags;
     public float4 bounds;
-    public uint4 reserved;
+    // The prototype's authored mechanical response in its cooked integer form: Q15.16
+    // stiffness, drag, and flutter, then the [0,1] damping in the low half of the last
+    // word and the bend limit in the high half. All zero outside a plant family.
+    public uint4 mechanics;
 };
+
+// One plant family's authored wind and bend response, unpacked from the prototype record.
+public struct GpuMechanicalResponse
+{
+    public float stiffness;
+    public float drag;
+    public float flutter;
+    public float damping;
+    public float bendLimit;
+    // False when the prototype carries no authored response (anything that is not a plant
+    // family), so the caller derives its response from the plant's height alone.
+    public bool authored;
+};
+
+public GpuMechanicalResponse gpuSceneMechanicalResponse(GpuScenePrototypeGpuRecord prototype)
+{
+    GpuMechanicalResponse response;
+    response.stiffness = float(int(prototype.mechanics.x)) / 65536.0;
+    response.drag = float(int(prototype.mechanics.y)) / 65536.0;
+    response.flutter = float(int(prototype.mechanics.z)) / 65536.0;
+    response.damping = float(prototype.mechanics.w & 0xffffu) / 65535.0;
+    response.bendLimit = float(prototype.mechanics.w >> 16u) / 65535.0;
+    response.authored = (prototype.mechanics.x | prototype.mechanics.y | prototype.mechanics.z
+        | prototype.mechanics.w) != 0u;
+    return response;
+}
 
 public struct GpuSceneReferenceGpuRecord
 {
@@ -393,7 +449,9 @@ public struct GpuSceneInstanceGpuRecord
 {
     public GpuHandle prototype;
     public GpuHandle deformation;
-    public GpuHandle sdf;
+    // Alignment padding keeping the transform payload 16-byte aligned. Occluders are a
+    // prototype property, so the instance record carries no SDF reference.
+    public uint2 reservedPad;
     public GpuArenaRange materialOverrides;
     public uint transformKind;
     public uint sourceGeneration;
@@ -584,6 +642,7 @@ public struct GpuSceneAddressBlock
     public uint64_t textures;
     public uint64_t coverage;
     public uint64_t skeletons;
+    public uint64_t sdfs;
     public uint64_t pages;
     public uint64_t scenePrototypes;
     public uint64_t sceneMaterials;
@@ -594,6 +653,7 @@ public struct GpuSceneAddressBlock
     public uint64_t lights;
     public uint64_t overrides;
     public uint64_t prototypeMaterials;
+    public uint64_t prototypeSdfs;
     public uint64_t materialParameters;
     public uint64_t vertices;
     public uint64_t indices;
@@ -609,12 +669,18 @@ public struct GpuSceneAddressBlock
     public uint64_t candidates;
     public uint64_t windRecords;
     public uint64_t interactionField;
-    public uint64_t reservedAddress;
+    public uint64_t quadCounters;
     public uint instanceCapacity;
     public uint lightCapacity;
     public uint coverageTemporalPhase;
     public uint pageRequestCapacity;
+    public uint pageRequestBudget;
+    public uint pageRequestClasses;
+    public uint2 reserved;
 };
+
+/// Counter word the geometry fragment shaders accumulate covered samples into.
+public static const uint GPU_SCENE_COUNTER_COVERED_SAMPLES = 20u;
 
 // The per-frame address block bound on the instance set; every übershader-family pass
 // resolves persistent scene records through it.
@@ -644,7 +710,10 @@ public struct GpuWindInstanceRecord
     public float3 swayPrevious;
     public float boundsInflation;
     public float3 interactionCurrent;
-    public float reserved0;
+    // 1.0 when the interaction cascade this instance reads changed since the previous
+    // frame — its stored displacement jumped rather than moved, so reprojection would
+    // smear the jump and the reactive-coverage pass marks the instance instead.
+    public float interactionReset;
     public float3 interactionPrevious;
     public float reserved1;
     public float4 branchQuadrature;
@@ -672,12 +741,16 @@ public float gpuInteractionTexelMeters(uint cascade)
     return 0.25 * float(1u << (2u * cascade));
 }
 
+// Reserved words are scalars, not a `uint3` — see `GpuAssemblyUseRecord`; the block starts at
+// offset 20, which is not 16-byte aligned.
 public struct GpuInteractionHeader
 {
     // Per-cascade centre texel in absolute world texel coordinates.
     public int2 centerTexel[GPU_INTERACTION_CASCADES];
     public uint generation;
-    public uint3 reserved;
+    public uint reserved0;
+    public uint reserved1;
+    public uint reserved2;
 };
 
 public struct GpuInteractionTexel
@@ -717,6 +790,55 @@ float3 gpuInteractionTexelValue(uint64_t field, uint cascade, int2 worldCoord, i
     return float3(value.displacement.x, -value.depress, value.displacement.y);
 }
 
+// Whether `positionXZ` falls inside `cascade`'s bilinear-safe window around `center`,
+// and the base texel coordinate + fraction of its footprint.
+bool gpuInteractionFootprint(
+    uint cascade, float2 positionXZ, int2 center, out int2 baseCoord, out float2 fraction)
+{
+    float texelMeters = gpuInteractionTexelMeters(cascade);
+    float2 grid = positionXZ / texelMeters - 0.5;
+    float2 base = floor(grid);
+    fraction = grid - base;
+    baseCoord = int2(int(base.x), int(base.y));
+    int2 offset = baseCoord - center;
+    int half = int(GPU_INTERACTION_TEXELS / 2u);
+    return offset.x >= -half + 1 && offset.y >= -half + 1 && offset.x < half - 2
+        && offset.y < half - 2;
+}
+
+// The finest cascade covering `positionXZ` for the given cascade centres, or
+// `GPU_INTERACTION_CASCADES` when the position falls outside every cascade. Taking the
+// centres as arguments is what lets a caller ask the same question of the previous
+// frame's field placement.
+public uint gpuSceneInteractionCascade(float2 positionXZ, int2 center0, int2 center1)
+{
+    for (uint cascade = 0u; cascade < GPU_INTERACTION_CASCADES; ++cascade)
+    {
+        int2 baseCoord;
+        float2 fraction;
+        int2 center = cascade == 0u ? center0 : center1;
+        if (gpuInteractionFootprint(cascade, positionXZ, center, baseCoord, fraction))
+        {
+            return cascade;
+        }
+    }
+    return GPU_INTERACTION_CASCADES;
+}
+
+// The field's live cascade centres, as the interaction step wrote them this frame.
+public void gpuSceneInteractionCenters(uint64_t field, out int2 center0, out int2 center1)
+{
+    center0 = int2(0, 0);
+    center1 = int2(0, 0);
+    if (field == 0)
+    {
+        return;
+    }
+    GpuInteractionHeader head = *(GpuInteractionHeader*)field;
+    center0 = head.centerTexel[0];
+    center1 = head.centerTexel[1];
+}
+
 // Bilinear world-space sample of the interaction field's displacement at a ground
 // position: horizontal push in xz, ground depression as negative y. The finest
 // cascade containing the position wins.
@@ -730,16 +852,10 @@ public float3 gpuSceneInteractionSample(uint64_t field, float2 positionXZ)
     GpuInteractionHeader head = *header;
     for (uint cascade = 0u; cascade < GPU_INTERACTION_CASCADES; ++cascade)
     {
-        float texelMeters = gpuInteractionTexelMeters(cascade);
-        float2 grid = positionXZ / texelMeters - 0.5;
-        float2 base = floor(grid);
-        float2 fraction = grid - base;
-        int2 baseCoord = int2(int(base.x), int(base.y));
+        int2 baseCoord;
+        float2 fraction;
         int2 center = head.centerTexel[cascade];
-        int2 offset = baseCoord - center;
-        int half = int(GPU_INTERACTION_TEXELS / 2u);
-        if (offset.x < -half + 1 || offset.y < -half + 1 || offset.x >= half - 2
-            || offset.y >= half - 2)
+        if (!gpuInteractionFootprint(cascade, positionXZ, center, baseCoord, fraction))
         {
             continue;
         }
@@ -751,6 +867,19 @@ public float3 gpuSceneInteractionSample(uint64_t field, float2 positionXZ)
             lerp(v00, v10, fraction.x), lerp(v01, v11, fraction.x), fraction.y);
     }
     return float3(0.0, 0.0, 0.0);
+}
+
+// Whether the instance in `slot` reads a discontinuous interaction displacement this
+// frame — the prepass's verdict, read back by the reactive-coverage pass.
+public bool gpuSceneWindInteractionReset(GpuSceneAddressBlock addresses, uint slot)
+{
+    if (addresses.windRecords == 0)
+    {
+        return false;
+    }
+    GpuWindInstanceRecord* record = (GpuWindInstanceRecord*)(
+        addresses.windRecords + uint64_t(slot) * GPU_WIND_INSTANCE_RECORD_SIZE);
+    return (*record).interactionReset != 0.0;
 }
 
 float3 gpuWindNormalizeOrZero(float3 value)
@@ -785,7 +914,7 @@ public float3 gpuSceneWindDeform(
     float weight = clamp(local.y * record.heightScale, 0.0, 1.0);
     float3 offset = (previous ? record.swayPrevious : record.swayCurrent) * (weight * weight)
         + (previous ? record.interactionPrevious : record.interactionCurrent) * weight;
-    uint semantic = assembly ? use.reserved.x : 0u;
+    uint semantic = assembly ? use.reserved0 : 0u;
     bool moving = semantic >= 1u && semantic <= 6u && semantic != 2u;
     if (moving && record.branchAmplitude > 0.0)
     {
@@ -828,6 +957,14 @@ public GpuSceneReferenceGpuRecord gpuSceneLoadMaterialReference(
     return *record;
 }
 
+public GpuSceneReferenceGpuRecord gpuSceneLoadSdfReference(
+    GpuSceneAddressBlock addresses, uint slot)
+{
+    GpuSceneReferenceGpuRecord* record = (GpuSceneReferenceGpuRecord*)(
+        addresses.sceneSdfs + uint64_t(slot) * GPU_SCENE_REFERENCE_SLOT_STRIDE + 16u);
+    return *record;
+}
+
 public GpuSceneReferenceGpuRecord gpuSceneLoadDeformation(
     GpuSceneAddressBlock addresses, uint slot)
 {
@@ -848,6 +985,12 @@ public GpuSceneLightGpuRecord gpuSceneLoadLight(GpuSceneAddressBlock addresses, 
     GpuSceneLightGpuRecord* record = (GpuSceneLightGpuRecord*)(
         addresses.lights + uint64_t(slot) * GPU_SCENE_LIGHT_SLOT_STRIDE + 16u);
     return *record;
+}
+
+public GpuHandle gpuScenePrototypeSdfHandle(GpuSceneAddressBlock addresses, uint element)
+{
+    GpuHandle* handle = (GpuHandle*)(addresses.prototypeSdfs + uint64_t(element) * 8u);
+    return *handle;
 }
 
 public GpuHandle gpuScenePrototypeMaterialHandle(GpuSceneAddressBlock addresses, uint element)
@@ -997,15 +1140,32 @@ public uint gpuScenePageIndex(
     return *value;
 }
 
-// Appends one missing-page request (a resident page-table slot) to this frame's request
-// buffer. A full buffer drops the request; the CPU drain clamps the count word.
-public void gpuSceneRequestPage(GpuSceneAddressBlock addresses, uint pageSlot)
+// Appends one missing-page request — a resident page-table slot — to this frame's
+// request buffer.
+//
+// The buffer is PARTITIONED BY VIEW CLASS: a count word per class, then one region per
+// class. Every view in the frame appends here, and the classes are not worth the same —
+// a camera miss is a hole in the image while a gather miss is a slightly thinner gather —
+// so a shared queue would let the cheapest reader crowd out the most expensive one on
+// nothing but atomic order. Owning a region means a class's drops depend on its own
+// volume and on nothing else.
+//
+// The region base uses the ALLOCATED capacity; the bound test uses the budget, which a
+// caller may lower below it to reach this path deliberately. Addressing off the budget
+// would move every region the moment it changed and the CPU drain would read garbage.
+// A full region drops the request, and the count word keeps counting so the drain can
+// price what was lost.
+public void gpuSceneRequestPage(GpuSceneAddressBlock addresses, uint pageSlot, uint viewClass)
 {
-    Atomic<uint>* count = (Atomic<uint>*)(addresses.pageRequests);
+    uint region = min(viewClass, addresses.pageRequestClasses - 1u);
+    Atomic<uint>* count = (Atomic<uint>*)(addresses.pageRequests + uint64_t(region) * 4u);
     uint index = count[0].add(1u);
-    if (index < addresses.pageRequestCapacity)
+    if (index < addresses.pageRequestBudget)
     {
-        uint* entry = (uint*)(addresses.pageRequests + 4u + uint64_t(index) * 4u);
+        uint64_t base = addresses.pageRequests
+            + uint64_t(addresses.pageRequestClasses) * 4u
+            + uint64_t(region) * uint64_t(addresses.pageRequestCapacity) * 4u;
+        uint* entry = (uint*)(base + uint64_t(index) * 4u);
         *entry = pageSlot;
     }
 }
@@ -1044,6 +1204,29 @@ public GpuCoverageRecord gpuSceneResidentCoverage(GpuSceneAddressBlock addresses
 {
     GpuCoverageRecord* record = (GpuCoverageRecord*)(
         addresses.coverage + uint64_t(handle.index) * GPU_COVERAGE_TABLE_STRIDE + 16u);
+    return *record;
+}
+
+// One baked signed distance field: the grid placement and atlas identity the occluder
+// scatter reads to compose an SdfInstance for a visible instance.
+// `localMin.w` is the R16_SNORM distance normalization clamp in local units;
+// `voxelDims.w` the shared bindless SDF slot; `indirectionDims.w` the prefiltered
+// atlas mip count; the corners are the padded grid bounds in local (rest) space.
+public struct GpuSdfTableRecord
+{
+    public float4 localMin;
+    public float4 localMax;
+    public uint4 voxelDims;
+    public uint4 indirectionDims;
+    public uint4 atlasBricks;
+};
+
+public static const uint GPU_SDF_TABLE_STRIDE = 96u;
+
+public GpuSdfTableRecord gpuSceneResidentSdf(GpuSceneAddressBlock addresses, GpuHandle handle)
+{
+    GpuSdfTableRecord* record = (GpuSdfTableRecord*)(
+        addresses.sdfs + uint64_t(handle.index) * GPU_SDF_TABLE_STRIDE + 16u);
     return *record;
 }
 
@@ -1187,4 +1370,25 @@ public bool gpuSceneRayCandidateCovered(
         surface.canonicalProbability,
         false);
     return coverage.covered;
+}
+
+
+/// Counts one covered sample, when something is measuring.
+///
+/// A HELPER INVOCATION'S ATOMICS ARE DISCARDED by the spec, so this counts only lanes that really
+/// covered a sample — while the `FRAGMENT_SHADER_INVOCATIONS` pipeline statistic counts every lane
+/// including helpers. Their ratio is quad utilization: the fraction of each shaded 2x2 quad that
+/// was not wasted, which no pipeline statistic reports on its own and which foliage destroys,
+/// being made of slivers.
+///
+/// A zero address means nothing is measuring, and the whole thing compiles away to a branch.
+public void gpuSceneCountCoveredSample(GpuSceneAddressBlock addresses)
+{
+    if (addresses.quadCounters == 0)
+    {
+        return;
+    }
+    uint* counters = (uint*)addresses.quadCounters;
+    uint previous;
+    InterlockedAdd(counters[GPU_SCENE_COUNTER_COVERED_SAMPLES], 1u, previous);
 }
