@@ -16,7 +16,8 @@ A panel body is not reachable until it is registered. Three places, all in one c
 
 The two dockspace islands are disjoint and stay that way — a scene panel and an asset-editor panel
 share no ids. Vegetation spans both: `vegetation` and `ecologyTimeline` are scene panels;
-`vegSummary`, `plantGraph`, and `biomeGraph` live in the asset-editor island.
+`vegSummary`, `plantGraph`, `plantWind`, `plantAtlas`, `plantHierarchy`, `plantSeason`,
+`plantProxies`, and `biomeGraph` live in the asset-editor island.
 
 ## Rules that are easy to break
 
@@ -50,6 +51,11 @@ share no ids. Vegetation spans both: `vegetation` and `ecologyTimeline` are scen
 | `vegetationPainting.ts`, `vegetationPlanting.ts` | The brush interaction model and single-plant placement |
 | `EcologyTimelinePanel.tsx` | Step and run over the world's biological clock |
 | `PlantGraphPanel.tsx` | The botanical graph, its variations, and validation |
+| `PlantWindPanel.tsx` | Wind and interaction preview: drives the real fields the previewed plant stands in |
+| `PlantAtlasPanel.tsx` | The packed coverage atlas the family samples, with a scrubbable mip level |
+| `PlantHierarchyPanel.tsx` | The cooked cut and its declared errors, with the cut pinnable so the preview draws either representation |
+| `PlantSeasonPanel.tsx` | Scrubs the year and binds the appearance the engine resolves to the live preview |
+| `PlantProxiesPanel.tsx` | Draws the family's derived collision capsules and navigation footprints over the preview |
 | `BiomeGraphPanel.tsx` | The biome placement graph |
 | `VegetationAssetWorkspace.tsx`, `vegetationAssetDetails.ts` | The asset-editor workspace for `.splant` / `.sbiome` / `.svegmap` |
 
