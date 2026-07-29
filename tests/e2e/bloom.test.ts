@@ -10,9 +10,9 @@ import type { RenderStats, SetBloomParams, SetBloomResult } from "@saffron/proto
 let engine: Engine;
 beforeAll(async () => {
   engine = await Engine.boot({ SAFFRON_SCRATCH_PROJECT: "1" });
-  // Size the scene view small so the bloom pyramid's compute dispatches stay cheap on the software
-  // rasterizer the headless (weston) surface falls back to — the base pipeline plus ~13 bloom
-  // dispatches at the default swapchain extent would otherwise starve the control drain on llvmpipe.
+  // Size the scene view small so the bloom pyramid's compute dispatches stay cheap when the host
+  // falls back to a software rasterizer — the base pipeline plus ~13 bloom dispatches at the
+  // default extent would otherwise starve the control drain on llvmpipe.
   await prepareScene(engine);
   // A bright cube so the pyramid has non-trivial HDR energy to spread (the validation oracle does
   // not depend on content, but this exercises the composite lerp on real radiance).

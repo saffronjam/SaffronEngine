@@ -17,8 +17,8 @@ import type {
 let engine: Engine;
 beforeAll(async () => {
   engine = await Engine.boot({ SAFFRON_SCRATCH_PROJECT: "1" });
-  // Size the scene view small so the extra fullscreen fog dispatch stays cheap on the software
-  // rasterizer the headless (weston) surface falls back to.
+  // Size the scene view small so the extra fullscreen fog dispatch stays cheap when the host
+  // falls back to a software rasterizer.
   await prepareScene(engine);
   // A cube so the depth buffer carries a real near-surface (the closed-form term integrates over
   // reconstructed world position; the validation oracle is content-independent, this exercises it).
