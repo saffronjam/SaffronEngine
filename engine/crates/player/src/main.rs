@@ -207,6 +207,27 @@ impl PlayerLayer {
         }
     }
 
+    /// Writes the rendered frame to the path in `SAFFRON_CAPTURE_FRAME`, overwriting it each
+    /// frame so the file holds the last one rendered.
+    ///
+    /// The test seam that lets the player's output be compared against the host's — the player
+    /// has no control plane to ask for a screenshot, and pairs with `SAFFRON_EXIT_AFTER_FRAMES`
+    /// to make a bounded run produce one deterministic image. Unset (every real run) it is a
+    /// single env read.
+    fn capture_frame(&mut self, renderer: &mut Renderer) {
+        let Some(path) = std::env::var_os("SAFFRON_CAPTURE_FRAME") else {
+            return;
+        };
+        match renderer.encode_active_offscreen_png() {
+            Ok(png) => {
+                if let Err(err) = std::fs::write(&path, &png.bytes) {
+                    tracing::error!("saffron-player: capture write failed: {err}");
+                }
+            }
+            Err(err) => tracing::error!("saffron-player: capture encode failed: {err}"),
+        }
+    }
+
     /// Lazily builds the one-off uploader from the renderer's device + queue (asset GPU uploads).
     fn ensure_uploader(&mut self, renderer: &Renderer) {
         if self.uploader.is_some() {
@@ -454,6 +475,7 @@ impl Layer for PlayerLayer {
         if let Err(err) = renderer.render_scene_offscreen() {
             tracing::error!("saffron-player: render_scene_offscreen: {err}");
         }
+        self.capture_frame(renderer);
     }
 
     fn on_detach(&mut self, _app: &mut App) {
@@ -465,6 +487,10 @@ impl Layer for PlayerLayer {
         self.runtime.shutdown_physics_globals();
         self.uploader = None;
         self.assets.clear_asset_caches();
+        // The mirror retains `Arc<GpuMesh>`/`Arc<GpuTexture>` clones for its mirrored prototypes
+        // and interned textures; they must release with the rest, or the device outlives its own
+        // destruction and the driver faults inside `vkDestroyInstance`.
+        self.gpu_scene_mirror = GpuSceneMirror::new();
     }
 }
 
