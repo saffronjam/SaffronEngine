@@ -167,6 +167,20 @@ and a scan of sixteen fixed slots per submission — no allocation, nothing grow
 formatted until a report is actually due. A seventeenth concurrent submission goes untracked rather
 than allocating.
 
+When the hang matures into an `ERROR_DEVICE_LOST`, two diagnostic extensions turn the bare code
+into a named culprit. With `VK_NV_device_diagnostic_checkpoints`, every render-graph pass and
+one-off upload submission drops a named marker into its command stream, and the loss paths query
+each queue for the last marker its front end and retirement reached — bracketing the wedged work
+to one pass. With `VK_EXT_device_fault`, the driver adds what kind of fault it saw and, when it
+knows them, the faulting GPU addresses. Both are enabled whenever the device offers them and cost
+one driver call per pass; on hardware without them the loss report is just the error code, as
+before:
+
+```text
+ERROR rendering  device loss checkpoint: 'wind-deform' reached TOP_OF_PIPE
+ERROR rendering  device fault address: READ_INVALID at 0xf744246000 (precision 0x1000)
+```
+
 ## Modes and capability
 
 `profiler.set-mode {off | timestamps | pipeline-stats}` selects the depth. `timestamps` allocates
@@ -229,6 +243,7 @@ recorded.
 | Per-pass and nested scopes | `render_graph.rs`, `nested_scopes.rs` | `record_submission_plan_profiled`, `ProfileRecorders`, `NestedScopeRecorder` |
 | Draw-path counters | `draw_list.rs` | `RenderStats` |
 | Hang watchdog | `watchdog.rs`, `upload.rs`, `renderer.rs` | `watch`, `InFlight`, `with_one_off_commands`, `begin_offscreen_frame` |
+| Device-loss diagnostics | `checkpoints.rs`, `device.rs`, `render_graph.rs` | `Checkpoints`, `DeviceFault`, `Device::log_device_loss_checkpoints`, `Error::is_device_loss` |
 | Frame ring, percentiles, stutter, config | `frame_history.rs` | `FrameHistory`, `FrameSample`, `FrameHistoryStats`, `PerfConfig`, `FRAME_HISTORY_CAPACITY` |
 | HUD grading | `editor/src/lib/perfThresholds.ts` | `frameTimeStatus`, `vramStatus` |
 | Wire surface | `protocol/src/dto.rs`, `control/src/commands_render.rs` | `RenderStatsDto`, `RenderPassTimingsDto`, `FrameHistoryDto`, `PerfConfigDto`, `profiler.set-mode`, `pass-timings`, `frame-history`, `get-perf-config`, `set-perf-config` |
