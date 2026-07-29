@@ -1475,6 +1475,181 @@ fn build_debug_overlays(
     }
 }
 
+/// The plant-proxy overlay: a cooked family's derived collision capsules and navigation footprints,
+/// drawn over the asset preview.
+///
+/// This is the counterpart to [`build_collider_overlays`], which guards itself off in the preview
+/// because a preview scene has no physics bodies to draw. A plant family's proxies are DERIVED — a
+/// result of what grew, like its dimensions — so there is nothing in the scene to attach them to and
+/// nothing else that would ever show them. They are read straight off the authored family.
+///
+/// Same two toggles as the scene, applied to whatever surface is in front of you: `colliders` for
+/// the capsules, `vegetationNavigation` for the footprints.
+fn build_plant_proxy_overlays(
+    editor: &mut SceneEditContext,
+    assets: &mut AssetServer,
+    cam: &CameraView,
+    width: u32,
+    height: u32,
+    vertices: &mut Vec<OverlayVertex>,
+) {
+    if !editor.previewing() || width == 0 || height == 0 {
+        return;
+    }
+    let show_collision = editor.debug_overlays.colliders;
+    let show_navigation = editor.debug_overlays.vegetation_navigation;
+    if !show_collision && !show_navigation {
+        return;
+    }
+    let subject = editor.preview_asset;
+    let Ok(family) = saffron_assets::load_plant_family_asset(assets, subject) else {
+        return;
+    };
+    let aspect = width as f32 / height as f32;
+    let view_projection = camera_projection(cam, aspect) * cam.view;
+    // Cyan matches the scene's solid colliders, so the two surfaces read the same way; breakable
+    // proxies take the warmer tone because "this one comes off" is the property worth spotting.
+    const PROXY_COLOR: Vec4 = Vec4::new(0.20, 0.95, 0.85, 0.9);
+    const BREAKABLE_COLOR: Vec4 = Vec4::new(1.0, 0.72, 0.25, 0.9);
+    const NAVIGATION_COLOR: Vec4 = Vec4::new(0.45, 0.65, 1.0, 0.85);
+    let metres = |value: saffron_spatial::DecisionScalar| value.bits() as f32 / 65_536.0;
+
+    if show_collision {
+        for proxy in &family.collision_proxies {
+            let color = if proxy.breakable {
+                BREAKABLE_COLOR
+            } else {
+                PROXY_COLOR
+            };
+            let center = Vec3::new(
+                metres(proxy.center[0]),
+                metres(proxy.center[1]),
+                metres(proxy.center[2]),
+            );
+            let dimensions = Vec3::new(
+                metres(proxy.dimensions[0]),
+                metres(proxy.dimensions[1]),
+                metres(proxy.dimensions[2]),
+            );
+            match proxy.shape {
+                saffron_runtime::PlantCollisionShape::Box
+                | saffron_runtime::PlantCollisionShape::ConvexHull => {
+                    // A hull has no wireframe of its own here; its bounding box is the honest
+                    // stand-in and is what the batched collision residency sizes against anyway.
+                    add_world_oriented_box(
+                        vertices,
+                        &view_projection,
+                        &Mat4::from_translation(center),
+                        dimensions,
+                        color,
+                        width,
+                        height,
+                    );
+                }
+                saffron_runtime::PlantCollisionShape::Sphere => {
+                    for (right, up) in [(Vec3::X, Vec3::Y), (Vec3::Y, Vec3::Z), (Vec3::Z, Vec3::X)]
+                    {
+                        add_world_ring(
+                            vertices,
+                            &view_projection,
+                            center,
+                            right,
+                            up,
+                            dimensions.x,
+                            color,
+                            width,
+                            height,
+                        );
+                    }
+                }
+                saffron_runtime::PlantCollisionShape::Capsule => {
+                    // Y-up, matching the cooker: radius in x, half-height in y. A plant's capsules
+                    // stand along the axis they were fitted to.
+                    let radius = dimensions.x;
+                    let half_height = dimensions.y;
+                    let top = center + Vec3::Y * half_height;
+                    let bottom = center - Vec3::Y * half_height;
+                    for ring_center in [top, bottom] {
+                        add_world_ring(
+                            vertices,
+                            &view_projection,
+                            ring_center,
+                            Vec3::X,
+                            Vec3::Z,
+                            radius,
+                            color,
+                            width,
+                            height,
+                        );
+                    }
+                    for offset in [Vec3::X * radius, Vec3::Z * radius] {
+                        add_clipped_overlay_line(
+                            vertices,
+                            &view_projection,
+                            top + offset,
+                            bottom + offset,
+                            1.5,
+                            color,
+                            width,
+                            height,
+                        );
+                        add_clipped_overlay_line(
+                            vertices,
+                            &view_projection,
+                            top - offset,
+                            bottom - offset,
+                            1.5,
+                            color,
+                            width,
+                            height,
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    if show_navigation {
+        for proxy in &family.navigation_proxies {
+            if proxy.footprint.len() < 2 {
+                continue;
+            }
+            let height_m = metres(proxy.height);
+            let corner = |point: &[saffron_spatial::DecisionScalar; 2], y: f32| {
+                Vec3::new(metres(point[0]), y, metres(point[1]))
+            };
+            // The footprint is a closed ring at the ground and again at the obstacle height, with
+            // uprights between — an author needs the HEIGHT as much as the outline, because that is
+            // what decides whether a character walks through or around.
+            for (index, point) in proxy.footprint.iter().enumerate() {
+                let next = &proxy.footprint[(index + 1) % proxy.footprint.len()];
+                for y in [0.0, height_m] {
+                    add_clipped_overlay_line(
+                        vertices,
+                        &view_projection,
+                        corner(point, y),
+                        corner(next, y),
+                        1.5,
+                        NAVIGATION_COLOR,
+                        width,
+                        height,
+                    );
+                }
+                add_clipped_overlay_line(
+                    vertices,
+                    &view_projection,
+                    corner(point, 0.0),
+                    corner(point, height_m),
+                    1.5,
+                    NAVIGATION_COLOR,
+                    width,
+                    height,
+                );
+            }
+        }
+    }
+}
+
 /// The physics collider overlay (`set-debug-overlays {colliders}`): a world-space wireframe
 /// per [`Collider`] — oriented box / sphere / capsule, or the cook-source mesh AABB for
 /// hull/mesh.
@@ -1865,6 +2040,7 @@ pub fn build_scene_edit_overlay(
     // Colliders draw in Edit AND Play (they read the authored Collider), so they sit outside
     // edit_chrome like the skeleton overlay, with their own preview guard (inside the call).
     build_collider_overlays(editor, assets, gpu, cam, width, height, &mut depth_tested);
+    build_plant_proxy_overlays(editor, assets, cam, width, height, &mut depth_tested);
     build_skeleton_overlay(editor, cam, width, height, &mut on_top);
     (depth_tested, on_top)
 }
@@ -2055,7 +2231,7 @@ mod tests {
             _hierarchy: &saffron_geometry::PortableVirtualHierarchy,
             _skin: &[saffron_geometry::VertexSkin],
             _morph: Option<&saffron_geometry::MorphData>,
-            _sdf_bake: Option<&saffron_rendering::SdfBake>,
+            _sdf: saffron_rendering::SdfSource<'_>,
         ) -> saffron_rendering::Result<std::sync::Arc<saffron_rendering::GpuMesh>> {
             unreachable!("an empty catalog never reaches the uploader")
         }

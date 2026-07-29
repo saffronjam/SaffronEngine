@@ -535,6 +535,13 @@ impl HostLayer {
         if let Err(error) = vegetation_result {
             tracing::error!("vegetation runtime advance failed: {error}");
         }
+        // Hand the sync's stage spans to the profiler. They are timed on the same monotonic clock
+        // the renderer stamps its own spans with, so a capture shows residency, promotion,
+        // collision and navigation INSIDE the frame they belong to rather than on a second
+        // timeline — or, as before this, not at all.
+        for (stage, start_ns, duration_ns) in self.runtime.vegetation_telemetry_mut().take_spans() {
+            renderer.record_cpu_span(stage.name(), start_ns, duration_ns);
+        }
         // The control plane's GPU-upload seam needs the host-owned one-off uploader; build
         // it before assembling the borrow (the asset commands resolve/upload through it).
         self.ensure_uploader(renderer);

@@ -92,12 +92,51 @@ impl ControlRenderer for HostControlRenderer<'_> {
         self.renderer.page_residency_stats()
     }
 
-    fn visibility_counters(&self) -> [u32; 16] {
+    fn visibility_counters(
+        &self,
+    ) -> [u32; saffron_rendering::SCENE_VISIBILITY_COUNTER_WORDS as usize] {
         self.renderer.visibility_counters()
+    }
+
+    fn gi_visibility_counters(
+        &self,
+    ) -> [u32; saffron_rendering::SCENE_VISIBILITY_COUNTER_WORDS as usize] {
+        self.renderer.gi_visibility_counters()
+    }
+
+    fn wind_interaction_resets(&self) -> u64 {
+        self.renderer.wind_interaction_resets()
+    }
+
+    fn vegetation_budgets(&self) -> saffron_assets::VegetationBudgets {
+        self.mirror.vegetation_budgets()
+    }
+
+    fn set_vegetation_budgets(&mut self, budgets: saffron_assets::VegetationBudgets) {
+        self.mirror.set_vegetation_budgets(budgets);
     }
 
     fn vegetation_breakdown(&self) -> saffron_assets::VegetationRenderBreakdown {
         self.mirror.vegetation_breakdown()
+    }
+
+    fn capture_plant_wind_record(
+        &self,
+        cell: saffron_spatial::WorldCellKey,
+        plant: saffron_runtime::PlantId,
+    ) -> Result<Option<saffron_control::PlantWindRecord>, String> {
+        let Some((slot, mechanics)) = self.mirror.plant_instance_slot(cell, plant) else {
+            return Ok(None);
+        };
+        Ok(self
+            .renderer
+            .capture_wind_record(slot)
+            .map_err(|error| error.to_string())?
+            .map(|record| saffron_control::PlantWindRecord {
+                slot,
+                record,
+                mechanics,
+            }))
     }
 
     fn page_faults(&self) -> u64 {
@@ -280,8 +319,100 @@ impl ControlRenderer for HostControlRenderer<'_> {
     fn set_rt_reflections(&mut self, enabled: bool) {
         self.renderer.set_rt_reflections(enabled);
     }
+    fn mesh_shader_supported(&self) -> bool {
+        self.renderer.mesh_shader_supported()
+    }
+    fn mesh_executor_active(&self) -> bool {
+        self.renderer.mesh_executor_active()
+    }
+    fn sdf_instances_dropped(&self) -> u32 {
+        self.renderer.sdf_instances_dropped()
+    }
+    fn sdf_instances_culled(&self) -> u32 {
+        self.renderer.sdf_instances_culled()
+    }
+
+    fn rt_instances_culled(&self) -> u32 {
+        self.renderer.rt_instances_culled()
+    }
+    fn rt_omm_supported(&self) -> bool {
+        self.renderer.omm_supported()
+    }
     fn rt_blas_count(&self) -> u32 {
         self.renderer.rt_blas_count()
+    }
+    fn rt_skinned_blas_count(&self) -> u32 {
+        self.renderer.rt_skinned_blas_count()
+    }
+    fn rt_tessellated_blas_count(&self) -> u32 {
+        self.renderer.rt_tessellated_blas_count()
+    }
+    fn cluster_as_supported(&self) -> bool {
+        self.renderer.cluster_as_supported()
+    }
+    fn rt_cluster_blas_count(&self) -> u32 {
+        self.renderer.rt_cluster_blas_count()
+    }
+    fn rt_clas_count(&self) -> u32 {
+        self.renderer.rt_clas_count()
+    }
+    fn ptlas_supported(&self) -> bool {
+        self.renderer.ptlas_supported()
+    }
+    fn rt_ptlas_ops(&self) -> (u32, u32, u32) {
+        self.renderer.rt_ptlas_ops()
+    }
+    fn view_history_invalidation(&self) -> &'static str {
+        self.renderer.view_history_invalidation()
+    }
+
+    fn vsm_page_budget(&self) -> u32 {
+        u32::try_from(self.renderer.vsm_page_budget()).unwrap_or(u32::MAX)
+    }
+
+    fn set_vsm_page_budget(&mut self, pages: u32) {
+        self.renderer.set_vsm_page_budget(pages as usize);
+    }
+
+    fn page_request_budget(&self) -> u32 {
+        self.renderer.page_request_budget()
+    }
+
+    fn set_page_request_budget(&mut self, entries: u32) {
+        self.renderer.set_page_request_budget(entries);
+    }
+
+    fn rt_accel_build_us(&self) -> u64 {
+        self.renderer.rt_accel_build_us()
+    }
+
+    fn cut_override(&self, view: saffron_rendering::SceneViewClass) -> u32 {
+        self.renderer.cut_override(view)
+    }
+
+    fn set_cut_override(&mut self, view: saffron_rendering::SceneViewClass, cut: u32) {
+        self.renderer.set_cut_override(view, cut);
+    }
+
+    fn rt_omm_micromaps(&self) -> u32 {
+        self.renderer.rt_omm_micromaps()
+    }
+
+    fn rt_omm_classes(&self) -> (u64, u64, u64) {
+        self.renderer.rt_omm_classes()
+    }
+
+    fn rt_blas_bytes(&self) -> u64 {
+        self.renderer.rt_blas_bytes()
+    }
+    fn rt_blas_built_bytes(&self) -> u64 {
+        self.renderer.rt_blas_built_bytes()
+    }
+    fn rt_tlas_bytes(&self) -> u64 {
+        self.renderer.rt_tlas_bytes()
+    }
+    fn rt_scratch_bytes(&self) -> u64 {
+        self.renderer.rt_scratch_bytes()
     }
 
     fn pipeline_count(&self) -> u32 {
