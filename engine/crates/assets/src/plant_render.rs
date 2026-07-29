@@ -40,6 +40,17 @@ pub struct PlantFamilyRender {
     pub combinations: Arc<[(u32, u32)]>,
     /// Each phenotype's `(id, variation, material slot remap)`.
     pub phenotypes: Arc<[PlantPhenotypeRender]>,
+    /// The family's authored wind and bend response, which the renderer's wind prepass
+    /// applies in place of deriving everything from the plant's height.
+    pub mechanics: saffron_vegetation::MechanicalResponse,
+    /// The family's packed coverage atlas, uploaded once per family.
+    ///
+    /// Present exactly when the cook packed one, and then the family's UVs address it — so a
+    /// present atlas is not an optimization the renderer may decline, it is the image those UVs
+    /// index. Held here rather than under a synthesized asset id because ids are minted uniformly
+    /// from the whole non-reserved range, leaving no id a family could derive without risking a
+    /// collision with a real asset.
+    pub atlas: Option<Arc<saffron_rendering::GpuTexture>>,
 }
 
 /// One phenotype's render-facing identity: its slot remap applies as instance
@@ -67,10 +78,27 @@ impl crate::AssetServer {
         family: Uuid,
         mesh: Arc<GpuMesh>,
         hierarchy: Arc<PortableVirtualHierarchy>,
+        mechanics: saffron_vegetation::MechanicalResponse,
     ) {
         self.page_source_by_uuid
             .insert(family.value(), PagePayloadSource::Cooked(hierarchy));
         self.mesh_by_uuid.insert(family.value(), Some(mesh));
+        self.plant_mechanics_by_uuid
+            .insert(family.value(), mechanics);
+    }
+
+    /// One plant family's authored wind and bend response, registered when its render
+    /// form loaded. Absent for anything that is not a plant family.
+    ///
+    /// The GPU-scene mirror reaches prototypes through the generic mesh path, which knows
+    /// nothing about plants; this is where that path asks whether the mesh it is about to
+    /// publish is one, so a family's response reaches its prototype record.
+    #[must_use]
+    pub fn plant_family_mechanics(
+        &self,
+        family: Uuid,
+    ) -> Option<saffron_vegetation::MechanicalResponse> {
+        self.plant_mechanics_by_uuid.get(&family.value()).copied()
     }
 
     /// Loads one plant family's renderable form from its validated `.splantc`, cached by
@@ -108,7 +136,13 @@ impl crate::AssetServer {
         let artifact = self.vegetation_artifact_store().read_plant(artifact_hash)?;
         let decoded = decode_plant_render_sections(&artifact)?;
         let mesh = gpu
-            .upload_mesh(&decoded.mesh, &decoded.hierarchy, &[], None, None)
+            .upload_mesh(
+                &decoded.mesh,
+                &decoded.hierarchy,
+                &[],
+                None,
+                saffron_rendering::SdfSource::Cooked(&decoded.distance_fields),
+            )
             .map_err(|err| Error::Io(format!("plant family mesh upload: {err}")))?;
         for row in &decoded.material_documents {
             // An empty pinned document means the cook resolved the material by identity
@@ -120,15 +154,40 @@ impl crate::AssetServer {
             self.material_by_uuid
                 .insert(row.0.value(), Some(Arc::new(asset)));
         }
-        self.register_family_render(family, Arc::clone(&mesh), Arc::new(decoded.hierarchy));
+        self.register_family_render(
+            family,
+            Arc::clone(&mesh),
+            Arc::new(decoded.hierarchy),
+            decoded.mechanics,
+        );
         let combinations: Arc<[(u32, u32)]> = mesh
             .assembly
             .as_ref()
             .map(|assembly| assembly.combinations.clone())
             .unwrap_or_default()
             .into();
+        // One upload per family, from the artifact's own bytes. sRGB matches how the slot
+        // textures it replaces were uploaded, so packing does not shift colour.
+        let atlas = decoded
+            .atlas
+            .as_ref()
+            .map(|atlas| {
+                let mips: Vec<saffron_rendering::TextureMipLevel<'_>> = atlas
+                    .levels
+                    .iter()
+                    .map(|level| saffron_rendering::TextureMipLevel {
+                        rgba: &level.rgba,
+                        width: level.width,
+                        height: level.height,
+                    })
+                    .collect();
+                gpu.upload_texture_mips(&mips, true)
+                    .map_err(|err| Error::Io(format!("plant family atlas upload: {err}")))
+            })
+            .transpose()?;
         Ok(PlantFamilyRender {
             mesh,
+            atlas,
             materials: decoded.material_slots.into(),
             combinations,
             phenotypes: decoded
@@ -142,6 +201,7 @@ impl crate::AssetServer {
                     material_remap: row.material_remap.into(),
                 })
                 .collect(),
+            mechanics: decoded.mechanics,
         })
     }
 }
@@ -152,7 +212,95 @@ pub(crate) struct DecodedPlantRender {
     pub(crate) hierarchy: PortableVirtualHierarchy,
     pub(crate) material_slots: Vec<Uuid>,
     pub(crate) material_documents: Vec<(Uuid, Vec<u8>)>,
+    /// The packed family atlas, when the cook produced one.
+    ///
+    /// The family's UVs already address it, so a family carrying an atlas must sample it rather
+    /// than its slots' own textures — the two are not interchangeable at this point.
+    pub(crate) atlas: Option<crate::FamilyAtlas>,
     pub(crate) phenotypes: Vec<PlantPhenotypeRow>,
+    pub(crate) mechanics: saffron_vegetation::MechanicalResponse,
+    /// The family-space signed distance field(s) cooked from the aggregate occupancy;
+    /// empty when the family cooked no voxel brick.
+    pub(crate) distance_fields: Vec<saffron_geometry::Sdf>,
+}
+
+/// One mip level of a family's packed coverage atlas, encoded for inspection.
+#[derive(Clone, Debug)]
+pub struct PlantAtlasImage {
+    /// Levels in the cooked chain.
+    pub level_count: u32,
+    /// The returned level's width in texels.
+    pub width: u32,
+    /// The returned level's height in texels.
+    pub height: u32,
+    /// Gutter texels the layout was packed with.
+    pub gutter: u32,
+    /// Where each material slot landed, in level-0 texels.
+    pub placements: Vec<crate::AtlasPlacement>,
+    /// The level as PNG bytes.
+    pub png: Vec<u8>,
+}
+
+/// One level of the packed coverage atlas a cooked family carries, or `None` when the cook
+/// produced none (a family whose slots resolve to catalog materials rather than packed coverage).
+///
+/// Reads the published artifact rather than re-deriving: the atlas the family's UVs address is the
+/// one in the bytes, and a second packing would produce a different layout for the same family.
+///
+/// # Errors
+///
+/// Returns [`Error::Io`] when the artifact is missing, its material section does not decode, the
+/// requested level is past the chain, or the level's bytes do not match its extent.
+pub fn plant_family_atlas_image(
+    assets: &crate::AssetServer,
+    artifact_hash: ContentHash,
+    level: u32,
+) -> Result<Option<PlantAtlasImage>> {
+    let artifact = assets
+        .vegetation_artifact_store()
+        .read_plant(artifact_hash)?;
+    let Some(atlas) = decode_plant_render_sections(&artifact)?.atlas else {
+        return Ok(None);
+    };
+    let level_count = u32::try_from(atlas.levels.len()).unwrap_or(u32::MAX);
+    let mip = atlas.levels.get(level as usize).ok_or_else(|| {
+        Error::Io(format!(
+            "atlas level {level} is past the chain ({level_count})"
+        ))
+    })?;
+    let buffer = image::RgbaImage::from_raw(mip.width, mip.height, mip.rgba.clone())
+        .ok_or_else(|| Error::Io("atlas level does not match its extent".to_owned()))?;
+    let mut png = std::io::Cursor::new(Vec::new());
+    buffer
+        .write_to(&mut png, image::ImageFormat::Png)
+        .map_err(|error| Error::Io(error.to_string()))?;
+    Ok(Some(PlantAtlasImage {
+        level_count,
+        width: mip.width,
+        height: mip.height,
+        gutter: atlas.layout.gutter,
+        placements: atlas.layout.placements.clone(),
+        png: png.into_inner(),
+    }))
+}
+
+/// The cooked virtual-geometry hierarchy a published family carries.
+///
+/// Read from the artifact rather than re-cooked: the cut a view selects is chosen against the
+/// errors in these bytes, so a freshly cooked hierarchy would answer a question about a different
+/// plant than the one on screen.
+///
+/// # Errors
+///
+/// Returns [`Error::Io`] when the artifact is missing or its sections do not decode.
+pub fn plant_family_hierarchy(
+    assets: &crate::AssetServer,
+    artifact_hash: ContentHash,
+) -> Result<PortableVirtualHierarchy> {
+    let artifact = assets
+        .vegetation_artifact_store()
+        .read_plant(artifact_hash)?;
+    Ok(decode_plant_render_sections(&artifact)?.hierarchy)
 }
 
 /// Decodes the hierarchy + geometry + material sections and flattens the prototype
@@ -175,18 +323,29 @@ pub(crate) fn decode_plant_render_sections(artifact: &[u8]) -> Result<DecodedPla
     let rows = decode_mesh_section(read(PlantCompiledSectionKind::Geometry)?.as_ref())?;
     let phenotypes =
         decode_phenotype_section(read(PlantCompiledSectionKind::Phenotypes)?.as_ref())?;
-    let materials =
+    let (materials, atlas) =
         decode_material_section(read(PlantCompiledSectionKind::MaterialsCoverage)?.as_ref())?;
     let mesh = flatten_prototype_rows(&hierarchy, &rows)?;
+    // The family-space distance field, cooked from the aggregate occupancy. A family
+    // that cooked no voxel brick writes no section — nothing aggregate to occlude with —
+    // so absence is a valid state, not a missing facet.
+    let distance_fields = match index.section(artifact, PlantCompiledSectionKind::DistanceField)? {
+        Some(bytes) if !bytes.is_empty() => saffron_geometry::sdf_set_from_bytes(bytes.as_ref())
+            .map_err(|err| Error::Io(format!("compiled plant distance field: {err}")))?,
+        _ => Vec::new(),
+    };
     Ok(DecodedPlantRender {
         mesh,
         hierarchy,
+        distance_fields,
         material_slots: materials.iter().map(|row| row.material).collect(),
         material_documents: materials
             .into_iter()
             .map(|row| (row.material, row.document))
             .collect(),
+        atlas,
         phenotypes,
+        mechanics: index.mechanical_response(artifact)?,
     })
 }
 
@@ -194,7 +353,7 @@ pub(crate) fn decode_plant_render_sections(artifact: &[u8]) -> Result<DecodedPla
 /// prototype-id order, verifying each row against its hierarchy prototype (source,
 /// selector hash, vertex count). Indices rebase to the flat stream; the assembly's
 /// per-prototype vertex bases rebase the executor's page-driven fetches the same way.
-fn flatten_prototype_rows(
+pub(crate) fn flatten_prototype_rows(
     hierarchy: &PortableVirtualHierarchy,
     rows: &[PlantGeometryMesh],
 ) -> Result<Mesh> {
