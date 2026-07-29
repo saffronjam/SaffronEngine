@@ -6,10 +6,12 @@
 //! a page's payload publishes only after its parent's payload is resident (roots first),
 //! so the GPU never observes a child without its drawable ancestor. Eviction reverses
 //! that order — only pages without resident children and without the guaranteed-root
-//! flag are candidates, picked by least-recent demand — and retires arena ranges through
-//! the fence-deferred reuse the arenas already provide. Demand arrives from the CPU
-//! prioritizer and from the per-frame GPU missing-page request buffer; priority is an
-//! explicit caller-computed weight, never distance alone.
+//! flag are candidates, picked by least-recent demand and then by the cheapest reader
+//! among pages demanded together — and retires arena ranges through the fence-deferred
+//! reuse the arenas already provide. Demand arrives from the CPU prioritizer and from the
+//! per-frame GPU missing-page request buffer; priority is an explicit caller-computed
+//! weight, never distance alone, and it describes the frame it was recorded in rather
+//! than accumulating across a page's whole life.
 
 use std::collections::HashMap;
 
@@ -28,7 +30,24 @@ pub struct PageDemandView {
     pub proj_scale: f32,
     /// World → clip for conservative frustum containment.
     pub view_proj: saffron_geometry::glam::Mat4,
+    /// Minimum corner of the window a GI or reflection ray can reach.
+    ///
+    /// Streaming used to be driven by the camera alone, which quietly assumed nothing off-screen
+    /// needed to be resident. A march gathers from behind the eye and a reflection shows what the
+    /// camera cannot, so a page inside this window is read whether or not it is visible — and a
+    /// non-resident one is a hole in the gather rather than a missing pixel.
+    pub gi_min: saffron_geometry::glam::Vec3,
+    /// Maximum corner of the reachable window.
+    pub gi_max: saffron_geometry::glam::Vec3,
 }
+
+/// Ceiling for a CPU-predicted page-demand priority.
+///
+/// The prioritizer scores the refinement frontier from projected error, which has no
+/// natural bound; clamping it here is what keeps every predicted score below the bands a
+/// GPU miss carries, so a page some view actually tried to read this frame outranks every
+/// page some view might read next.
+pub const PAGE_DEMAND_PREDICTED_CEILING: u64 = 1_000_000_000_000_000_000;
 
 /// Byte budgets for resident page payloads.
 #[derive(Clone, Copy, Debug)]
@@ -69,6 +88,33 @@ pub struct PageResidencyStats {
     /// Microseconds those faults took, summed. Divided by `faults` it is the mean fault latency;
     /// kept as a sum so the counter stays additive and the caller picks the window.
     pub fault_latency_us: u64,
+    /// Missing-page requests the GPU raised that no region had room for, summed since
+    /// boot. Kept as a running total for the same reason the other counters here are:
+    /// overflow is bursty, and the frame a caller happens to sample is not the frame the
+    /// buffer filled.
+    pub requests_dropped: u64,
+    /// Bit per view class whose request region has filled since boot
+    /// ([`crate::SceneViewClass::bit`]). The count says how much was lost; this says
+    /// whose, which is what decides whether it matters.
+    pub request_overflow_classes: u32,
+}
+
+/// Applies one demand to `entry`. Demands arriving in the same frame take the most
+/// urgent of them; a demand in a later frame REPLACES the priority rather than raising
+/// it, so a page reads as what wants it now — a page the camera passed once and a gather
+/// still reads is a gather's page, and holding the camera's band would make it outlive
+/// every page the image is actually made of.
+fn record_demand(entry: &mut PageEntry, frame: u64, priority: u64) {
+    if entry.last_demand_frame == frame {
+        entry.priority = entry.priority.max(priority);
+    } else {
+        entry.last_demand_frame = frame;
+        entry.priority = priority;
+    }
+    if matches!(entry.state, PageState::Unloaded) {
+        entry.state = PageState::Requested;
+        entry.requested_at = Some(std::time::Instant::now());
+    }
 }
 
 enum PageState {
@@ -100,6 +146,8 @@ pub struct PageResidency {
     evictions: u64,
     faults: u64,
     fault_latency_us: u64,
+    requests_dropped: u64,
+    request_overflow_classes: u32,
     frame: u64,
 }
 
@@ -194,25 +242,25 @@ impl PageResidency {
         if let Some(entry) = self.pages.get_mut(&handle.index)
             && entry.generation == handle.generation
         {
-            entry.last_demand_frame = frame;
-            entry.priority = entry.priority.max(priority);
-            if matches!(entry.state, PageState::Unloaded) {
-                entry.state = PageState::Requested;
-                entry.requested_at = Some(std::time::Instant::now());
-            }
+            record_demand(entry, frame, priority);
         }
+    }
+
+    /// Records demand the GPU raised and the request buffer could not hold: `dropped`
+    /// requests lost across the classes in `classes`.
+    ///
+    /// A dropped request is not lost geometry — the page faults again next frame — but it
+    /// is latency nobody asked for, and it is invisible from outside unless counted.
+    pub fn note_dropped_requests(&mut self, dropped: u32, classes: u32) {
+        self.requests_dropped = self.requests_dropped.saturating_add(u64::from(dropped));
+        self.request_overflow_classes |= classes;
     }
 
     /// Records demand for a raw resident page-table slot (a GPU missing-page request).
     pub fn demand_slot(&mut self, slot: u32, priority: u64) {
         let frame = self.frame;
         if let Some(entry) = self.pages.get_mut(&slot) {
-            entry.last_demand_frame = frame;
-            entry.priority = entry.priority.max(priority);
-            if matches!(entry.state, PageState::Unloaded) {
-                entry.state = PageState::Requested;
-                entry.requested_at = Some(std::time::Instant::now());
-            }
+            record_demand(entry, frame, priority);
         }
     }
 
@@ -334,6 +382,8 @@ impl PageResidency {
             evictions: self.evictions,
             faults: self.faults,
             fault_latency_us: self.fault_latency_us,
+            requests_dropped: self.requests_dropped,
+            request_overflow_classes: self.request_overflow_classes,
             ..PageResidencyStats::default()
         };
         for entry in self.pages.values() {
@@ -434,7 +484,11 @@ impl PageResidency {
                         && !entry.guaranteed_root
                         && entry.resident_children == 0
                 })
-                .min_by_key(|(_, entry)| entry.last_demand_frame)
+                // Least-recently demanded first, then the cheapest reader among pages
+                // demanded together: a page nobody has asked for in a hundred frames is
+                // dead weight whoever last wanted it, and among pages every view still
+                // wants, the gather's go before the camera's.
+                .min_by_key(|(_, entry)| (entry.last_demand_frame, entry.priority))
                 .map(|(index, entry)| GpuHandle {
                     index: *index,
                     generation: entry.generation,
@@ -532,6 +586,60 @@ mod tests {
         residency.register_page(root, None, true);
         assert_eq!(residency.stats().requested, 2);
         assert_eq!(residency.stats().faults, 0);
+    }
+
+    /// The two demand sources share one numeric space, and the whole point of the bands
+    /// is that a miss outranks a prediction. Nothing else in the tree compares them, so
+    /// the ordering would drift silently the first time either side is retuned.
+    #[test]
+    fn every_missed_page_outranks_every_predicted_one() {
+        for class in crate::SceneViewClass::ALL {
+            assert!(
+                class.page_demand_priority() > PAGE_DEMAND_PREDICTED_CEILING,
+                "{class:?} misses must outrank the prioritizer's ceiling"
+            );
+        }
+        assert!(
+            crate::SceneViewClass::Camera.page_demand_priority()
+                > crate::SceneViewClass::ShadowPage.page_demand_priority(),
+            "the image outranks its shadows"
+        );
+        assert!(
+            crate::SceneViewClass::ShadowPage.page_demand_priority()
+                > crate::SceneViewClass::Gi.page_demand_priority(),
+            "a shadow outranks a gather"
+        );
+    }
+
+    /// A page's priority names the class that wants it NOW. Holding a running maximum
+    /// instead would let one camera glance mark a page as the camera's for the rest of the
+    /// run, and eviction would then protect it over every page the image is actually made
+    /// of. No device needed: the demand clock owns this.
+    #[test]
+    fn a_later_frame_replaces_the_priority_rather_than_raising_it() {
+        let mut residency = PageResidency::new(PageResidencyBudgets::default());
+        let handle = GpuHandle {
+            index: 3,
+            generation: 1,
+        };
+        residency.register_page(handle, None, false);
+
+        residency.begin_frame();
+        residency.demand(handle, crate::SceneViewClass::Gi.page_demand_priority());
+        residency.demand(handle, crate::SceneViewClass::Camera.page_demand_priority());
+        assert_eq!(
+            residency.pages[&3].priority,
+            crate::SceneViewClass::Camera.page_demand_priority(),
+            "demands in one frame take the most urgent of them"
+        );
+
+        residency.begin_frame();
+        residency.demand(handle, crate::SceneViewClass::Gi.page_demand_priority());
+        assert_eq!(
+            residency.pages[&3].priority,
+            crate::SceneViewClass::Gi.page_demand_priority(),
+            "the camera moved on and the gather did not"
+        );
     }
 
     struct Fixture {
@@ -689,6 +797,195 @@ mod tests {
                 .byte_length,
             96,
             "the guaranteed root stays"
+        );
+
+        fixture.device.wait_idle().expect("idle");
+    }
+
+    /// Among pages every view still wants, the cheapest reader's page is the one that
+    /// goes. Recency alone cannot express this: both were demanded on the same frame, so
+    /// without the class tiebreak the choice is whichever the hash map happened to reach
+    /// first, and half the time that is the page the camera is drawing from.
+    #[test]
+    fn pages_demanded_together_evict_the_gathers_before_the_cameras() {
+        let Some(mut fixture) = fixture(200) else {
+            return;
+        };
+        let root = insert_page(&mut fixture, None, true);
+        let camera_leaf = insert_page(&mut fixture, Some(root), false);
+        let gather_leaf = insert_page(&mut fixture, Some(root), false);
+        let arriving = insert_page(&mut fixture, Some(root), false);
+
+        let root_request = *fixture
+            .residency
+            .take_load_requests(1)
+            .first()
+            .expect("root requested");
+        fixture
+            .residency
+            .complete_load(root_request, vec![0_u8; 96]);
+        fixture
+            .residency
+            .publish_ready(&mut fixture.gpu_data, &mut fixture.pending)
+            .expect("publish root");
+
+        fixture.residency.begin_frame();
+        fixture.residency.demand(
+            camera_leaf,
+            crate::SceneViewClass::Camera.page_demand_priority(),
+        );
+        fixture.residency.demand(
+            gather_leaf,
+            crate::SceneViewClass::Gi.page_demand_priority(),
+        );
+        for handle in fixture.residency.take_load_requests(8) {
+            fixture.residency.complete_load(handle, vec![0_u8; 48]);
+        }
+        fixture
+            .residency
+            .publish_ready(&mut fixture.gpu_data, &mut fixture.pending)
+            .expect("publish both leaves");
+        assert_eq!(fixture.residency.stats().resident, 3, "root + two leaves");
+
+        // Both are still wanted this frame, and a third page arrives over budget.
+        fixture.residency.begin_frame();
+        fixture.residency.demand(
+            camera_leaf,
+            crate::SceneViewClass::Camera.page_demand_priority(),
+        );
+        fixture.residency.demand(
+            gather_leaf,
+            crate::SceneViewClass::Gi.page_demand_priority(),
+        );
+        fixture.residency.demand(
+            arriving,
+            crate::SceneViewClass::Camera.page_demand_priority(),
+        );
+        for handle in fixture.residency.take_load_requests(8) {
+            fixture.residency.complete_load(handle, vec![0_u8; 48]);
+        }
+        fixture
+            .residency
+            .publish_ready(&mut fixture.gpu_data, &mut fixture.pending)
+            .expect("publish the arriving page");
+
+        assert_eq!(fixture.residency.stats().evictions, 1);
+        assert_eq!(
+            fixture
+                .gpu_data
+                .page_table
+                .get(gather_leaf)
+                .expect("gather leaf record")
+                .byte_length,
+            0,
+            "the gather's page went"
+        );
+        assert_eq!(
+            fixture
+                .gpu_data
+                .page_table
+                .get(camera_leaf)
+                .expect("camera leaf record")
+                .byte_length,
+            48,
+            "the camera's page stayed"
+        );
+
+        fixture.device.wait_idle().expect("idle");
+    }
+
+    /// The class only breaks ties. Ordering by class FIRST would make one camera glance
+    /// outrank a gather that has been reading its page every frame since — and because a
+    /// page's priority never falls on its own, that protection would never expire.
+    #[test]
+    fn a_page_nobody_asks_for_goes_before_one_a_gather_still_reads() {
+        let Some(mut fixture) = fixture(200) else {
+            return;
+        };
+        let root = insert_page(&mut fixture, None, true);
+        let glanced_at = insert_page(&mut fixture, Some(root), false);
+        let gather_leaf = insert_page(&mut fixture, Some(root), false);
+        let arriving = insert_page(&mut fixture, Some(root), false);
+
+        let root_request = *fixture
+            .residency
+            .take_load_requests(1)
+            .first()
+            .expect("root requested");
+        fixture
+            .residency
+            .complete_load(root_request, vec![0_u8; 96]);
+        fixture
+            .residency
+            .publish_ready(&mut fixture.gpu_data, &mut fixture.pending)
+            .expect("publish root");
+
+        // The camera passes it once and never looks again.
+        fixture.residency.begin_frame();
+        fixture.residency.demand(
+            glanced_at,
+            crate::SceneViewClass::Camera.page_demand_priority(),
+        );
+        for handle in fixture.residency.take_load_requests(8) {
+            fixture.residency.complete_load(handle, vec![0_u8; 48]);
+        }
+        fixture
+            .residency
+            .publish_ready(&mut fixture.gpu_data, &mut fixture.pending)
+            .expect("publish the glanced-at page");
+
+        fixture.residency.begin_frame();
+        fixture.residency.demand(
+            gather_leaf,
+            crate::SceneViewClass::Gi.page_demand_priority(),
+        );
+        for handle in fixture.residency.take_load_requests(8) {
+            fixture.residency.complete_load(handle, vec![0_u8; 48]);
+        }
+        fixture
+            .residency
+            .publish_ready(&mut fixture.gpu_data, &mut fixture.pending)
+            .expect("publish the gather's page");
+        assert_eq!(fixture.residency.stats().resident, 3);
+
+        // The gather is still reading; the camera's old page is not being read at all.
+        fixture.residency.begin_frame();
+        fixture.residency.demand(
+            gather_leaf,
+            crate::SceneViewClass::Gi.page_demand_priority(),
+        );
+        fixture.residency.demand(
+            arriving,
+            crate::SceneViewClass::Camera.page_demand_priority(),
+        );
+        for handle in fixture.residency.take_load_requests(8) {
+            fixture.residency.complete_load(handle, vec![0_u8; 48]);
+        }
+        fixture
+            .residency
+            .publish_ready(&mut fixture.gpu_data, &mut fixture.pending)
+            .expect("publish the arriving page");
+
+        assert_eq!(fixture.residency.stats().evictions, 1);
+        assert_eq!(
+            fixture
+                .gpu_data
+                .page_table
+                .get(glanced_at)
+                .expect("glanced-at record")
+                .byte_length,
+            0,
+            "the page nobody reads went"
+        );
+        assert_eq!(
+            fixture
+                .gpu_data
+                .page_table
+                .get(gather_leaf)
+                .expect("gather leaf record")
+                .byte_length,
+            48,
+            "the page a gather reads every frame stayed"
         );
 
         fixture.device.wait_idle().expect("idle");
