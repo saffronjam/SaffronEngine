@@ -205,6 +205,27 @@
       "fixture": "toggle-off"
     },
     {
+      "name": "set-hierarchy-cut",
+      "params": "SetHierarchyCutParams",
+      "result": "HierarchyCutResult",
+      "status": "typed",
+      "fixture": "empty"
+    },
+    {
+      "name": "vsm-page-budget",
+      "params": "VsmPageBudgetParams",
+      "result": "VsmPageBudgetResult",
+      "status": "typed",
+      "fixture": "empty"
+    },
+    {
+      "name": "page-request-budget",
+      "params": "PageRequestBudgetParams",
+      "result": "PageRequestBudgetResult",
+      "status": "typed",
+      "fixture": "empty"
+    },
+    {
       "name": "set-restir",
       "params": "ToggleParams",
       "result": "SetRestirResult",
@@ -1157,6 +1178,27 @@
       "skip": "requires an exact bound vegetation runtime generation"
     },
     {
+      "name": "vegetation-usd-skeletons",
+      "params": "UsdSkeletonsParams",
+      "result": "UsdSkeletonsResult",
+      "status": "typed",
+      "skip": "requires a USD stage on disk"
+    },
+    {
+      "name": "vegetation-wind-record",
+      "params": "VegetationWindRecordParams",
+      "result": "VegetationWindRecordResult",
+      "status": "typed",
+      "skip": "requires a mirrored resident plant and at least one rendered frame"
+    },
+    {
+      "name": "vegetation-budgets",
+      "params": "VegetationBudgetsParams",
+      "result": "VegetationBudgetsResult",
+      "status": "typed",
+      "skip": "reads and rewrites live mirror budgets"
+    },
+    {
       "name": "vegetation-verify-artifacts",
       "params": "VegetationVerifyParams",
       "result": "VegetationVerifyResult",
@@ -1218,6 +1260,41 @@
       "result": "BotanicalGrowthDto",
       "status": "typed",
       "skip": "requires an authored native plant-family asset"
+    },
+    {
+      "name": "plant-proxies",
+      "params": "PlantProxiesParams",
+      "result": "PlantProxiesResult",
+      "status": "typed",
+      "skip": "requires an authored plant-family asset in the loaded project"
+    },
+    {
+      "name": "plant-season-phenotype",
+      "params": "PlantSeasonPhenotypeParams",
+      "result": "PlantSeasonPhenotypeResult",
+      "status": "typed",
+      "skip": "requires an authored plant-family asset in the loaded project"
+    },
+    {
+      "name": "plant-hierarchy",
+      "params": "PlantHierarchyParams",
+      "result": "PlantHierarchyResult",
+      "status": "typed",
+      "skip": "requires a cooked plant family in the loaded project"
+    },
+    {
+      "name": "plant-atlas",
+      "params": "PlantAtlasParams",
+      "result": "PlantAtlasResult",
+      "status": "typed",
+      "skip": "requires a cooked plant family carrying a packed coverage atlas"
+    },
+    {
+      "name": "plant-phenotypes",
+      "params": "PlantPhenotypesParams",
+      "result": "PlantPhenotypesResult",
+      "status": "typed",
+      "skip": "requires an authored plant-family asset in the loaded project"
     },
     {
       "name": "plant-elements",
