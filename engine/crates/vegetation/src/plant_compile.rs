@@ -452,6 +452,7 @@ pub fn compile_plant_family(
     asset: &PlantFamilyAsset,
     snapshots: &[PlantSourceSnapshot],
     limits: PlantCompileLimits,
+    modules: &dyn crate::BotanicalModuleResolver,
 ) -> Result<PlantCompileOutput> {
     validate_plant_family(asset)?;
     match &asset.source {
@@ -459,7 +460,7 @@ pub fn compile_plant_family(
             compile_imported_plant_family(asset, recipe, snapshots, limits)
         }
         PlantFamilySource::Native { graph, grafts } => {
-            compile_native_plant_family(asset, graph, grafts, snapshots, limits)
+            compile_native_plant_family(asset, graph, grafts, snapshots, limits, modules)
         }
     }
 }
@@ -644,6 +645,34 @@ fn compile_imported_plant_family(
                         statistics.rejected = statistics.rejected.saturating_add(1);
                         continue;
                     }
+                };
+                let selected = if source.role == PlantSourceRole::Geometry {
+                    match partition_selected_by_parts(
+                        asset,
+                        source.id,
+                        selected,
+                        targets_by_source.get(&source.id),
+                    ) {
+                        Ok(selected) => selected,
+                        Err(partition) => {
+                            push_diagnostic(
+                                &mut diagnostics,
+                                limits,
+                                diagnostic(
+                                    PlantCompileDiagnosticSeverity::Error,
+                                    PlantCompileDiagnosticCode::InvalidGeometry,
+                                    Some(source.id),
+                                    Some(source.selector.clone()),
+                                    partition.path,
+                                    &partition.message,
+                                ),
+                            )?;
+                            statistics.rejected = statistics.rejected.saturating_add(1);
+                            continue;
+                        }
+                    }
+                } else {
+                    selected
                 };
                 for selected_mesh in selected {
                     if meshes.len() >= limits.meshes as usize {
@@ -873,6 +902,7 @@ fn compile_native_plant_family(
     grafts: &[crate::PlantSourceReference],
     snapshots: &[PlantSourceSnapshot],
     limits: PlantCompileLimits,
+    modules: &dyn crate::BotanicalModuleResolver,
 ) -> Result<PlantCompileOutput> {
     let source = native_plant_source_id(asset.id);
     let content_hash = native_botanical_graph_content_hash(graph);
@@ -992,7 +1022,7 @@ fn compile_native_plant_family(
     let mut assemblies = Vec::new();
     let mut failed = false;
     for index in 0..graph.variations.len() {
-        let growth = match crate::grow(graph, index) {
+        let growth = match crate::grow(graph, index, modules, &crate::BotanicalBudget::COOK) {
             Ok(growth) => growth,
             Err(error) => {
                 push_diagnostic(
@@ -1262,6 +1292,77 @@ fn selected_meshes<'a>(
             })
             .collect(),
     }
+}
+
+struct PartPartitionError {
+    path: &'static str,
+    message: String,
+}
+
+/// Splits a geometry source's selection into per-submesh rows wherever the family's
+/// Part-destination submesh targets partition an element, so each part's assembly use
+/// places only the part's own geometry.
+///
+/// The residual rows must stay unambiguous: a row bound to no target is placed by the
+/// part referencing the source, so several parts sharing such a row would each place the
+/// whole of it — coincident duplicate draws no phenotype mask can hide.
+fn partition_selected_by_parts<'a>(
+    asset: &PlantFamilyAsset,
+    source: u128,
+    selected: Vec<SelectedMesh<'a>>,
+    targets: Option<&Vec<&PlantManualSemanticTarget>>,
+) -> std::result::Result<Vec<SelectedMesh<'a>>, PartPartitionError> {
+    let part_targets = targets
+        .into_iter()
+        .flatten()
+        .copied()
+        .filter(|target| {
+            matches!(target.destination, PlantSemanticDestination::Part(_))
+                && matches!(target.selector, PlantSourceSelector::Submesh { .. })
+        })
+        .collect::<Vec<_>>();
+    let referencing_parts = asset
+        .parts
+        .iter()
+        .filter(|part| part.sources.contains(&source))
+        .count();
+    let mut output = Vec::with_capacity(selected.len());
+    for row in selected {
+        let partitioned = row.submesh.is_none()
+            && selector_element_id(&row.snapshot.selector).is_some_and(|element| {
+                part_targets.iter().any(|target| {
+                    matches!(&target.selector,
+                        PlantSourceSelector::Submesh { element: target_element, .. }
+                            if *target_element == element)
+                })
+            });
+        if partitioned {
+            for index in 0..row.snapshot.mesh.submeshes.len() {
+                output.push(SelectedMesh {
+                    snapshot: row.snapshot,
+                    submesh: Some(index),
+                });
+            }
+        } else {
+            output.push(row);
+        }
+    }
+    for row in &output {
+        let selector = row.output_selector();
+        let bound = part_targets
+            .iter()
+            .any(|target| target.selector == selector);
+        if !bound && referencing_parts > 1 {
+            return Err(PartPartitionError {
+                path: "source.imported.semanticTargets",
+                message: format!(
+                    "several parts reference this source, and selection {selector:?} is bound \
+                     to none of them; bind every submesh to its part with a semantic target"
+                ),
+            });
+        }
+    }
+    Ok(output)
 }
 
 fn selected_joints<'a>(
@@ -2367,6 +2468,9 @@ mod tests {
             provenance: provenance(),
         };
         PlantFamilyAsset {
+            role: crate::PlantFamilyRole::Family,
+            modules: Vec::new(),
+            module_recursion_limit: crate::MAX_PLANT_MODULE_RECURSION,
             version: PLANT_ASSET_VERSION,
             id: Uuid(2_000),
             name: "Oak".to_owned(),
@@ -2489,10 +2593,20 @@ mod tests {
     #[test]
     fn compile_is_byte_identical_under_snapshot_order_changes() {
         let asset = asset();
-        let first =
-            compile_plant_family(&asset, &[snapshot()], PlantCompileLimits::default()).unwrap();
-        let second =
-            compile_plant_family(&asset, &[snapshot()], PlantCompileLimits::default()).unwrap();
+        let first = compile_plant_family(
+            &asset,
+            &[snapshot()],
+            PlantCompileLimits::default(),
+            &crate::NoBotanicalModules,
+        )
+        .unwrap();
+        let second = compile_plant_family(
+            &asset,
+            &[snapshot()],
+            PlantCompileLimits::default(),
+            &crate::NoBotanicalModules,
+        )
+        .unwrap();
         assert!(first.publishable());
         assert_eq!(first.family_hash, second.family_hash);
         assert_eq!(first.family, second.family);
@@ -2505,16 +2619,24 @@ mod tests {
     #[test]
     fn family_tags_participate_in_the_normalized_hash() {
         let original = asset();
-        let original_hash =
-            compile_plant_family(&original, &[snapshot()], PlantCompileLimits::default())
-                .unwrap()
-                .family_hash;
+        let original_hash = compile_plant_family(
+            &original,
+            &[snapshot()],
+            PlantCompileLimits::default(),
+            &crate::NoBotanicalModules,
+        )
+        .unwrap()
+        .family_hash;
         let mut changed = original;
         changed.tags = vec![crate::PlantTagId::new(19).unwrap()];
-        let changed_hash =
-            compile_plant_family(&changed, &[snapshot()], PlantCompileLimits::default())
-                .unwrap()
-                .family_hash;
+        let changed_hash = compile_plant_family(
+            &changed,
+            &[snapshot()],
+            PlantCompileLimits::default(),
+            &crate::NoBotanicalModules,
+        )
+        .unwrap()
+        .family_hash;
         assert_ne!(original_hash, changed_hash);
     }
 
@@ -2526,8 +2648,13 @@ mod tests {
         };
         recipe.sources[0].settings.handedness = SourceHandedness::Left;
         recipe.sources[0].settings.forward_axis = SourceAxis::PositiveZ;
-        let output =
-            compile_plant_family(&asset, &[snapshot()], PlantCompileLimits::default()).unwrap();
+        let output = compile_plant_family(
+            &asset,
+            &[snapshot()],
+            PlantCompileLimits::default(),
+            &crate::NoBotanicalModules,
+        )
+        .unwrap();
         assert!(output.publishable(), "{:?}", output.diagnostics);
         let mesh = &output.family.unwrap().meshes[0];
         assert_eq!(mesh.indices, vec![0, 2, 1]);
@@ -2542,8 +2669,13 @@ mod tests {
         source.meshes[0].mesh.vertices = vec![Vertex::default(); 3];
         source.meshes[0].mesh.vertices.extend(referenced);
         source.meshes[0].mesh.submeshes[0].vertex_offset = 3;
-        let output =
-            compile_plant_family(&asset, &[source], PlantCompileLimits::default()).unwrap();
+        let output = compile_plant_family(
+            &asset,
+            &[source],
+            PlantCompileLimits::default(),
+            &crate::NoBotanicalModules,
+        )
+        .unwrap();
         assert!(output.publishable(), "{:?}", output.diagnostics);
         assert_eq!(output.family.unwrap().meshes[0].vertices.len(), 3);
     }
@@ -2553,8 +2685,13 @@ mod tests {
         let asset = asset();
         let mut source = snapshot();
         source.meshes[0].selector = selector(99, "oak/renamed-leaves");
-        let output =
-            compile_plant_family(&asset, &[source], PlantCompileLimits::default()).unwrap();
+        let output = compile_plant_family(
+            &asset,
+            &[source],
+            PlantCompileLimits::default(),
+            &crate::NoBotanicalModules,
+        )
+        .unwrap();
         assert!(!output.publishable());
         assert_eq!(output.conflicts.conflicts.len(), 1);
         assert_eq!(output.conflicts.conflicts[0].target, 30);
@@ -2569,8 +2706,13 @@ mod tests {
         let asset = asset();
         let mut source = snapshot();
         source.content_hash = [9; 32];
-        let output =
-            compile_plant_family(&asset, &[source], PlantCompileLimits::default()).unwrap();
+        let output = compile_plant_family(
+            &asset,
+            &[source],
+            PlantCompileLimits::default(),
+            &crate::NoBotanicalModules,
+        )
+        .unwrap();
         assert!(output.publishable());
         assert_eq!(output.source_updates.len(), 1);
         assert_eq!(output.source_updates[0].current, [9; 32]);
@@ -2586,8 +2728,13 @@ mod tests {
         compute_tangents(&mut source.meshes[0].mesh);
         source.materials[0].alpha_classification = AlphaClassification::Masked;
         source.materials[0].coverage_source = CoverageSource::AlbedoAlpha;
-        let output =
-            compile_plant_family(&asset, &[source], PlantCompileLimits::default()).unwrap();
+        let output = compile_plant_family(
+            &asset,
+            &[source],
+            PlantCompileLimits::default(),
+            &crate::NoBotanicalModules,
+        )
+        .unwrap();
         assert!(!output.publishable());
         assert!(output.diagnostics.iter().any(|diagnostic| {
             diagnostic.code == PlantCompileDiagnosticCode::MissingCoverageUv
@@ -2600,7 +2747,14 @@ mod tests {
     fn a_graft_normalizes_through_the_imported_source_path() {
         let mut asset = asset();
         let mut graph = crate::BotanicalGraphDocument::sapling(0x5a11);
-        let grown = crate::grow(&graph, 0).unwrap().assembly;
+        let grown = crate::grow(
+            &graph,
+            0,
+            &crate::NoBotanicalModules,
+            &crate::BotanicalBudget::COOK,
+        )
+        .unwrap()
+        .assembly;
         let leaf = grown.elements[0].clone();
         let hero = PlantSourceReference {
             id: 77,
@@ -2637,9 +2791,13 @@ mod tests {
         grafted.source = hero.id;
         grafted.content_hash = hero.content_hash;
 
-        let output =
-            compile_plant_family(&asset, &[native, grafted], PlantCompileLimits::default())
-                .unwrap();
+        let output = compile_plant_family(
+            &asset,
+            &[native, grafted],
+            PlantCompileLimits::default(),
+            &crate::NoBotanicalModules,
+        )
+        .unwrap();
         assert!(output.publishable(), "{:?}", output.diagnostics);
         assert_eq!(output.statistics.grafts, 1);
         let family = output.family.unwrap();
@@ -2674,8 +2832,13 @@ mod tests {
         lonely.content_hash = native_botanical_graph_content_hash(&graph);
         lonely.meshes.clear();
         lonely.joints.clear();
-        let missing =
-            compile_plant_family(&asset, &[lonely], PlantCompileLimits::default()).unwrap();
+        let missing = compile_plant_family(
+            &asset,
+            &[lonely],
+            PlantCompileLimits::default(),
+            &crate::NoBotanicalModules,
+        )
+        .unwrap();
         assert!(!missing.publishable());
         assert!(
             missing
@@ -2700,8 +2863,13 @@ mod tests {
         source.content_hash = native_botanical_graph_content_hash(&graph);
         source.meshes.clear();
         source.joints.clear();
-        let output =
-            compile_plant_family(&asset, &[source], PlantCompileLimits::default()).unwrap();
+        let output = compile_plant_family(
+            &asset,
+            &[source],
+            PlantCompileLimits::default(),
+            &crate::NoBotanicalModules,
+        )
+        .unwrap();
         assert!(output.publishable(), "{:?}", output.diagnostics);
         let family = output.family.unwrap();
         // A native family grows real geometry: one mesh with a submesh per material slot, a
@@ -2714,5 +2882,196 @@ mod tests {
         assert_eq!(family.materials.len(), 1);
         assert_eq!(family.sources[0].0, native_plant_source_id(asset.id));
         assert!(output.statistics.vertices > 0 && output.statistics.joints > 0);
+    }
+
+    fn two_submesh_mesh() -> Mesh {
+        let quad = |base: f32| {
+            [
+                Vertex {
+                    position: Vec3::new(-1.0, base, 0.0),
+                    normal: Vec3::Z,
+                    uv0: Vec2::new(0.0, 0.0),
+                    ..Vertex::default()
+                },
+                Vertex {
+                    position: Vec3::new(1.0, base, 0.0),
+                    normal: Vec3::Z,
+                    uv0: Vec2::new(1.0, 0.0),
+                    ..Vertex::default()
+                },
+                Vertex {
+                    position: Vec3::new(0.0, base + 1.0, 0.0),
+                    normal: Vec3::Z,
+                    uv0: Vec2::new(0.5, 1.0),
+                    ..Vertex::default()
+                },
+            ]
+        };
+        let mut mesh = Mesh {
+            vertices: quad(0.0).into_iter().chain(quad(1.0)).collect(),
+            indices: vec![0, 1, 2, 3, 4, 5],
+            submeshes: vec![
+                Submesh {
+                    first_index: 0,
+                    index_count: 3,
+                    vertex_offset: 0,
+                    material_slot: 0,
+                },
+                Submesh {
+                    first_index: 3,
+                    index_count: 3,
+                    vertex_offset: 0,
+                    material_slot: 1,
+                },
+            ],
+        };
+        compute_tangents(&mut mesh);
+        mesh
+    }
+
+    fn two_part_asset(partitioned: bool) -> PlantFamilyAsset {
+        let mut asset = asset();
+        asset.parts = vec![
+            PlantPart {
+                id: 40,
+                parent: None,
+                semantic: PlantPartSemantic::Trunk,
+                material_slot: 0,
+                sources: vec![10],
+            },
+            PlantPart {
+                id: 41,
+                parent: Some(40),
+                semantic: PlantPartSemantic::Leaf,
+                material_slot: 1,
+                sources: vec![10],
+            },
+        ];
+        asset.material_slots = vec![Uuid(3_000), Uuid(3_001)];
+        let PlantFamilySource::Imported(recipe) = &mut asset.source else {
+            unreachable!("the fixture asset is an imported recipe");
+        };
+        recipe.semantic_targets = if partitioned {
+            vec![
+                PlantManualSemanticTarget {
+                    id: 30,
+                    source: 10,
+                    selector: PlantSourceSelector::Submesh {
+                        element: 20,
+                        index: 0,
+                    },
+                    destination: PlantSemanticDestination::Part(40),
+                },
+                PlantManualSemanticTarget {
+                    id: 31,
+                    source: 10,
+                    selector: PlantSourceSelector::Submesh {
+                        element: 20,
+                        index: 1,
+                    },
+                    destination: PlantSemanticDestination::Part(41),
+                },
+            ]
+        } else {
+            // Both parts bound to the same whole element: valid at the asset level,
+            // ambiguous at compile time — neither part owns a distinct geometry slice.
+            vec![
+                PlantManualSemanticTarget {
+                    id: 30,
+                    source: 10,
+                    selector: selector(20, "oak/leaves"),
+                    destination: PlantSemanticDestination::Part(40),
+                },
+                PlantManualSemanticTarget {
+                    id: 31,
+                    source: 10,
+                    selector: selector(20, "oak/leaves"),
+                    destination: PlantSemanticDestination::Part(41),
+                },
+            ]
+        };
+        asset
+    }
+
+    fn two_submesh_snapshot() -> PlantSourceSnapshot {
+        let mut source = snapshot();
+        source.meshes[0].mesh = two_submesh_mesh();
+        source.meshes[0].material_slots = vec![Uuid(3_000), Uuid(3_001)];
+        source.materials.push(PlantSourceMaterialSnapshot {
+            selector: selector(22, "oak/bark-material"),
+            material: Uuid(3_001),
+            content_hash: [4; 32],
+            surface: MaterialSurface::Standard,
+            alpha_classification: AlphaClassification::Opaque,
+            coverage_source: CoverageSource::ModeledGeometry,
+        });
+        source
+    }
+
+    /// Part-destination submesh targets split the source into one row per submesh, and
+    /// each row's assembly use carries its own part — a mask that hides one part must
+    /// remove that part's geometry, which a whole-mesh use per part cannot do.
+    #[test]
+    fn part_submesh_targets_partition_the_source_into_per_part_rows() {
+        let asset = two_part_asset(true);
+        let output = compile_plant_family(
+            &asset,
+            &[two_submesh_snapshot()],
+            PlantCompileLimits::default(),
+            &crate::NoBotanicalModules,
+        )
+        .unwrap();
+        assert!(output.publishable(), "{:?}", output.diagnostics);
+        let family = output.family.unwrap();
+        let selectors = family
+            .meshes
+            .iter()
+            .map(|mesh| mesh.selector.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            selectors,
+            vec![
+                PlantSourceSelector::Submesh {
+                    element: 20,
+                    index: 0
+                },
+                PlantSourceSelector::Submesh {
+                    element: 20,
+                    index: 1
+                },
+            ]
+        );
+        assert!(
+            family
+                .meshes
+                .iter()
+                .all(|mesh| mesh.submeshes.len() == 1 && mesh.vertices.len() == 3)
+        );
+        let hierarchy = crate::plant_hierarchy_input(&asset, &family, &[]).unwrap();
+        assert_eq!(hierarchy.meshes.len(), 2);
+        let placements = hierarchy
+            .micro_instances
+            .iter()
+            .map(|instance| (instance.prototype, instance.part))
+            .collect::<Vec<_>>();
+        assert_eq!(placements, vec![(0, 40), (1, 41)]);
+    }
+
+    /// Several parts sharing one un-partitioned row would each place the whole row —
+    /// coincident duplicate draws no phenotype mask can hide — so the compile refuses it.
+    #[test]
+    fn several_parts_on_an_unpartitioned_source_are_refused() {
+        let output = compile_plant_family(
+            &two_part_asset(false),
+            &[two_submesh_snapshot()],
+            PlantCompileLimits::default(),
+            &crate::NoBotanicalModules,
+        )
+        .unwrap();
+        assert!(!output.publishable());
+        assert!(output.diagnostics.iter().any(|entry| {
+            entry.code == PlantCompileDiagnosticCode::InvalidGeometry
+                && entry.path == "source.imported.semanticTargets"
+        }));
     }
 }
