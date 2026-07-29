@@ -11,6 +11,15 @@ executor draws. What makes a family different is assembly — the cooked hierarc
 each source prototype through *uses* (per-part local transforms), and the renderer
 expands those uses on the GPU instead of duplicating geometry.
 
+A use places its part's own geometry and nothing more. When several parts share one
+source file, the family's Part-destination submesh semantic targets partition it: the
+compile splits the source into one normalized row per submesh, each row cooks to its
+own prototype, and each use binds to the part its target names — so a combination mask
+that deactivates a part removes that part's geometry from the picture, its shadow, and
+its ray-traced shape alike. Several parts claiming one un-partitioned source is a
+compile error, because their uses would each place the whole source as coincident
+duplicates no mask could tell apart.
+
 ## From artifact to family mesh
 
 `AssetServer::load_plant_family` reads the family's validated `.splantc` by exact
@@ -159,10 +168,58 @@ The executor vertex paths then rebase the vertex fetch to the placed prototype's
 the instance transform. Memory stays flat: uses expand at traversal time, never in the
 geometry or page payloads.
 
+## Scrubbing the year
+
+Which appearance a plant renders comes from typed lifecycle state and the seasonal phase, never from
+inspecting an active mesh. Lifecycle wins: dead and stump take the dead role, senescent takes the
+senescent role, and only a healthy plant falls through to the first phenotype whose window contains
+the current phase. The cooked phenotype is the fallback throughout.
+
+`plant-season-phenotype` answers that question for a point in the year, and the Season panel in the
+Plant workspace scrubs it and binds the answer to the live preview. It calls the same resolver the
+renderer does rather than reimplementing the rule — a preview that resolved the season its own way
+would be showing an appearance the scene never picks, which is exactly the kind of error a timeline
+hides.
+
+The phenotype and its variation bind together, because a phenotype draws a specific variation and
+applying one without the other shows a combination the family never declares.
+
+```sh
+sa plant-season-phenotype '{"plant":"Silver birch","seasonMille":700}'
+sa plant-season-phenotype '{"plant":"Silver birch","seasonMille":700,"lifecycle":"dead"}'
+```
+
+## One atlas per family
+
+A family's coverage slots pack into a single atlas at cook time, and the family's UVs are rewritten
+to address it. The two are one decision: a family that shipped a packed atlas but slot-local UVs — or
+the reverse — samples texels the cook never placed there, and both halves look well-formed on their
+own, so nothing downstream can detect the disagreement.
+
+The gutter carries the edge texel's *colour* at zero alpha rather than transparent black, because a
+transparent-black gutter filters into the slot's edge as a dark fringe. The mip chain is
+alpha-area-preserving for the same reason in the other direction: a naive box filter loses coverage
+with every level, and distant foliage thins out.
+
+`plant-atlas` returns one level as a PNG with its placements, read out of the published artifact
+rather than re-packed — a second packing of the same slots produces a different arrangement, and that
+is not the one the plant is sampling. The Atlas panel in the Plant workspace shows it over a checker,
+with the level scrubbable, since a level that lost coverage is invisible at level zero.
+
+```sh
+sa plant-atlas '{"plant":"Silver birch"}' -o json | jq '{width, height, levelCount, placements}'
+```
+
+A family whose slots resolve to catalog materials cooks no atlas. That is a fact about the family,
+not a failure.
+
 ## In the code
 
 | What | File | Symbols |
 |---|---|---|
+| Season → appearance | `vegetation/src/season.rs`, `control/src/commands_asset.rs` | `resolve_rendered_phenotype`, `plant-season-phenotype` |
+| Family atlas + coverage mips | `assets/src/atlas.rs`, `coverage.rs` | `generate_family_atlas`, `pack_atlas`, `FamilyAtlas`, `AtlasLayout`, `CoverageMip` |
+| Atlas inspection | `assets/src/plant_render.rs`, `control/src/commands_asset.rs` | `plant_family_atlas_image`, `PlantAtlasImage`, `plant-atlas` |
 | Family load, decode, and flatten | `assets/src/plant_render.rs` | `load_plant_family`, `PlantFamilyRender` |
 | Section decode mirrors | `assets/src/plant_cook.rs` | `decode_mesh_section`, `decode_plant_material_document` |
 | Assembly-part table build | `rendering/src/upload.rs` | `assembly_from_hierarchy`, `MeshAssembly` |
