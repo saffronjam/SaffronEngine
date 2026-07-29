@@ -239,6 +239,7 @@ fn render_stats_dto(renderer: &dyn ControlRenderer) -> RenderStatsDto {
             overflow: stats.vsm.overflow as i32,
         },
         rt_instances: stats.rt_instances as i32,
+        rt_aggregate_instances: stats.rt_aggregate_instances as i32,
         frame_ms: stats.frame_ms,
         fps: stats.fps,
         gpu_ms: stats.gpu_ms,
@@ -276,7 +277,31 @@ fn render_stats_dto(renderer: &dyn ControlRenderer) -> RenderStatsDto {
         restir: renderer.restir_enabled(),
         ssr: renderer.ssr_enabled(),
         rt_reflections: renderer.rt_reflections_enabled(),
+        mesh_shader: renderer.mesh_shader_supported(),
+        mesh_executor: renderer.mesh_executor_active(),
+        sdf_instances_dropped: renderer.sdf_instances_dropped() as i32,
+        sdf_instances_culled: renderer.sdf_instances_culled() as i32,
+        rt_instances_culled: renderer.rt_instances_culled() as i32,
+        omm_supported: renderer.rt_omm_supported(),
         blas_count: renderer.rt_blas_count() as i32,
+        skinned_blas_count: renderer.rt_skinned_blas_count() as i32,
+        tessellated_blas_count: renderer.rt_tessellated_blas_count() as i32,
+        cluster_as_supported: renderer.cluster_as_supported(),
+        cluster_blas_count: renderer.rt_cluster_blas_count() as i32,
+        clas_count: renderer.rt_clas_count() as i32,
+        ptlas_supported: renderer.ptlas_supported(),
+        ptlas_partitions: renderer.rt_ptlas_ops().0 as i32,
+        ptlas_writes: renderer.rt_ptlas_ops().1 as i32,
+        ptlas_updates: renderer.rt_ptlas_ops().2 as i32,
+        accel_build_us: renderer.rt_accel_build_us().to_string(),
+        omm_micromaps: renderer.rt_omm_micromaps() as i32,
+        omm_opaque: renderer.rt_omm_classes().0.to_string(),
+        omm_transparent: renderer.rt_omm_classes().1.to_string(),
+        omm_unknown: renderer.rt_omm_classes().2.to_string(),
+        blas_bytes: renderer.rt_blas_bytes().to_string(),
+        blas_built_bytes: renderer.rt_blas_built_bytes().to_string(),
+        tlas_bytes: renderer.rt_tlas_bytes().to_string(),
+        rt_scratch_bytes: renderer.rt_scratch_bytes().to_string(),
         pipelines: renderer.pipeline_count() as i32,
         bindless_textures: renderer.bindless_texture_count() as i32,
         bindless_free: renderer.bindless_free_count() as i32,
@@ -399,6 +424,7 @@ fn alarm_event_dto(event: &AlarmEvent) -> AlarmEventDto {
         fingerprint: event.fingerprint.to_string(),
         metric: event.metric.clone(),
         pass: event.pass.clone(),
+        owner: event.owner.clone(),
         severity: alarm_severity_to_dto(event.severity),
         state,
         value: event.value,
@@ -428,6 +454,7 @@ fn active_alarms_dto(renderer: &dyn ControlRenderer) -> ActiveAlarmsDto {
             fingerprint: alarm.fingerprint.to_string(),
             metric: alarm.metric.clone(),
             pass: alarm.pass.clone(),
+            owner: alarm.owner.clone(),
             severity: alarm_severity_to_dto(alarm.severity),
             value: alarm.value,
             threshold: alarm.threshold,
@@ -643,6 +670,7 @@ pub fn register_render_commands(reg: &mut CommandRegistry) {
             let stats = ctx.renderer.gpu_scene_mirror_stats();
             let residency = ctx.renderer.page_residency_stats();
             Ok(GpuSceneMirrorStatsDto {
+                history_invalidation: ctx.renderer.view_history_invalidation().to_owned(),
                 meshes: stats.meshes as u32,
                 materials: stats.materials as u32,
                 textures: stats.textures as u32,
@@ -664,9 +692,12 @@ pub fn register_render_commands(reg: &mut CommandRegistry) {
                     evictions: residency.evictions,
                     faults: residency.faults,
                     fault_latency_us: residency.fault_latency_us,
+                    requests_dropped: residency.requests_dropped,
+                    request_overflow_classes: residency.request_overflow_classes,
                 },
                 visibility: {
                     let words = ctx.renderer.visibility_counters();
+                    let gi = ctx.renderer.gi_visibility_counters();
                     saffron_protocol::SceneVisibilityStatsDto {
                         visible: words[0],
                         retested: words[1],
@@ -679,6 +710,18 @@ pub fn register_render_commands(reg: &mut CommandRegistry) {
                         culled_frustum: words[13],
                         culled_occlusion: words[14],
                         sub_quad_triangles: words[15],
+                        visited_nodes: words
+                            [saffron_rendering::SCENE_VISIBILITY_COUNTER_VISITED_NODES],
+                        culled_nodes: words
+                            [saffron_rendering::SCENE_VISIBILITY_COUNTER_CULLED_NODES],
+                        gi_reach_visible: gi[saffron_rendering::SCENE_VISIBILITY_COUNTER_VISIBLE],
+                        gi_reach_culled: gi
+                            [saffron_rendering::SCENE_VISIBILITY_COUNTER_CULLED_REACH],
+                        bins: words[saffron_rendering::SCENE_VISIBILITY_COUNTER_BINS],
+                        deformed: words[saffron_rendering::SCENE_VISIBILITY_COUNTER_DEFORMED],
+                        interaction_resets: ctx.renderer.wind_interaction_resets(),
+                        covered_samples: words
+                            [saffron_rendering::SCENE_VISIBILITY_COUNTER_COVERED_SAMPLES],
                         overflow_flags: words[2],
                         pressure_flags: words[4],
                     }
@@ -1005,6 +1048,67 @@ pub fn register_render_commands(reg: &mut CommandRegistry) {
             }
             Ok(TonemapResult {
                 mode: ctx.renderer.tonemap_mode(),
+            })
+        },
+    );
+
+    reg.register::<saffron_protocol::SetHierarchyCutParams, saffron_protocol::HierarchyCutResult>(
+        "set-hierarchy-cut",
+        "set-hierarchy-cut {auto|coarse|fine} [camera|shadow|gi] — pin one view's \
+         hierarchy cut (omit the cut to read)",
+        |ctx, params| {
+            use saffron_protocol::{HierarchyCutDto, HierarchyCutViewDto};
+            let view_dto = params.view.unwrap_or_default();
+            let view = match view_dto {
+                HierarchyCutViewDto::Camera => saffron_rendering::SceneViewClass::Camera,
+                HierarchyCutViewDto::Shadow => saffron_rendering::SceneViewClass::ShadowPage,
+                HierarchyCutViewDto::Gi => saffron_rendering::SceneViewClass::Gi,
+            };
+            if let Some(cut) = params.cut {
+                ctx.renderer.set_cut_override(
+                    view,
+                    match cut {
+                        HierarchyCutDto::Auto => saffron_rendering::SCENE_CUT_AUTO,
+                        HierarchyCutDto::Coarse => saffron_rendering::SCENE_CUT_FORCE_COARSE,
+                        HierarchyCutDto::Fine => saffron_rendering::SCENE_CUT_FORCE_FINE,
+                    },
+                );
+            }
+            Ok(saffron_protocol::HierarchyCutResult {
+                view: view_dto,
+                cut: match ctx.renderer.cut_override(view) {
+                    saffron_rendering::SCENE_CUT_FORCE_COARSE => HierarchyCutDto::Coarse,
+                    saffron_rendering::SCENE_CUT_FORCE_FINE => HierarchyCutDto::Fine,
+                    _ => HierarchyCutDto::Auto,
+                },
+            })
+        },
+    );
+
+    reg.register::<saffron_protocol::VsmPageBudgetParams, saffron_protocol::VsmPageBudgetResult>(
+        "vsm-page-budget",
+        "vsm-page-budget {pages} — shadow pages a frame may render (omit to read)",
+        |ctx, params| {
+            if let Some(pages) = params.pages {
+                ctx.renderer.set_vsm_page_budget(pages);
+            }
+            Ok(saffron_protocol::VsmPageBudgetResult {
+                pages: ctx.renderer.vsm_page_budget(),
+            })
+        },
+    );
+
+    reg.register::<saffron_protocol::PageRequestBudgetParams, saffron_protocol::PageRequestBudgetResult>(
+        "page-request-budget",
+        "page-request-budget {entries} — missing-page requests one view class may raise \
+         per frame (omit to read)",
+        |ctx, params| {
+            if let Some(entries) = params.entries {
+                ctx.renderer.set_page_request_budget(entries);
+            }
+            Ok(saffron_protocol::PageRequestBudgetResult {
+                entries: ctx.renderer.page_request_budget(),
+                capacity: saffron_rendering::PAGE_REQUEST_CAPACITY,
             })
         },
     );
@@ -1430,6 +1534,24 @@ mod tests {
         with_stub(stub, |ctx| {
             reg.dispatch(ctx, &json!({ "id": 1, "cmd": cmd, "params": params }))
         })
+    }
+
+    /// `set-hierarchy-cut` pins the cut, reads it back, and refuses nothing — an unknown value is
+    /// not reachable through the typed enum, and omitting the field reads rather than resets.
+    #[test]
+    fn set_hierarchy_cut_pins_reads_and_returns_to_auto() {
+        let mut stub = StubRenderer::default();
+        let read = run(&mut stub, "set-hierarchy-cut", json!({}));
+        assert_eq!(read["result"]["cut"], json!("auto"));
+
+        let coarse = run(&mut stub, "set-hierarchy-cut", json!({ "cut": "coarse" }));
+        assert_eq!(coarse["result"]["cut"], json!("coarse"));
+        // Reading again must not reset it: an omitted field is a question, not an instruction.
+        let again = run(&mut stub, "set-hierarchy-cut", json!({}));
+        assert_eq!(again["result"]["cut"], json!("coarse"));
+
+        let auto = run(&mut stub, "set-hierarchy-cut", json!({ "cut": "auto" }));
+        assert_eq!(auto["result"]["cut"], json!("auto"));
     }
 
     #[test]
@@ -1885,6 +2007,7 @@ mod tests {
                         fingerprint: 42,
                         metric: "frame-budget".to_owned(),
                         pass: String::new(),
+                        owner: String::new(),
                         severity: AlarmSeverity::Warning,
                         kind: AlarmEventKind::Firing,
                         value: 20.0,
@@ -1898,6 +2021,7 @@ mod tests {
                         fingerprint: 42,
                         metric: "frame-budget".to_owned(),
                         pass: String::new(),
+                        owner: String::new(),
                         severity: AlarmSeverity::Warning,
                         kind: AlarmEventKind::Resolved,
                         value: 8.0,
@@ -1915,6 +2039,7 @@ mod tests {
                 fingerprint: 42,
                 metric: "frame-budget".to_owned(),
                 pass: String::new(),
+                owner: String::new(),
                 severity: AlarmSeverity::Critical,
                 value: 20.0,
                 threshold: 16.6,
