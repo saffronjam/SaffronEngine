@@ -81,6 +81,16 @@ pub struct ResolvedMaterials {
     pub shader: String,
 }
 
+/// The aggregate occupancy that reproduces `transmission_mean` across `thickness_m`.
+///
+/// The extinction coefficient is achromatic, so one density has to stand for three channels;
+/// the channel mean is the reduction that preserves total transmitted energy rather than
+/// favouring a perceptual weighting the injection path does not use.
+pub(crate) fn derive_parity_occupancy(transmission_mean: [f32; 3], thickness_m: f32) -> f32 {
+    let mean = (transmission_mean[0] + transmission_mean[1] + transmission_mean[2]) / 3.0;
+    saffron_material::parity_occupancy(mean, thickness_m)
+}
+
 /// The entity-level aggregate occupancy: an entity whose submeshes are all thin
 /// sheets occupies its bounds only fractionally, and the densest sheet's aggregate
 /// occupancy stands in for the whole; any solid submesh (or no submeshes) keeps the
@@ -240,7 +250,16 @@ fn thin_sheet_material(
         coverage_source_extent: parameters.coverage.source_extent,
         energy_limit: unit(parameters.energy_limit),
         aggregate: AggregateMaterialMoments {
-            occupancy: unit(moments.occupancy),
+            // Occupancy is DERIVED, not authored: it is the density at which marching through
+            // the sheet's own mean thickness transmits the sheet's own mean transmission. The
+            // aggregate voxel and the triangles it replaces then describe one optical depth,
+            // so a plant crossing that transition does not change how much light it lets
+            // through — which is what an authored occupancy sitting beside an authored
+            // transmission cannot guarantee.
+            occupancy: derive_parity_occupancy(
+                moments.transmission_mean.map(scalar),
+                scalar(moments.thickness_mean),
+            ),
             albedo_mean: vec3(moments.albedo_mean),
             roughness_mean: unit(moments.roughness_mean),
             transmission_mean: vec3(moments.transmission_mean),
@@ -679,7 +698,7 @@ mod tests {
             _hierarchy: &saffron_geometry::PortableVirtualHierarchy,
             _skin: &[saffron_geometry::VertexSkin],
             _morph: Option<&saffron_geometry::MorphData>,
-            _sdf_bake: Option<&saffron_rendering::SdfBake>,
+            _sdf: saffron_rendering::SdfSource<'_>,
         ) -> saffron_rendering::Result<Arc<saffron_rendering::GpuMesh>> {
             unreachable!("the precedence tests use zero texture ids; no upload happens")
         }
@@ -839,25 +858,79 @@ mod tests {
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
+    /// A thin sheet transmitting `transmission` through `thickness_m` of mean thickness.
+    fn parity_sheet(transmission: f32, thickness_m: f32) -> SubmeshMaterial {
+        let mut params = saffron_vegetation::ThinSheetFoliageParameters::default();
+        let scalar = |value: f32| {
+            saffron_spatial::DecisionScalar::from_f64(f64::from(value)).expect("in-range scalar")
+        };
+        params.voxel_moments.transmission_mean = [scalar(transmission); 3];
+        params.voxel_moments.thickness_mean = scalar(thickness_m);
+        let mut material = SubmeshMaterial::default();
+        material.thin_sheet = Some(thin_sheet_material(&params));
+        material
+    }
+
     #[test]
     fn occupancy_follows_the_densest_sheet_and_solid_wins() {
         assert_eq!(derive_entity_occupancy(&[]), 1.0);
-        let sheet = |occupancy_bits: u16| {
-            let mut params = saffron_vegetation::ThinSheetFoliageParameters::default();
-            params.voxel_moments.occupancy =
-                saffron_spatial::UnitInterval::from_bits(occupancy_bits);
-            let mut material = SubmeshMaterial::default();
-            material.thin_sheet = Some(thin_sheet_material(&params));
-            material
-        };
-        // Two sheets: the densest wins (bits scale to [0, 1]).
-        let dense = sheet(u16::MAX);
-        let sparse = sheet(u16::MAX / 4);
+        // A sheet that transmits less is denser, so it wins the entity-level max.
+        let dense = parity_sheet(0.05, 0.2);
+        let sparse = parity_sheet(0.8, 0.2);
         let both = [sparse.clone(), dense.clone()];
-        assert!((derive_entity_occupancy(&both) - 1.0).abs() < 1e-3);
+        let dense_occupancy = dense
+            .thin_sheet
+            .as_ref()
+            .expect("sheet")
+            .aggregate
+            .occupancy;
+        assert!((derive_entity_occupancy(&both) - dense_occupancy).abs() < 1e-4);
+        assert!(
+            dense_occupancy
+                > sparse
+                    .thin_sheet
+                    .as_ref()
+                    .expect("sheet")
+                    .aggregate
+                    .occupancy,
+            "the less transmissive sheet must be the denser one"
+        );
         // A solid submesh keeps the entity solid regardless of sheets.
-        let mixed = [sheet(u16::MAX / 4), SubmeshMaterial::default()];
+        let mixed = [sparse, SubmeshMaterial::default()];
         assert_eq!(derive_entity_occupancy(&mixed), 1.0);
+    }
+
+    #[test]
+    fn aggregate_occupancy_transmits_what_the_triangles_it_replaces_did() {
+        // The parity contract: marching the derived occupancy across the sheet's own thickness
+        // must return the sheet's own transmission. Without it the plant changes brightness at
+        // the triangle-to-voxel transition, which is the artifact the derivation exists to stop.
+        for (transmission, thickness) in [(0.5_f32, 0.25_f32), (0.2, 1.0), (0.9, 0.05)] {
+            let sheet = parity_sheet(transmission, thickness);
+            let aggregate = sheet.thin_sheet.as_ref().expect("sheet").aggregate;
+            let marched = saffron_material::aggregate_transmittance(aggregate.occupancy, thickness);
+            assert!(
+                (marched - transmission).abs() < 1e-3,
+                "transmission {transmission} through {thickness}m marched back as {marched}"
+            );
+        }
+        // Opaque matter is solid, and so is a sheet with no thickness to absorb across.
+        assert_eq!(
+            parity_sheet(0.0, 0.5)
+                .thin_sheet
+                .expect("sheet")
+                .aggregate
+                .occupancy,
+            1.0
+        );
+        assert_eq!(
+            parity_sheet(0.5, 0.0)
+                .thin_sheet
+                .expect("sheet")
+                .aggregate
+                .occupancy,
+            1.0
+        );
     }
 
     #[test]

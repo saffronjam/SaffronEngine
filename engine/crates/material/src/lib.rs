@@ -5,6 +5,10 @@
 use saffron_core::Uuid;
 use saffron_spatial::{DecisionScalar, UnitInterval};
 
+// The surface vocabulary is stated in these two scalar types, so a consumer of a
+// `MaterialSurface` needs them without also depending on `saffron-spatial`.
+pub use saffron_spatial::{DecisionScalar as SurfaceScalar, UnitInterval as SurfaceUnit};
+
 /// Material validation failure.
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum Error {
