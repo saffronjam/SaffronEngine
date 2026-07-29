@@ -96,24 +96,13 @@ const SLANG_VERSION: &str = "2026.10";
 
 /// The exact per-shader `slangc` flag set. A named constant so the flag-drift guard test asserts
 /// against one source of truth.
-pub const SLANGC_SPV_FLAGS: &[&str] = &[
-    "-profile",
-    "glsl_450",
-    "-target",
-    "spirv",
-    "-emit-spirv-directly",
-    "-fvk-use-entrypoint-name",
-    "-matrix-layout-column-major",
-    "-capability",
-    SLANGC_CAPABILITIES,
-];
+pub use saffron_core::SLANGC_SPV_FLAGS;
 
 /// Capabilities the shaders actually use that `glsl_450` does not imply (bindless non-uniform
 /// indexing, sparse residency + min-LOD texture sampling, fragment-fully-covered, inline ray query,
 /// the `VK_EXT_mesh_shader` task/mesh stages, and the SPIR-V debug-info extensions). Declared up
 /// front so Slang does not implicitly upgrade the profile and emit an informational warning per
 /// entry point.
-const SLANGC_CAPABILITIES: &str = "SPV_KHR_non_semantic_info+SPV_GOOGLE_user_type+spvSparseResidency+spvMinLod+spvFragmentFullyCoveredEXT+spvShaderNonUniformEXT+spvRayQueryKHR+spvMeshShadingEXT+spvGroupNonUniform+spvGroupNonUniformBallot";
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -1082,7 +1071,7 @@ mod tests {
                 "-fvk-use-entrypoint-name",
                 "-matrix-layout-column-major",
                 "-capability",
-                SLANGC_CAPABILITIES,
+                saffron_core::SLANGC_CAPABILITIES,
                 "-I",
                 "/shaders",
                 "-o",

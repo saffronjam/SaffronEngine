@@ -71,21 +71,9 @@ fn resolve_slangc(
     PathBuf::from("slangc")
 }
 
-/// The fixed `slangc` flag set the runtime compiles share, matching the static
-/// xtask shader flags: `-profile glsl_450 -target spirv -emit-spirv-directly
-/// -fvk-use-entrypoint-name -matrix-layout-column-major -capability <atoms>`. The capabilities are
-/// declared so Slang does not implicitly upgrade the profile (see `xtask`'s `SLANGC_CAPABILITIES`).
-const SLANGC_FLAGS: &[&str] = &[
-    "-profile",
-    "glsl_450",
-    "-target",
-    "spirv",
-    "-emit-spirv-directly",
-    "-fvk-use-entrypoint-name",
-    "-matrix-layout-column-major",
-    "-capability",
-    "SPV_KHR_non_semantic_info+SPV_GOOGLE_user_type+spvSparseResidency+spvMinLod+spvFragmentFullyCoveredEXT+spvShaderNonUniformEXT+spvRayQueryKHR",
-];
+/// The `slangc` flag set every compile shares, offline and at runtime. Defined once in
+/// `saffron-core` because these two compilers previously kept separate copies and drifted.
+use saffron_core::SLANGC_SPV_FLAGS as SLANGC_FLAGS;
 
 /// Builds the full `slangc` argv (program first) for compiling `slang_path` to
 /// `spv_path`, optionally adding `-I <include_dir>` (the mesh variant, so `import
@@ -315,17 +303,12 @@ mod tests {
 
     /// The fixed flag set every variant carries, in order, between the `.slang` input and
     /// the `-o <spv>` tail (and, for the mesh variant, the `-I <dir>` insertion).
-    const EXPECTED_FLAGS: &[&str] = &[
-        "-profile",
-        "glsl_450",
-        "-target",
-        "spirv",
-        "-emit-spirv-directly",
-        "-fvk-use-entrypoint-name",
-        "-matrix-layout-column-major",
-        "-capability",
-        "SPV_KHR_non_semantic_info+SPV_GOOGLE_user_type+spvSparseResidency+spvMinLod+spvFragmentFullyCoveredEXT+spvShaderNonUniformEXT+spvRayQueryKHR",
-    ];
+    ///
+    /// This is the shared constant, not a transcription of it. A local copy here is what let
+    /// the runtime compiler drift away from the offline one unnoticed: the test happily pinned
+    /// the stale list it carried itself, so a capability missing from the real compile looked
+    /// correct right up until a shader needed it.
+    const EXPECTED_FLAGS: &[&str] = SLANGC_FLAGS;
 
     /// No argv element may contain a shell quote or a redirection token.
     fn assert_no_shell_tokens(argv: &[OsString]) {
