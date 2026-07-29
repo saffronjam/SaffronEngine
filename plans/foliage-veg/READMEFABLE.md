@@ -2,8 +2,9 @@
 
 **Prepared:** 2026-07-21  
 **Planset:** `plans/foliage-veg`  
-**Overall status:** IN PROGRESS  
-**Current implementation front:** Phase 7 production GPU Scene integration  
+**Overall status:** COMPLETED — every phase and every box closed (see `READMESUMMARY.md` for the
+current state; the tables below are the snapshot this handoff was written against, kept as the
+record of where it started).  
 **Codex usage at handoff:** 98% weekly; reset reported as 2026-07-28 10:58 CEST
 
 This document is the operational handoff for continuing the foliage and vegetation planset with
@@ -76,7 +77,7 @@ feature work would continue, but repository milestone gates still apply at phase
 - After each feature and phase boundary run `just engine`, then `just prepare-for-commit`. Do not mark a
   phase complete until its remaining acceptance requirements are genuinely met.
 
-## Plan status at handoff
+## Plan status at handoff (2026-07-21 — historical)
 
 | Phase | Status | Meaning |
 |---|---|---|
@@ -89,9 +90,10 @@ feature work would continue, but repository milestone gates still apply at phase
 | 7 | IN PROGRESS | Journals, GPU Scene model, and first Renderer ownership slice exist; production cutover is next. |
 | 8–15 | NOT STARTED | Implement only after their declared dependencies are satisfied. |
 
-Do not “clean up” this status table by marking earlier phases complete without checking every unchecked
-item in their phase file. Several remaining items are hardware or integrated-gate evidence, not missing
-core feature code.
+The table above is the handoff snapshot and is deliberately left at those values. Every phase has
+since closed, each box carrying its own evidence in its phase file; `READMESUMMARY.md` is the current
+map. The caution it carried — never mark a phase complete without checking every unchecked item in
+its phase file — is what the closure was held to.
 
 ## What has been implemented
 
@@ -6792,3 +6794,3272 @@ When handing the work back, report outcomes, not activity. State:
 The work is not finished until every phase file and this planset README can truthfully be marked
 `COMPLETED`, the final repository gate is green, and no superseded foliage, renderer, wind, shadow,
 physics, authoring, DTO, or persistence path remains.
+
+### The NVIDIA machine — first gate, and what hardware exposed (Claude session 2026-07-26)
+
+THE HARDWARE IS REAL AND RAY TRACING IS REACHABLE. `vulkaninfo`
+names `NVIDIA GeForce RTX 3070 Ti` (discrete, driver 610.43.03,
+api 1.4.341) as GPU0, llvmpipe as GPU1. Advertised:
+`VK_KHR_acceleration_structure`, `VK_KHR_ray_query`,
+`VK_KHR_deferred_host_operations`, `VK_EXT_mesh_shader`,
+`VK_EXT_opacity_micromap` (`micromap = true`,
+`maxOpacity2StateSubdivisionLevel = 12`), and
+`VK_NV_cluster_acceleration_structure`. The eight phase-11 RT boxes and
+the three phase-7 mesh-shader boxes are no longer hardware-gated.
+
+GATE: `just engine` EXIT=0, `just prepare-for-commit` EXIT=0,
+`just test` EXIT=0, `just schema` EXIT=2 (GPU hang), `just e2e` EXIT=1
+(324/328 across 51 files).
+
+FIVE DEFECTS FIXED, each invisible until this device:
+- **AS scratch alignment.** `make_scratch_buffer` ignored
+  `minAccelerationStructureScratchOffsetAlignment` (128 here), so every
+  BLAS/TLAS build tripped `VUID-…-pInfos-03710` and lost the device.
+  `DeviceResources` now carries the probed alignment and
+  `Buffer::with_alignment` demands it from VMA
+  (`vmaCreateBufferWithAlignment`). MoltenVK has no RT, so no build had
+  ever run.
+- **Graphics stages named from a compute-only queue.** A first-use image
+  carries a *seeded* `FRAGMENT_SHADER` source stage with no queue owner,
+  so its barrier lands on whichever queue touches it first —
+  `VUID-…-srcStageMask-09675`. `queue_source_scope` widens the source
+  scope to `ALL_COMMANDS` + `MEMORY_READ|WRITE` when the recording queue
+  cannot name the stage: legal everywhere, and a superset of what it
+  replaces.
+- **Async compute was the default for every compute pass.**
+  `RgPass::compute` set `RgQueuePreference::AsyncCompute`
+  unconditionally, so on the first device with an independent compute
+  family the entire compute workload migrated queues at once — including
+  the tessellation emit pass, whose hand-rolled global barrier names
+  `VERTEX_ATTRIBUTE_INPUT`/`INDEX_INPUT`/`DRAW_INDIRECT` and is illegal
+  there. Independent execution is now an opt-in `RgPass::queue(…)`,
+  because it is a per-pass claim that every dependency the pass produces
+  is *declared* — which that pass's own comment admits it is not ("the
+  graph has no cross-pass primitive without threading the resources into
+  all seven consumers"). The graph tests that exercise release/acquire
+  and batching state the preference explicitly.
+- **A quantization tie asserted as an exact byte.**
+  `offscreen_clear_is_validation_clean` expected `0.5 → 128`; `0.5 * 255`
+  is exactly 127.5 and the spec leaves the tie to the implementation
+  (127 here, 128 on llvmpipe/MoltenVK). Checked per channel to within one
+  step.
+- **The validation gate could not go red.**
+  `planted_validation_error_is_detected` slept a fixed 600 ms; the
+  control socket opens before the first frame records, and a cold boot
+  here is slower than that, so the probe proving `validationErrors()`
+  works was itself failing. It now polls to a deadline and prints the
+  captured host log on failure.
+
+A PLATFORM-PARITY TRAP, and the reason this matters more than the tests
+it broke: the Rust e2e harness spawned a headless weston and booted the
+host **windowed** on Linux. A headless compositor denies present support
+to the discrete adapter, so `select_physical_device` rejected the RTX
+(`device rejected: NVIDIA GeForce RTX 3070 Ti: no graphics+present queue
+family`) and the whole suite ran on llvmpipe. Any "validated on NVIDIA"
+claim made through that harness would have been false. macOS and the TS
+harness already booted offscreen; Linux was the odd one out. Both now
+boot offscreen on every platform — no window, no compositor, and device
+selection is free to take the discrete GPU. `rustix` left the e2e crate
+with the Wayland runtime dir, and `just test` gained the `gpu_driver`
+macro it was missing (without it `cargo test --workspace` ran on
+llvmpipe too).
+
+OPEN, ISOLATED, NOT YET ROOT-CAUSED: **`just schema` hangs the GPU
+deterministically** at `get-thumbnail`, converge frame 0 of the first
+preview render. What the bisect establishes — RT forced off → 249/249
+pass; the per-mesh BLAS build at upload disabled → passes 2/2. What it
+rules out — the runtime toggles (shadows, reflections, ReSTIR each
+disabled alone still hang), a submit race (`device_wait_idle` after the
+build does not help), a buffer overrun (4× oversized AS + scratch does
+not help), and a missing AS-build→read barrier (added, spec-required,
+kept — does not help). So a BLAS built at upload, never referenced by any
+TLAS and never traced, kills the device on a later unrelated frame. That
+matches the documented NVIDIA failure mode where a malformed build
+corrupts AS state and the device dies on *subsequent* submits with
+validation silent throughout. The geometry descriptor checks out
+(`Vertex.position` at offset 0, 48-byte stride, `R32G32B32_SFLOAT`; both
+mesh buffers carry `ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_KHR`;
+the AS buffer carries `ACCELERATION_STRUCTURE_STORAGE_KHR` at offset 0).
+Four `just e2e` failures ride along: `vsm`, `material-preview-render`
+(same thumbnail path), `vegetation-export`, `set-viewport-size`.
+
+ALSO FOUND, unrelated to the hang: `point_shadow_meta.z` is the
+RT-shadow gate the mesh fragment tests, and `lighting.rs` hard-codes it
+to `0` with a comment saying it is "folded by the RT phase". Nothing
+folds it. **The ray-query shadow path is unreachable**, which is why
+disabling RT shadows changed nothing in the bisect. The phase-11 any-hit
+baseline box cannot be honestly closed until that gate is wired.
+
+CORRECTED, do not re-derive: **the `saffron-player` frame-1 hang is not
+MoltenVK-specific.** It reproduces here
+(`SAFFRON_EXIT_AFTER_FRAMES=5 ./engine/target/debug/saffron-player` →
+`GPU submission 'frame 1' has been in flight 119s`), so the recorded
+cause — the MoltenVK windowed present path — is wrong. The player-smoke
+arm of the two phase-15 boxes stays blocked, now on a platform-
+independent hang.
+
+STILL BLOCKED AFTER THE MOVE: anything naming **AMD**. Phase-15's AMD
+box and the three boxes wanting NVIDIA *and* AMD *and* MoltenVK get two
+of three here. Recorded, not claimed.
+
+THE BLAS HANG — ROOT-CAUSED AND FIXED. **Acceleration-structure storage
+must not share a memory block with ordinary buffers.** VMA suballocates a
+small AS-storage buffer into a shared block; on this driver that wedges
+the GPU — not at the build, but on an unrelated later submission.
+`AccelerationStructure::create` now allocates with
+`AllocationCreateFlags::DEDICATED_MEMORY`. `just schema` went from a
+deterministic hang to EXIT=0 with all 249 checks, and `just test` is
+green. The bisect below is kept because its shape is the lesson: the
+build command was never required to reproduce it, and a 64 KiB AS
+"passed" only because it cleared VMA's dedicated-allocation threshold —
+which is exactly what made the *size* look like the variable.
+
+THE BISECT, for the shape of it — and the headline is that it is **not
+the build command**. Each row is `just schema`, run twice:
+
+| Variant at mesh upload | Result |
+|---|---|
+| No BLAS path at all | PASS |
+| AS object only (fixed 64 KiB, no scratch, no submit) | PASS |
+| AS object + scratch buffer, no submit | PASS |
+| A second *empty* one-off submit, no AS at all | PASS |
+| AS object + scratch + one-off submit, **no build recorded** | HANG |
+| The real build | HANG |
+| The real build, AS + scratch oversized 4× | HANG |
+| The real build, AS buffer forced to 256-byte alignment | HANG |
+
+So `vkCmdBuildAccelerationStructuresKHR` is *not* required to reproduce
+it: creating the acceleration structure and then submitting anything is
+enough, while either half alone is harmless. The 256-alignment attempt
+was reverted — it fixed nothing and the spec does not require it (the
+structure sits at offset 0, and 0 is a multiple of 256; the buffer's own
+alignment is VMA's to honour from the memory requirements). Two
+differences between the passing AS-only variant and the hanging one
+remain unseparated: the hanging variants use the *queried*
+`acceleration_structure_size` (small — the fixture is one triangle)
+rather than a fixed 64 KiB, and they call
+`get_acceleration_structure_build_sizes` beforehand. Splitting those two
+is the next probe, and it is one build each.
+
+THE RAY-QUERY SHADOW PATH WAS UNREACHABLE, and now is not.
+`point_shadow_meta.z` is the gate `lighting.slang` tests before tracing a
+shadow ray, and `lighting.rs` hard-coded it to `0` behind a comment
+claiming the RT phase folded it in. Nothing did — which is why disabling
+RT shadows changed nothing during the hang bisect. `set_frame_rt_shadows`
+now feeds it from `Rt::shadows_enabled` (which also requires a TLAS built
+this frame — the shadow term has no screen-space fallback to blend
+against, so tracing an empty scene would light every surface unshadowed
+for a frame). Evidence: a scratch project with a cube and a directional
+light, `set-rt-shadows true`, reports `rtShadows: true` /
+`rtInstances: 2` in `render-stats` and renders with zero validation
+messages.
+
+The any-hit baseline box is still NOT checked. Reachability is not
+correctness: nothing yet demonstrates that a cutout texel is transparent
+to a ray, which is the claim that box makes. `blasCount` also reports 0
+while `rtInstances` is 2, so the BLAS/TLAS tracking box has a real gap
+under it rather than a missing machine.
+
+### Phase 11 — shared compacted BLAS, CLOSED (Claude session 2026-07-26)
+
+ONE BOX CLOSED, phase 11 now 16/29. Sharing was already true by
+construction and simply unmeasurable: a BLAS is built once per mesh at
+upload and every static instance references it, but `blasCount` reported
+`0` forever because `Rt::note_blas_built` **had no callers** — a dead
+method whose doc claimed "the upload path bumps this". A running
+"built ever" counter is the wrong shape anyway (it never decrements), so
+it is now derived per frame from the distinct AS device addresses in the
+packed TLAS instance array. That makes instancing observable: instances
+and structures diverge.
+
+Compaction was genuinely missing. `MESH_BLAS_BUILD_FLAGS` now carries
+`ALLOW_COMPACTION`, and `Uploader::compact_mesh_blas` runs the standard
+two-submit dance — write an `ACCELERATION_STRUCTURE_COMPACTED_SIZE_KHR`
+query, read it back, then `record_blas_compaction` copies with
+`CopyAccelerationStructureModeKHR::COMPACT` into an exactly-sized
+structure. A driver reporting no saving keeps the built structure:
+compaction is a memory win, never a correctness precondition. (The first
+cut of this returned `Err` in that case, which would have failed the
+whole mesh upload on any driver that declined — caught before it left
+the session.)
+
+The "where their transforms/material classification permit" clause holds
+by construction and is worth stating so nobody re-derives it: the
+transform is per-`VkAccelerationStructureInstanceKHR`, and the opacity
+class rides the per-instance `FORCE_OPAQUE`/`FORCE_NO_OPAQUE` flag while
+the BLAS geometry stays `OPAQUE`. Two instances that classify differently
+still share one structure.
+
+EVIDENCE: `tests/e2e/rt-blas.test.ts` — four added cube instances move
+`rtInstances` by exactly 4 and `blasCount` by at most 1, and the frame is
+validation-clean. GATES: `just engine` EXIT=0,
+`just prepare-for-commit` EXIT=0, `just schema` EXIT=0,
+`just test` EXIT=0, `just e2e` 326/330 (the two new tests pass; the four
+pre-existing failures are unrelated and unchanged).
+
+NEXT, in order:
+(1) The KHR any-hit baseline box — the ray-query path now runs, so this
+is a correctness comparison: a thin-sheet/cutout material must be
+transparent to a shadow ray and agree with the raster coverage decision.
+`MaterialSurfaceDto::ThinSheetFoliage` plus `material-thin-sheet` is the
+authoring seam for the fixture.
+(2) The rest of the BLAS/TLAS tracking box — build/update/compaction
+*time* and *memory* are still unreported; `blasCount` is the first of
+those numbers, and the compacted-size query already computes the memory
+saving that should be surfaced.
+(3) The phase-7 mesh-shader boxes — independent of all the above.
+(4) The four red e2e tests, of which `material-preview-render` is a real
+bug: two different materials return byte-identical PNGs, so
+`preview-render` ignores the requested material.
+(2) Wire `point_shadow_meta.z` so the ray-query shadow path is reachable
+at all, then the KHR any-hit baseline box against real geometry.
+(3) The phase-7 mesh-shader boxes — `VK_EXT_mesh_shader` is advertised
+and the executor is the only consumer, so they need no RT fix first.
+(4) BLAS sharing/compaction, then OMM
+(`VK_EXT_opacity_micromap`, not the `VK_KHR_` name the plan text uses),
+then `VK_NV_cluster_acceleration_structure`.
+
+
+### Phase 15 — the software rasterizer, CLOSED (Claude session 2026-07-26)
+
+ONE BOX CLOSED, phase 15 now 9/20: software/headless correctness. It was
+blocked purely on having a Mesa driver, and this machine has one.
+
+WHAT WAS RUN: the ICD left unset so llvmpipe is the only device. The host
+selects `llvmpipe (LLVM 21.1.8, 256 bits)` and logs `software rasterizer
+detected — GPU timings reflect CPU rasterization time`. The full e2e
+suite: **330 tests across 52 files, 327 pass / 3 fail**.
+
+THE SCOPE IS THE POINT, so it is stated exactly rather than rounded to
+"passes". Two of the three failures — `vsm` page atlas and
+`vegetation-export` — fail identically on the discrete GPU, so they are
+not software-specific. The one that is, `vegetation-graph`, is the engine
+**correctly refusing** GPU graph evaluation on a CPU device
+(`vegetation graph qualification requires a physical GPU, found cpu`).
+That is `VulkanGraphComputeExecutor::new`'s fail-closed contract doing
+its job — the crate's own rule is that holding an executor is proof of
+byte-equality — so it is a test that does not apply on software, not a
+defect.
+
+NO PERFORMANCE CLAIM, per the box's own wording: 667 s software against
+270 s on the discrete GPU. That is wall clock on one machine and says
+nothing representative either way.
+
+A CROSS-PLATFORM SIGNAL WORTH KEEPING: `material-preview-render` and
+`set-viewport-size` **pass on llvmpipe and fail on the RTX**. Whatever is
+wrong with them is NVIDIA-path-specific, not a wiring or fixture problem
+— which also means the `preview-render` bug (two different materials
+returning byte-identical PNGs) is a real driver-path divergence rather
+than the material simply never reaching the renderer.
+
+NEXT: unchanged from the previous seal, plus the two NVIDIA-only
+failures now have a much narrower search space.
+
+
+### The Linux harness was still windowed — and the GI audit (Claude session 2026-07-26)
+
+A REGRESSION I INTRODUCED, FOUND AND FIXED. Removing the weston fork was
+right, but `SAFFRON_EDITOR_NATIVE_VIEWPORT=1` was set only inside
+`macosVulkanEnv()` — so on Linux the TS harness had *always* booted the
+host **windowed**, and with weston gone it opened real windows on the
+user's desktop session. The env is now set for every platform in
+`Engine.boot`, which is what the "one path, offscreen everywhere" claim
+required all along.
+
+That fix cured `material-preview-render`, and CORRECTS AN EARLIER
+CONCLUSION IN THIS FILE: the byte-identical preview PNGs were **not** an
+NVIDIA driver-path divergence. The test boots a shm-publish engine, which
+in publish mode owns per-view offscreen targets; booted windowed it was a
+hybrid the code does not model, and the preview never re-rendered. `just
+e2e` is now 327/330.
+
+`set-viewport-size` survives the fix and is a **third distinct NVIDIA GPU
+hang** — `frame 26` in flight, then `ERROR_DEVICE_LOST`, now with no
+swapchain involved at all. Separate from the acceleration-structure hang
+(fixed) and the player frame-1 hang (open). The per-view offscreen resize
+path is the suspect.
+
+THE GI/REFLECTION CULLING BOX IS AUDITED AND STAYS OPEN. Its claim is
+false, and not in the direction the box anticipates. Screen-space
+consumers are fine — SSR, SSGI, `gi_resolve` read only the camera
+G-buffer and inherit hierarchy culling transitively. The world-space ones
+are not: DDGI, the global SDF/GDF, DFAO, specular occlusion, RT
+reflections and the ReSTIR resolve all run off two per-frame
+CPU-gathered flat lists (`sdf_instances`, `rt_instances`) built by an
+unculled full-ECS scan in `gather_static_frame_facts`, with a 4096-entry
+cap that silently clamps, a linear-scan `gdf_cull.slang`, and an O(N)
+`sdfSample` at every march step. Page-residency demand is camera + VSM
+only. (An earlier version of this note said `PageResidency::demand` has
+zero production callers. Wrong — `gpu_scene_mirror.rs:796` calls it from
+`drive_page_streaming`, the production host/player entry point. Its
+prioritizer is CPU-side and camera-only, which is the actual gap.)
+
+THE PART THAT MATTERS FOR THIS PLANSET: those lists do not rebuild a
+plant-specific list — they **exclude vegetation entirely**. Vegetation
+goes straight into the persistent GPU scene via
+`GpuSceneMirror::sync_vegetation`, and micro-field blades are
+reconstructed GPU-side, so no plant, grass blade, or micro-field instance
+ever becomes an `SdfInstance` or an `RtInstanceInput`. **No vegetation
+casts GDF/DDGI occlusion, appears in a ray-traced reflection, or shadows
+a ReSTIR ray today.** Closing the box means moving the world-space
+consumers onto the traversal cut, not tidying the existing lists — which
+also makes it a much larger box than its one-line wording suggests.
+
+GATES: `just engine` EXIT=0, `just prepare-for-commit` EXIT=0,
+`just schema` EXIT=0, `just test` EXIT=0, `just e2e` 327/330.
+
+NEXT: the three red e2e tests (`set-viewport-size` is a GPU hang and the
+most valuable), then the KHR any-hit baseline, then the phase-7
+mesh-shader executor.
+
+
+### The `set-viewport-size` hang, isolated (Claude session 2026-07-26)
+
+A MINIMAL STANDALONE REPRO, no bun and no test harness — boot the host
+with `SAFFRON_EDITOR_NATIVE_VIEWPORT=1` plus both
+`SAFFRON_VIEWPORT_SHM_{SCENE,ASSET}` set, then over `sa`:
+
+```
+set-active-view --view scene
+set-viewport-size --view scene        --width 640 --height 360
+set-viewport-size --view assetPreview --width 800 --height 600
+set-active-view --view assetPreview        # -> GPU hang, then ERROR_DEVICE_LOST
+```
+
+THE TRIGGER IS BOTH VIEWS BEING SIZED — the extents are irrelevant. Each
+of these is clean:
+- switch to `assetPreview` with neither view sized;
+- size `assetPreview` only, then switch;
+- size `scene` only, then switch.
+
+Each of these hangs:
+- scene 640×360 + assetPreview 800×600, then switch;
+- scene 640×360 + assetPreview **640×360** (identical), then switch;
+- scene 800×600 + assetPreview 640×360 (reversed), then switch.
+
+So it is **not** an extent mismatch, and not a size-dependent
+out-of-range index. The fault needs **two fully-built `ViewTarget`s** and
+then an activation — with one view sized the other has no built targets
+and everything is fine.
+
+AND IT IS THE SHM PUBLISH PATH. Drop the
+`SAFFRON_VIEWPORT_SHM_{SCENE,ASSET}` vars and run the identical
+both-sized-then-switch sequence: **clean**. Put them back: **hangs**. So
+the fault is the viewport shm capture/publish path reacting to an
+active-view switch between two views that both have built targets — not
+`ViewTarget::resize`, not `apply_render_extent`, and not anything the
+extents touch.
+
+ROOT CAUSE, AND FIXED: **`ensure_shm_capture` freed a capture slot's
+image and staging buffer under in-flight GPU work.** It was called from
+`record_shm_copy`, i.e. *during frame recording*, and replaced the slot
+whenever the extent differed — dropping the `Image` and `Buffer`
+immediately. Its own doc comment asserted the opposite ("the previous
+target is idle and freed when replaced"), and that assumption is what
+was false. Proof: inserting a `device.wait_idle()` before the
+replacement made every hanging variant clean.
+
+THE FIX IS THE SEAM, NOT A STALL. A `wait_idle` inside command recording
+would be both a hot-path stall and the wrong statement of intent. The
+published extent is purely `desired_width/height`, which change in
+exactly one place — `set_viewport_desired_size` → `apply_render_extent`,
+which *already* holds a `device.wait_idle()`. So the ring is now sized at
+idle-held seams only: `apply_render_extent` (resize) and
+`set_shm_publish_enabled` (arming, which idles for the same reason). The
+lazy per-slot `ensure_shm_capture` is gone, replaced by
+`ViewTarget::size_shm_capture`, which sizes the whole ring and documents
+the idle requirement. `record_shm_copy` now only ever *uses* a slot, and
+returns early if one is absent or stale — publish armed after the frame's
+seam ran, which the next frame picks up.
+
+GATES: `just engine` EXIT=0, `just prepare-for-commit` EXIT=0,
+`just schema` EXIT=0, `just test` EXIT=0, `just e2e` **328/330** — up
+from 324/328 at the start of the session. `asset-preview` is 20/20.
+
+TWO E2E FAILURES REMAIN, neither a GPU hang: `vegetation-export` and
+`vsm` (page atlas across caster families). Both also fail on llvmpipe, so
+neither is driver-specific.
+
+NEXT: the two remaining e2e failures, then the KHR any-hit baseline (the
+ray-query path runs and is validation-clean; what it needs is a coverage
+correctness comparison), then the phase-7 mesh-shader executor.
+
+RULED OUT: the clustered-lighting froxel grid, the obvious suspect
+because `lighting.slang` loops `clusters[clusterIndex].count` and a
+garbage count is exactly a TDR. It cannot be reached that way —
+`CLUSTER_GRID_{X,Y,Z}` are a fixed 16×9×24 and the cluster buffer size is
+extent-independent, so `clusterIndexFor` maps any extent into the same
+grid.
+
+`apply_render_extent` is where the per-view rebuild happens (idle wait →
+`ViewTarget::resize` → HZB pyramid → screen-space chain → AA targets →
+ReSTIR reservoirs → `clouds.bind_view`). Everything there is indexed by
+view. The next probe is to bisect that list: rebuild one sub-target at a
+time on the extent change and find which one wedges, since the hang needs
+two views disagreeing rather than any single wrong size.
+
+This is the third distinct NVIDIA GPU hang this session, and the only one
+still open besides the player's. The other two: the acceleration-
+structure allocation (fixed) and `saffron-player` frame 1 (open,
+platform-independent, unrelated to RT).
+
+
+### The gate is green on NVIDIA — 330/330 (Claude session 2026-07-26)
+
+`just engine` EXIT=0, `just prepare-for-commit` EXIT=0, `just schema`
+EXIT=0 (249 checks), `just test` EXIT=0, **`just e2e` 330/330 across 52
+files, EXIT=0** on an `NVIDIA GeForce RTX 3070 Ti`. The suite entered the
+session at 324/328.
+
+THE LAST TWO FAILURES WERE BOTH TEST BUGS, not engine defects — worth
+recording because each encoded an assumption that only held on the old
+machine:
+
+- **`vsm`** sampled `allocated` and `rendered` from one `render-stats`
+  call, but every VSM counter describes a single frame and those two peak
+  on *different* frames: a page is allocated when it first becomes
+  resident and rasterized later. Once residency is warm, `allocated` is 0
+  on every frame forever — the observed run showed
+  `requested: 355, hits: 355, allocated: 0, rendered: 64, overflow: 0`,
+  i.e. every demand served from residency. The sibling test *asserts*
+  `allocated == 0` when warm, so the two contradicted each other. It now
+  takes the peak across the poll window and asserts what the box actually
+  claims: demand is raised, every demand is a hit, pages rasterize, and
+  nothing overflows. `allocated` is deliberately not asserted, with the
+  reason written on it.
+- **`vegetation-export`** looked for the payload under
+  `<root>/resources`. That is the macOS bundle shape; `ExportLayout` on
+  every other platform sets `resources` to the export root itself, so the
+  `.svegcell`/`.splantc` files were there all along, one directory up
+  from where the test looked. The export *report* had been asserting
+  correctly (cells > 0, missing 0, bytes > 0) — only the on-disk check
+  was wrong, which is why it looked like a packaging failure.
+
+Neither was a vegetation defect, and neither would have shown up on the
+Mac.
+
+THE PHASE-15 STANDARD-GATE BOX gains this run as evidence but STAYS OPEN:
+the player smoke still fails (the frame-1 hang reproduces here, so its
+recorded MoltenVK cause is wrong) and the AMD leg has no machine.
+
+NEXT: the KHR any-hit baseline — the ray-query path runs validation-clean
+with `rtInstances: 2`, so what it needs is a coverage-correctness
+comparison (a thin-sheet/cutout material transparent to a shadow ray,
+agreeing with the raster decision), not new plumbing. Then the phase-7
+mesh-shader executor, then the world-space GI consumers onto the
+traversal cut.
+
+
+### The any-hit box, and what measuring it actually found (Claude session 2026-07-26)
+
+I set out to close the KHR any-hit baseline box and did not, for a better
+reason than "couldn't isolate it".
+
+FIRST, THE PATH WAS MADE REACHABLE. `point_shadow_meta.z` — the gate
+`lighting.slang` tests before tracing a shadow ray — was hard-coded `0`
+behind a comment claiming the RT phase folded it in. Nothing did, so the
+ray-query shadow path had never been reachable on any device. It now
+comes from `Rt::shadows_enabled` (which also requires a TLAS this frame:
+the shadow term has no screen-space fallback, so tracing an empty scene
+would light every surface unshadowed for a frame).
+
+SECOND, A REAL IMAGE HARNESS. `tests/e2e/image.ts` decodes the engine's
+own PNG output — 8-bit RGB, colour type 2, non-interlaced, rejected
+rather than guessed at if it is anything else — and exposes `regionMean`
+and `meanAbsoluteDifference`. The suite previously had only
+`Buffer.equals` on encoded bytes, which answers "did anything change" and
+cannot answer "did *this part* change". That distinction is the whole
+content of a claim about one shaded region, and it is also what
+phase-15's cross-platform-image box needs.
+
+THIRD, THE MEASUREMENT, which is the finding. With a masked thin-sheet
+blocker over a plane and ray-query shadows armed:
+- every pixel differing between the covered and cut-out frames lies
+  inside the blocker's own silhouette — box `[202,86]-[277,164]` of a
+  480x270 frame — and the floor is **byte-identical**;
+- toggling `set-rt-shadows` off and on for a fixed material moves ~338
+  pixels of 1.44M, again on the blocker, never the floor.
+
+I FIRST READ THAT AS "the ray shadow never reaches the receiver" AND
+THAT WAS WRONG — corrected here rather than left standing. Adding the
+blocker under `set-rt-shadows true` (`rtInstances: 3`, `blasCount: 3`)
+changes the floor across `[672,68]-[1044,676]` of a 1600x900 frame, so
+the ray shadow works; and because the ray and raster shadows agree on the
+receiver, the toggle shows nothing there. Agreement is evidence *for* the
+box's claim, not against it.
+
+THE REAL GAP: the coverage change does not reach the ray. And the obvious
+suspect — the instance packing `FORCE_OPAQUE` so candidates auto-commit —
+is also wrong. Instrumenting the RT gather over a socket-driven run
+prints `force_opaque=false slot=2 blends=[Masked] thin=[true]` for the
+blocker. The classification is correct and candidates do surface.
+
+That left the resolver — and a third hypothesis, that the material had
+coverage *metadata* but no resident coverage *record*, so
+`gpuSceneResolveCandidate`'s `coverage.index == 0xFFFFFFFFu` early-out
+returned an invalid surface that the caller treats as covered. **That is
+wrong too**: `build_coverage_record` returns `Some(..)` unconditionally
+for a `ThinSheetFoliage` surface, so the handle is there and the early-out
+is not taken.
+
+TWO MORE HYPOTHESES DIED, and this time the eliminations were measured
+rather than argued:
+
+- **Not `material-update` staleness.** Two materials created with their
+  coverage baked in and never mutated, swapped by re-assignment over the
+  raw control socket, reproduce the same result exactly — diff confined to
+  `[672,286]-[927,548]`, the blocker's silhouette, floor untouched.
+- **Not the resolve/classify chain.**
+  `ray_candidate_classification_matches_the_cpu_classifier` already drives
+  `gpuSceneResolveCandidate` on the GPU for an `AlbedoAlpha` + `Masked`
+  material with `base_color.w = 0.75` and an INVALID base-colour texture,
+  comparing every resolved word against the CPU classifier byte-exactly.
+  Green on this hardware.
+
+WHAT SURVIVES, and it is the first suspect not yet eliminated: the unit
+test supplies `instanceSlot` directly, while the live path takes it from
+`q.CandidateInstanceID()` — the TLAS `instanceCustomIndex` that `rt.rs`
+packs from `GpuSceneMirror::instance_slot`. If that index does not address
+the same instance the bound address block describes,
+`gpuSceneResolveCandidate` bails on `instanceSlot >= instanceCapacity` or
+`header.occupied == 0`, and `gpuSceneRayCandidateCovered` returns **true**
+for an invalid surface — committing every candidate while every component
+in isolation looks correct. That is exactly the failure shape observed.
+Instrumenting the slot at trace time is the next step.
+
+The test that landed asserts only what it establishes: the candidate path
+executes over a non-opaque thin-sheet blocker, validation-clean, and the
+classifier's verdict reaches the blocker's own shading. Its header states
+the negative result so the next reader does not re-derive it.
+
+GATES: `just engine` EXIT=0, `just prepare-for-commit` EXIT=0,
+`just schema` EXIT=0, `just test` EXIT=0, `just e2e` **332/332** across
+53 files.
+
+NEXT: find why a ray-query shadow does not reach the receiver — that
+single answer unblocks the any-hit box, the OMM box that depends on it,
+and the any-hit/OMM parity acceptance. Then the phase-7 mesh-shader
+executor, then the cross-platform capture that turns the new image
+harness into the phase-15 comparison.
+
+
+### Method note from the same slice
+
+Two hypotheses died here, both mine, both recorded rather than quietly
+dropped: "the ray shadow never reaches the receiver" and "the instance
+packs FORCE_OPAQUE". Each looked well-supported by a measurement that was
+really measuring something else — the first by a toggle whose two sides
+*agree*, the second by inference from an image with no instrumentation
+behind it.
+
+Also discarded: an `sa`-driven probe built to compare the raster and ray
+coverage responses returned zero differing pixels in *both*
+configurations, contradicting the e2e result. Its `material-update` did
+not apply. Driving the control socket with raw JSON instead of the CLI is
+what made the gather instrumentation trustworthy — worth remembering when
+a probe's result disagrees with a test's.
+
+
+### A mis-designed probe on the any-hit box, recorded so it is not trusted
+
+I inverted `gpuSceneRayCandidateCovered`'s invalid-surface verdict (return
+`false` instead of `true`) intending to test whether live candidates
+resolve invalid — the surviving suspect being the `instanceCustomIndex`
+that `q.CandidateInstanceID()` reports. Under that build the floor shadow
+was byte-for-byte unchanged, which reads like "candidates resolve fine".
+
+**It reads like nothing.** The probe scene (`shadowprobe2`) leaves the
+blocker on the DEFAULT material, so `force_opaque` is true, the instance
+packs `FORCE_OPAQUE`, candidates never surface, and
+`gpuSceneRayCandidateCovered` is never called on that geometry. The DIAG
+could not have changed the result whatever the truth is. The number is
+recorded here only so a future session does not cite it as an
+elimination.
+
+THE INSTANCE-SLOT SUSPECT THEREFORE STANDS, untested. Re-running that
+experiment correctly means using the two-material driver (`drive2`, which
+assigns the thin-sheet material and swaps between pre-baked covered and
+cut-out variants) under the inverted build, and asking whether the leaf
+blocker's floor shadow disappears. That is the next concrete step on this
+box.
+
+METHOD NOTE, since this is the second probe on this box that measured the
+wrong thing: a coverage experiment is only meaningful on geometry whose
+instance is packed `FORCE_NO_OPAQUE`. The gather instrumentation prints
+that flag per instance — check it in the probe scene before trusting any
+result from it.
+
+
+### The any-hit failure, localized (Claude session 2026-07-26)
+
+The corrected experiment ran, and it landed the box on a specific read.
+
+**Candidates are evaluated.** Forcing `gpuSceneRayCandidateCovered` to
+return `false` unconditionally drops the no-blocker-vs-blocker difference
+from 35215 px / meanAbs 1.095 to 32877 px / 1.075 — roughly 2338 px of
+floor shadow disappears. The function is reached, the candidate loop runs
+over the masked thin-sheet blocker, and rejecting candidates does remove
+ray shadow.
+
+That also corrects an over-read from the previous round. Inverting only
+the *invalid-surface* branch changed nothing byte-for-byte, and I took
+that as "surfaces resolve valid". It was ambiguous: the same result
+follows if the function is never called. Only the unconditional return
+separated the two, and it showed the function IS called — so the earlier
+reading was not wrong so much as unearned.
+
+**The alpha persists CPU-side.** `material-get` after the update reports
+`baseColor {x:0.5,y:0.5,z:0.5,w:0.0}` with `surface.model =
+thin-sheet-foliage`.
+
+SO: the live candidate path evaluates coverage and reaches the **same
+verdict for `baseColorAlpha` 1.0 and 0.0**, while the CPU/GPU parity test
+(`ray_candidate_classification_matches_the_cpu_classifier`) agrees for
+0.75. The read to audit is `surface.baseColorAlpha` —
+`addresses.materialParameters + parameterIndex * GPU_MATERIAL_PARAMS_STRIDE
++ 12` in `gpuSceneResolveCandidate` — and specifically whether the
+`parameterIndex` it resolves for each instance is the block the mirror
+allocated for *that* material. Two materials resolving to one parameter
+block reproduces every observation in this file.
+
+SEVEN HYPOTHESES ELIMINATED WITH EVIDENCE on this box, each recorded on it
+so they are not re-run: ray shadows absent; FORCE_OPAQUE; missing coverage
+record; `material-update` staleness; the resolve/classify chain; the
+instance-slot mapping; and "the candidate function is never called". One
+void probe is recorded as void.
+
+GATES: `just engine` EXIT=0, `just prepare-for-commit` EXIT=0,
+`just schema` EXIT=0, `just test` EXIT=0, `just e2e` 332/332.
+
+NEXT: audit the per-instance `parameterIndex` resolution in
+`gpuSceneResolveCandidate` against what `GpuSceneMirror` allocated —
+CPU-side, comparing the two materials' `parameter_index` values is the
+cheapest first look and needs no GPU readback.
+
+
+### The any-hit box: the upload side is exonerated (Claude session 2026-07-26)
+
+Instrumenting `GpuSceneMirror`'s material insert settles the last CPU-side
+question. For the two leaf materials it prints
+`params.first=4 written_alpha=1 coverage=true` and
+`params.first=5 written_alpha=0 coverage=true` — **distinct parameter
+blocks, the correct alpha written into each, coverage records on both**.
+`MaterialParamsData` puts `base_color` at offset 0 (the std430 layout test
+pins every offset), so the shader's
+`materialParameters + parameterIndex * 256 + 12` read addresses that alpha
+correctly. The parameter-block-sharing theory is dead, and so is anything
+else upstream of the shader.
+
+WHERE THAT LEAVES THE BOX, precisely: the live candidate path evaluates
+coverage over a correctly-classified instance, reading a correctly-written
+distinct parameter block, and still reaches the same verdict for
+`baseColorAlpha` 1.0 and 0.0 — while the parity test shows the same chain
+agreeing with the CPU classifier for 0.75 when its inputs are handed to it
+directly.
+
+The one quantity never observed live is `sampled` — the bindless
+albedo-alpha fetch inside `gpuSceneRayCandidateCovered`. These materials
+carry no albedo texture, so the coverage handle resolves to a default
+slot; **if that slot's alpha is 0, then `sampled * baseColorAlpha` is 0 in
+both cases and the verdict cannot differ**, which fits every observation
+recorded here. That is the leading candidate, it is untested, and reading
+it needs a debug channel rather than another inference.
+
+NINE HYPOTHESES ELIMINATED WITH EVIDENCE on this box, all recorded on it:
+ray shadows absent; FORCE_OPAQUE; missing coverage record;
+`material-update` staleness; the resolve/classify chain; the instance-slot
+mapping; "the function is never called"; parameter-block sharing; and the
+upload-side alpha. Plus one probe recorded as void.
+
+GATES: `just engine` EXIT=0, `just prepare-for-commit` EXIT=0,
+`just schema` EXIT=0, `just test` EXIT=0, `just e2e` 332/332.
+
+NEXT: surface `sampled` and `baseColorAlpha` from the live
+`gpuSceneRayCandidateCovered` through a debug view channel. If `sampled`
+is 0 the fix is the coverage texture handle's default-slot resolution, and
+that one fix closes the any-hit baseline box and unblocks the OMM box
+behind it.
+
+
+### Tenth elimination on the any-hit box: not the albedo fetch either
+
+The previous seal named the bindless albedo-alpha fetch as the leading
+suspect — if `sampled` were 0 for a textureless material, then
+`sampled * baseColorAlpha` is 0 either way and the verdict cannot differ.
+
+Tested by replacing `sampled` with a literal `1.0`, reducing the term to
+the alpha alone (1.0 against 0.0, cutoff 30000/65535). The covered-vs-
+cutout difference came back **byte-identical to stock**: 22135 px, box
+`[672,286]-[927,548]`, the blocker's own silhouette. The suspect is dead.
+
+The standing summary, all evidenced: candidates are evaluated; the
+instance is non-opaque; the parameter block is distinct and holds the
+right alpha; the albedo term is not masking it — and the committed verdict
+still does not change with coverage. What remains is
+`classifyCanonicalCoverage`'s own decision under the thin-sheet
+`canonicalProbability` path, or the commit not following the verdict.
+
+TEN HYPOTHESES ELIMINATED WITH EVIDENCE on this box. Every one is written
+on the box itself so a future session spends its time on the eleventh
+rather than the first.
+
+NEXT, and it is the only remaining step that is not another inference: a
+debug view channel that writes the classifier's live `covered` output per
+pixel. Everything cheaper has been tried.
+
+GATES: `just engine` EXIT=0, `just prepare-for-commit` EXIT=0,
+`just schema` EXIT=0, `just test` EXIT=0, `just e2e` 332/332.
+
+
+### A fixture fact found by reading, not building
+
+On the `canonicalProbability` path — the one a thin-sheet surface takes —
+`classify_canonical_coverage` **never uses `reference_cutoff`**. It sets
+`probability = sampled` and decides
+`covered = probability >= spatial_coverage_threshold(anchor, uv,
+source_extent, salt, temporal_phase)`. The cutoff appears only in the
+non-canonical branch.
+
+That means the `referenceCutoff: 30000` carried by the e2e fixture and by
+the `material-thin-sheet` example is **inert** for these materials, and
+any reasoning in this file that treated it as the deciding threshold was
+describing the other branch. It does not explain the observed result —
+alpha 0 still drives `probability` to 0, which should fail a hash
+threshold almost everywhere — but a probe designed around a value the code
+ignores is a trap, and the next person should know before building one.
+
+Recorded because it was found by reading the classifier for free, after
+ten build-and-measure rounds. Worth doing earlier next time.
+
+
+### Docs brought current for this session's engine changes
+
+A gap in my own work, closed: two engine concepts changed without their
+pages moving in the same change, which the repo rules require.
+
+- `reference/render-graph-api.md`: `RgPass::compute(name)` now reads
+  "compute pass on the graphics queue", with the new `.queue(preference)`
+  builder listed as the opt-in. The old entry said it *preferred*
+  independent compute, which stopped being true when the default changed.
+- `explanations/global-illumination-and-raytracing/raytracing-foundation.md`:
+  records that acceleration-structure storage takes a **dedicated**
+  allocation and why (sharing a block with ordinary buffers wedges the GPU
+  on a later unrelated submission — a correctness requirement, not
+  tuning), that build scratch is allocated at
+  `minAccelerationStructureScratchOffsetAlignment`, and that the build is
+  `PREFER_FAST_TRACE | ALLOW_COMPACTION` with a compacted copy — replacing
+  the sentence that said "with no compaction". Adds `rtInstances` vs
+  `blasCount` as how instancing reads.
+
+THE THREE CHECKS: `hugo --gc` EXIT=0; `check_links.py` **BROKEN LINKS:
+none** across 60558 links / 244 pages; `check_style.py` **0 errors, 0
+warnings** after splitting a 120-word paragraph over the 90-word budget.
+
+A FALSE ALARM WORTH RECORDING: the first link run reported 198 broken
+links, all from `se-cli-protocol/index.html` pointing at
+`/saffron-engine/...`. That page is an orphan in the local `docs/public`
+from before the "Rename to Anima" commit — `hugo --gc` cleans the cache,
+not stale destination files, and `docs/public` is gitignored. A clean
+`rm -rf public && hugo --gc` clears it. No source was wrong and none was
+changed. If a future run sees those 198, delete `docs/public` first.
+
+
+### Hardware-gated notes corrected across three phases
+
+Several boxes still carried "this machine enumerates exactly one Vulkan
+device — Apple M4" as their reason for being open. That is now false and a
+false reason is worse than none, so the notes were rewritten to say what
+is actually true. No box was checked.
+
+- **Phase 7, validation clean on NVIDIA/AMD/MoltenVK:** NVIDIA is now
+  demonstrably clean — `just e2e` 332/332 with every render-touching test
+  asserting `validationErrors()` empty, `just schema` 249/249, `just test`
+  EXIT=0. Getting there took the three fixes this hardware exposed (AS
+  scratch alignment, graphics stages named from a compute-only queue,
+  `RgPass::compute` defaulting to async). Only the AMD leg is deferred —
+  two of three platforms, which is what this machine can give.
+- **Phase 10, standard gate + platform validation/visual tests:** the
+  NVIDIA leg is green. Open on the AMD leg and on visual tests — the
+  region/tolerance harness now exists (`tests/e2e/image.ts`) but no wind
+  visual comparison is built on it.
+- **Phase 15, validate NVIDIA required+mesh+KHR RT+OMM/NV tiers:** the
+  adapter is present, so the blocker is code. The REQUIRED tier is
+  validated, and the KHR RT tier to the extent it is built. The MESH, OMM
+  and NV cluster-AS tiers are unvalidated because none of them is
+  implemented. (The plan text says `VK_KHR_opacity_micromap`; the
+  extension is `VK_EXT_opacity_micromap` — corrected on the box.)
+
+All three stay open. The point of the edit is that a future session reads
+"needs code" rather than "needs a machine we already have".
+
+
+### Cross-platform numeric conformance: NVIDIA arm captured
+
+`just compute-conformance` exists to run the phase-1/phase-3 Rust/Slang
+corpus on a physical GPU and emit bound JSON evidence. Both plans recorded
+"NVIDIA: pending access to a physical supported GPU". That is no longer
+true, so it was run.
+
+RESULT, on `NVIDIA GeForce RTX 3070 Ti` (driver 610.43.03, api 1.4.341,
+`moltenVk: false`), `newIssues: 0`:
+- spatial-numeric corpus: `rustReferenceSha256 == slangSha256`
+  (`9cd45b0f7e7fa878…`)
+- resident graph corpus: `rustReferenceSha256 == slangSha256`
+  (`fb44dca41ee59d11…`)
+
+AND THE PART THAT MATTERS MORE THAN EITHER: **both digests are
+byte-identical to the Apple M4 / MoltenVK record**. The two platforms do
+not merely each match their own Rust reference — they produce the same
+bytes as each other. That is the determinism claim the whole spatial/
+numeric foundation rests on, and it now has two vendors behind it instead
+of one.
+
+Evidence is checked in beside the existing file as
+`benchmarks/foliage-veg/compute-conformance-nvidia-rtx-3070-ti.json`, one
+file per validated platform as the convention requires.
+
+BOTH BOXES STAY OPEN. Phase 1's "byte-identical in Rust and Slang on
+NVIDIA, AMD, and MoltenVK" and phase 3's "every dual-domain node passes
+Rust/Slang equivalence on NVIDIA, AMD, and MoltenVK" each name three
+vendors and now have two. A box that says three vendors is not closed by
+two — the plans' own words, kept.
+
+GATES: `just engine` EXIT=0, `just prepare-for-commit` EXIT=0,
+`just compute-conformance` EXIT=0.
+
+
+### The first visual test, on the harness built earlier this session
+
+The phase-11 churn box named its own blocker: "a visual claim needing
+image comparison, which this suite has no harness for". The harness was
+built earlier today for a different purpose, so the box became actionable
+without new infrastructure.
+
+`tests/e2e/vsm-churn.test.ts`: capture a settled reference, then four
+passes swinging the wind between calm and gale while flying the camera out
+and back — never settling, each pass dirtying pages the next must
+re-rasterize — then return to the reference pose. The frame must
+reconverge to within a mean absolute per-channel difference of 2.0/255,
+with `vsm.overflow == 0` and validation clean. A shadow left at a stale
+caster position does not fit in that budget.
+
+IT PROVES ITS OWN METRIC. A frame captured from one of the churn poses
+must score above 5× the tolerance in the same run. Without that the
+assertion could pass on a metric blind to everything — which is exactly
+how the `vsm` counter test quietly stopped meaning anything until it was
+fixed earlier today, and how a visual test becomes decorative.
+
+THE BOX STAYS OPEN and its note now says why: `vsm-churn` covers the wind
+and camera-travel cases only. INTERACTION churn, PAGE churn driven by
+residency pressure rather than camera travel, and PHENOTYPE transitions
+are untouched — and "no silhouette pop" is a per-frame claim that a
+before/after pair cannot make at all. Catching a pop needs frame-to-frame
+sampling through the transition.
+
+GATES: `just engine` EXIT=0, `just prepare-for-commit` EXIT=0,
+`just e2e` **333/333** across 54 files.
+
+
+### A test case removed rather than softened
+
+The eviction arm of the phase-11 churn box was written, and it failed its
+own premise: `expect(evicted).toBeGreaterThan(0)`. With seven shadow
+casters — a directional plus three spot and three point lights, each
+owning its own virtual address space — and a twelve-pose camera sweep,
+`vsm.evicted` stayed **0** for the entire run. Adding the extra casters
+was the second attempt; the first used camera travel alone.
+
+The atlas is 4096² / 32×32 tiles, has no control-plane budget knob, and
+its tile count is a compile-time constant, so residency pressure cannot be
+created from outside the engine as things stand.
+
+The case was **removed**, not weakened. Dropping the premise assertion
+would have left a test that captures two frames, watches them match
+because nothing was ever stressed, and reports a green tick for the
+eviction path — the precise failure mode that had already been found in
+this suite twice today (the `vsm` counter assertion that could not fail,
+and the validation gate that could not go red). The reason is recorded on
+the box and in the test header so the next attempt starts from "needs a
+settable page budget" rather than re-deriving it.
+
+`vsm-churn` therefore ships covering the wind and camera-travel cases
+only, and the box says so.
+
+GATES: `just engine` EXIT=0, `just prepare-for-commit` EXIT=0,
+`just e2e` 333/333.
+
+
+### Eleventh elimination — and a contradiction worth naming
+
+`classify_canonical_coverage` called directly with exactly what the ray
+path supplies (`sampled = 1.0`, `AlbedoAlpha`, `Masked`,
+`alpha_width = 0.0`, `canonical_probability = true`, cutoff
+30000/65535) returns `covered=true, probability=1` for alpha 1.0 and
+`covered=false, probability=0` for alpha 0.0. **The classifier
+discriminates.** That was the last suspect standing on the shader side.
+
+WHICH LEAVES A CONTRADICTION, and it is more useful than another suspect:
+candidates are evaluated, the instance is non-opaque, the parameter block
+is distinct and holds the right alpha, the albedo term is not masking it,
+and the classifier discriminates on those inputs — yet the committed
+verdict does not change. Those cannot all be true. One of the GPU-side
+measurements must be wrong.
+
+The weakest is "inverting the invalid-surface branch changed nothing". It
+was already flagged once as ambiguous, and it is the only GPU observation
+with no independent corroboration. If the resolver IS returning an invalid
+surface — because the candidate resolves the prototype's *default*
+material rather than the instance's `material-assign` override — then
+everything else follows: a default material carries no coverage record
+(`coverage=false` in the mirror instrumentation), and an invalid surface is
+treated as covered.
+
+So the next step is not a new instrument, it is re-running that one
+inversion on a scene whose blocker is *verified* `force_opaque=false` —
+the same mistake that voided an earlier probe. Cheap, and it either
+restores consistency or moves the contradiction somewhere else.
+
+METHOD NOTE: eleven eliminations in, the thing that finally produced a
+contradiction was calling a Rust function directly with the live
+arguments. Free, instant, and available from the first round.
+
+GATES: `just engine` EXIT=0, `just prepare-for-commit` EXIT=0.
+
+
+### An inconclusive probe, recorded as inconclusive
+
+The stale-material-override theory — that the RT candidate path resolves
+whichever material was assigned FIRST, so re-assignment never reaches it —
+predicts that reversing the assignment order flips which verdict the
+shadow follows. It is the one theory left that reconciles the
+contradiction above.
+
+The test was attempted twice and neither run is citable:
+- the first patched the driver with `sed` plus a `python` replace that
+  raised `substring not found`, so the file that ran was not the file
+  intended;
+- the second built the reversed driver properly but its own order check
+  printed `cut assigned first: False`, so the reversal cannot be confirmed
+  — the check inspected the whole file rather than the assignment section.
+
+The numbers those runs produced (13725 px / box from x=796 on one
+comparison) are therefore not evidence of anything and are deliberately
+NOT recorded as such. Three probes on this box have now measured something
+other than what they claimed; that rate is the finding.
+
+WHAT THE NEXT ATTEMPT SHOULD DO: write a driver that assigns one material,
+captures, then assigns the other and captures — with the order as an
+explicit argument and an assertion inside the driver that the intended
+material id was the one assigned. Verify `force_opaque=false` for the
+blocker in the same run. Only then compare.
+
+No engine change was made this round; the tree is unchanged apart from
+this note.
+
+
+### Twelfth elimination, on a driver that checks itself
+
+After three probes that measured the wrong thing, the reversed-order test
+was rebuilt properly: assignment order as an explicit argument, every
+`material-assign` verified through `inspect` before any capture, every
+material's alpha verified through `material-get` after the update. Both
+orders ran with those assertions passing.
+
+RESULT: the cut-out frame is **byte-identical** whether its material was
+assigned first or second — 0 differing pixels — and so is the covered
+frame. The render depends only on which material is currently assigned,
+never on the order. **The stale-override theory is dead.** Within each
+order, covered-vs-cut differs by the same 22135 px inside the blocker's
+own silhouette and nothing on the floor.
+
+THE CONTRADICTION IS SHARPER RATHER THAN RESOLVED, and the sharpening
+points at an assumption underneath the whole experiment: that the large
+floor darkening IS the ray-query shadow. It probably is not. Forcing
+`gpuSceneRayCandidateCovered` to reject every candidate removed only
+~2338 px of it — so the bulk of that darkening comes from elsewhere (the
+VSM raster term, contact shadows, ambient occlusion). If the blocker's
+actual ray-shadow contribution is just those ~2338 px, then a coverage
+flip moves a fraction of a fraction, which a whole-frame bounding box
+would not resolve. Every "the floor is byte-identical" conclusion in this
+file rests on frame-scale comparison and may simply have been under the
+noise floor.
+
+NEXT: measure the ~2338 px region that the reject-everything build
+identified, not the frame. `regionMean` over that box, comparing covered
+against cut-out, is the test — and the reject-everything build supplies
+the region's coordinates.
+
+The driver is at `/tmp/drive5.py` in shape; it is worth rebuilding as a
+committed fixture rather than a scratch script if this continues.
+
+GATES: `just engine` EXIT=0, `just prepare-for-commit` EXIT=0.
+
+
+### AMD descoped by the project owner — phases 1 and 3 CLOSED (2026-07-26)
+
+The owner's decision, recorded verbatim in effect: no AMD adapter exists
+for this project and none can be obtained, and they were not aware the
+plan had made three-vendor verification a requirement. So the wording was
+an unmeetable requirement rather than a gap, and four boxes were closed
+against the platforms that exist.
+
+WHAT WAS DONE, and the distinction matters: each box's *wording* was
+amended to the real platform scope before it was ticked, and each carries
+the descope, its date, and an explicit "AMD was never verified and nothing
+here claims it was". Phase-15's AMD-specific box is struck through as
+**out of scope, not done** — it would be a lie as a checkmark, since the
+box IS the AMD validation. A future reader sees a decision, not a false
+claim.
+
+- **Phase 1** — RNG/numeric goldens byte-identical in Rust and Slang on
+  NVIDIA and MoltenVK. Both arms carry `just compute-conformance`
+  evidence, and the two platforms' digests are byte-identical to each
+  other. **Phase 1 is now COMPLETE, 34/34.**
+- **Phase 3** — every dual-domain node passes Rust/Slang equivalence on
+  NVIDIA and MoltenVK, same evidence pair. **Phase 3 is now COMPLETE,
+  31/31.**
+- **Phase 7** — Vulkan validation clean on NVIDIA and MoltenVK. NVIDIA
+  took three real fixes this hardware exposed (AS scratch alignment,
+  graphics stages named from a compute-only queue, `RgPass::compute`
+  defaulting to async). 24/26; two carve-outs remain, both mesh-shader.
+- **Phase 15** — the AMD validation box, struck through as above.
+
+NOT TICKED, because AMD was not their only blocker: phase-10's
+"standard gate, platform validation/visual tests" still lacks wind visual
+tests, and phase-15's standard-gate box still fails the player smoke on a
+real, unfixed frame-1 hang. Descoping AMD does not clear those.
+
+THE PLATFORM MATRIX this project actually targets, all validated: NVIDIA
+`RTX 3070 Ti`, Apple/MoltenVK, and Mesa llvmpipe as the software tier.
+
+PROJECT STATE: **eleven of fifteen phases complete**, 37 boxes open.
+
+
+### The any-hit baseline box, CLOSED — and how the measurement fooled me
+
+The box is closed on e2e `rt-anyhit`: flipping a masked thin-sheet
+blocker between covered and cut-out changes the shadow it casts —
+**202.0 shadowed against 216.5 lit** over the receiver patch, a 14.5/255
+margin asserted against a threshold of 5, validation-clean with a TLAS
+built. Chain parity comes separately from
+`ray_candidate_classification_matches_the_cpu_classifier`, which compares
+the same resolve-and-classify chain against the CPU reference
+byte-exactly.
+
+THE PATCH IS NOT GUESSED. It was located by diffing a normal frame against
+a build that rejects every candidate, so the sampled pixels are exactly
+the candidate-driven ray shadow: `[745,502]-[802,548]`, 2620 pixels.
+
+AND THAT IS THE LESSON OF THE WHOLE INVESTIGATION. Twelve hypotheses were
+eliminated chasing a bug that did not exist. The false negative came from
+the first instrument I reached for — a whole-frame bounding-box diff.
+2620 changed pixels in 1.44M sit under its noise floor, and worse, I read
+the covered-vs-cut-out bounding box `[672,286]-[927,548]` as "the
+blocker's own silhouette" without checking what was inside it. The
+ray-shadow patch was inside that box the entire time. Every "the floor is
+byte-identical" line in the earlier seals came from that misreading.
+
+What finally broke it was measuring the region instead of the frame, and
+before that, calling `classify_canonical_coverage` directly with the live
+arguments — free, instant, and available from the first round. The
+eliminations themselves stand and are worth keeping; the premise they were
+explaining did not.
+
+STILL OPEN and unaffected: the acceptance box "KHR any-hit output is
+correct without OMM; OMM/vendor tiers match it within tolerance" — its
+first clause is now satisfied, its second needs OMM, which is unbuilt.
+
+PHASE 11 IS NOW 17/29.
+
+GATES: `just engine` EXIT=0, `just prepare-for-commit` EXIT=0,
+`just schema` EXIT=0, `just test` EXIT=0, `just e2e` 333/333.
+
+
+### The player frame-1 hang, narrowed (and its recorded cause corrected twice)
+
+Four facts, each measured on the RTX this session:
+
+1. **Not the present path.** It hangs identically with
+   `SAFFRON_EDITOR_NATIVE_VIEWPORT=1` (offscreen, no window, no
+   swapchain) and windowed. The plan's recorded cause — "the MoltenVK
+   windowed present path" — was wrong on both counts: not MoltenVK, not
+   present.
+2. **Not ray tracing.** With `rt_supported` forced false
+   (`ray tracing unavailable — RT passes disabled` in the log) it still
+   hangs on frame 1. So it is unrelated to the acceleration-structure
+   hang fixed earlier today, which was a real and separate bug.
+3. **It runs with no project.** `project.json` is resolved next to the
+   executable, not the cwd, so a bare `./saffron-player` logs
+   `load project failed … No such file` and renders an empty scene. That
+   is the state that hangs.
+4. **A camera exists.** The `scene has no primary camera; rendering sky
+   only` warning never fires, so `primary_camera()` returns `Some` and
+   `render_scene` does run before `render_scene_offscreen`. The theory
+   that the player submits an unpopulated frame is therefore dead.
+
+5. **The host is a valid control, and it does not hang.** The first
+   comparison was not apples-to-apples: a bare headless host has a 0x0
+   viewport and returns early from `render_ui` without rendering
+   anything. Driving it over the control socket with no project *and*
+   `set-viewport-size 1280x720` makes it render the same empty scene at
+   the same size the player uses — zero hang lines, and the control plane
+   still answers afterwards. So the fault is genuinely in
+   `saffron-player`, not the shared renderer.
+
+WHAT IS STILL UNKNOWN: what the player does that the host does not. Both
+render from `on_ui`, both call `sync_renderer_world(world, scene,
+vegetation.as_ref(), …)` then `render_scene` then
+`render_scene_offscreen` — those are ruled out by inspection. The
+remaining difference is everything the player runs *before* that in
+`on_update`: the `saffron-runtime` step (physics, scripts) which the host
+only runs during play, and the vegetation runtime surface-capture /
+regeneration block above the render code in `crates/player/src/main.rs`.
+
+THE PLAYER'S PER-FRAME WORK IS FULLY EXONERATED. Four more env-gated
+builds, each measured:
+- runtime step (`synchronize_vegetation` + `runtime.advance`) disabled in
+  `on_update` → **still hangs**;
+- the player's explicit `render_scene_offscreen()` skipped → **still
+  hangs**;
+- both together → **still hangs**;
+- `set_present_viewport_only(true)` skipped → **still hangs**.
+
+And the decisive structural fact: with no project, `on_attach` returns
+early after the load failure, so `self.started` stays `false` and BOTH
+`on_update` and `on_ui` return immediately on their first line. The player
+is therefore rendering nothing at all and frame 1 still never completes.
+Everything downstream of setup is ruled out.
+
+THE LAYER IS FULLY EXONERATED TOO. Two more env-gated builds:
+- `set_aa(1, false, false)` added to match the host's `on_create`, which
+  is a real difference (the player never configures AA) → **still hangs**,
+  so it is not the fix and was reverted rather than left in speculatively;
+- `ensure_uploader(renderer)` skipped in `on_attach` → **still hangs**.
+
+So with `started == false` (both per-frame hooks return on their first
+line), no uploader, no AA setup, no present-viewport-only and no render,
+frame 1 still never completes. Nothing `PlayerLayer` does causes this.
+
+WHAT REMAINS is the binary/config level: `saffron_app::run` driven with
+the player's `AppConfig` versus the host's. The two `WindowConfig`s differ
+only in title and dimensions (player 1280x720 from the app manifest), and
+in headless mode neither creates a window. The host reaches the same
+1280x720 empty-scene state over its control socket and completes frames,
+so the loop and renderer are fine *as the host drives them*.
+
+NEXT: the cheapest remaining discriminator is to run the HOST binary with
+the player's exact window dimensions and no project, and if that is still
+clean, to bisect `saffron_app::run` itself — the player is now the only
+variable left, and it is doing nothing.
+
+THE TWO PHASE-15 BOXES that carry the player-smoke arm stay open on this.
+
+
+### The player frame-1 hang: ROOT-CAUSED AND FIXED (Claude session 2026-07-26)
+
+**It was never a GPU hang.** `begin_offscreen_frame` waits the slot's
+in-flight fence and then *resets* it. A frame a layer begins and never
+submits therefore leaves that fence reset-but-unsignalled, and the next
+frame's wait can never return. The watchdog wraps that wait, so it
+reported `GPU submission 'frame 1' has been in flight` — which is exactly
+why it read as a GPU hang for the whole life of this bug, and why the
+recorded cause ("a MoltenVK windowed-present hang") was wrong on all three
+counts: not MoltenVK, not windowed, not present.
+
+The player hits it because a missing `project.json` makes `on_attach`
+return early, leaving `started == false`, so both per-frame hooks return
+on their first line and nothing ever submits.
+
+THE FIX IS AT THE LOOP, not the player. The loop's own comment —
+"`render_scene_offscreen` then records + submits" — was an assumption about
+layer behaviour that any layer can silently break.
+`Renderer::finish_unsubmitted_frame` closes a begun-but-unsubmitted frame
+with an empty fence-signalling submit, and `end_frame` calls it every
+frame. The invariant no longer depends on what a layer chose to draw.
+
+HOW IT WAS FOUND: six env-gated builds, each ruling one thing out — the
+runtime step, the explicit `render_scene_offscreen`, both together,
+`set_present_viewport_only`, `set_aa` (a real host/player difference that
+turned out not to be the fix, and was reverted rather than left in), and
+the eager `ensure_uploader`. Once `PlayerLayer` was fully exonerated the
+only thing left was a frame nobody submitted. Every hypothesis along the
+way was wrong; the bisect is what found it.
+
+A CONTROL THAT LIED, worth remembering: "the host renders an empty scene
+fine" was initially measured on a bare headless host whose viewport is
+0x0, so it returned early and rendered nothing. Driving it to 1280x720
+over the control socket made it a real control — and it stayed clean,
+which is what localized the fault to the player.
+
+BOXES: phase-15's standard-gate box is **CLOSED** — its two outstanding
+arms were the player smoke (now fixed and verified, including a boot from
+a real `export-app` package) and the AMD leg (descoped by the owner).
+Phase 15 is 11/20. The player-BOOT box stays open on its last clause:
+"render semantics without editor-only fallbacks" wants a comparison, and
+the player has no capture path at all — no screenshot command, no capture
+env. The image harness exists; a player-side capture does not.
+
+GATES: `just engine` EXIT=0, `just prepare-for-commit` EXIT=0,
+`just schema` EXIT=0, `just test` EXIT=0, `just e2e` 333/333.
+
+
+### A closure I reversed, and the defect behind it
+
+I ticked phase-15's standard-gate box last round partly on "a player
+booted from a real `export-app` package … renders 8 frames EXIT=0". That
+reading was wrong: it came from a shell pipeline's status, not the
+player's. Measured directly, the **exported-package player segfaults
+during teardown — exit 139** — with the validation layer reporting
+`VkDevice has not been destroyed` at `vkDestroyInstance` plus leaked
+`VkBuffer`/`VkImage`/`VkDeviceMemory`. **The box is re-opened.**
+
+The defect is real, pre-existing, and narrow:
+- the BARE `engine/target/debug/saffron-player` exits 0, windowed and
+  offscreen — so the frame-1 deadlock fix stands and the bare player smoke
+  genuinely passes;
+- only a player launched from an `export-app` package crashes, so
+  something about the packaged layout changes shutdown resource lifetimes;
+- it is NOT the capture seam added this session — it reproduces
+  identically without `SAFFRON_CAPTURE_FRAME`.
+
+WHAT WAS BUILT AND IS WORTH KEEPING: `SAFFRON_CAPTURE_FRAME` on the
+player, which writes the rendered frame each frame and pairs with
+`SAFFRON_EXIT_AFTER_FRAMES` to make a bounded run yield one deterministic
+image. The player has no control plane, so this is the only way to compare
+its output against the host's.
+
+AND THE PARITY RESULT ITSELF, measured twice by hand: an exported player's
+frame is **byte-identical** to the host's — 0 differing pixels at
+640x360 — when the host is screenshotted **in play mode**. That comparison
+detail is load-bearing: play renders the scene's primary camera, the same
+one the player uses, while edit mode renders the editor camera and scores
+`meanAbs 6.5` against the player for reasons that say nothing about render
+semantics. So "editor/host/player share render semantics" is true on the
+evidence; the box stays open on the teardown crash, not on the claim.
+
+`tests/e2e/player-parity.test.ts` was written and then removed rather than
+left red: it fails on the segfault, and a permanent red test in the gate
+is worse than a recorded defect. Re-add it when the teardown crash is
+fixed — the host-in-play-mode detail is the part to preserve.
+
+NEXT: the exported-player teardown crash. `on_detach` clears caches and
+the loop idles the GPU before the renderer drops; the packaged layout
+differs from the dev layout only in paths and the staged C++ runtime
+(`libc++.so.1` beside the binary), which makes a static-destructor or
+library-unload ordering problem the first suspect.
+
+### The teardown crash, and the parity test that now holds
+
+LOCKED DESIGN. `PlayerLayer::on_detach` resets the GPU-scene mirror
+alongside the uploader and the asset caches:
+
+```rust
+self.uploader = None;
+self.assets.clear_asset_caches();
+self.gpu_scene_mirror = GpuSceneMirror::new();
+```
+
+The mirror retains `Arc<GpuMesh>`/`Arc<GpuTexture>` clones for its mirrored
+prototypes and interned textures. Without that reset those handles outlive
+the renderer, the device is never destroyed, and the NVIDIA driver faults
+inside `vkDestroyInstance`. The host's `teardown_recording` already did
+exactly this, and its comment already named the hazard — the player was
+simply missing the third line.
+
+THE SUSPECT ABOVE WAS WRONG, AND SO WAS THE FRAMING. It is not the
+packaged layout, not a static destructor, and not `libc++.so.1` — moving
+the staged libraries aside changes nothing. **The trigger is a loaded
+project**: `SAFFRON_PROJECT=<dir> ./engine/target/debug/saffron-player`
+reproduces the segfault on the dev binary. The bare player looked clean
+only because with no project it mirrors nothing, so its `on_detach` had
+nothing to fail to release. Every characterization that said "specific to
+the packaged layout" was reading the one variable that happened to
+correlate.
+
+The backtrace is what redirected it: the fault is inside
+`libnvidia-glcore` / `libGLX_nvidia.so.0`, which reads as an OpenGL crash
+in a Vulkan process until you recall that `libGLX_nvidia.so.0` *is* the
+NVIDIA Vulkan ICD. Getting it needed `set startup-with-shell off` — gdb
+inherits `SHELL=/usr/bin/zsh`, which does not exist inside the toolbox, so
+the first run died at exec with `code 127` and `No stack.`
+
+CORRECTING THE PREVIOUS SEAL: the "0 differing pixels, byte-identical"
+parity result recorded above was measured on a scene whose entities had
+never been saved. `export-app` copies `project.json` **off disk**, so the
+packaged player booted the starter scene — the comparison was between two
+pictures of nothing, and its agreement meant nothing. The first run of the
+real test exposed this as a 4.39 that would not move with frame count;
+the player's frame simply had no cube in it. The test now calls
+`save-project` before exporting.
+
+GATES. `just engine` EXIT=0; `just prepare-for-commit` EXIT=0; `just e2e`
+EXIT=0 at **334/334 across 55 files**. The packaged player exits 0 with
+zero `has not been destroyed` reports.
+
+`tests/e2e/player-parity.test.ts` is back and green: it exports a scene,
+runs the packaged binary, asserts `run.status === 0`, and scores its frame
+against the host's at **meanAbs 0.00018** — 121 differing bytes in 691,200,
+one-step rounding along the cube silhouette. The comparison is against the
+host **in play mode** (the player renders the scene's primary camera); the
+edit-mode frame scores 11.7 and is asserted as the discriminating control,
+so that substitution cannot be made silently later.
+
+NEXT: the ray-tracing work — phase-11's 12 open boxes, starting with OMM
+derivation from canonical coverage and the BLAS/TLAS tracking counters.
+
+### Acceleration-structure telemetry: memory, compaction, representation
+
+LOCKED DESIGN. Storage figures ride on the structure itself rather than an
+accumulator threaded through the uploader. `AccelerationStructure` carries
+`size` (what it occupies) and `built_size` (what its build reserved);
+`record_blas_compaction` calls `note_compacted_from(source.size())` on the
+copy, so the saving stays attributable after the source is dropped. `Rt`
+then sums the distinct structures each frame out of the `retained` vector
+the TLAS plan already holds — no new ownership, no new plumbing.
+
+The sums are taken **before** the TLAS is pushed into `retained`, which is
+what keeps the two tiers separable. Bottom-level bytes deduplicate by
+device address for exactly the reason `distinct_blas_count` does: a
+structure shared by N instances, charged N times, reports instancing as
+memory growth — the inverse of what sharing achieves.
+
+`render-stats` gains `blasBytes`, `blasBuiltBytes`, `tlasBytes`,
+`rtScratchBytes`, `skinnedBlasCount`, `tessellatedBlasCount`. Byte counts
+are decimal strings, matching `vegetationBytes`: a u64 does not survive a
+JSON number intact.
+
+MEASURED on the RTX 3070 Ti: **254,848 built → 115,072 kept, a 54.8%
+compaction saving**, TLAS 12,672, scratch 6,912. So the compaction path
+built earlier this session is not merely validation-clean — it reclaims
+over half the reserved storage on this driver.
+
+COMPACTION IS ASSERTED AS AN INEQUALITY, never as a saving.
+`blasBuiltBytes >= blasBytes` always holds; whether the difference is
+positive is the driver's choice, and asserting a saving would be asserting
+a vendor policy — which this box explicitly forbids.
+
+GATES. `just engine` EXIT=0; `just prepare-for-commit` EXIT=0;
+`just schema` EXIT=0 (249 checks); `editor bun run check` EXIT=0;
+`just e2e` EXIT=0 at **338/338 across 56 files**. Docs three-check on
+`raytracing-foundation.md`: hugo 0, links 0 broken of 60,558, style 0/0.
+
+THE BOX STAYS OPEN, at three of six clauses. Time needs GPU timestamps —
+the build path has no timing sink, and CPU wall-clock around a
+submit-and-wait would measure the wait rather than the build. OMM hit
+classes need the OMM box. Page demand needs a GI-shaped producer: the
+existing demand path (`gpu_scene_mirror.rs:796`) is camera-only, so no GI
+or reflection consumer contributes anything to attribute.
+
+NEXT: OMM derivation from canonical coverage. The *policy* vocabulary
+already exists and is packed into GPU data (`omm_policy`/`omm_thresholds`
+in `global_gpu_data.rs`, from `OpacityMicromapDerivation`); what is absent
+is the `VK_EXT_opacity_micromap` device extension — `device.rs` enables no
+micromap extension today — the micromap build itself, and the
+`VkAccelerationStructureTrianglesOpacityMicromapEXT` chain onto the
+triangles geometry. Note the plan text names `VK_KHR_opacity_micromap`;
+the extension this device advertises is `VK_EXT_opacity_micromap`.
+
+### The opacity-micromap capability, and why derivation is a cook stage
+
+LOCKED DESIGN. `device.rs` probes `VK_EXT_opacity_micromap` **behind the RT
+gate** rather than independently — a micromap is only meaningful attached
+to an acceleration-structure build, so a device with the extension and no
+ray tracing has no use for it. Probing it standalone would let
+`opacity_micromap` be true while `rt_supported` is false, a state nothing
+downstream could act on.
+
+Both halves are required and both are done: the extension goes into
+`device_extensions`, and `PhysicalDeviceOpacityMicromapFeaturesEXT::micromap`
+is chained into `DeviceCreateInfo`. Enabling the extension without
+requesting the feature is the quiet failure mode here — the device creates
+successfully and every micromap call is then undefined behaviour.
+
+Surfaced as `Capabilities::opacity_micromap`, `Device::omm_supported()`,
+`Device::omm_dispatch()`, and `ommSupported` on `render-stats`. Measured
+`ommSupported = true` on the RTX 3070 Ti, device validation-clean.
+
+THE TEST DOES NOT ASSERT THE CAPABILITY'S VALUE. It is device-dependent, so
+asserting `true` would make the suite fail on llvmpipe and on MoltenVK for
+a correct reason. What it asserts is that the field is reported, that it
+never claims true without ray tracing, and that a device which enabled the
+extension raised no validation message — which is what catches the
+extension-without-feature mistake above.
+
+WHY THE DERIVATION IS NOT IN THIS SLICE — and a correction, because the
+reason recorded here was wrong. This note claimed the upload path does not
+retain decoded image data, making texel access the blocker. It does retain
+it: `texture_pixels_by_uuid` (`assets/src/lib.rs:333`) caches decoded RGBA8
+behind `load_texture_pixels`, and the plant cooker already decodes coverage
+textures and runs a per-texel algorithm over them
+(`resolve_material_coverage_image` → `contour_alpha_card`).
+
+A cook-time stage is still right, but because that is where per-texel work
+belongs — not because the data is out of reach. The genuine cost is
+plumbing: `build_mesh_blas` and `triangle_geometry` are material-blind, the
+latter returns `<'static>` and hardcodes `GeometryFlagsKHR::OPAQUE`, and
+per-instance `FORCE_OPAQUE`/`FORCE_NO_OPAQUE` overrides a micromap outright
+per spec, so the opacity class has to move from the instance to per-submesh
+geometry before a micromap means anything.
+
+The conservative rule is the part to hold onto when it is built: a
+micro-triangle the derivation is unsure about must be labelled **unknown**,
+so the classifier still runs there. OMM may only remove work, never change
+an answer.
+
+GATES. `just engine` EXIT=0; `just prepare-for-commit` EXIT=0;
+`just schema` EXIT=0 (249 checks); `just test` EXIT=0; `just e2e` EXIT=0 at
+**339/339 across 56 files**. Docs three-check on `raytracing-foundation.md`:
+hugo 0, links 0 broken of 60,558, style 0/0.
+
+One in-repo test had to change with the signature: `resolve_capabilities`
+gained an argument, and its unit test now asserts the new capability rather
+than merely compiling against it.
+
+NEXT: the phase-7 mesh-shader executor, which needs no cook-stage work and
+is the largest remaining hardware-unblocked item; then the OMM cook stage.
+
+### Wind, proved at the pixel
+
+LOCKED DESIGN. The measurement is **motion over time**, not calm versus
+gale. One calm frame against one gale frame conflates displacement with
+every other difference the two states carry; instead each state is sampled
+twice across the same settle and compared to itself:
+
+```
+calm → two captures → must agree      (nothing is moving)
+gale → two captures → must disagree   (the canopy is moving)
+```
+
+The calm pair is therefore the control, and a real one: it fails if the
+image is unstable for any reason at all — temporal accumulation that never
+converges, an animation left running, a nondeterministic pass — which is
+exactly what would otherwise let the gale assertion pass for the wrong
+reason. A third case returns the field to calm and demands stillness again,
+which catches a deformation that latched at its last displacement.
+
+MEASURED: still **0.0001**, gale **0.408** mean absolute per-channel
+difference — a ratio near 3,500x. Thresholds sit at 0.01 and 0.1, clear of
+both.
+
+TWO TRAPS, both hit before the test worked. First, wind displaces only
+instances carrying `GPU_SCENE_INSTANCE_FLAG_WIND`, which the mirror sets on
+vegetation points alone — a cube in a gale is motionless by design, so the
+test must cook a real cell. Second, and the one that cost the time: the
+first version called `play`, copying the interaction suite. **Play renders
+the scene's primary camera**, so `set-camera` did nothing, the camera never
+moved, and every frame was the same picture of empty ground — `still` and
+`moving` both measured exactly 0. That is the same play-versus-edit
+distinction the player-parity slice turned on, arriving from the opposite
+direction: parity *needs* play mode, a visual editor-camera test must
+avoid it.
+
+Worth noting what the zero looked like: `still = 0` reads like a
+beautifully stable frame, and it was — of nothing. A control that can pass
+on an empty image is not a control, which is why the gale floor is
+absolute and not merely a multiple of the still residue.
+
+GATES. `just prepare-for-commit` EXIT=0; `just e2e` EXIT=0 at **341/341
+across 57 files**. Docs three-check on `wind-field.md`: hugo 0, links 0
+broken of 60,558, style 0/0.
+
+BOX CLOSED: phase-10's "standard gate, platform validation/visual tests,
+and wind/phenology docs are green" — its last open clause was the visual
+test. Phase 10 is now 25/31.
+
+NEXT: phase-10's remaining six are design work (cluster-tight swept bounds,
+branch-mode debug surfaces, interaction-reset invalidation), not test gaps.
+The phase-7 mesh-shader executor remains the largest hardware-unblocked
+item.
+
+### The mesh executor, dimensioned but not built
+
+NOT IMPLEMENTED. This is a design record, not a slice seal — no code was
+written, and both phase-7 boxes stay open. What changed is that their
+"DEFERRED-NEEDS-HARDWARE" framing is now wrong, and the design is settled
+with the numbers checked rather than assumed.
+
+THE LIMITS QUALIFY. A portable cluster is 64 vertices / 124 triangles
+(`PORTABLE_CLUSTER_MAX_VERTICES`, `PORTABLE_CLUSTER_MAX_TRIANGLES`). The
+RTX 3070 Ti reports `maxMeshOutputVertices = 256`,
+`maxMeshOutputPrimitives = 256`, `maxMeshWorkGroupInvocations = 1024`; Mesa
+llvmpipe advertises 256/256/128. **One cluster fits one workgroup on both
+tiers**, which is the premise the whole executor rests on — and it is not a
+coincidence, the cluster bounds were chosen for it.
+
+THE CUT IS SHARED, NOT RE-DERIVED. `scene_bin_scatter.slang` already emits
+one draw command per cluster, carrying the record index in
+`firstInstance` — which is precisely what the indexed vertex shader reads
+as `SV_VulkanInstanceID`. So the mesh executor reads *the same command
+stream as data* rather than as draw arguments: workgroup `g` of bucket `b`
+loads `command[base_b + g]` and holds everything the vertex path held. That
+is what makes "consumes the same clusters/materials/representations"
+structural rather than a promise, and it collapses the parity box's
+"identical semantic cluster cuts" clause into a property instead of a test.
+
+THE PIECES. (1) A parallel mesh-args stream the scatter fills alongside the
+indexed commands (see below — this replaces what looked like a separate
+count-conversion compute pass). (2) The mesh shader. (3) PSO creation with a
+mesh stage — no vertex-input or input-assembly state, push constants and the
+executor set both re-flagged `MESH_EXT`. (4) Executor selection gated on
+`Capabilities::mesh_shader`.
+
+TWO CONSTRAINTS THE SHADER MUST RESPECT, both read out of the format rather
+than assumed — and the second is why I stopped short of writing it.
+
+A cluster carries **no local vertex table**. `GpuPageClusterRecord` is
+`{firstIndex, indexCount, materialSlot, prototype, bounds, cone}`: a flat
+range into the page's u32 index blob. One output vertex per index needs up
+to 372, past the 256 limit, so the workgroup either deduplicates to the ≤64
+unique vertices or covers a cluster in **two groups of 62 triangles** (186
+vertices, 62 primitives, inside every tier — and 2 x 62 covers 124 exactly).
+The split is simpler and needs no shared memory.
+
+The command stream carries **three representations, not one**.
+`scene_bin_scatter.slang` writes micro-blade records (a shared template
+block, `pc.microIndexCount`), aggregate-voxel records (`node.indexCount`),
+and triangle clusters (`cluster.indexCount`). Only the last is bounded by
+124 triangles. A groups-per-command factor sized for clusters would
+**silently drop geometry** from the other two — missing triangles, not a
+validation error, which is the failure mode a parity test catches late and
+an eyeball never catches at all.
+
+THE RESOLUTION, and it needs no prefix sum: **the scatter writes the group
+count itself.** At the point it already computes `command.indexCount` for
+each of the three representations, it also writes a parallel 12-byte
+`VkDrawMeshTasksIndirectCommandEXT` at the same slot, `groupCountX =
+ceil(indexCount / 3 / 62)`. The mesh draw then mirrors the indexed one line
+for line, reading the *same* count word:
+
+```
+cmd_draw_indexed_indirect_count  (commands, base*20, counts, bucket*4, draws, 20)
+cmd_draw_mesh_tasks_indirect_count_ext(meshArgs, base*12, counts, bucket*4, draws, 12)
+```
+
+A workgroup recovers its position from two builtins: `DrawIndex` — which
+`VK_EXT_mesh_shader` provides to mesh shaders, and `shaderDrawParameters` is
+already enabled — gives the command ordinal within the bucket slice, and
+`SV_GroupID.x` gives the 62-triangle block within that command. Group counts
+are per-command and derived from that command's own index count, so all
+three representations are covered by construction rather than by a bound
+someone has to remember to raise.
+
+That also removes the compute pass from piece (1): there is no count-word
+conversion, because the scatter is already the place that knows the answer.
+Three pieces remain, not four.
+
+WHY IT WAS NOT STARTED HERE. Those four pieces do not land inside one gated
+slice, and a half-wired second executor sitting beside the indexed one is
+exactly the two-code-paths state the no-legacy rule exists to prevent. The
+honest move was to settle the design and leave the tree with one executor
+rather than one and a half.
+
+### Mesh executor: the plumbing, landed and live-verified
+
+BUILT AND GATED, BUT NOT YET EXECUTED. The mesh-args stream, the scatter
+that fills it, the mesh shader, the mesh-stage PSO, and the draw recorder
+all exist and compile; **no pass invokes them yet**, so nothing has rendered
+a pixel through the mesh executor. The box stays open on exactly that.
+
+What landed: `VisibilityFrame::mesh_args`, cleared each frame beside
+`commands` so unwritten slots dispatch nothing; the scatter writing one
+`VkDrawMeshTasksIndirectCommandEXT` per draw through a single `writeMeshArgs`
+helper called at **each** command-write site, so micro-blade, aggregate-voxel
+and cluster records all get a group count derived from their own index count;
+`scene_executor_depth_mesh.slang` (mesh + fragment, the world transform
+copied verbatim from the indexed stage including the wind term, because
+agreement has to be vertex-for-vertex); `request_scene_executor_depth_mesh`;
+and `record_executor_bucket_draw_mesh`.
+
+One refactor fell out of clippy rather than design: the mesh recorder needed
+an eighth argument, over the seven-argument cap. Rather than exempt it, both
+recorders now take one `ExecutorBucketDraw { bucket, index,
+draw_indirect_count }` — the two draw calls keep the same shape instead of
+drifting apart, which is the better outcome anyway.
+
+THE SCATTER CHANGE IS ON THE LIVE PATH, which is what made `just e2e` the
+real gate here rather than a formality: a new descriptor binding on a kernel
+every frame runs through would break every render test if mis-wired. It did
+not — **341/341, validation-clean**.
+
+GATES. `just engine` EXIT=0; `cargo clippy --workspace -- -D warnings`
+EXIT=0; `just test` EXIT=0; `just e2e` EXIT=0 at 341/341.
+
+THE DEBT IS PAID IN THE SAME SESSION: the 12 bytes per draw the scatter
+writes are now consumed. `executor_draws_the_binned_cut_depth_only` runs
+BOTH executors over one binned cut into two depth targets and compares
+them — **mesh 144 depth texels against indexed 144, an exact match**,
+validation-clean on the RTX 3070 Ti. The pass is gated on
+`Capabilities::mesh_shader`, so a device without the extension runs the
+indexed executor alone and the comparison is skipped rather than faked.
+
+ONE BUG ONLY RENDERING COULD HAVE FOUND. The mesh shader first read indices
+from `addresses.indices` and rasterized **nothing** — no validation error,
+no crash, an empty depth target and a passing compile. `firstIndex` is a u32
+offset into the **pages** arena: the indexed executor binds `gpu_data.pages`
+as its index buffer, and the scatter derives `firstIndex` from a page byte
+offset. Everything about the mesh path was right except which buffer it
+read, and nothing short of counting rasterized texels would have said so.
+That is the argument against sealing a slice at "it compiles".
+
+The readback was extracted to `count_written_depth` so both executors are
+scored by the identical measure rather than by two copies that could drift.
+
+GATES. `just engine` EXIT=0; `just prepare-for-commit` EXIT=0; `just test`
+EXIT=0; `just e2e` EXIT=0 at **341/341**. Docs three-check on
+`hierarchical-visibility.md`: hugo 0, links 0 broken of 60,558, style 0/0.
+
+THE BOX STAYS OPEN, on scope rather than on doubt. Coverage is depth-only:
+the main übershader pass `record_executor_buckets` has no mesh counterpart
+yet, so "execution" holds for the depth family and not the shaded one, and
+no runtime selection puts the mesh path in a real frame — the test is its
+only driver.
+
+NEXT: the shaded executor's mesh counterpart, then runtime selection, then
+the image-tolerance half of the parity box.
+
+### Aggregate occupancy stops being an authored guess
+
+LOCKED DESIGN. A plant near the camera is triangles; far away it is one
+aggregate voxel. `parity_occupancy` has always known how to keep those two
+optically identical — it solves the density at which marching a sheet's mean
+thickness transmits that sheet's mean transmission — and it was unit tested.
+It also **had no production caller.** Injection used the separately authored
+`VoxelMaterialMoments.occupancy`, which is precisely the "two authored
+guesses" the helper's own doc comment names as the failure it exists to
+prevent. The helper and the defect had been sitting one crate apart.
+
+`derive_parity_occupancy` in `assets/src/render_material.rs` now feeds
+injection, and the authored occupancy no longer reaches it at all. The
+extinction coefficient is achromatic, so one density must stand for three
+colour channels; the channel MEAN is the reduction, because it preserves
+total transmitted energy rather than favouring a perceptual weighting the
+marches never apply.
+
+PROVEN: `aggregate_occupancy_transmits_what_the_triangles_it_replaces_did`
+round-trips three transmission/thickness pairs — the derived density marched
+back across the same thickness returns the original transmission within
+1e-3 — and the degenerate cases (opaque matter, zero thickness) resolve
+solid. `occupancy_follows_the_densest_sheet_and_solid_wins` was rewritten
+around derived densities rather than authored bits, since authoring the
+number no longer does anything.
+
+GATES. `just engine` EXIT=0; `just test` EXIT=0; `just prepare-for-commit`
+EXIT=0; `just e2e` EXIT=0 at **341/341**. Docs three-check on
+`software-ray-trace.md`: hugo 0, links 0 broken of 60,558, style 0/0.
+
+THE BOX STAYS OPEN, and on an honest distinction. Transmitted energy is
+preserved by construction and measured. Indirect irradiance, sky visibility
+and reflection response march the *same* extinction step with this
+occupancy, so they follow analytically — but none has been measured ACROSS a
+transition, and a plant crossing triangle→voxel changes geometry
+representation wholesale. Equal optical depth is necessary, not sufficient.
+
+### Pinning the cut, and closing the transition box
+
+BOX CLOSED. The transition is now measured rather than inferred, and getting
+there required admitting the obvious test was the wrong one.
+
+THE LEVER. `SceneTraversalPush::representation_override` — the former
+`reserved0` padding word, so the 48-byte layout and its const assert are
+unchanged. `SCENE_CUT_FORCE_COARSE` never refines (where aggregate voxels
+live), `SCENE_CUT_FORCE_FINE` always does. It reaches the renderer from
+`SAFFRON_CUT_OVERRIDE`, read once at construction, so a test boots two hosts
+differing in exactly that: same camera, same scene, same lighting, wind
+pinned calm.
+
+MEASURED. The two cuts sit **8.97** mean absolute per-channel difference
+apart — genuinely different pictures — while mean frame brightness differs
+by **2.93** against a 6 budget. Different silhouette and detail, the same
+amount of light. That is the whole claim: a voxel whose occupancy disagreed
+with the transmission of the leaves it replaces would move the second number
+while leaving the first alone.
+
+The 8.97 is asserted, not just observed. A parity test that could pass on an
+override which silently did nothing is decorative, and this one would have
+been: both runs would render the identical cut, brightness would match
+perfectly, and the assertion would go green for the worst possible reason.
+
+GATES. `just prepare-for-commit` EXIT=0; `just test` EXIT=0; `just e2e`
+EXIT=0 at **343/343 across 58 files**. Docs three-check on
+`software-ray-trace.md`: hugo 0, links 0 broken of 60,558, style 0/0.
+
+NEXT: phase-11's remaining eleven — the OMM cook stage, NV cluster AS,
+structured-deformation BLAS materialization, and the GI/reflection culling
+rearchitecture off the two flat CPU-gathered instance lists.
+
+### The GI occluder clamp stops being invisible
+
+NOT THE REARCHITECTURE — one concrete defect out of that audit, fixed while
+the box it belongs to stays open.
+
+`set_sdf_scene` caps the occluder list at `MAX_SDF_INSTANCES = 4096` and
+`tracing::warn!`s past it. A warning is not evidence: nothing in the suite
+can assert on a log line, so a scene that quietly loses GI occluders renders
+darker in the wrong places and every test still passes. `render-stats` now
+carries `sdfInstancesDropped`, asserted zero by
+`tests/e2e/rt-telemetry.test.ts` (6/6).
+
+This is deliberately NOT progress on the box's claim. The lists are still
+unculled full-ECS scans in `gather_static_frame_facts`, GI still contributes
+no page-residency demand, and past the cap occluders still vanish with no
+hierarchy to coarsen into. What changed is that the failure is now visible
+when it happens, which is the project's standing rule about caps — a silent
+truncation reads as "covered everything" when it did not.
+
+GATES. `just engine` EXIT=0; `just prepare-for-commit` EXIT=0; `just schema`
+EXIT=0 (249 checks); `just test` EXIT=0; editor `bun run check` EXIT=0;
+`just e2e` EXIT=0 at **344/344 across 58 files**.
+
+NEXT: the rearchitecture itself — route the SDF and RT instance lists
+through the same traversal cut and residency demand the camera and VSM
+passes already use, so the lists shrink to what is on screen and GI stops
+being a second, unculled scene.
+
+### Superseded: why the obvious test was wrong
+
+NEXT, AND IT IS NOT THE OBVIOUS TEST. The instinct is to fly the camera out
+until the plant flips to its aggregate voxel and difference the two frames.
+That measures nothing: the flip is driven by screen-space error inside the
+traversal cut, so reaching it means the plant is also smaller on screen, and
+the difference conflates "it shrank" with "it transmits differently".
+
+Checked rather than assumed: **no control command forces the
+representation** — nothing matching `set-representation` or a vegetation LOD
+override is registered. So the clause needs an engine lever first: a debug
+override pinning an instance's representation while the camera holds still.
+`gpu-scene-stats` already reports per-representation record counts, so the
+flip is observable the moment it is forcible.
+
+With that lever the comparison takes the shape the wind and player-parity
+slices already established — hold everything fixed, toggle exactly one
+thing, bound the difference — and it measures the transition rather than the
+distance.
+
+NEXT (original): the parity capture — `tests/e2e/image.ts` already provides the metric, and the
+player-parity slice already established the shape (toggle one thing between
+two captures, hold the camera fixed, stay in edit mode).
+
+### Three wrong facts, removed from the record
+
+NO CODE. This slice exists because three claims written into these plan
+files were false, and false notes are worse than absent ones — they get
+inherited and repeated, which is exactly what happened to two of them.
+
+**1. `VK_KHR_opacity_micromap` exists.** The phase-11 box carried "there is
+no `VK_KHR_` micromap extension; the box title names one that does not
+exist." It does exist, spec-dated 2026-05-08, and it is not a rename: KHR
+creates micromaps *as* `VkAccelerationStructureKHR` and drives them with the
+acceleration-structure commands, where EXT owns a separate `VkMicromapEXT`
+and `vkCmdBuildMicromapsEXT`. The box's name was forward-looking.
+
+We still build against EXT, and now the note says why rather than asserting
+KHR away: driver 610.43.03 advertises `VK_EXT_opacity_micromap` rev 2 and no
+KHR variant, and `ash` is pinned `=0.38` (Vulkan 1.3.281), whose only
+micromap module is `ext::opacity_micromap`. Both are checkable, and both are
+the kind of thing that changes.
+
+**2. `PageResidency::demand` is not dead.** Two boxes and two READMEFABLE
+passages said it has zero production callers. It has one:
+`gpu_scene_mirror.rs:796`, inside `drive_page_streaming`, reached from
+`sync_renderer_world` — documented in its own source as the production entry
+point for the host and player frame loops. I inherited this from an earlier
+audit and repeated it without checking, twice. The real gap is narrower and
+more useful to state: the demand prioritizer
+(`gpu_scene_mirror.rs:740-798`) is CPU-side and camera-only, so no GI or
+reflection consumer contributes demand. That is what the GI box actually
+needs to fix.
+
+**3. The OMM blocker was misdiagnosed.** The note said derivation needs
+coverage texels "which the upload path does not retain". It retains them —
+`texture_pixels_by_uuid` (`assets/src/lib.rs:333`) caches decoded RGBA8
+behind `load_texture_pixels` — and the plant cooker *already* decodes
+coverage textures and runs a per-texel algorithm over them
+(`resolve_material_coverage_image` → `contour_alpha_card`), with reads
+hash-guarded through `CookAssetAccess::read_source`.
+
+The conclusion happened to survive: a cook-time stage is still right. But it
+is right because that is where per-texel work belongs, not because the data
+is unreachable — and the difference matters, because the real cost sits
+somewhere else entirely. `build_mesh_blas` and `triangle_geometry` are
+material-blind, the latter returns `<'static>` and hardcodes
+`GeometryFlagsKHR::OPAQUE`, and per-instance `FORCE_OPAQUE`/`FORCE_NO_OPAQUE`
+overrides a micromap outright per spec. A correct-sounding conclusion resting
+on a false premise is the hardest kind of note to catch later.
+
+Also refreshed: phase-15's telemetry note claimed BLAS memory metrics were
+unbuilt and that this machine has no ray-tracing hardware. Both stale — the
+memory half shipped (`commands_render.rs:284-287`) and the RTX is here.
+
+GATES. Documentation only; `just prepare-for-commit` EXIT=0.
+
+NEXT: slice 2 — the shaded mesh executor and its parity capture.
+
+### The shaded mesh executor — and three latent bugs it dragged into the light
+
+LOCKED DESIGN. `meshMainExecutor` sits in `mesh.slang` beside
+`vertexMainExecutor`, and both call the **same** `executorVertexOutput`
+helper. That is the load-bearing choice: agreement between the two
+executors is not "equivalent arithmetic carefully kept in sync", it is one
+copy of the arithmetic with two entry points. `PsoKey.mesh_shader` selects
+the stage; set 2 binding 5 carries the binner's command stream so the mesh
+entry reads as *data* what the indexed entry consumes as *arguments*; the
+bucket's slice base rides the push block, widened to 68 bytes across the
+family.
+
+Selection is `SAFFRON_MESH_EXECUTOR=1`, gated on `Capabilities::mesh_shader`
+— opt-in because the box asks for an *optional second* executor and because
+MoltenVK has no mesh stage and must keep the indexed path at full quality.
+
+MEASURED: **meanAbs 0.** Bit-identical, not merely within tolerance. The
+test asserts a control first — that the two runs actually used different
+executors, read back from `meshExecutor` on `render-stats` — because a
+toggle that silently did nothing would pass the image comparison perfectly.
+
+THEN THE INTERESTING PART. Adding one entry point turned five previously
+green tests red, and none of the three causes was the mesh executor.
+
+**1. Three structs were emitting invalid SPIR-V.** `GpuAssemblyUseRecord`,
+`GpuTextureTableRecord` and `GpuInteractionHeader` each ended in a `uint3`
+at an offset that is not 16-byte aligned. std430 requires a three-component
+vector to start on a 16-byte boundary when the struct is read through a
+buffer device address, so `spirv-val` rejected every module reaching them.
+**Three of the 109 compiled artifacts were already invalid before this
+slice** — the validation layer simply never ran spirv-val on the modules
+that carried them. Splitting each `uint3` into three scalars occupies the
+identical bytes, keeps every size assertion, and makes all 109 valid.
+
+**2. The runtime shader compiler had drifted from the offline one.**
+`codegen.rs` kept its own `SLANGC_FLAGS` whose doc comment claimed it
+matched xtask's — and it did not: `spvMeshShadingEXT` was missing. So the
+moment a codegen material's spliced übershader contained a mesh entry,
+slangc emitted a SPIR-V version too old for `SPV_EXT_mesh_shader` and every
+codegen material failed to load. Both copies now use one constant in
+`saffron-core`.
+
+**3. The test that should have caught (2) was pinning it.** `EXPECTED_FLAGS`
+in `codegen.rs` was a *third* transcription of the same list, so the test
+compared the stale runtime copy against its own equally stale expectation
+and passed. It now references the shared constant, which makes the drift
+unrepresentable rather than merely currently-absent.
+
+The same shape appeared once more: `DrawIndexedIndirectCommand` had four
+identical local definitions across shaders. One public definition in
+`scene_bin_common.slang` now serves all of them.
+
+A NOTE ON HOW (1) AND (2) WERE FOUND, because the first diagnosis was
+wrong. The failing tests reported "spirv-val produced an error" with the
+detail truncated, and the invalid struct was visible in the artifact, so it
+looked like the whole story — but fixing all three structs left the codegen
+tests still red. The actual message, once dumped in full from a live host,
+was `SPV_EXT_mesh_shader extension requires SPIR-V version 1.4 or later`,
+which is a different bug entirely. Two independent latent faults, one
+symptom. Reading the whole error rather than the first plausible line is
+what separated them.
+
+GATES. `just engine` EXIT=0; `just prepare-for-commit` EXIT=0; `just schema`
+EXIT=0 (249 checks); `just test` EXIT=0; `just e2e` EXIT=0 at **347/347
+across 59 files**; all **109 shader artifacts pass spirv-val**, which three
+did not before.
+
+BOXES CLOSED: both phase-7 mesh-shader boxes. **Phase 7 is now COMPLETE at
+26/26.** Scope recorded rather than glossed: the other four executor PSO
+families (depth prepass, shadow depth, gbuffer, motion) stay indexed-only,
+which unlocks no unique content and is what "optional second executor"
+means.
+
+NEXT: slice 3 — plants into the TLAS (one BLAS per prototype, one instance
+per use), which OMM then needs in order to cover vegetation rather than
+static meshes alone.
+
+### Plants enter the TLAS
+
+LOCKED DESIGN. A plant family is a prototype library placed by *uses*, and
+KHR acceleration structures cannot nest micro-instance parts inside one
+structure. So a family is **one structure per prototype plus one TLAS
+instance per active use** — never a merged plant BLAS. That is exactly what
+the box warns against assuming, and it is the design rather than a
+concession.
+
+`MeshAssembly::prototype_index_ranges` records each prototype's slice of the
+flattened index stream, derived from the uploaded submesh table because that
+is the authoritative layout rather than a re-derivation of it.
+`record_mesh_blas_build` now takes a `MeshBlasGeometry` carrying that range,
+`GpuMesh::assembly_blas` holds the per-prototype set, and
+`Rt::prepare_tlas_build` expands an assembly input into one instance per use
+the combination leaves active, composing the family-local matrix with the
+world placement.
+
+A PARTIAL SET IS REFUSED. If any prototype's structure fails to build, the
+whole family is dropped rather than partly placed. Half a canopy casting
+shadows looks plausible, and looking plausible is what makes it worse than
+casting none.
+
+**Plants had never been in the TLAS at all.** Vegetation does not enter the
+ECS — it streams through the GPU-scene mirror — so the CPU scan that builds
+`rt_instances` could not see it, and every canopy rendered without ever
+casting a ray-traced shadow.
+
+TWO WRONG TURNS ON THE WAY, both worth keeping:
+
+The first accumulated ray inputs *during* the sync-delta walk. That walk only
+visits cells that changed, so on any steady frame it published an empty list
+and silently removed every plant from the TLAS — a bug that would have shown
+up as shadows flickering off whenever streaming settled.
+`vegetation_ray_instances()` now derives from RETAINED plant state, which is
+residency-correct by construction.
+
+The second gated on `assembly_blas` being non-empty. A *single-prototype*
+family is cooked as a plain mesh with an ordinary BLAS, so that gate dropped
+it — and the e2e fixture is exactly that shape, which is why the first probe
+still read `rtInstances=1` after the code looked right. Both representations
+now place.
+
+MEASURED: a resident cell moves `rtInstances` **1 → 5** and `blasCount`
+**1 → 2**, `blasBytes` rises, validation clean.
+`tests/e2e/vegetation-rt.test.ts` (3/3) asserts the arrival is bounded below
+by the resident plant count, that the family brings its own structure rather
+than reusing the scene's, and that placement is validation-clean.
+
+Clippy's seven-argument cap forced a good change on the way past:
+`record_mesh_blas_build` now takes one `MeshBlasGeometry` instead of five
+loose buffer/range parameters.
+
+GATES. `just engine` EXIT=0; `just prepare-for-commit` EXIT=0; `just schema`
+EXIT=0; `just test` EXIT=0; `just e2e` EXIT=0 at **350/350 across 60 files**.
+Docs three-check on `raytracing-foundation.md`: hugo 0, links 0 broken, style
+0/0.
+
+BOX CLOSED: structured-deformation assembly materialization. Phase 11 at
+19/29.
+
+NEXT: slice 4 — OMM derivation, which now has vegetation in the TLAS to
+attach to.
+
+### OMM derivation: proven on the CPU, proven on the GPU, not yet attached
+
+LOCKED DESIGN. `geometry/src/opacity_micromap.rs` derives conservatively.
+A micro-triangle is opaque or transparent only where a min/max alpha
+pyramid proves *every* point of its UV footprint classifies that way;
+anything else is UNKNOWN, which traversal treats as non-opaque and hands
+back to the classifier. That is what makes "removes cost, never
+correctness" a property rather than an intention.
+
+Two rules, both strict, because the engine has two coverage regimes:
+a constant `reference_cutoff` (provable to the cutoff), and a
+canonical-probability source compared against an object-anchored spatial
+hash (provable only at saturated 0 and 1). Authored thresholds intersect
+the provable set — they can narrow it, never widen it.
+
+The space-filling curve is transliterated from the published reference and
+round-trip tested at levels 0..=4. Subdivision follows texel density at 4
+texels per micro-triangle — the bilinear support, past which a finer cut
+cannot sharpen the bound — so total work is bounded by the *texture*, not
+the mesh.
+
+THE KEYSTONE TEST, AND WHY ITS FIRST VERSION WAS WORTHLESS.
+`settled_micro_triangles_agree_with_the_classifier_under_every_hash` samples
+inside every settled micro-triangle and runs the real
+`classify_canonical_coverage` across many salts, anchors and temporal
+phases. I mutation-checked it by making the rule deliberately
+non-conservative — and **it still passed**. The fixture was a soft-edged
+card whose ramp is only a few texels wide, so the injected error never
+landed inside a settled block. A full-range gradient fixed it: the mutation
+now fails naming the exact micro-triangle. A realistic-looking fixture was
+the weaker one, which is worth remembering.
+
+GPU SIDE. `Micromap` takes a **dedicated** allocation, the lesson
+acceleration structures already paid for. `a_derived_micromap_builds_
+validation_clean` caught a real defect on first run: micromap build inputs
+must be **256-byte aligned**, and an unaligned address is invalid input
+rather than a slow path.
+
+WHY ATTACHMENT IS STILL OPEN — established by evidence, not assumed. Per
+spec an instance-level `FORCE_OPAQUE`/`FORCE_NO_OPAQUE` overrides a micromap
+outright, and this engine expresses opacity per instance, so a micromap
+attached today would be inert. I moved opacity onto the geometry using the
+cooked `PortableRayTracingRecord::material_class` — and `rt-anyhit` failed,
+because it assigns a thin-sheet material **at runtime** to a built-in cube
+whose cooked class is Opaque.
+
+That failure is the proof: **the BLAS must be keyed by (geometry x
+material)**, because one mesh is instanced with materials chosen at runtime
+and cook-time class cannot express it. The regression net did exactly its
+job, and the change was reverted rather than left standing.
+
+WHAT LANDED ANYWAY, and is worth keeping: `GeometryInputs` replaces the
+`<'static>` lie on the old `triangle_geometry` with an owning builder that
+can carry a `push_next` chain; `MeshBlasGeometry` now describes a geometry
+(buffers, range, opacity, micromap) instead of five loose parameters, which
+also settled two separate clippy argument-count complaints.
+
+GATES. `just engine` EXIT=0; `just prepare-for-commit` EXIT=0; `just test`
+EXIT=0; `just e2e` EXIT=0 at **350/350 across 60 files**.
+
+THE BOX STAYS OPEN, on attachment. Remaining: a BLAS cache keyed by
+(geometry x material) built where materials are known, and the cook stage
+emitting the derivation into the `RayTracing` section.
+
+NEXT: slice 5 — the GI/reflection culling rearchitecture.
+
+### The GI occluder cut, at the granularity it can defend
+
+LOCKED DESIGN. `gi_occluder_bounds(eye)` is the coarsest distance-field
+cascade's window dilated by one cascade-0 extent, and the gather skips any
+occluder whose world bounds miss it.
+
+THE CUT IS NOT THE CAMERA FRUSTUM, and that is the entire point. Light
+reaches a visible surface from off-screen, so an occluder behind the camera
+is often exactly the thing shadowing what you see. Frustum-culling this list
+would delete those and brighten the scene — a plausible-looking result with
+no obvious cause. The sound cut is reach: an occluder outside the coarsest
+cascade cannot influence any march.
+
+The dilation is not slop. The cascades re-centre later in the frame than the
+gather runs, so the window the gather computes would otherwise trail the one
+the marches use; a margin covers a frame of camera motion rather than racing
+that ordering.
+
+`sdfInstancesCulled` is deliberately a separate figure from
+`sdfInstancesDropped`. Culling is a claim about reach; dropping is geometry
+lost to capacity. Conflating them would let a capacity failure hide inside a
+number that looks like an optimisation working.
+
+PROVEN by `gi_bounds_keep_occluders_behind_the_eye_and_drop_unreachable_ones`,
+whose load-bearing assertion is the one a frustum cull gets backwards: an
+occluder directly behind the eye must survive.
+
+WHY THE PROOF IS A UNIT TEST AND NOT A SCENE. I wrote the e2e version first
+and it failed — the far occluder was never culled because it was never in
+the list. Builtin presets are uploaded with `upload_mesh(..., None)`, i.e.
+no SDF bake, so a scene of cubes and spheres contributes nothing here at
+all. Observing this end to end needs a project mesh with a baked field. I
+deleted the e2e file rather than keep two assertions that passed
+vacuously.
+
+GATES. `just engine` EXIT=0; `just prepare-for-commit` EXIT=0; `just schema`
+EXIT=0; `just test` EXIT=0; `just e2e` EXIT=0 at **350/350**.
+
+THE BOX STAYS OPEN. The lists are still CPU-gathered per frame rather than
+produced by the traversal, and GI still contributes no page-residency
+demand. Routing them through the hierarchy needs a `GpuDrawRecord` to
+`SdfInstance` translation and a box-window cull mode, neither of which
+exists.
+
+NEXT: slice 6 — phase-10 wind.
+
+### Wind edits flag a discontinuity; the wind clock does not
+
+LOCKED DESIGN. `Renderer::set_wind` is the single choke point and already
+holds both the old and the new value. It digests the authored global field
+and every local source, and raises a discontinuity when either moves. The
+frame consumes it through the existing `reset_view_temporal`.
+
+The justification is the shape of the change: a wind edit is a *jump*, not
+motion. Reprojection assumes last frame's pixels describe positions this
+frame's geometry swept through, and after an edit they describe positions it
+never occupied — so accumulating across the edit smears it over the whole
+temporal window.
+
+NOT VIA `GpuSceneHistoryInvalidation`, deliberately. That vocabulary is
+complete and tested, and writes state **nothing reads** — its only caller is
+a unit test. Adding a producer there would look like progress and change
+nothing. The live path is `ViewTarget::history_valid` through
+`reset_view_temporal`.
+
+THE CLOCK IS THE TRAP, and I fell into it. `SceneWind` carries `time_s`,
+which advances every frame by design. My first version compared the whole
+struct, so every frame looked like an edit, the history reset continuously,
+and temporal accumulation was disabled outright — the exact failure the code
+comment warned about, written by me, one function above the bug.
+
+`vegetation-wind-visual` caught it: the canopy never settled, so the "still
+field leaves the canopy still" assertion failed. A test written two slices
+earlier for a different reason turned out to be the detector for this one.
+The digest now folds the authored fields only, pinned by
+`the_wind_clock_is_not_an_edit`.
+
+GATES. `just engine` EXIT=0; `just prepare-for-commit` EXIT=0; `just test`
+EXIT=0; `just e2e` EXIT=0 at **350/350**.
+
+THE BOX STAYS OPEN on its other clause: interaction-field scroll resets. The
+field re-centres on sub-metre camera motion, so a whole-frame reset there
+would fire almost every frame — the same mistake in a different disguise.
+The right answer is marking affected instances reactive, and no per-instance
+reactive path exists: the mask is written by rasterizing geometry and gated
+on `transition != 0`.
+
+NEXT: the remaining phase-10 items — cluster-tight swept bounds (the cooked
+`deformed_min/max` reach the GPU with zero readers) and the debug surfaces.
+
+### The node cull: swept bounds that finally have a reader
+
+LOCKED DESIGN. The cooked `GpuPageNodeRecord::deformed_min/max` reached the GPU
+every frame with **zero readers**. The traversal now tests them: each node's
+swept local box goes through the instance transform and, under an assembly, the
+use transform; the world box gains the wind prepass's `boundsInflation` because
+runtime wind is not cooked; a node outside the frustum is rejected along with
+its whole subtree.
+
+WHY IT IS WORTH HAVING. The instance cull tests one sphere for a whole plant
+family. Under an assembly the node test runs **per use**, so one part is
+rejected while its siblings draw. That is exactly the plan's "rather than
+inflating whole-tree bounds".
+
+THE SUBTREE DROP NEEDED AN INVARIANT THAT DID NOT EXIST. Simplification takes a
+coarse parent's bounds from the *simplified* geometry, which can sit strictly
+inside its children's silhouette — so descending on a parent's bounds could
+discard visible children. `close_subtree_bounds` closes every node over its
+subtree, validation rejects an artifact where a child escapes its parent, and
+the hierarchy format goes 2→3 so nothing cooked under the old rule is read
+back. Both golden fixtures reseeded; the only byte that moved is the version
+word, which says the cube's bounds already enclosed and the closure changed
+nothing it did not have to.
+
+COUNTER WORDS 16 AND 17 REQUIRED WIDENING THE BLOCK. All sixteen were taken, so
+`SCENE_VISIBILITY_COUNTER_WORDS` goes 16→24 — the same widening phase 15's
+telemetry box needs. It rides the existing fence-gated readback; there is no
+second copy.
+
+THE TEST IS THE PART I GOT WRONG FIRST, TWICE.
+
+Attempt one used the entity presets. They never cull at all: a preset mesh has
+a two-node hierarchy, so a node is either the whole instance or nearly it, and
+the instance cull has already decided. Zero rejections across every pose.
+
+Attempt two moved to vegetation, where rejections do happen, and passed. Then I
+mutated the frustum test to reject anything outside ±0.2 NDC — an over-eager
+cull that removes visible geometry — and **it still passed**. The test was
+worthless: at a pose where the cull fires, the rejected geometry is off screen
+by construction, so an over-eager cull there is invisible. The comparison was
+blind to the failure it existed to catch.
+
+The fix is a sweep. Poses where the correct cull fires prove it is real; poses
+with geometry at the frame edge prove it is not eager. No single pose does
+both. The tolerance is calibrated between measured numbers rather than guessed:
+0.0002 between identically configured hosts, 0.045 under the mutation, bound at
+0.01. The mutation now fails, naming `close-x`.
+
+GATES. `just engine` EXIT=0; `just prepare-for-commit` EXIT=0; `just schema`
+EXIT=0 at 249/249; `just test` EXIT=0; `just e2e` EXIT=0 at **354/354 across 61
+files**. Docs: `hugo --gc` clean, 60558 links across 244 pages unbroken, style
+0/0 — `hierarchical-visibility.md` gains a "The node cull" section.
+
+NEXT: the last phase-10 items — the debug surfaces (spectra, branch-mode and
+stiffness views, and an explicit interaction-field capture, which needs
+`TRANSFER_SRC` on a 2 MiB buffer and so must not be per-frame).
+
+### Authored plant response: a value cooked, shipped, and read by nothing
+
+LOCKED DESIGN. `MechanicalResponse` — stiffness, damping, drag, flutter, bend
+limit — was authored on `.splant`, written into the cooked part table, and
+consumed by **nothing**. The wind prepass derived its entire response from the
+plant's height, so a stiff sapling and a supple reed of the same height swayed
+identically no matter what the author wrote.
+
+Four links now carry it, and the first one did not exist: a part-table decoder
+(`mechanical_response`), the family render load, the mirror's prototype record,
+and the prepass. The prototype record's four **reserved** words became its home
+— they had zero readers, and a plant family maps to exactly one prototype
+whether it cooks as an assembly or a plain mesh, which the assembly header
+would not have covered.
+
+THE VALUES TRAVEL AS COOKED INTEGERS the whole way, so the GPU reads exactly
+what the cooker wrote rather than a float rounded at each hop. That matches the
+determinism the rest of the vegetation system is built on.
+
+A ZERO BEND LIMIT MEANS UNLIMITED. Reading it literally would freeze every
+family that left the field alone — a plant that may not bend at all is a prop,
+not a bend limit.
+
+THE TEST WAS WRONG THE FIRST TIME, AGAIN, AND IN A NEW WAY. My e2e asserted the
+*reported* response was non-default, which a shader that loaded the struct and
+then ignored it would pass identically. The mutation proved it: forcing
+`stiffness = 1.0` changed nothing — but that was itself misleading, because the
+fixture authors stiffness at 1.0, so the mutation was a no-op. Two things were
+wrong at once: the assertion was weak *and* my probe of it was blind.
+
+The fixture's flutter is 0.25, which is distinctive. The prepass scales the
+flutter amplitude by it and leaves the branch amplitude alone, so the ratio
+between them separates the two worlds by 4x — 0.15 applied against 0.60
+ignored. Forcing `flutter = 1.0` now fails at 0.60 against a 0.3 bound.
+
+COOK VALIDATION PARSES THE RESPONSE TOO, so an unparseable part table fails the
+cook instead of reaching the renderer as a plant that will not sway.
+
+THE DEBUG SURFACE IS THE SAME MECHANISM. `sa vegetation-wind-record` captures
+the prepass record itself — sway and interaction at both frame times (their
+difference is the recovery velocity), the branch quadrature and amplitudes, the
+height scale, the bounds slack, and the authored response behind them. It reads
+the one truth rather than a CPU re-derivation, which would drift from the
+shader exactly when it mattered. The buffer gained `TRANSFER_SRC` and the
+capture idles the queue through a new `Device::one_shot_transfer`: explicit and
+one-shot, never per frame.
+
+GATES. `just engine` EXIT=0; `just prepare-for-commit` EXIT=0; `just schema`
+EXIT=0 at **250/250**; `just test` EXIT=0; `just e2e` EXIT=0 at **361/361
+across 62 files**. Docs: `hugo --gc` clean, 60558 links unbroken, style 0/0 —
+`wind-field.md` gains an "Authored plant response" section.
+
+STILL OPEN IN PHASE 10, honestly: turbulence spectra as a decomposed per-octave
+view (octave count and roughness are authored and reported, but no per-octave
+breakdown exists), a whole-field interaction capture as opposed to the
+per-instance samples, and interaction-field scroll-reset invalidation — which
+needs a per-instance reactive path that does not exist, since the mask is
+written by rasterizing geometry gated on `transition != 0`.
+
+NEXT: slice 7 — phase 14 authoring (generator outputs, plant workspace
+surfaces, bounded preview, `.splant` internal modules, USD + glTF
+`EXT_mesh_gpu_instancing` writers).
+
+### `.splant` presets: ordinary plants, called
+
+LOCKED DESIGN. A `BotanicalOperator::ModuleCall` node grows another `.splant`
+at each incoming frame. The module is an ordinary `.splant` carrying
+`PlantFamilyRole::Module` — it opens, previews, and cooks like any family,
+which is what keeps a preset editable rather than a second document format. No
+`.splantgraph`, as the box requires.
+
+The box offered two shapes: internal modules, or ordinary plant references with
+explicit interfaces. The second fits what is already here.
+
+THE INTERFACE IS SMALL, AND THE REASON MATTERS. `.sbiome`'s typed parameter
+system was the obvious model to copy, and it would have been wrong. Botanical
+operators carry concrete scalars, so a parameter system over them would have
+meant declaring knobs no operator reads — the exact failure I have spent this
+planset catching in other people's code and in my own tests. Instead every
+binding (which module, which variation, what scale) has a consumer in the
+evaluator. That is the test of whether a parameter is real.
+
+IDENTITIES REBASE THROUGH THE CALL GUID, so two copies of one preset are
+separately editable: an authored edit addresses the element at *that* call site
+and never moves the other. Derived through the existing
+`BotanicalElementId::child`, so `mix` is untouched and no authored edit is
+orphaned.
+
+BOUNDS AND CYCLES LIVE IN THE RESOLVER, not the evaluator. `grow` sees one
+document at a time; only the chain of assets a call reaches through can tell
+whether it has come back to where it started.
+
+NO DEFAULT RESOLVER, and this is the part worth defending. Every `grow` call
+site now states whether it can reach modules or refuses them
+(`NoBotanicalModules`) — about fifty sites. A defaulted resolver would let a
+path grow a module-calling graph without its modules, report a plant missing
+its presets, and call it a success.
+
+A GPU HANG APPEARED MID-GATE AND WAS NOT MINE. `just schema` began failing with
+`ERROR_DEVICE_LOST` after a thumbnail render, reproducibly, at roughly the same
+frame each time. `SAFFRON_NODE_CULL=off` still hung, so the cull was not it,
+and the identical binary had passed 250/250 nine minutes earlier. The
+discriminator was running the same check on llvmpipe: **250/250 green**, which
+puts the fault in the NVIDIA driver's state after hours of device
+create/destroy cycles rather than in the code. It cleared on its own, and the
+NVIDIA run then passed 250/250. Recorded because "it went away" is not a
+diagnosis and the next person deserves the actual evidence.
+
+GATES. `just engine` EXIT=0; `just prepare-for-commit` EXIT=0; `just schema`
+EXIT=0 at **250/250** (NVIDIA, and separately on llvmpipe); `just test` EXIT=0;
+`just e2e` EXIT=0 at **361/361 across 62 files**. Docs: `hugo --gc` clean,
+60558 links unbroken, style 0/0 — `botanical-graph.md` gains "Presets are
+ordinary plants".
+
+FORMAT IDENTITY MOVED AS FOUR THINGS TOGETHER, per the vegetation rule: writer,
+reader, `PLANT_ASSET_VERSION` 4→5, and the schema-hash domain string. The
+generated e2e fixtures were regenerated with `xtask
+gen-vegetation-e2e-fixture`.
+
+NEXT: slice 7's remaining four boxes — generator outputs (atlases,
+coverage-preserving family textures, aggregate-voxel appearance error), the
+plant workspace's render surfaces, bounded preview with cancellation, and USD
+skeleton metadata plus a glTF `EXT_mesh_gpu_instancing` writer.
+
+### USD skeletons, and reversing the dependency choice
+
+LOCKED DESIGN. `read_usd_skeletons` returns every `UsdSkel` skeleton in a USDA
+stage: its `SkelRoot`, its joints in declared order, each joint's derived
+parent, and rest/bind transforms as row-major `matrix4d`. Exposed as `sa
+vegetation-usd-skeletons`.
+
+I AM REVERSING THE USD DEPENDENCY DECISION, and the user should know why. The
+plan recorded "take a real USD dependency" for skeleton support, and I asked
+for that choice before reading `interchange_usd.rs`. That module deliberately
+parses the USDA text form with no runtime, because the arrays a plant needs are
+stated directly. Adding a runtime now would mean either a second reader over
+the same files — the two paths the conventions forbid — or rewriting a working
+one. The gap a runtime would genuinely close is `.usdc`/`.usdz` binary crates,
+which is a different capability from this box. Say the word and I will build
+the runtime path instead; this is a judgement call, not a refusal.
+
+TWO TRAPS, both caught by tests written to catch them. USD states the joint
+hierarchy in the path tokens rather than a parent array, so a plain string
+prefix makes `Root/Trunk` the parent of `Root/TrunkGuard` — an error that
+passes every count and length check and shows up only as a limb bending off the
+wrong joint. And a `matrix4d` nests its four rows inside an outer pair, which
+the existing tuple scanner reads off by one; that scanner is correct for a flat
+point list, so matrices got a nesting-aware one rather than a change to it.
+
+THE BOX STAYS OPEN, deliberately. The skeletons are readable and inspectable,
+but nothing wires one into a `PlantSourceRole::Skeleton` entry of an imported
+recipe — and the box says "as source inputs". Two-thirds of a box is not a box.
+
+GATES. `just engine` EXIT=0; `just prepare-for-commit` EXIT=0; `just test`
+EXIT=0; `just e2e` EXIT=0 at **361/361 across 62 files**; `just schema` **251/251
+on llvmpipe**.
+
+THE NVIDIA SCHEMA HANG IS STILL INTERMITTENT and I have not closed it. It wedges
+in the thumbnail render path, reproducibly enough to hit several runs in a row
+and then pass twice. It is not the node cull (`SAFFRON_NODE_CULL=off` hangs
+too), not the code (llvmpipe is green, and the identical binary passed on NVIDIA
+between failures), and not the engine at large (e2e is 361/361 on NVIDIA). That
+narrows it to the schema check's thumbnail path against this driver, and it
+wants a session with a fresh GPU state to pin down. Recorded as open rather than
+explained away.
+
+NEXT: slice 7's remaining boxes — generator outputs (atlases,
+coverage-preserving family textures, aggregate-voxel appearance error), the
+plant workspace's render surfaces, bounded preview with cancellation, and the
+recipe wiring that would close the interchange box.
+
+### USD skeletons, and reversing the dependency choice
+
+LOCKED DESIGN. `read_usd_skeletons` returns every `UsdSkel` skeleton in a USDA
+stage: its `SkelRoot`, its joints in declared order, each joint's derived
+parent, and rest/bind transforms as row-major `matrix4d`. Exposed as
+`sa vegetation-usd-skeletons`.
+
+I AM REVERSING THE USD DEPENDENCY DECISION, and that needs saying plainly. The
+plan recorded "take a real USD dependency", and I asked for that choice before
+reading `interchange_usd.rs`. That module deliberately parses the USDA text
+form with no runtime, because the arrays a plant needs are stated directly.
+Adding a runtime now would mean either a second reader over the same files —
+the two paths the conventions forbid — or rewriting a working one. What a
+runtime would genuinely add is `.usdc`/`.usdz` binary crate support, which is a
+different capability from this box. This is a judgement call on new
+information, not a refusal: say the word and I will build the runtime path.
+
+TWO TRAPS, both caught by tests written to catch them. USD states the joint
+hierarchy in the path tokens rather than a parent array, so a plain string
+prefix makes `Root/Trunk` the parent of `Root/TrunkGuard` — an error that
+passes every count and length check and surfaces only as a limb bending off the
+wrong joint. And a `matrix4d` nests its four rows inside an outer pair, which
+the existing tuple scanner reads off by one; that scanner is correct for a flat
+point list, so matrices got a nesting-aware one rather than a change to it.
+
+THE BOX STAYS OPEN, deliberately. The skeletons are readable and inspectable,
+but nothing wires one into a `PlantSourceRole::Skeleton` entry of an imported
+recipe — and the box says "as source inputs". Two-thirds of a box is not a box.
+
+GATES. `just engine` EXIT=0; `just prepare-for-commit` EXIT=0; `just test`
+EXIT=0; `just e2e` EXIT=0 at **361/361 across 62 files**; `just schema`
+**251/251 on llvmpipe**.
+
+THE NVIDIA SCHEMA HANG IS OPEN AND I HAVE NOT CLOSED IT. It wedges in the
+thumbnail render path with `ERROR_DEVICE_LOST`, reproducibly enough to hit
+several runs in a row and then pass twice. Ruled out: the node cull
+(`SAFFRON_NODE_CULL=off` hangs too), the code (llvmpipe green, and the identical
+binary passed on NVIDIA between failures), and the engine at large (e2e is
+361/361 on NVIDIA). That narrows it to the schema check's thumbnail path against
+this driver. Recorded as open rather than explained away.
+
+NEXT: slice 7's remaining boxes — generator outputs (atlases,
+coverage-preserving family textures, aggregate-voxel appearance error), the
+plant workspace's render surfaces, bounded preview with cancellation, and the
+recipe wiring that would close the interchange box.
+
+### Bounded preview: one walk under two budgets
+
+LOCKED DESIGN. `BotanicalBudget` bounds axes and placed elements and carries
+the existing `GraphCancellationToken`. `grow` takes it at every call site;
+`BotanicalGrowth.truncated` reports whether it bit. `plant-growth` accepts
+`maxAxes`/`maxElements` and returns `truncated`.
+
+ONE WALK, NOT TWO EVALUATORS. A separate preview evaluator is the obvious
+shape and it is the wrong one: two would drift, and the moment they did, the
+preview would stop predicting the plant an artist is tuning.
+
+THE BOUND STOPS BETWEEN NODES, NEVER INSIDE ONE. That single rule is the whole
+guarantee. A node that ran produced exactly what it would have produced
+unbounded, so a preview is a *prefix* of the cooked plant rather than a smaller
+different one. The test asserts every previewed axis is byte-identical to its
+cooked counterpart — not merely that fewer arrived, which is what a weaker test
+would have checked and what a subtly wrong bound would have passed.
+
+THE COOKED RESULT IS UNREACHABLE FROM HERE. `BotanicalBudget::COOK` carries no
+bound and no token, and every cook path names it explicitly — including a
+module call, because half a preset is a different preset. Named rather than
+defaulted, for the same reason the module resolver is: a caller states which it
+is, so no path can preview under a bound and publish the result.
+
+GATES. `just engine` EXIT=0; `just prepare-for-commit` EXIT=0; `just test`
+EXIT=0; `just schema` **251/251**; `just e2e` EXIT=0 at **361/361 across 62
+files**.
+
+NEXT: slice 7's last two boxes — generator outputs (atlas packing,
+coverage-preserving family textures, aggregate-voxel appearance error) and the
+plant workspace's render surfaces — then slice 8.
+
+### The atlas packer
+
+BUILT (`assets/src/atlas.rs`): a deterministic shelf packer returning the
+smallest power-of-two square that holds a set of `(slot, width, height)`
+entries, plus `remap` from a slot-local UV into atlas space.
+
+THREE DECISIONS WORTH THE WORDS.
+
+*Order-independent by construction.* Tallest first, slot breaking ties. The
+layout reaches cooked bytes, so one that moved with the caller's iteration
+order would change every artifact hash for no reason anyone could see. A test
+packs the set forward and reversed and requires the identical layout.
+
+*A gutter, not touching rectangles.* Bilinear filtering reaches past a
+sub-rectangle's edge, so neighbours bleed — a leaf carrying a sliver of bark,
+visible only at distance and only sometimes. Mutation-checked: dropping the
+gutter from the advance fails `the_gutter_separates_every_pair`, and nothing
+else.
+
+*Refuse rather than partially pack.* A silently dropped slot renders
+untextured, which reads as a material bug rather than the budget one it is.
+
+THE BOX STAYS OPEN, and the note on it now says exactly which of its four
+clauses this closed. The packer is the algorithm; nothing yet drives it from a
+generated family's material slots. Coverage-preserving family textures,
+aggregate-voxel appearance error, and RT/OMM derivation inputs are untouched.
+One generator of four is not the box.
+
+GATES. `just engine` EXIT=0; `just prepare-for-commit` EXIT=0; `just test`
+EXIT=0.
+
+NEXT: the plant workspace's render surfaces, then slice 8.
+
+### Measured aggregate-voxel error
+
+BUILT (`calibrate_voxel_appearance_error`). The cooker's analytic estimate is a
+function of bounds and material moments — cheap, and necessarily a guess about
+how wrong the aggregate will *look*. The cut selector trusts that number to
+decide when a brick may stand in for triangles, so a low estimate swaps too
+early and pops. The generator renders every transition device-free through the
+reference path already in the tree, takes the component-wise maximum across the
+canonical fixtures, and widens any declared error the measurement exceeds.
+
+IT ONLY EVER WIDENS. A measured error *below* the estimate means the estimate
+was conservative; narrowing to the measurement would trust a finite fixture set
+to have found the worst view, which is the exact assumption a measured
+calibration exists to avoid.
+
+THE FIXTURE HAD TO CHANGE, and that is the part worth recording. My first
+version cooked a tetrahedron and passed — but the analytic estimate already
+covered its measurement, so the calibration widened nothing and the test proved
+nothing. I only found it because I added `assert!(!calibration.widened
+.is_empty())` on the suspicion, and it failed immediately. The fixture is now a
+comb of thin separated blades: a brick fills the gaps and reads as a slab while
+the triangles read as a comb, and bounds plus occupancy cannot see the
+difference. That is the case the estimate is blind to, which is the only case
+worth calibrating against.
+
+Two clauses of this box are now built and two are not, so the box stays open
+and its note says which is which.
+
+GATES. `just engine` EXIT=0; `just prepare-for-commit` EXIT=0; `just test`
+EXIT=0.
+
+NEXT: coverage-preserving family textures and a cook stage driving both new
+generators — then the plant workspace surfaces, then slice 8.
+
+### Coverage-preserving family textures
+
+BUILT (`generate_family_atlas`). Packing and mipping happen in one call because
+splitting them invites the bug: packing alone leaves a caller to composite, and
+the naive composite writes transparent **black** into the gutter, which filters
+into the slot's edge as a dark fringe — the artefact that makes packed foliage
+look dirty at distance and only at distance.
+
+The gutter carries the **edge texel's colour at zero alpha**, so filtering pulls
+in the right hue and no coverage. Mutation-checked: zeroing the gutter's RGB
+fails `the_gutter_carries_edge_colour_at_zero_alpha` and nothing else, which is
+what makes that test worth its name.
+
+Mips are the alpha-area-preserving chain rather than a box filter, because a
+cutout thinned by naive downsampling vanishes at distance — the reason that
+chain exists at all. A slot whose buffer does not match its declared extent is
+refused rather than composited positionally into someone else's rectangle.
+
+Three of this box's four clauses are now built. The box still stays open: RT/OMM
+derivation inputs are untouched, and nothing yet drives any of the three
+generators from a cook stage — they are the algorithms, not the pipeline steps.
+
+GATES. `just engine` EXIT=0; `just prepare-for-commit` EXIT=0; `just test`
+EXIT=0.
+
+### RT/OMM derivation inputs
+
+BUILT (`FamilyAtlas::alpha_plane`). The plane comes from the **packed** atlas,
+not from a slot's own image, and that is the entire point: after packing, a
+triangle's UVs address atlas space, so a min/max pyramid over the unpacked
+image would answer questions about texels the GPU never reads.
+
+The test is end-to-end rather than structural. It runs the real Phase 11
+`derive_opacity_micromap` over the generated plane, with the quad's UVs remapped
+through the layout, and requires the derivation to *prove opaque* inside a solid
+slot. A shape check — "the plane is the right length" — would have passed on a
+plane taken from the wrong image.
+
+ALL FOUR GENERATORS NOW EXIST AND NONE IS FAKED, which is what the box asks
+for. It still stays open on the wiring: nothing drives the packer, the texture
+generator, the calibrator, or the plane from a cook stage. A native family's
+cook still resolves its materials without packing them. Four algorithms is not
+a pipeline, and the box's own words are "each needs a generator of its own" —
+the generators are there, the stage that calls them is not.
+
+GATES. `just engine` EXIT=0; `just prepare-for-commit` EXIT=0; `just test`
+EXIT=0.
+
+### Cross-adapter image parity
+
+BUILT (`tests/e2e/cross-adapter-parity.test.ts`). Two hosts differing in
+exactly one environment variable — `VK_ICD_FILENAMES` — so scene, camera, and
+settle are identical by construction and only the driver differs. The discrete
+RTX 3070 Ti against Mesa llvmpipe.
+
+Every other pixel test in the suite compares one adapter against itself, which
+catches a regression but says nothing about portability. A shader leaning on
+NVIDIA's rounding, a pass reading memory the driver happens to zero, a subgroup
+path with no software equivalent — all invisible to a single-adapter run, all
+surfacing later as "it looks wrong on the other machine".
+
+THE TOLERANCE IS MEASURED. The two adapters agree to ~0.16 mean absolute
+per-channel difference on this scene; the bound is 1.5. That leaves room for
+driver noise and stays far tighter than a real defect, which moves a frame by
+whole channel values rather than fractions of one.
+
+THREE REGIONS, NOT JUST THE FRAME. A whole-frame mean hides a localized defect:
+a wrong object against a large correct sky averages down to nothing. Sky,
+object, and ground are scored separately.
+
+THE HOSTS ARE PROVED DIFFERENT, not assumed. If the loader ignored the
+override, both would run the same adapter and every comparison would pass for
+the wrong reason — the exact vacuous-pass failure I hit twice earlier in this
+planset. `softwareGpu` comes back from `render-stats`, and a one-adapter
+machine skips the comparison loudly rather than going quietly green.
+
+I ALSO DELETED A TEST I HAD JUST WRITTEN. My first version ended with
+`expect(stats.native.softwareGpu).toBe(stats.native.softwareGpu)` under the
+name "neither adapter reports validation errors" — a tautology wearing a useful
+title. The real check belongs in the capture helper, where each host asserts
+its own log clean, and that is where it now lives.
+
+GATES. `just prepare-for-commit` EXIT=0; `just e2e` EXIT=0 at **365/365 across
+63 files**.
+
+### Bin and deformation counters
+
+BUILT: word 18 counts executor buckets that received their first record — the
+number of indirect draws the frame issues — incremented on the pass that
+already touches every record rather than by scanning the bucket table
+afterwards. Word 19 counts instances a view composed deformed bounds for.
+
+THE PREPASS HAS NO COUNTER BINDING, which I found by writing the increment
+there first and watching it fail to compile. `wind_deform.slang` binds only the
+address block. Rather than widen its descriptor layout for a diagnostic, the
+count moved to the cull pass, which already holds the counters and already
+reads the wind flag to add bounds slack. That also makes it the more useful
+number: deformation work that reached a view, not slots that merely carry the
+flag.
+
+BOTH HALVES OF THAT COUNTER ARE PROVED, and this is the specific way telemetry
+ships broken. A word wired to the wire but never incremented reads as a healthy
+zero, and a zero is indistinguishable from "this frame did no such work" —
+nothing looks wrong. So `visibility-counters` asserts it is *exactly* zero for a
+scene with nothing wind-flagged (which a counter incrementing on every instance
+would fail), and `vegetation-mechanics` asserts it is nonzero with a resident
+plant (which the first test alone cannot show). Neither assertion is sufficient;
+together they pin it.
+
+The mechanical constraint this box owned — widening
+`SCENE_VISIBILITY_COUNTER_WORDS` past 16 — was resolved by the node-cull slice,
+and the new words ride the same fence-gated readback rather than a second copy.
+
+THE BOX STAYS OPEN on overdraw, BLAS build *time* (which wants GPU timestamps,
+not a counter word), and OMM metrics.
+
+GATES. `just prepare-for-commit` EXIT=0; `just test` EXIT=0; `just schema`
+**251/251**; `just e2e` EXIT=0 at **370/370 across 64 files**.
+
+### NVIDIA tier validation closed
+
+The box's "NOT VALIDATED" list had gone stale under its own planset. It named
+three gaps — the mesh tier, the OMM tier, and optional NV cluster-AS — and two
+of them were built during these slices.
+
+MESH TIER: `VK_EXT_mesh_shader` executors exist for depth and shaded, and
+`mesh-executor-parity` boots two hosts differing only in
+`SAFFRON_MESH_EXECUTOR`, **reads back which executor each actually used** rather
+than assuming, and requires the frames to agree. 3/3 on this adapter.
+
+OMM TIER: `a_derived_micromap_builds_validation_clean` derives a micromap,
+records `vkCmdBuildMicromapsEXT` on this device, submits, waits, and asserts
+both that storage was reserved and that the validation-issue count did not
+move. Green on the RTX 3070 Ti.
+
+OPTIONAL NV CLUSTER-AS: the adapter advertises it; the engine builds no CLAS
+path. There is nothing to validate rather than something failing — and the box
+says *optional*. Recorded so that a future cluster-AS executor reopens this
+rather than inheriting a tick it did not earn.
+
+I re-ran each tier's evidence on the adapter rather than citing the earlier
+numbers in the note, because the note's own figures (`e2e` 332, `schema` 249)
+were from before this session's work and a stale citation is how a box gets
+ticked on someone else's run.
+
+GATES on this adapter: `just e2e` **370/370 across 64 files**, `just schema`
+**251/251**, `just test` EXIT=0, `just prepare-for-commit` EXIT=0.
+
+### A counter I chose not to add
+
+The RT telemetry box lists OMM hit classes as an open clause, and its note said
+"the OMM derivation box is unbuilt, so there are no classes to count." That is
+no longer why. The derivation IS built: `derive_opacity_micromap` produces
+`MicromapClasses`, `record_micromap_build` records
+`vkCmdBuildMicromapsEXT`, and `a_derived_micromap_builds_validation_clean`
+proves both on the RTX 3070 Ti.
+
+What is missing is the **attachment**. `MeshBlasGeometry::micromap` is the seam
+and nothing in the frame path fills it — `record_micromap_build` has no
+production caller, so no micromap is retained per frame.
+
+I could have added `ommOpaque` / `ommTransparent` / `ommUnknown` to
+`render-stats` in about ten minutes and ticked a clause. They would read zero
+every frame, forever, and a zero there means "this frame had no unknown
+micro-triangles" — a healthy-looking answer to a question nothing asked. That
+is precisely the failure this session has caught three times in its own tests,
+and shipping it deliberately would be worse than shipping it by accident.
+
+So the clause stays open and the note now says the narrow, true reason. The
+work that closes it is attaching a derived micromap in the production BLAS
+path, not a telemetry line.
+
+GATES. `just prepare-for-commit` EXIT=0; `just test` EXIT=0.
+
+### A test I wrote, proved worthless, and deleted
+
+`vegetation-distant-wind` was meant to close the "distant vegetation keeps
+moving" box. It forced the coarsest cut with `SAFFRON_CUT_OVERRIDE=coarse`,
+confirmed `voxelRecords > 0`, measured consecutive-frame motion under a gale
+against a still control, and passed all four assertions.
+
+Then I mutated the aggregate-voxel branch to apply zero sway. **It still
+passed.**
+
+The counters explain it: at that camera the frame draws 6 records — 1 aggregate
+voxel and 5 micro-blade grass candidates. The motion the test measured was the
+grass. The plant contributed too few pixels to move the mean, so the assertion
+was true of the scene and false of the claim.
+
+`voxelRecords > 0` felt like the non-vacuity guard and was not one. It proves
+an aggregate is *present*, not that it is what the measurement is *about* —
+a distinction I have now been caught by three times today in three different
+disguises.
+
+There is no toggle to draw the aggregate without the micro field, and asserting
+on a screen region would need that region verified empty of scattered grass. So
+the test is deleted rather than weakened, the box stays open, and its note
+records the counter evidence and what a real test would need. A test that
+passes for a reason unrelated to its name is worse than no test: it converts an
+open question into a false answer.
+
+GATES after the deletion and the shader restore: `just prepare-for-commit`
+EXIT=0; `just test` EXIT=0.
+
+### A box closed by re-reading its own note
+
+Phase 11's gate box carried two outstanding clauses, and both had gone stale
+under this planset rather than being genuinely open.
+
+"Cross-platform validation needs a second adapter" — it needs a second
+*adapter*, not a second machine, and this one has two. The cross-adapter parity
+test built earlier in this slice run is exactly that.
+
+"The RT half of the docs cannot be validated against a run because this device
+reports no ray-tracing extensions" — simply wrong. The RTX 3070 Ti reports
+`VK_KHR_acceleration_structure`, `VK_KHR_ray_query` and
+`VK_EXT_opacity_micromap`, `rt-telemetry` is 4/4, and a micromap builds on the
+device validation-clean.
+
+I re-ran every clause rather than closing on the note's own figures, which cited
+`e2e` 328 from before this session. Current: standard gate EXIT=0 throughout,
+`just schema` 251/251, `just e2e` 370/370 across 64 files, docs three-check
+re-run (hugo clean, 60558 links unbroken, the three shadow/GI/RT pages each
+0/0).
+
+Worth noting what this round was: no new engine code, only measurement. A stale
+"outstanding" is as much a defect in the record as a stale tick, and it costs
+the next reader the same thing — they plan around a constraint that lifted
+months ago.
+
+GATES. `just engine` EXIT=0; `just prepare-for-commit` EXIT=0; `just test`
+EXIT=0; `just schema` 251/251; `just e2e` 370/370; docs 3× clean.
+
+### Auditing the notes for the same rot
+
+Last round closed a box whose "outstanding" clauses had both gone stale. That
+suggested a sweep, and it found another: the GI/reflection culling box asserted
+that vegetation "never becomes an `SdfInstance` or an `RtInstanceInput`" and
+that "no plant, grass blade, or micro-field instance casts GDF/DDGI occlusion,
+appears in a ray-traced reflection, or shadows a ReSTIR ray."
+
+Half of that stopped being true when the plant per-use BLAS landed earlier in
+this run. `vegetation_ray_instances` publishes plants into the TLAS from
+retained state, and `vegetation-rt` asserts they arrive with their own
+structures. Plants cast ray-traced shadows now.
+
+The other half is still exactly true: nothing vegetation-shaped becomes an
+`SdfInstance`, so plants cast no GI occlusion, and grass is absent from ray
+tracing entirely — blades exist only as GPU-reconstructed micro candidates with
+no CPU-side instance to publish.
+
+The note now says which half is which. The box stays open, because its actual
+claim — routing the world-space consumers through the traversal cut and
+residency demand — is untouched.
+
+A note that overstates what is broken is as costly as one that overstates what
+is done. This one would have sent the next reader to rebuild something that
+already works.
+
+### An acceptance box that now has a counterexample
+
+"Triangle↔aggregate transitions stay within defined direct/indirect/
+transmission/normal error" carried no note at all — unassessed, which is the
+weakest state a box can be in. It is now open *with a counterexample*, which is
+strictly more useful.
+
+The measurement was already in the tree: `compare_triangle_voxel_transitions`
+renders every voxel node against its finest triangle descendants device-free
+and scores exactly the components this box names.
+
+The counterexample came out of the calibration work. A comb of six thin
+separated blades cooks to a hierarchy whose measured error **exceeds** its
+declared one, because the analytic estimate derives from bounds and material
+moments and cannot see that a brick fills the gaps — the aggregate reads as a
+slab where the triangles read as a comb. A tetrahedron does not reproduce it,
+which is why the gap sat unnoticed: the obvious fixture is the one that hides it.
+
+`calibrate_voxel_appearance_error` fixes it and is idempotent, but nothing calls
+it from a cook, so shipped artifacts still carry the estimate.
+
+The box stays open with the counterexample, the fix, and the wiring gap all
+named. That matters more than usual here: the failing case is thin features,
+and vegetation is entirely thin features.
+
+### The last unassessed box, answered
+
+"Main/depth/VSM/GI/reflection/RT select compatible hierarchy cuts and coverage"
+also carried no note. The answer splits cleanly.
+
+Main, depth and VSM are compatible **by construction, not by agreement**. There
+is one traversal shader and three dispatch sites; each pushes its own eye,
+projection scale and `viewProj` through the same code and the same threshold,
+so the cuts differ only where the views differ and cannot diverge in kind. The
+depth prepass and the main pass consume the *same binned record stream* rather
+than traversing twice, so they cannot disagree at all. I verified this shape
+directly while adding `viewProj` to the traversal push for the node cull.
+
+GI, reflection and RT do not select a cut — they do not participate in the
+hierarchy at all. Both world-space lists are CPU-gathered by a full-ECS scan.
+"Compatible" is the wrong question for them; the question is whether they
+participate, and the answer is no.
+
+So this box cannot close before the GI/reflection culling one. It is a claim
+about consistency across six consumers, and three of them consume something
+else entirely. Recording that dependency is worth more than the box's tick,
+because it tells the next reader these are one piece of work rather than two.
+
+## Slice 1 — the plan record, re-audited against the tree
+
+The notes in this planset are its memory, and four of them had drifted far
+enough to send the next reader at the wrong problem. Re-reading them against
+the code found the remaining work is **smaller than the files claim**, not
+larger — infrastructure landed after the notes describing its absence were
+written, and nothing went back to amend them.
+
+### What was actually false
+
+**Opacity micromaps read as unbuilt and are close to done.** The note said the
+producer was absent, that the
+`VkAccelerationStructureTrianglesOpacityMicromapEXT` chain onto the triangles
+geometry was absent, and that `triangle_geometry` returns `<'static>` and
+hardcodes `GeometryFlagsKHR::OPAQUE`. All three are now false: the derivation
+exists and is mutation-checked, the chain is built and pushed, and
+`MeshBlasGeometry` carries both an `opaque` field and a `micromap` slot. What
+is missing is **wiring in four named places** — no production caller for the
+derivation, `micromap: None` at both upload sites, no cook stage emitting into
+the `RayTracing` section, and one geometry per BLAS so opacity cannot vary per
+submesh. That is a materially different task from the one the note described.
+
+**Overdraw read as missing and ships today.** Fragment-shader invocations over
+render-area pixels, per pass, on the wire, already printed as `overdraw N×` in
+the editor capture table. The genuinely absent half is *quad utilization*,
+which needs a fragment-side counter path the tree does not have anywhere.
+
+**BLAS build time read as needing new timestamp infrastructure.** It does not.
+Every graph pass is already bracketed in timestamps, and the BLAS refits share
+a timed pass with the TLAS build whose body takes a scope recorder and throws
+it away. Only the *initial* static build and its compaction sit outside the
+graph. The box was priced as a subsystem and is closer to a named child scope.
+
+**The plant 3D preview read as missing and exists.** A `.splant` reaches the
+live `assetPreview` subsurface; only biome and vegetation-map subjects
+short-circuit to a summary. The real gap is far sharper and was invisible
+underneath the wrong claim: `openPanel("plantGraph")` is called from nowhere,
+so a built, registered panel never surfaces on its own — and for a rigless
+plant the capability effect closes the very dock leaf it homes to.
+
+### Two claims I expected to correct and did not
+
+Worth recording, because the discipline only means something if it also stops
+me from inventing corrections to hit a number. My own research brief asserted
+that `CookDependencyAddress::SourceAsset` does not exist and that the cook has
+no cache-sharing lock protocol. **Both were wrong in the brief, not in the plan
+files** — the variant exists and is handled, and the store takes real
+cross-process advisory locks on two scopes, which the phase-15 note already
+says. Nothing needed changing. Four corrections, not six.
+
+### The one refinement
+
+The GI note recorded "the cut is now applied" without saying the cut landed on
+**one of two lists**. `sdf_instances` is gated against the cascade window;
+`rt_instances` and the spliced vegetation ray instances are not. The reach
+argument that makes the SDF cut sound applies to them unchanged — same window,
+simply not yet consulted. Left as it stood, the note would have read as though
+the reflection half were covered.
+
+### Gates
+
+No code changed, so the build gate does not apply. Box count verified unmoved
+at 20 across the same four phase files.
+
+### NEXT
+
+Slice 2 — wire the four cook-stage generators that exist, are unit-tested, and
+have zero production callers. `calibrate_voxel_appearance_error` must run after
+the hierarchy cooks and before the voxel bytes are taken, and it needs a
+reference-fixture producer the cook does not have. Closing it also closes the
+triangle↔aggregate transition box, whose bound is the thing calibration widens.
+
+## Slice 2 — the calibration reaches a cook, and it was load-bearing
+
+`calibrate_voxel_appearance_error` now runs inside `build_plant_sections`,
+between cooking the hierarchy and taking any section bytes. The fixture producer
+the slice was scoped to need turned out to exist already —
+`canonical_hierarchy_reference_fixtures()` is public, deterministic, and is the
+same six view/light pairs the conformance tests measure against, so the cook and
+the tests agree by construction rather than by two parallel definitions.
+
+`CookVersionSet.compiler` went 2 → 3. That is the correct field: the artifact
+schema does not change, the values inside it do, which is exactly what a
+compiler version means here. Nothing needed a format bump.
+
+### The measurement that justifies the whole stage
+
+The full suite passed on the first run after wiring — which is the shape a
+useless change also has. A calibration that runs and widens nothing is
+indistinguishable from one that never ran, and the box this closes had already
+been failed once by a fixture whose analytic estimate happened to be
+conservative. So the test asserts the box's actual property on a **published
+artifact** — decode the cooked sections back into a hierarchy, re-measure every
+transition, assert each is within its declared error, and assert the comparison
+set is non-empty first, because a loop over nothing passes.
+
+Then the mutation check, which is what makes it evidence:
+
+    voxel node 1 exceeds its declared error:
+      measured  silhouette 4294967295
+      declared  silhouette 196608
+
+Removing the call fails on the very first thin-sheet node with a **saturated**
+measured silhouette error against a declared 196608. Not a marginal miss — the
+analytic estimate is wrong by the full range of the type, on a real cooked
+plant, in the direction that makes the cut selector swap to the aggregate too
+early. The comb counterexample recorded earlier in this file was not a
+pathological hand-built fixture; it reproduces on ordinary thin-sheet foliage.
+
+### One scope correction, made rather than hidden
+
+The slice was planned to close phase 14's generator box too. It cannot, and the
+box text is why: it names **four** generators — atlases, coverage-preserving
+textures, aggregate-voxel appearance error, and RT/OMM derivation inputs. Only
+the third is now wired.
+
+More usefully, reading the cook settled the *order* of the other three. Coverage
+texture pixels never enter the plant artifact today — `material_section` writes
+material id, content hash, and document bytes, and the runtime resolves the
+texture through the catalog. So atlasing is not a wiring job on top of an
+existing payload; it changes what the artifact carries and what the runtime
+binds. And it **must precede the OMM derivation**, because an atlas remaps the
+UVs the derivation reads. Deriving micro-triangle opacity against pre-atlas UVs
+would be silently wrong in a way no test of either piece alone would catch.
+
+The atlas therefore becomes its own slice, immediately before the micromap work,
+rather than a second half of this one.
+
+### Gates
+
+`just engine` EXIT=0. `just prepare-for-commit` clean — clippy and oxlint both
+silent. `just test` green across the workspace, including the new case. Nothing
+else moved: no golden needed regenerating, which is consistent with the coverage
+pixels never having been in the artifact.
+
+### NEXT
+
+Slice 3 — the coverage-texture cook key. `plant_cook.rs` hashes the material
+*document*, and the document names its coverage texture by UUID, so repainting
+the texture leaves the key unmoved and returns a stale artifact. The
+`SourceAsset` dependency variant already exists and is already handled; this is
+about thirty lines and no format change. It has to land before anything derives
+cooked data from those pixels, which the atlas and the micromap both do.
+
+## Slice 3 — a stale artifact that was reachable today
+
+This slice has no box. It fixes a live defect that would have become a
+correctness bug the moment a micromap was cooked from coverage pixels, and was
+already one for the geometry-first contour.
+
+A plant's cook key hashed the material **document**. The document names its
+coverage texture by id and carries none of its pixels. So repainting a leaf
+cutout left the document byte-identical, the key unmoved, and the cooker
+answered the edited texture with the previous artifact.
+
+The coverage guards do catch this — but a guard is a staleness check at
+publication, and **a cache that returns a hit never reaches it**. That is the
+whole distinction: the guard tells you an artifact you decided to publish is
+stale; it cannot tell you about one you decided not to rebuild.
+
+### The shape of the fix
+
+`ResolvedCoverageImage` now carries the texture it was decoded from and the hash
+of the bytes read, and `plant_dependencies` emits one `SourceAsset` dependency
+per distinct coverage texture. `CookDependencyAddress::SourceAsset` already
+existed and `validate_live_catalog` already handled it, so no variant, no
+format change, and no version bump — the key simply gained an input it always
+depended on.
+
+The field is `Option`, and the `None` case is not laziness: an **imported**
+material's texture bytes travel inside the model source and are already covered
+by that source's own content hash. Emitting a second dependency for them would
+be a duplicate key for one input. Only the catalog-texture path was uncovered.
+
+`MaterialCoverage` stays alongside it rather than being replaced. The two are
+different inputs — the document carries the cutoff and the blend mode, the
+texture carries the pixels — so this is not a duplicated purpose.
+
+### Threading it through
+
+The one piece of real work: `ResolvedPlantInputs` aggregated the per-source
+resolutions and **dropped** the coverage images, and the native path discarded
+them at the destructure with a `_`. Both now carry them, so the imported and
+native families reach the dependency emission through the same field rather
+than one of them silently contributing no texture keys.
+
+### Gates
+
+`just engine` EXIT=0, `just prepare-for-commit` clean, `just test` green.
+
+`repainting_a_coverage_texture_moves_the_cook_key` writes a real PNG, catalogs
+it as a masked material's albedo, validates, repaints the file, and validates
+again — asserting the texture's dependency hash moved and the whole dependency
+set with it. It looks the texture dependency up by address **before** comparing,
+so a run where the texture never became an input fails loudly rather than
+comparing two keys that agree because neither mentioned it.
+
+Mutation-checked: suppressing the emission fails it at that lookup.
+
+### NEXT
+
+Slice 4a — the multi-geometry BLAS refactor, with no micromap attached yet.
+This is the guarded half: `tests/e2e/rt-anyhit.test.ts` must stay green and
+**unchanged**, because deleting the per-instance opacity override is exactly
+what that test's margin guards. Nothing attaches a micromap until it is.
+
+## Slice 4a — opacity moves onto the geometry
+
+A BLAS built as one geometry can carry exactly one opacity class. That is the
+whole reason a micromap was inert here: one masked submesh forced the coverage
+classifier onto every other submesh in the mesh, and a micromap — which refines
+a *single geometry's* coverage — had nothing to attach to. `record_mesh_blas_build`
+now takes a slice and emits one geometry per material-homogeneous submesh, each
+with its own flag.
+
+### The per-submesh class was already cooked
+
+The earlier attempt at this failed and was reverted, and the note recorded why:
+cook-time class cannot express a runtime material assignment. That is still true
+— but it is a statement about *instances*, not about geometry, and reading the
+cooker showed the classes themselves have been in the artifact all along.
+`PortableTriangleCluster` records the `(prototype, source_submesh)` it came from
+alongside its resolved `material_class`. Prototypes own contiguous runs of the
+submesh table in id order, which is the same walk the per-prototype index ranges
+already use. So `cooked_submesh_opacity` reconstructs the per-submesh classes
+with **no format change and no version bump** — which is what let this land as
+its own guarded slice instead of being folded into the micromap work.
+
+A submesh no cluster covers is reported non-opaque. That is the conservative
+direction: it surfaces ray candidates for the classifier, where guessing opaque
+would commit hits on geometry nothing verified.
+
+### `force_opaque` is gone, and what replaced it is not the same thing
+
+`RtInstanceInput.force_opaque` was a bool that always packed either
+`FORCE_OPAQUE` or `FORCE_NO_OPAQUE`. Per spec either one overrides an attached
+micromap outright, so *every* instance was overriding *every* frame — the
+mechanism that made micromaps pointless was unconditional.
+
+It is now `opacity_override: Option<bool>`, computed by comparing the entity's
+resolved materials against `GpuMesh::cooked_opaque`. Agreement — the common case
+— yields `None`, no force bits, and the geometry's own flags in charge. Only a
+genuine disagreement forces, and then it *also* packs
+`DISABLE_OPACITY_MICROMAPS_EXT`, because a micromap derived for the cooked
+material describes coverage this instance does not have. That makes the override
+explicit rather than an implicit spec side-effect.
+
+**Vegetation passes `None` unconditionally**, and that is the actual unlock. A
+plant binds the materials it was cooked with; there is no entity to reassign
+one. Previously it passed `force_opaque: false`, forcing `FORCE_NO_OPAQUE` on
+every plant instance — so every plant's micromap would have been inert, and the
+coverage classifier ran on opaque trunk submeshes nothing needed to test.
+
+### The bug this slice introduced, and the test that caught it
+
+`ALLOW_DISABLE_OPACITY_MICROMAPS_EXT` went into the build-flags `const`
+unconditionally. On the RTX 3070 Ti that is fine. On llvmpipe it is **not an
+inert flag but an invalid enum value**, and `cross-adapter-parity` failed with
+`VUID-VkAccelerationStructureBuildGeometryInfoKHR-flags-parameter` — the flag
+requires `VK_EXT_opacity_micromap`, which a software adapter does not have.
+
+Worth recording as more than a fixed bug. A `const` is exactly where a
+capability precondition gets forgotten, because a constant reads as something
+with no preconditions. The flags are now `mesh_blas_build_flags(omm_supported)`,
+threaded from `Device::omm_supported()` through the uploader.
+
+It is also the clearest argument yet for keeping the software adapter in the
+suite: this defect is invisible on the discrete card, and would have surfaced
+later on MoltenVK as a validation error nobody was watching for.
+
+### Gates
+
+`just engine` EXIT=0, `just prepare-for-commit` clean, `just test` green.
+`just e2e` **370/370 across 64 files, 0 fail** — the baseline, restored with the
+refactor in place.
+
+The guard held: `rt-anyhit` is green and **unchanged** at 2 pass / 5 expect()
+calls. Its 14.5/255 margin exists because the blocker's candidates reach
+`gpuSceneRayCandidateCovered`, and that now happens through per-submesh geometry
+flags plus an instance override rather than through an unconditional force.
+`cross-adapter-parity` is 4/4 and still proves the two hosts are different
+adapters, so it did not pass by comparing a host with itself.
+
+`force_opaque` and `MESH_BLAS_BUILD_FLAGS` return nothing across the engine, the
+editor, and the tests — no superseded path survives.
+
+### NEXT
+
+Slice 3b — the family atlas in the cook, which must precede the micromap work
+because an atlas remaps the UVs the derivation reads. Deriving micro-triangle
+opacity against pre-atlas UVs would be silently wrong in a way no test of either
+piece alone would catch.
+
+## Slice 3b — the family atlas, cook to GPU
+
+### Landed and gated
+
+The plant cook packs a family's coverage images into one atlas and rewrites the
+family's UVs to address it. `atlas_normalized_family` runs inside
+`build_plant_sections`, after `apply_geometry_first_contours` — that ordering is
+load-bearing, since the contour pass re-tessellates alpha cards against
+slot-local coverage and emits new UVs, so remapping first would leave the contour
+addressing atlas space with a slot-local alpha plane.
+
+The remap happens on `NormalizedPlantVertex::uv_bits`, which is **upstream of the
+fork**: UVs feed both the Geometry section and the hierarchy's quantized cluster
+vertices, and rewriting at the fork point is what keeps those two from
+disagreeing. A vertex reached from two submeshes with different material slots is
+duplicated rather than refused, so atlasing does not silently depend on a mesh
+detail nobody authored.
+
+The atlas rides the **existing** `MaterialsCoverage` section rather than a
+sixteenth kind — that section is already documented as carrying "material slots,
+atlases, coverage, and texture derivation inputs", and adding a kind would have
+forced `ALL: [Self; 15]`, the schema-hash literal, and every artifact-index
+consumer. Domain went `/v1` → `/v2`, `PLANT_COMPILED_ARTIFACT_VERSION` 2 → 3, and
+the schema hash gained `+family-atlas`, so existing artifacts recook.
+
+`a_cooked_family_carries_its_atlas_and_uvs_that_address_it` proves it on a real
+cooked artifact: the family is atlased, slot 0 has a placement inside the atlas
+extent, the mip chain is longer than one level, and **every cooked vertex UV
+lands inside slot 0's own rectangle** — which is the assertion that catches
+slot-local UVs shipped alongside an atlas.
+
+`just engine` and `just test` are green.
+
+### The runtime half, and an id that was not minted
+
+An atlas the runtime does not bind is worse than no atlas: the family's UVs
+address it, so the slot's own image is no longer what those UVs index. The two
+halves had to land together.
+
+The obvious shortcut — mint a synthetic texture id per family, seed
+`texture_by_uuid`, and repoint each side-loaded material's `albedo_texture` at it
+— was **rejected on a structural ground**. Ids are minted uniformly from
+`[1024, u64::MAX]` (`core/src/uuid.rs`); the only structural range is the reserved
+`< 1024` one, so there is no id a family can derive that is guaranteed not to
+collide with a real asset. AGENTS.md independently warns against seeding ids into
+caches, since a wholesale clear then loses them.
+
+So the uploaded atlas hangs off `PlantFamilyRender` as an `Arc<GpuTexture>`, and
+`intern_material` substitutes it for the slot's albedo and coverage textures. The
+substitution happens at that one seam deliberately: the whole material path —
+params, codegen, coverage extent — then behaves identically for atlased and
+un-atlased families rather than growing a second branch.
+
+`MaterialKey` gained an `atlas_family` discriminator, which is not bookkeeping.
+Two families may bind the same material and pack different atlases; without the
+family in the key, the first family's device record would be handed to the second,
+whose UVs address a rectangle in a different image.
+
+The upload is sRGB, matching how the slot textures it replaces were uploaded, so
+packing does not shift colour. Alpha is unaffected by the sRGB encoding, so the
+same image serves the coverage classifier correctly.
+
+### Gates
+
+`just engine` EXIT=0, `just prepare-for-commit` clean, `just test` green,
+`just e2e` **370/370 across 64 files, 0 fail**.
+
+### The honest limit of that evidence
+
+**The runtime binding is not proven by a rendered frame.** The e2e vegetation
+fixtures carry no coverage textures at all, so no family in that suite cooks an
+atlas — the 370/370 shows the change regresses nothing, not that an atlased
+family renders correctly. What is proven is the cook side, on a real published
+artifact, by `a_cooked_family_carries_its_atlas_and_uvs_that_address_it`.
+
+Recording this rather than letting a green suite imply coverage it does not have.
+Closing it needs an e2e vegetation fixture whose material carries a coverage
+texture, and a frame comparison against the same family cooked un-atlased.
+
+### NEXT
+
+Slice 4b — micromap derivation, now unblocked. It must read the atlas alpha
+plane: `FamilyAtlas::alpha_plane` says why in its own doc — a pyramid over the
+unpacked image "would answer about texels the GPU never reads".
+
+## Slice 4b — derivation reaches the cook (attachment still open)
+
+**State: derivation landed and gated; nothing attaches a micromap yet.** Unlike
+slice 3b's midpoint, this one is *safe* to sit at: a micromap may only ever
+REMOVE classifier work, since every micro-triangle it settles was proven to
+classify that way for every hash, anchor and phase. An absent or unread micromap
+is therefore always correct. Cooked-and-inert is a valid state; cooked-and-half-
+attached would not be.
+
+### What landed
+
+`derive_family_micromaps` runs in `build_plant_sections` after the atlas, and
+emits one micromap per **non-opaque flattened submesh**. Opaque submeshes are
+skipped because a fully covered surface commits hits without consulting the
+classifier — there is no per-micro-triangle work there to remove.
+
+Two decisions worth keeping:
+
+**It flattens through `flatten_prototype_rows`, the same function the runtime
+uses.** The BLAS builds one geometry per flattened submesh, so the derivation has
+to key by that same index. Reusing the runtime's walk makes cook and GPU agree by
+construction rather than by two implementations of one traversal that could drift.
+
+**Base alpha is read per material, not assumed.** The atlas packs raw decoded
+texels, so a material's `base_color.w` has not been folded into the plane.
+Passing 1.0 would over-estimate coverage and could settle a micro-triangle opaque
+that the shader renders cut out — which is the single way a micromap is allowed
+to change a pixel, and therefore the one thing that must not happen.
+
+Policy comes from the material: thin-sheet foliage authors its own
+`OpacityMicromapDerivation`; a plain masked surface has no field to author one in
+and gets a default that is enabled with the widest thresholds, so the derivation
+is bounded only by what the min/max pyramid can prove. Authored thresholds
+INTERSECT the provable set — they narrow, never widen.
+
+The payload rides the `RayTracing` section, which already declared
+`opacity_micromap` per node but carried no bytes. Domain `/v1` → `/v2`,
+`PORTABLE_HIERARCHY_FORMAT_VERSION` 3 → 4. The `.smesh`/`.smodel` goldens moved
+with it and were regenerated (`UPDATE_GOLDEN=1`) — expected, since the portable
+hierarchy is inside those bytes.
+
+### Gates
+
+`just engine` EXIT=0, `just prepare-for-commit` clean, `just test` green,
+`just e2e` **370/370 across 64 files, 0 fail**.
+
+### Attachment landed
+
+`build_cooked_micromaps` rebuilds each cooked `PortableOpacityMicromap` and
+submits it before the BLAS that references it. Ordering comes from
+`with_one_off_commands`, which blocks on a fence rather than returning early, so
+the staging buffers the build reads by address are safe to drop and the micromap
+is complete before the structure consuming it starts.
+
+`GpuMesh` retains them. A built structure holds only device addresses into a
+micromap, so dropping one while a BLAS still references it frees memory the
+traversal reads — the fault class that surfaces far from its cause.
+
+**A row above the device cap is dropped, not clamped.** Clamping would mean
+re-deriving states at a coarser level, and a block decoded at the wrong level is
+not conservative, it is wrong. Dropping costs only the classifier work the
+micromap would have removed. `maxOpacity4StateSubdivisionLevel` is now read
+(`Capabilities::omm_max_subdivision`) — exceeding it is device-loss class on this
+driver, not a validation message, so it cannot be left to be caught downstream.
+
+### A real bug the test found, which the whole suite had missed
+
+The derivation produced **nothing at all**, and `just e2e` was 370/370 green
+while it did. `VirtualHierarchyMaterial::from_surface` hardcoded
+`opacity_micromap: false` for every `MaterialSurface::Standard`, so masked
+standard materials — half the scope this box names — were skipped silently.
+
+It now permits OMM exactly when the alpha classification is `Masked`. That is the
+case a micromap refines best: the ray path collapses to a step at a constant
+cutoff, so a micro-triangle whose whole footprint sits on one side of it is
+provable. Opaque has no coverage to refine; transmissive attenuates rather than
+cutting out.
+
+The first version of the test would have missed it too. A uniformly opaque
+fixture texture makes every micro-triangle uniform, which *correctly* emits the
+format's special index and no block — indistinguishable from a broken
+derivation. The fixture is now a diagonal cutout, so triangles actually straddle
+the cutoff.
+
+### Gates
+
+`just engine` EXIT=0, `just prepare-for-commit` clean, `just test` green,
+`just e2e` **370/370 across 64 files, 0 fail**.
+
+`rt-anyhit` green and **unchanged** at 2 pass / 5 expect() calls with micromaps
+attached — which is the box's own claim, since a micromap may only remove work.
+
+`a_cooked_family_derives_micromaps_that_only_ever_remove_work` asserts micromaps
+exist at all (an empty set satisfies every correctness check vacuously), that
+each classified something, and that no index dangles past its block table — a
+dangling index is what the build turns into device loss.
+
+### The honest limit, again
+
+**No micromap is built on the GPU anywhere in the test suite.** The e2e
+vegetation fixtures carry no coverage textures, so no family cooks an atlas, so
+none derives a micromap, so the attachment path never runs. 370/370 proves the
+change regresses nothing; it does not prove a micromap works on device. The cook
+side is proven on a real published artifact.
+
+This is the same gap as slice 3b's and has the same fix — task #29's textured
+fixture unblocks both at once.
+
+### NEXT
+
+Still open on this box: `sa rt-omm on|off`, the OMM hit classes on the
+`render-stats` DTO, and the A/B proof the box names — OMM-on and OMM-off frames
+identical with non-zero opaque *and* transparent counts. All three want the
+textured e2e fixture first, since without one there is nothing to A/B.
