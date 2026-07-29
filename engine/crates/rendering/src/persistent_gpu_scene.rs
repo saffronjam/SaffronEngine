@@ -348,8 +348,9 @@ pub struct GpuScenePrototypeRecord {
     pub materials: Arc<[GpuSceneMaterialHandle]>,
     /// Optional shared deformation definition.
     pub deformation: Option<GpuSceneDeformationHandle>,
-    /// Optional shared SDF resource.
-    pub sdf: Option<GpuSceneSdfHandle>,
+    /// Ordered SDF-reference list — one per baked field of the prototype's mesh, empty
+    /// when it baked none. Occluders are a prototype property; instances carry none.
+    pub sdfs: Arc<[GpuSceneSdfHandle]>,
     /// Guaranteed-resident hierarchy root.
     pub root_page: GpuScenePageHandle,
     /// Conservative object-space bounding sphere.
@@ -358,6 +359,10 @@ pub struct GpuScenePrototypeRecord {
     pub source_generation: u32,
     /// Prototype flags.
     pub flags: u32,
+    /// The authored mechanical response in its cooked integer form, or all zero when the
+    /// prototype is not a plant family. See [`crate::GpuScenePrototypeGpuRecord::mechanics`]
+    /// for the packing.
+    pub mechanics: [u32; 4],
 }
 
 /// Mutable per-world instance record.
@@ -371,8 +376,6 @@ pub struct GpuSceneInstanceRecord {
     pub material_overrides: Arc<[GpuSceneMaterialOverride]>,
     /// Optional instance-specific deformation output.
     pub deformation: Option<GpuSceneDeformationHandle>,
-    /// Optional instance-specific SDF.
-    pub sdf: Option<GpuSceneSdfHandle>,
     /// Source scene/cell generation.
     pub source_generation: u32,
     /// Instance flags.
@@ -1108,6 +1111,28 @@ pub enum GpuSceneHistoryInvalidation {
     RepresentationChange,
     /// The shared GPU Scene was rebuilt.
     SceneRebuild,
+    /// The wind field jumped: speed, gust, or a source edit the reprojection cannot follow.
+    ///
+    /// Distinct from `CameraCut` because nothing about the view moved — the GEOMETRY did, and only
+    /// the deformed geometry. Keeping the two apart is what lets a reader tell a camera teleport
+    /// from an artist dragging a wind slider when both blank the same history.
+    WindDiscontinuity,
+}
+
+impl GpuSceneHistoryInvalidation {
+    /// A stable lowercase name for logs and the control plane.
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::NewView => "new-view",
+            Self::CameraCut => "camera-cut",
+            Self::Resize => "resize",
+            Self::OriginShift => "origin-shift",
+            Self::RepresentationChange => "representation-change",
+            Self::SceneRebuild => "scene-rebuild",
+            Self::WindDiscontinuity => "wind-discontinuity",
+        }
+    }
 }
 
 /// View-local temporal, visibility, HZB, and command preparation state.
@@ -1941,7 +1966,7 @@ impl PersistentGpuScene {
         if let Some(deformation) = record.deformation {
             require(&self.shared.deformations, deformation, "deformation")?;
         }
-        if let Some(sdf) = record.sdf {
+        for &sdf in record.sdfs.iter() {
             require(&self.shared.sdfs, sdf, "SDF")?;
         }
         require(&self.shared.pages, record.root_page, "page")?;
@@ -1958,9 +1983,6 @@ impl PersistentGpuScene {
         let prototype = require(&self.shared.prototypes, record.prototype, "prototype")?;
         if let Some(deformation) = record.deformation {
             require(&self.shared.deformations, deformation, "deformation")?;
-        }
-        if let Some(sdf) = record.sdf {
-            require(&self.shared.sdfs, sdf, "SDF")?;
         }
         self.validate_instance_against_prototype(record, prototype)
     }
@@ -2055,12 +2077,7 @@ impl PersistentGpuScene {
         self.shared
             .prototypes
             .iter()
-            .any(|(_, prototype)| prototype.sdf == Some(handle))
-            || self
-                .worlds
-                .values()
-                .flat_map(|world| world.instances.iter())
-                .any(|(_, instance)| instance.sdf == Some(handle))
+            .any(|(_, prototype)| prototype.sdfs.contains(&handle))
     }
 
     fn page_is_referenced(&self, handle: GpuScenePageHandle) -> bool {
@@ -2315,11 +2332,12 @@ mod tests {
             geometry: device_handle(20),
             materials: Arc::from([material]),
             deformation: None,
-            sdf: None,
+            sdfs: Vec::new().into(),
             root_page,
             bounds: [0.0, 0.0, 0.0, 1.0],
             source_generation: 1,
             flags: 0,
+            mechanics: [0; 4],
         }
     }
 
@@ -2348,7 +2366,6 @@ mod tests {
             transform: static_transform(),
             material_overrides: Arc::from([]),
             deformation: None,
-            sdf: None,
             source_generation: 1,
             flags: 0,
             combination: 0,

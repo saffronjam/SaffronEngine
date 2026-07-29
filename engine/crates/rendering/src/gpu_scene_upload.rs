@@ -52,10 +52,36 @@ const INITIAL_OVERRIDE_ELEMENTS: u64 = 4_096;
 const ADDRESS_BLOCK_ALIGNMENT: u64 = 512;
 
 const _: () = assert!(size_of::<GpuSceneAddressBlock>() as u64 <= ADDRESS_BLOCK_ALIGNMENT);
-/// Entry capacity of one frame slot's missing-page request buffer.
+/// Entry capacity of ONE VIEW CLASS's region in a frame slot's missing-page request
+/// buffer — a per-class ceiling, not a shared one.
 pub const PAGE_REQUEST_CAPACITY: u32 = 4_096;
-/// Byte size of one frame slot's request slice: a count word plus the entries.
-const PAGE_REQUEST_SLOT_BYTES: u64 = 4 + PAGE_REQUEST_CAPACITY as u64 * 4;
+/// Bytes of one request entry: the resident page-table slot. The class is the region the
+/// entry sits in, so carrying it again would be a second copy that could disagree with
+/// the first.
+const PAGE_REQUEST_ENTRY_BYTES: usize = 4;
+/// Bytes before the first region: one count word per class.
+const PAGE_REQUEST_HEADER_BYTES: usize = crate::SCENE_VIEW_CLASSES * 4;
+/// Byte size of one frame slot's request slice: the counts plus one region per class.
+const PAGE_REQUEST_SLOT_BYTES: u64 = PAGE_REQUEST_HEADER_BYTES as u64
+    + crate::SCENE_VIEW_CLASSES as u64
+        * PAGE_REQUEST_CAPACITY as u64
+        * PAGE_REQUEST_ENTRY_BYTES as u64;
+
+/// One frame's drained missing-page requests, and what the buffer could not hold.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct PageRequestDrain {
+    /// Requested page-table slots, deduplicated, each carrying the most urgent class that
+    /// missed it — one page cannot be streamed twice, and the cheapest reader must not be
+    /// what its priority is set from. Most urgent class first.
+    pub requests: Vec<(u32, crate::SceneViewClass)>,
+    /// Requests no region had room for, summed over the classes: demand that was raised
+    /// and lost, so the page faults again next frame, later than it needed to.
+    pub dropped: u32,
+    /// Bit per class whose region filled ([`crate::SceneViewClass::bit`]). WHICH class
+    /// overflowed is the whole diagnostic — the camera's is a stall in the image, a
+    /// gather's is a slightly thinner gather.
+    pub overflow_classes: u32,
+}
 
 /// Buffer device addresses of every GPU-scene table for one frame, bound as one uniform
 /// block so growth never rewrites a descriptor. A zero address with zero capacity marks a
@@ -75,6 +101,8 @@ pub struct GpuSceneAddressBlock {
     pub coverage: u64,
     /// Resident skeleton table.
     pub skeletons: u64,
+    /// Baked signed-distance-field table.
+    pub sdfs: u64,
     /// Resident page table.
     pub pages: u64,
     /// Shared scene prototype table.
@@ -95,6 +123,8 @@ pub struct GpuSceneAddressBlock {
     pub overrides: u64,
     /// Prototype material-handle arena.
     pub prototype_materials: u64,
+    /// Per-prototype packed scene-SDF handle arena.
+    pub prototype_sdfs: u64,
     /// Material parameter-block arena.
     pub material_parameters: u64,
     /// Global vertex byte arena.
@@ -126,20 +156,36 @@ pub struct GpuSceneAddressBlock {
     pub wind_records: u64,
     /// The world interaction field (header + damped-oscillator texel cascades).
     pub interaction_field: u64,
-    /// Reserved ABI address slot (keeps the 16-byte block alignment).
-    pub reserved_address: u64,
+    /// Fragment-side coverage counters, or 0 when nothing is measuring.
+    ///
+    /// A helper invocation's stores and atomics are discarded by the spec, so an atomic here counts
+    /// COVERED samples while the `FRAGMENT_SHADER_INVOCATIONS` pipeline statistic counts every lane
+    /// including helpers. The ratio is quad utilization, which no pipeline statistic reports on its
+    /// own. Zero disables the increment through the same idiom every other optional address uses,
+    /// so an unprofiled frame pays nothing. Also keeps the block's 16-byte alignment.
+    pub quad_counters: u64,
     /// Slot capacity of the bound world's instance table.
     pub instance_capacity: u32,
     /// Slot capacity of the bound world's light table.
     pub light_capacity: u32,
     /// Deterministic temporal phase for canonical-coverage classification this frame.
     pub coverage_temporal_phase: u32,
-    /// Entry capacity of the missing-page request buffer.
+    /// Allocated entry capacity of one view class's request region — the region stride.
     pub page_request_capacity: u32,
+    /// Entries a class may actually append this frame, at most the capacity. Lowering it
+    /// is how the overflow path is reached deliberately; addressing must never use it, or
+    /// every region would move the moment it changed.
+    pub page_request_budget: u32,
+    /// Request regions in the buffer, one per [`crate::SceneViewClass`]. Carried rather
+    /// than mirrored as a shader constant so the two halves cannot drift apart.
+    pub page_request_classes: u32,
+    /// Padding to the block's 16-byte alignment. Named because `bytemuck::Pod` will not
+    /// accept a struct whose padding is implicit.
+    pub reserved: [u32; 2],
 }
 
 const _: () = assert!(
-    size_of::<GpuSceneAddressBlock>() == 272,
+    size_of::<GpuSceneAddressBlock>() == 304,
     "the GPU-scene address block must match the locked std430 layout"
 );
 
@@ -309,9 +355,12 @@ pub struct GpuSceneUploader {
     overrides: GlobalGpuArena<SceneOverrideArena>,
     worlds: BTreeMap<u64, GpuSceneWorldTables>,
     prototype_ranges: HashMap<u32, GpuArenaRange>,
+    prototype_sdf_ranges: HashMap<u32, GpuArenaRange>,
     override_ranges: HashMap<(u64, u32), GpuArenaRange>,
     address_blocks: Buffer,
     page_requests: Buffer,
+    /// Entries one class may append per frame; lowering it makes overflow reachable.
+    page_request_budget: u32,
 }
 
 impl GpuSceneUploader {
@@ -350,6 +399,7 @@ impl GpuSceneUploader {
             )?,
             worlds: BTreeMap::new(),
             prototype_ranges: HashMap::new(),
+            prototype_sdf_ranges: HashMap::new(),
             override_ranges: HashMap::new(),
             address_blocks: Buffer::new(
                 device.resources(),
@@ -373,6 +423,7 @@ impl GpuSceneUploader {
                     ..Default::default()
                 },
             )?,
+            page_request_budget: PAGE_REQUEST_CAPACITY,
         })
     }
 
@@ -388,33 +439,69 @@ impl GpuSceneUploader {
     }
 
     /// Drains `frame_slot`'s missing-page requests appended by the previous use of the
-    /// slot, then resets its count word. Call after the slot's fence has completed.
-    /// Entries are resident page-table slot indices, deduplicated in append order.
-    pub fn drain_page_requests(&mut self, frame_slot: usize) -> Vec<u32> {
+    /// slot, then resets its count words. Call after the slot's fence has completed.
+    ///
+    /// Each class's region is read in isolation, most urgent class first, so a page
+    /// several views missed lands once under the most urgent of them. A region's count
+    /// word keeps counting past the budget, which is how the drop count is known at all
+    /// — the number of requests ATTEMPTED is on the device already, and reporting only
+    /// the ones that fit would discard it.
+    pub fn drain_page_requests(&mut self, frame_slot: usize) -> PageRequestDrain {
         let base = frame_slot * PAGE_REQUEST_SLOT_BYTES as usize;
-        // SAFETY: HOST_VISIBLE + MAPPED; the slot's prior GPU writes completed with its
-        // fence before this frame reused the slot.
-        let requested = unsafe {
-            let count_ptr = self.page_requests.mapped_ptr().add(base).cast::<u32>();
-            let count = count_ptr.read_unaligned().min(PAGE_REQUEST_CAPACITY) as usize;
-            let mut entries = Vec::with_capacity(count);
-            for entry in 0..count {
-                entries.push(
-                    self.page_requests
+        let budget = self.page_request_budget as usize;
+        let mut drain = PageRequestDrain::default();
+        let mut seen: std::collections::HashSet<u32> = std::collections::HashSet::new();
+        let mut classes = crate::SceneViewClass::ALL;
+        classes.sort_by_key(|class| std::cmp::Reverse(class.page_demand_priority()));
+        for class in classes {
+            let region = class.ordinal() as usize;
+            // SAFETY: HOST_VISIBLE + MAPPED; the slot's prior GPU writes completed with
+            // its fence before this frame reused the slot. Every offset is inside the
+            // slot's own slice by construction.
+            let attempted = unsafe {
+                let count_ptr = self
+                    .page_requests
+                    .mapped_ptr()
+                    .add(base + region * 4)
+                    .cast::<u32>();
+                let attempted = count_ptr.read_unaligned();
+                let taken = (attempted as usize).min(budget);
+                let region_base = base
+                    + PAGE_REQUEST_HEADER_BYTES
+                    + region * PAGE_REQUEST_CAPACITY as usize * PAGE_REQUEST_ENTRY_BYTES;
+                for entry in 0..taken {
+                    let slot = self
+                        .page_requests
                         .mapped_ptr()
-                        .add(base + 4 + entry * 4)
+                        .add(region_base + entry * PAGE_REQUEST_ENTRY_BYTES)
                         .cast::<u32>()
-                        .read_unaligned(),
-                );
+                        .read_unaligned();
+                    if seen.insert(slot) {
+                        drain.requests.push((slot, class));
+                    }
+                }
+                count_ptr.write_unaligned(0);
+                attempted as usize
+            };
+            if attempted > budget {
+                drain.dropped = drain
+                    .dropped
+                    .saturating_add((attempted - budget).min(u32::MAX as usize) as u32);
+                drain.overflow_classes |= class.bit();
             }
-            count_ptr.write_unaligned(0);
-            entries
-        };
-        let mut seen = std::collections::HashSet::new();
-        requested
-            .into_iter()
-            .filter(|slot| seen.insert(*slot))
-            .collect()
+        }
+        drain
+    }
+
+    /// Entries one class may append per frame, at most [`PAGE_REQUEST_CAPACITY`].
+    #[must_use]
+    pub fn page_request_budget(&self) -> u32 {
+        self.page_request_budget
+    }
+
+    /// Sets that budget, clamped to a usable region.
+    pub fn set_page_request_budget(&mut self, entries: u32) {
+        self.page_request_budget = entries.clamp(1, PAGE_REQUEST_CAPACITY);
     }
 
     /// Byte stride between per-frame address-block slices.
@@ -433,6 +520,7 @@ impl GpuSceneUploader {
         deformed: (u64, u64),
         wind_records: u64,
         interaction_field: u64,
+        quad_counters: u64,
         coverage_temporal_phase: u32,
     ) -> GpuSceneAddressBlock {
         let resident = gpu_data.table_descriptors(device);
@@ -444,6 +532,7 @@ impl GpuSceneUploader {
             textures: resident.textures.address,
             coverage: resident.coverage.address,
             skeletons: resident.skeletons.address,
+            sdfs: resident.sdfs.address,
             pages: resident.pages.address,
             scene_prototypes: self.prototypes.descriptor(device).address,
             scene_materials: self.materials.descriptor(device).address,
@@ -454,6 +543,7 @@ impl GpuSceneUploader {
             lights: world_tables.map_or(0, |tables| tables.lights.descriptor(device).address),
             overrides: self.overrides.address(device),
             prototype_materials: gpu_data.prototype_materials.address(device),
+            prototype_sdfs: gpu_data.prototype_sdfs.address(device),
             material_parameters: gpu_data.material_parameters.address(device),
             vertices: gpu_data.vertices.address(device),
             indices: gpu_data.indices.address(device),
@@ -463,7 +553,7 @@ impl GpuSceneUploader {
             candidates: device.buffer_device_address(gpu_data.micro_candidates.handle()),
             wind_records,
             interaction_field,
-            reserved_address: 0,
+            quad_counters,
             page_bytes: gpu_data.pages.address(device),
             page_requests: self.page_request_address(device, frame_slot),
             deformed_vertices: deformed.0,
@@ -475,6 +565,9 @@ impl GpuSceneUploader {
             light_capacity: world_tables.map_or(0, |tables| tables.lights.slot_capacity() as u32),
             coverage_temporal_phase,
             page_request_capacity: PAGE_REQUEST_CAPACITY,
+            page_request_budget: self.page_request_budget,
+            page_request_classes: crate::SCENE_VIEW_CLASSES as u32,
+            reserved: [0; 2],
         }
     }
 
@@ -640,10 +733,19 @@ impl GpuSceneUploader {
                             slot,
                             p.materials.len(),
                         )?;
+                        ensure_range(
+                            &mut self.prototype_sdf_ranges,
+                            &mut gpu_data.prototype_sdfs,
+                            slot,
+                            p.sdfs.len(),
+                        )?;
                     }
                     (GpuSceneUploadTarget::Prototype, GpuSceneUploadPayload::Tombstone) => {
                         if let Some(range) = self.prototype_ranges.remove(&slot) {
                             gpu_data.prototype_materials.retire(range)?;
+                        }
+                        if let Some(range) = self.prototype_sdf_ranges.remove(&slot) {
+                            gpu_data.prototype_sdfs.retire(range)?;
                         }
                     }
                     (
@@ -706,6 +808,10 @@ impl GpuSceneUploader {
             gpu_data.prototype_materials.prepare_growth(device)?,
             "prototype-materials grow",
         );
+        push(
+            gpu_data.prototype_sdfs.prepare_growth(device)?,
+            "prototype-sdfs grow",
+        );
         for (world, tables) in &mut self.worlds {
             push(
                 tables.instances.prepare_growth(device)?,
@@ -731,6 +837,7 @@ impl GpuSceneUploader {
     ) -> Result<()> {
         let GlobalGpuData {
             prototype_materials,
+            prototype_sdfs,
             uploads,
             ..
         } = gpu_data;
@@ -760,7 +867,24 @@ impl GpuSceneUploader {
                                 )?
                                 .enqueue(graph, device, "scene-prototype materials");
                         }
-                        let body = prototype_body(p, material_range);
+                        let sdf_range = self
+                            .prototype_sdf_ranges
+                            .get(&slot)
+                            .copied()
+                            .unwrap_or_default();
+                        if sdf_range.count > 0 {
+                            let handles: Vec<GpuHandle> =
+                                p.sdfs.iter().map(|handle| handle.raw()).collect();
+                            prototype_sdfs
+                                .stage(
+                                    uploads,
+                                    frame_slot,
+                                    sdf_range,
+                                    bytemuck::cast_slice(&handles),
+                                )?
+                                .enqueue(graph, device, "scene-prototype sdfs");
+                        }
+                        let body = prototype_body(p, material_range, sdf_range);
                         self.prototypes.stage_slot(
                             uploads,
                             frame_slot,
@@ -967,6 +1091,7 @@ fn ensure_range<K: std::hash::Hash + Eq + Copy, A>(
 fn prototype_body(
     record: &GpuScenePrototypeRecord,
     material_range: GpuArenaRange,
+    sdf_range: GpuArenaRange,
 ) -> GpuScenePrototypeGpuRecord {
     GpuScenePrototypeGpuRecord {
         geometry: record.geometry,
@@ -974,12 +1099,12 @@ fn prototype_body(
         deformation: record
             .deformation
             .map_or(GpuHandle::INVALID, |handle| handle.raw()),
-        sdf: record.sdf.map_or(GpuHandle::INVALID, |handle| handle.raw()),
+        sdf_range,
         root_page: record.root_page.raw(),
         bounds: record.bounds,
         source_generation: record.source_generation,
         flags: record.flags,
-        reserved: [0; 4],
+        mechanics: record.mechanics,
     }
 }
 
@@ -992,7 +1117,7 @@ fn instance_body(
         deformation: record
             .deformation
             .map_or(GpuHandle::INVALID, |handle| handle.raw()),
-        sdf: record.sdf.map_or(GpuHandle::INVALID, |handle| handle.raw()),
+        reserved_pad: [0; 2],
         material_overrides: override_range,
         transform_kind: GPU_SCENE_TRANSFORM_STATIC,
         source_generation: record.source_generation,
@@ -1189,6 +1314,11 @@ pub fn record_pending_global_uploads(
         graph,
     );
     enqueue_growth(
+        gpu_data.sdfs.prepare_growth(device)?,
+        "sdf-table grow",
+        graph,
+    );
+    enqueue_growth(
         gpu_data.page_table.prepare_growth(device)?,
         "page-table grow",
         graph,
@@ -1248,6 +1378,7 @@ pub fn record_pending_global_uploads(
         textures,
         coverage,
         skeletons,
+        sdfs,
         page_table,
         vertices,
         indices,
@@ -1270,6 +1401,7 @@ pub fn record_pending_global_uploads(
             GlobalGpuTableKind::Texture => stage_if_live(textures, uploads, frame_slot, handle),
             GlobalGpuTableKind::Coverage => stage_if_live(coverage, uploads, frame_slot, handle),
             GlobalGpuTableKind::Skeleton => stage_if_live(skeletons, uploads, frame_slot, handle),
+            GlobalGpuTableKind::Sdf => stage_if_live(sdfs, uploads, frame_slot, handle),
             GlobalGpuTableKind::Page => stage_if_live(page_table, uploads, frame_slot, handle),
         }?;
         if let Some(upload) = upload {
@@ -1328,6 +1460,9 @@ pub fn record_pending_global_uploads(
             GlobalGpuTableKind::Skeleton => skeletons
                 .retire(uploads, frame_slot, handle)?
                 .map(|retirement| retirement.tombstone),
+            GlobalGpuTableKind::Sdf => sdfs
+                .retire(uploads, frame_slot, handle)?
+                .map(|retirement| retirement.tombstone),
             GlobalGpuTableKind::Page => page_table
                 .retire(uploads, frame_slot, handle)?
                 .map(|retirement| retirement.tombstone),
@@ -1381,6 +1516,114 @@ mod tests {
             index,
             generation: 1,
         }
+    }
+
+    /// Appends `slots` to `class`'s region of frame slot 0 exactly as the shader would,
+    /// including the count word running past the budget on the ones that did not fit.
+    fn append_page_requests(
+        uploader: &GpuSceneUploader,
+        class: crate::SceneViewClass,
+        slots: &[u32],
+    ) {
+        let region = class.ordinal() as usize;
+        let budget = uploader.page_request_budget() as usize;
+        // SAFETY: HOST_VISIBLE + MAPPED, nothing in flight in this test, and every offset
+        // is inside frame slot 0's own slice.
+        unsafe {
+            let count_ptr = uploader
+                .page_requests
+                .mapped_ptr()
+                .add(region * 4)
+                .cast::<u32>();
+            let region_base = PAGE_REQUEST_HEADER_BYTES
+                + region * PAGE_REQUEST_CAPACITY as usize * PAGE_REQUEST_ENTRY_BYTES;
+            for slot in slots {
+                let index = count_ptr.read_unaligned();
+                count_ptr.write_unaligned(index + 1);
+                if (index as usize) < budget {
+                    uploader
+                        .page_requests
+                        .mapped_ptr()
+                        .add(region_base + index as usize * PAGE_REQUEST_ENTRY_BYTES)
+                        .cast::<u32>()
+                        .write_unaligned(*slot);
+                }
+            }
+        }
+    }
+
+    /// A class's region is its own: what it loses is decided by its own volume, and what
+    /// it keeps cannot be taken by a louder neighbour.
+    ///
+    /// This is the property the whole partition exists for. Before it, every view in the
+    /// frame appended to one queue in atomic order, so a gather sweeping a hundred-metre
+    /// box could crowd out the camera — and a dropped camera request is a page the image
+    /// is made of arriving a frame late, repeatedly, with nothing saying so.
+    #[test]
+    fn a_flooded_class_loses_only_its_own_requests() {
+        let Some(device) = device_or_skip() else {
+            return;
+        };
+        let mut uploader = GpuSceneUploader::new(&device).expect("uploader");
+        uploader.set_page_request_budget(4);
+
+        append_page_requests(&uploader, crate::SceneViewClass::Camera, &[10, 11]);
+        // The gather raises three times what its region holds.
+        let flood: Vec<u32> = (100..112).collect();
+        append_page_requests(&uploader, crate::SceneViewClass::Gi, &flood);
+        append_page_requests(&uploader, crate::SceneViewClass::ShadowPage, &[50]);
+
+        let drain = uploader.drain_page_requests(0);
+        assert_eq!(
+            drain.dropped, 8,
+            "only the gather's overflow is lost (12 raised, 4 held)"
+        );
+        assert_eq!(
+            drain.overflow_classes,
+            crate::SceneViewClass::Gi.bit(),
+            "and it is named as the gather's"
+        );
+        let camera: Vec<u32> = drain
+            .requests
+            .iter()
+            .filter(|(_, class)| *class == crate::SceneViewClass::Camera)
+            .map(|(slot, _)| *slot)
+            .collect();
+        assert_eq!(
+            camera,
+            vec![10, 11],
+            "the camera keeps every request it made"
+        );
+        assert!(
+            drain
+                .requests
+                .iter()
+                .any(|(slot, class)| *slot == 50 && *class == crate::SceneViewClass::ShadowPage),
+            "so does the shadow view"
+        );
+
+        // Draining resets every count word, so the next frame starts clean.
+        assert_eq!(uploader.drain_page_requests(0), PageRequestDrain::default());
+        device.wait_idle().expect("idle");
+    }
+
+    /// A page several classes missed is streamed once, under the most urgent of them.
+    /// Taking whichever arrived first would let a gather set the priority of a page the
+    /// camera is waiting on, and eviction would then price it as the gather's.
+    #[test]
+    fn a_page_two_classes_missed_arrives_once_at_the_higher_band() {
+        let Some(device) = device_or_skip() else {
+            return;
+        };
+        let mut uploader = GpuSceneUploader::new(&device).expect("uploader");
+        append_page_requests(&uploader, crate::SceneViewClass::Gi, &[7]);
+        append_page_requests(&uploader, crate::SceneViewClass::Camera, &[7]);
+
+        let drain = uploader.drain_page_requests(0);
+        assert_eq!(drain.requests, vec![(7, crate::SceneViewClass::Camera)]);
+        assert_eq!(drain.dropped, 0);
+        assert_eq!(drain.overflow_classes, 0);
+        device.wait_idle().expect("idle");
     }
 
     /// Records and submits `graph` on a throwaway pool, waiting for completion.
@@ -1593,11 +1836,12 @@ mod tests {
                     geometry: device_handle(20),
                     materials: std::sync::Arc::from([material]),
                     deformation: None,
-                    sdf: None,
+                    sdfs: Vec::new().into(),
                     root_page: page,
                     bounds: [1.0, 2.0, 3.0, 4.0],
                     source_generation: 5,
                     flags: 0,
+                    mechanics: [0; 4],
                 },
             ))
             .expect("prototype")
@@ -1620,7 +1864,6 @@ mod tests {
                         material,
                     }]),
                     deformation: None,
-                    sdf: None,
                     source_generation: 6,
                     flags: 0,
                     combination: 0,
@@ -1927,11 +2170,12 @@ mod tests {
                         geometry: device_handle(20),
                         materials: std::sync::Arc::from([material]),
                         deformation: None,
-                        sdf: None,
+                        sdfs: Vec::new().into(),
                         root_page: page,
                         bounds: [1.0, 2.0, 3.0, 4.5],
                         source_generation: 5,
                         flags: 0,
+                        mechanics: [0; 4],
                     },
                 ))
                 .expect("prototype")
@@ -1953,7 +2197,6 @@ mod tests {
                             material,
                         }]),
                         deformation: None,
-                        sdf: None,
                         source_generation: 6,
                         flags: 0,
                         combination: 0,
@@ -1989,7 +2232,8 @@ mod tests {
                 .expect("record");
             run_graph(&device, &mut graph);
 
-            let block = uploader.build_address_block(&device, &gpu_data, WORLD, 0, (0, 0), 0, 0, 0);
+            let block =
+                uploader.build_address_block(&device, &gpu_data, WORLD, 0, (0, 0), 0, 0, 0, 0);
             assert!(block.instances != 0 && block.scene_prototypes != 0);
             let outputs = run_compute(
                 std::sync::Arc::clone(&device),
@@ -2116,6 +2360,7 @@ mod tests {
             64,
             "GPU_PAGE_TABLE_STRIDE"
         );
+        assert_eq!(gpu_data.sdfs.slot_stride(), 96, "GPU_SDF_TABLE_STRIDE");
         drop(gpu_data);
         drop(device);
     }
@@ -2279,6 +2524,8 @@ mod tests {
                     ),
                     shader_index: 0,
                     flags: 0,
+                    proxy_albedo: 0,
+                    occupancy: 1.0,
                 })
                 .expect("masked material");
             pending.stage_record(GlobalGpuTableKind::Material, mat_masked);
@@ -2298,6 +2545,8 @@ mod tests {
                     ),
                     shader_index: 0,
                     flags: 0,
+                    proxy_albedo: 0,
+                    occupancy: 1.0,
                 })
                 .expect("canonical material");
             pending.stage_record(GlobalGpuTableKind::Material, mat_canonical);
@@ -2337,11 +2586,12 @@ mod tests {
                         geometry,
                         materials: std::sync::Arc::from([scene_mat_default, scene_mat_shadowed]),
                         deformation: None,
-                        sdf: None,
+                        sdfs: Vec::new().into(),
                         root_page: page,
                         bounds: [0.5, 0.5, 0.0, 1.0],
                         source_generation: 1,
                         flags: 0,
+                        mechanics: [0; 4],
                     },
                 ))
                 .expect("prototype")
@@ -2362,7 +2612,6 @@ mod tests {
                             material: scene_mat_override,
                         }]),
                         deformation: None,
-                        sdf: None,
                         source_generation: 1,
                         flags: 0,
                         combination: 0,
@@ -2388,7 +2637,7 @@ mod tests {
 
             const PHASE: u32 = 5;
             let block =
-                uploader.build_address_block(&device, &gpu_data, WORLD, 0, (0, 0), 0, 0, PHASE);
+                uploader.build_address_block(&device, &gpu_data, WORLD, 0, (0, 0), 0, 0, 0, PHASE);
 
             // (instance slot, primitive, sampled alpha, barycentrics). Cases: the slot-0
             // default material, the slot-1 override, an out-of-capacity instance, and an
