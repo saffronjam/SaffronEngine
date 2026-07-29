@@ -55,6 +55,39 @@ summed acceptance-to-terminal latency. A tally on the poll the manager already w
 each job's terminal state exactly once, so reading the queue's state costs seven numbers rather than
 every retained job's payload.
 
+## Budgets name the content, not the pass
+
+Stage times say the residency stage got slower. They cannot say which cell filled up or which family
+filled it, and that is the question an author actually has to answer. So the resident population is
+measured against three budgets — plants per cell, instances per family, and a family's cooked
+blade-candidate upper bound — and a breach raises an alarm through the same machinery the renderer's
+frame-budget and VRAM detectors use, carrying the cell coordinates or the family's catalog name as its
+owner.
+
+The renderer could not compute these itself: it sees passes and counters, not cells and families, and
+has no vegetation dependency to grow. The breach is derived where the population is known and handed
+to the alarm state as an owned budget, so coalescing, escalation, and the `FIRING`/`RESOLVED` event
+stream apply unchanged. The owner is part of the alarm fingerprint, so two cells over the same budget
+stay two alarms rather than collapsing into whichever breached last.
+
+Resolution is by absence: the complete set of live breaches is published every frame, and an alarm
+whose breach stops being reported resolves. A reporter that published only on breach would leave its
+alarms firing after the condition cleared.
+
+```sh
+sa vegetation-budgets --cellPlants 4096 --familyInstances 16384
+sa vegetation-budgets                     # omit every field to read
+sa list-active-alarms -o json | jq '.alarms[] | select(.metric | startswith("vegetation-"))'
+```
+
+The defaults are generous on purpose. The point is to catch content that has run away, not to narrate
+an ordinary scene; a project tightens them to what it intends to ship. A budget of zero turns that
+budget off.
+
+The Vegetation Telemetry panel shows the same three things together — stage times, resident bytes, and
+the live breaches with their owners — so the numbers are noticed rather than only being available to
+someone who already suspected a problem.
+
 ## Why no per-instance mode
 
 An instrumentation path that reads back per-instance data every frame changes the thing it measures
@@ -69,7 +102,10 @@ tax every frame pays.
 |---|---|---|
 | Counters and stage timing | `runtime/src/vegetation_telemetry.rs` | `VegetationTelemetry`, `VegetationStage`, `VegetationStageTimes` |
 | Stage instrumentation | `runtime/src/session.rs` | `synchronize_vegetation` |
-| Control surface | `control/src/commands_vegetation_runtime.rs` | `vegetation-telemetry` |
+| Control surface | `control/src/commands_vegetation_runtime.rs` | `vegetation-telemetry`, `vegetation-budgets` |
+| Owned budget breaches | `assets/src/gpu_scene_mirror.rs` | `VegetationBudgets`, `vegetation_budget_breaches` |
+| Owned alarms | `rendering/src/frame_history.rs` | `OwnedBudgetBreach`, `AlarmKey`, `ActiveAlarm::owner` |
+| Editor panel | `editor/src/panels/VegetationTelemetryPanel.tsx` | `VegetationTelemetryPanel` |
 | Canonical mutation size | `vegetation/src/mutation.rs` | `VegetationMutationRecord::canonical_byte_len` |
 
 ## Related

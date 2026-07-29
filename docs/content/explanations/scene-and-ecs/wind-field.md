@@ -71,6 +71,17 @@ texel springs back to rest over about a second. The prepass samples the field at
 each instance root and micro blades fold it into their baked bend, so trampled
 vegetation leans from the root while wind keeps swaying the tips.
 
+Because the cascades follow the camera, texels scroll in at rest. Texels are keyed by
+absolute world coordinate, so a standing plant keeps its texel and reads a continuous
+value as the window slides past — the jump comes only when a plant changes which cascade
+covers it, since the coarser cascade holds separate state. The prepass asks which cascade
+covers the instance under this frame's centres and under the previous frame's, and marks
+the instance reactive when the answers differ, so the reactive-coverage pass biases those
+pixels toward the current frame instead of letting TAA reproject a value with no history
+behind it. Motion within a cascade is not a reset and is not marked. `gpu-scene-stats`
+reports `visibility.interactionResets` as a running total since boot: a reset lasts one
+frame, so a per-frame count would read zero on nearly every sample.
+
 Placeable `WindSource` entities composite over the global field: directional, point,
 vortex, wake, and volume influences with a radius and edge falloff. A volume source
 scales the global term (zero strength shelters its interior); the others add their own
@@ -86,6 +97,57 @@ sa -o json sample-wind --positionM '[12, 3, 40]'
 sa emit-interaction-impulse --positionM '[12, 40]' --radiusM 2 --strength 4
 ```
 
+## Authored plant response
+
+The field says what the air is doing; the plant family says how it answers. `.splant` authors
+stiffness, damping, drag, flutter, and a bend limit, and the deformation prepass applies them:
+stiffness raises the branch mode's frequency as its square root and divides the amplitude, drag
+scales how hard the field pushes, flutter scales the leaf term, damping bleeds amplitude, and the
+bend limit caps the result. A stiff sapling and a supple reed of the same height therefore move
+differently, which without the response they could not.
+
+The values travel as cooked integers the whole way — the part table, the family render load, the
+prototype record's four words — so the GPU reads exactly what the cooker wrote rather than a float
+rounded twice. A prototype that is not a plant family carries zeros, and the prepass reads that as
+the height-derived model, which is what every ordinary mesh gets.
+
+A zero bend limit means unlimited. A plant that may not bend at all is a prop rather than a bend
+limit, and reading zero literally would freeze every family that left the field alone.
+
+`vegetation-wind-record` captures one plant's prepass record: the sway at both frame times, the
+interaction displacement at both, the branch quadrature and amplitudes, the height scale, the
+bounds slack, and the response behind them. It is explicit and one-shot — the buffer is device-local
+and reading it idles the queue — and it is the only view of what the prepass actually computed,
+since every raster pass applies these stored words rather than re-deriving wind.
+
+```sh
+sa -o json vegetation-wind-record --cell '{"coordinates":["0","0","0"],"level":0}' --plant <id>
+```
+
+## Proving the field reaches pixels
+
+Only instances flagged for wind are displaced, and the mirror sets that flag on vegetation points
+alone — a cube in a gale is motionless by design, not by defect. That makes wind easy to assert
+structurally and easy to get wrong invisibly: a path that computes a correct sway record and never
+displaces a vertex satisfies every non-visual check.
+
+The e2e suite closes that gap by measuring **motion over time** rather than calm against gale.
+Comparing one calm frame to one gale frame conflates displacement with everything else the two
+states differ in. Instead each state is sampled twice across the same interval and compared against
+itself: a still field must produce consecutive frames that agree, and a gale must not.
+
+The still pair doubles as the control. It fails if the image is unstable for any reason — temporal
+accumulation that never converges, an animation left running, a nondeterministic pass.
+
+A settled field measures about 0.0001 mean absolute per-channel difference between consecutive
+frames; a gale measures about 0.4, some three thousand times higher. Returning the field to calm
+must restore stillness, which is what catches a deformation that latched at its last displacement
+instead of tracking the field.
+
+> [!NOTE]
+> A visual wind test must stay in edit mode. Play renders the scene's primary camera, so the editor
+> camera the test positions is ignored and every frame becomes the same picture of nothing.
+
 ## In the code
 
 | What | File | Symbols |
@@ -93,12 +155,17 @@ sa emit-interaction-impulse --positionM '[12, 40]' --radiusM 2 --strength 4
 | Field evaluation | `wind/src/lib.rs` | `WindProfile`, `WindSample`, `sample`, `sample_composed` |
 | GPU mirror | `wind.slang` | `sampleWindVelocity`, `windSwayOffset`, `windInstanceHash` |
 | Deformation prepass + sway records | `wind_deform.slang` · `global_gpu_data.slang` | `GpuWindInstanceRecord`, `gpuSceneWindSway` |
+| Authored plant response | `vegetation/src/asset.rs` · `vegetation/src/artifact.rs` · `global_gpu_data.slang` | `MechanicalResponse`, `mechanical_response`, `gpuSceneMechanicalResponse` |
+| Response capture | `renderer.rs` · `commands_vegetation_runtime.rs` | `Renderer::capture_wind_record`, `vegetation-wind-record` |
 | Interaction field + emitters | `wind_interact.slang` · `world.rs` · `commands_render.rs` | `gpuSceneInteractionSample`, `World::motion_emitters`, `emit-interaction-impulse` |
+| Scroll-reset reactive marking | `wind_deform.slang` · `mesh.slang` · `renderer.rs` | `gpuSceneInteractionCascade`, `gpuSceneWindInteractionReset`, `vertexMainReactiveTransition` |
 | Frame wind words | `lighting.rs` · `renderer.rs` | `SceneWind`, `Renderer::set_wind`, `Lighting::set_frame_wind` |
 | Local sources | `scene/src/component.rs` · `scene/src/scene.rs` | `WindSource`, `Scene::local_wind_sources` |
 | Authored settings | `scene/src/environment.rs` | `WindSettings` |
 | Settings wire + validation | `control/src/commands_scene.rs` | `set-wind`, `validate_wind` |
 | Editor rows | `editor/src/panels/EnvironmentPanel.tsx` | the Wind section |
+| The visual proof | `tests/e2e/vegetation-wind-visual.test.ts` | the still/gale motion comparison |
+| The response proof | `tests/e2e/vegetation-mechanics.test.ts` | the flutter-to-branch amplitude ratio |
 
 ## Related
 
