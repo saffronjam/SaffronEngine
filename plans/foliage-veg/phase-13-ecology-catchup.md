@@ -12,10 +12,13 @@ phenotype the source of lifecycle truth.
 ## Clock and state ownership
 
 - [x] Consume a monotonic world simulation clock and keep `ecology_tick` independent of the existing
-  calendar/phenology time. (`EcologyClock` in `vegetation/src/ecology.rs` counts fixed ecology ticks
-  and is structurally incapable of moving backwards: `ticks_to` refuses a target behind the clock and
-  `complete` accepts only the exact successor, so a skipped tick cannot drop a generation and a
-  repeat cannot double-apply one. It derives nothing from the calendar.)
+  calendar/phenology time. (`VegetationEcologyClock` in `runtime/src/vegetation_ecology.rs` folds each
+  play step's `dt` into simulated microseconds, and the vegetation synchronization point executes the
+  whole ticks that fall out of it. `EcologyClock` in `vegetation/src/ecology.rs` counts those fixed
+  ticks and is structurally incapable of moving backwards: `EcologyClock::advance_to` refuses a target
+  behind the clock and `EcologyState::publish_region_tick` accepts only the exact successor, so a
+  skipped tick cannot drop a generation and a repeat cannot double-apply one. Neither derives anything
+  from the calendar.)
 - [x] Persist last completed tick, simulation version, checkpoint identity, boundary summaries, and
   enough state to prove unload/catch-up equivalence. (`EcologyState` carries the rule-set version,
   the clock, and per-cell `EcologyCellSummary` rows; it is a section of `VegetationState`'s canonical
@@ -43,7 +46,11 @@ phenotype the source of lifecycle truth.
 - [x] Use compact SoA state and spatial hashing over active simulation facets; never promote plants
   merely to simulate ecology. (`EcologyPlantState` is a compact row read straight from the macro SoA;
   `advance_cell` takes a slice of them and touches no entity, no scene, and no promotion machinery.
-  Nothing in the tick can promote a plant — it has no access to do so.)
+  Nothing in the tick can promote a plant — it has no access to do so. `CellSpatialIndex` is the
+  uniform grid over cell keys bucketed at the influence radius; `dependency_regions` builds its
+  closure through it and `advance_region` and `region_state` read each cell's halo through it, so a
+  neighbourhood query costs its own neighbourhood rather than a walk of every planted cell.
+  `the_grid_index_answers_exactly_what_a_scan_answers` pins it against a brute-force scan.)
 - [x] Double-buffer ticks: tick `N+1` reads only immutable tick `N` local/halo state and emits owned
   changes for `N+1`. (`advance_cell` is a pure function: `&[EcologyPlantState]` plus
   `&[EcologyCellSummary]` halo in, `EcologyTickOutput` out. It mutates nothing in place, and the
@@ -160,15 +167,16 @@ advance a bounded fixture and dump canonical cell/checkpoint hashes.
 ## Acceptance
 
 - [x] Continuous simulation equals unload→time advance→dependency-region catch-up byte-for-byte.
-  (`catch_up_equals_continuous_simulation` in `runtime_world.rs` runs one world tick by tick and
+  (`catch_up_equals_continuous_simulation` in `runtime_world/tests.rs` runs one world tick by tick and
   another by jumping to tick 8 and catching up, then compares `canonical_bytes()` of the reduced
   persistent state, not just the checkpoint hash. `a_region_awaiting_residency_owes_its_ticks` adds
   the unload leg: time advances while nothing is loaded, and the reload catches up to the same
   bytes a resident-throughout world holds.)
 - [x] Results are identical across worker counts, shuffled plant/cell order, different residency paths,
-  and origin rebasing. (`disjoint_regions_commit_the_same_state_in_either_order` covers region order,
-  which is what a worker count varies — catch-up runs on the calling thread and a region is a pure
-  function of its inputs, so there is no shared accumulator for a worker to race on.
+  and origin rebasing. (`catch_up_is_identical_across_worker_counts` runs a four-region world at one
+  worker and at four and compares `canonical_bytes()`: `compute_region_ticks` spreads the pure
+  per-region rules across `EcologyCatchUpBudget::workers` and commits in canonical region order.
+  `disjoint_regions_commit_the_same_state_in_either_order` covers region order,
   `a_tick_is_reproducible_and_neighbour_order_independent` covers neighbour order,
   `unordered_plants_are_refused` plus the sort in `region_state` pins plant order, and
   `a_region_awaiting_residency_owes_its_ticks` covers the residency path. Origin rebasing is a
@@ -193,7 +201,7 @@ advance a bounded fixture and dump canonical cell/checkpoint hashes.
   touches no ledger. A prediction is transient and never reaches the ring.)
 - [x] Catch-up cancellation/supersession cannot publish a partial tick generation.
   (`advance_region` computes every cell before returning anything, `publish_region_tick` validates
-  every cell's successor tick before storing any, and `advance_region_one_tick` checks that
+  every cell's successor tick before storing any, and `commit_region_tick` checks that
   publication precondition *before* committing mutations — so a refusal at any point leaves neither
   the plant deltas nor the tick generation behind. `a_region_publishes_a_whole_tick_or_none_of_it`
   proves a skipping publication moves no cell.)

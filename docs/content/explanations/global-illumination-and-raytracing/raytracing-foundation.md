@@ -196,6 +196,33 @@ let index = instances.len() as u32;
 instances.push(make_instance(transform_rows(model), index, blas.address));
 ```
 
+## What a candidate resolves against
+
+A traced candidate carries the bottom-level structure it hit and a geometry index within it. Neither
+names a scene record, and both are needed: the record supplies the material overrides and coverage
+inputs the [canonical classifier](../../materials-and-pipelines/ubershader-and-specialization/) reads, and the
+geometry index supplies the submesh whose index slice the primitive belongs to.
+
+So each packed instance's `instanceCustomIndex` is its own position in the frame's placement list,
+and a parallel **ray-instance table** turns that position back into an identity: the GPU-scene
+instance slot, and the submesh element the structure's geometry 0 corresponds to.
+
+The submesh element is what makes a plant work. A plain mesh's structure holds one geometry per
+submesh of the mesh, so geometry 0 is submesh 0. An assembly prototype's structure holds one geometry
+per submesh of **its span**, so geometry 0 is wherever that prototype's run starts in the family's
+table. Without the rebase a leaf card would resolve the trunk's material, and reaching for a
+containing index range instead of the geometry index resolves the wrong submesh for every geometry
+after the first — a per-geometry primitive index is not a position in the shared stream.
+
+An entry whose slot reads `RT_UNMIRRORED_INSTANCE` resolves nothing and its candidates commit. That
+is the honest answer for the two representations that have no submeshes to name: the aggregate,
+which merges its sources into voxel bricks, and a deforming instance's refit structure. Both are
+placed `FORCE_OPAQUE`, so no candidate reaches the classifier from them anyway.
+
+The table is sized before the frame's address block is published — from an upper bound on the
+placements the captured scene can expand into — because the block carries its address, and a table
+that regrew mid-frame would leave the block naming a freed allocation.
+
 The instance buffer is host-visible and mapped, one per frame in flight, grown by doubling from a
 64-instance seed (`ensure_tlas_capacity`). The TLAS is sized for the buffer's capacity rather than
 the frame's count, so it is recreated only when capacity grows; otherwise the same structure is
@@ -287,10 +314,11 @@ capacity starts at zero.
 | Per-mesh BLAS | `rendering/src/rt.rs`, `upload.rs` | `record_mesh_blas_build`, `MeshBlasBuild`; `Uploader::build_mesh_blas` |
 | Deforming-BLAS refit | `rendering/src/rt.rs`, `draw_list.rs` | `plan_skinned_blas_refits`, `BlasRefitOp`; `DeformedRtInstance` |
 | TLAS prep + record | `rendering/src/rt.rs` | `Rt::prepare_tlas_build`, `TlasBuildPlan`, `record_tlas_build_plan`, `ensure_tlas_capacity`, `seed_empty_tlas` |
-| Instance packing | `rendering/src/rt.rs` | `make_instance`, `transform_rows` |
-| Static-instance capture | `assets/src/render_scene.rs` | `render_scene` (the `set_rt_scene` call) |
+| Instance packing | `rendering/src/rt/` | `make_instance`, `transform_rows`, `Placement` |
+| Ray-instance identity | `rendering/src/rt/`, `global_gpu_data.slang` | `GpuRayInstanceRecord`, `Rt::ensure_frame_ray_instances`, `Rt::write_ray_instances`; `gpuSceneRayInstance`, `gpuSceneResolveCandidate`, `gpuSceneRayCandidateCovered` |
+| Static-instance capture | `assets/src/render_scene/` | `render_scene` (the `set_rt_scene` call) |
 | The graph pass | `rendering/src/renderer.rs` | the `tlas-build` `RgPass` |
-| Plant family structures | `rendering/src/upload.rs`, `rt.rs`, `assets/src/gpu_scene_mirror.rs` | `MeshAssembly::prototype_index_ranges`, `GpuMesh::assembly_blas`, `MeshBlasGeometry`, `GpuSceneMirror::vegetation_ray_instances` |
+| Plant family structures | `rendering/src/upload.rs`, `rt.rs`, `assets/src/gpu_scene_mirror.rs` | `MeshAssembly::prototype_slices`, `AssemblyPrototypeSlice`, `GpuMesh::assembly_blas`, `MeshBlasGeometry`, `GpuSceneMirror::ray_instances` |
 | Aggregate representation | `rendering/src/upload.rs`, `rt.rs` | `GpuMesh::aggregate_blas`, `RtCutView`, `Rt::aggregate_instance_count` |
 | Storage telemetry | `rendering/src/rt.rs`, `resources.rs` | `distinct_blas_bytes`, `Rt::blas_bytes`; `AccelerationStructure::size`, `note_compacted_from` |
 | Micromap capability | `rendering/src/device.rs` | `Capabilities::opacity_micromap`, `Device::omm_supported`, `Device::omm_dispatch` |

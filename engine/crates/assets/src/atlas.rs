@@ -5,14 +5,11 @@
 //! otherwise one draw, so the cooker packs them into one atlas and rewrites the generated UVs into
 //! the sub-rectangle each slot landed in.
 //!
-//! The packer is a skyline over shelves: entries sort by descending height then by slot so the
-//! order never depends on a hash or an iteration whim, and the same inputs produce the same layout
-//! on every target. That matters because the layout reaches cooked bytes, and a layout that moved
-//! between runs would change every artifact hash for no reason.
-//!
-//! Every entry gets a gutter of transparent texels. Without one, bilinear filtering at a
-//! sub-rectangle's edge reaches into its neighbour, which is the classic atlas bleed: a leaf with a
-//! sliver of bark along its edge, visible only at distance and only sometimes.
+//! The packer is a skyline over shelves. Entries sort by descending height then by slot, so the
+//! layout depends on neither a hash nor an iteration whim — it reaches cooked bytes, and a layout
+//! that moved between runs would change every artifact hash. Every entry carries a gutter of
+//! transparent texels: without one, bilinear filtering at a sub-rectangle's edge reaches into its
+//! neighbour, which is the classic atlas bleed.
 
 /// Transparent texels kept between packed entries and around the atlas border.
 ///
@@ -204,6 +201,8 @@ pub struct FamilySlotImage {
 pub struct FamilyAtlas {
     /// Where each slot landed, and the atlas extent.
     pub layout: AtlasLayout,
+    /// Encoding of the packed texels, which an upload has to match.
+    pub format: saffron_vegetation::PlantTextureFormat,
     /// The full mip chain, level 0 first.
     pub levels: Vec<crate::CoverageMip>,
 }
@@ -277,6 +276,9 @@ pub fn generate_family_atlas(
             layout.height,
             reference_cutoff_bits,
         ),
+        // The slot images composite as decoded, so the packed texels carry the same sRGB colour
+        // encoding the slot textures were authored in.
+        format: saffron_vegetation::PlantTextureFormat::Rgba8Srgb,
         layout,
     })
 }
@@ -485,9 +487,9 @@ mod tests {
 
     #[test]
     fn the_generated_plane_drives_a_real_opacity_micromap_derivation() {
-        // The clause this closes: the RT/OMM derivation inputs are GENERATED from the packed
-        // atlas rather than assumed. A derivation over a slot's own image would classify texels
-        // the GPU never reads, because after packing a triangle's UVs address atlas space.
+        // The RT/OMM derivation inputs come from the packed atlas: a derivation over a slot's
+        // own image would classify texels the GPU never reads, because after packing a triangle's
+        // UVs address atlas space.
         //
         // Two triangles cover a whole slot's rectangle, so the derivation has a footprint that is
         // entirely inside opaque texels and can prove it.

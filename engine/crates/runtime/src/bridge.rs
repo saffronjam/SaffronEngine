@@ -1,21 +1,14 @@
 //! The runtime's [`ScriptHostBridge`] implementation: the concrete end of the POD seam
-//! `saffron-script` declares so the `sa.*` physics bindings and the `sa.log` sink reach
-//! the live world without `saffron-script` importing `saffron-physics`.
+//! `saffron-script` declares, so the `sa.*` physics bindings and the `sa.log` sink reach the live
+//! world without `saffron-script` importing `saffron-physics`.
 //!
-//! One [`RuntimeScriptBridge`] holds the handles the bindings reach — the live play world
-//! and the play scene (for the scene-reading `enable_ragdoll`) — as `Rc<RefCell<…>>` cells
-//! the [`RuntimeSession`](crate::RuntimeSession) shares with it, plus a [`SharedScriptSink`]
-//! log buffer.
+//! [`RuntimeScriptBridge`] holds the play world and scene as `Rc<RefCell<…>>` cells shared with the
+//! [`RuntimeSession`](crate::RuntimeSession) — `Rc` rather than a `Mutex` because the VM is `!Send`.
+//! Sharing the cells is what lets an installed callback see the live world, which is `None` before
+//! start and after stop.
 //!
-//! `Rc<RefCell>` is the single-thread shared-mutable idiom: the VM is `!Send`, so no `Mutex`
-//! is needed, and the bridge is an installed callback object, not one of the value-owned
-//! session fields. The session installs it onto the [`ScriptHost`](saffron_script::ScriptHost)
-//! on start and shares the same cells so the bridge sees the live world while it exists (a
-//! no-op `None` world before start / after stop).
-//!
-//! `sa.log` cannot write straight into the consumer's log ring while a script tick runs, so
-//! the line is appended to [`SharedScriptSink`] (a tiny cell) and the session drains it once
-//! each call batch returns ([`RuntimeSession::take_logs`](crate::RuntimeSession::take_logs)).
+//! `sa.log` cannot write into the consumer's log ring while a script tick runs, so the line lands in
+//! [`SharedScriptSink`] and the session drains it once the call batch returns.
 
 use std::cell::RefCell;
 use std::rc::Rc;

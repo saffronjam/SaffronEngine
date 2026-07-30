@@ -2,11 +2,10 @@
 //! private to this crate: only `device.rs` and `rt_cluster.rs` may import them.
 //!
 //! The pinned ash release carries no binding for this extension, so the structs below are
-//! transcribed from the toolbox SDK's `vulkan_core.h`. Two belts keep them honest:
-//! `the_pinned_ash_release_still_lacks_this_extension` fails on any ash bump with
-//! instructions to delete this module in favour of the generated binding, and the device
-//! probe refuses to enable the extension on any other spec revision, because a revision
-//! bump can move struct layouts and a hand-written binding has no generator following it.
+//! transcribed from the SDK's `vulkan_core.h`. Two belts keep them honest:
+//! `the_pinned_ash_release_still_lacks_this_extension` fails on any ash bump, and the device probe
+//! refuses to enable the extension on any other spec revision, since a revision bump can move
+//! struct layouts and a hand-written binding has no generator following it.
 
 use std::ffi::{CStr, c_void};
 

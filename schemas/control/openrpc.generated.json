@@ -3012,6 +3012,24 @@
       }
     },
     {
+      "name": "vegetation-ecology-clock",
+      "summary": "vegetation-ecology-clock {running?, tickMilliseconds?, maxTicksPerSync?, workers?, water?, warmth?} — the world clock biology advances on (omit to read)",
+      "params": [
+        {
+          "name": "params",
+          "schema": {
+            "$ref": "#/components/schemas/VegetationEcologyClockParams"
+          }
+        }
+      ],
+      "result": {
+        "name": "result",
+        "schema": {
+          "$ref": "#/components/schemas/VegetationEcologyClockDto"
+        }
+      }
+    },
+    {
       "name": "vegetation-combustion",
       "summary": "sample fuel, moisture, health, occupancy, and what is alight in a volume",
       "params": [
@@ -7445,6 +7463,9 @@
             "$ref": "#/components/schemas/FogVolume"
           },
           {
+            "$ref": "#/components/schemas/WindSource"
+          },
+          {
             "$ref": "#/components/schemas/Relationship"
           },
           {
@@ -7552,6 +7573,9 @@
           },
           "FogVolume": {
             "$ref": "#/components/schemas/FogVolume"
+          },
+          "WindSource": {
+            "$ref": "#/components/schemas/WindSource"
           },
           "Relationship": {
             "$ref": "#/components/schemas/Relationship"
@@ -14170,6 +14194,9 @@
           "sceneGatherMs": {
             "type": "number"
           },
+          "sceneGatherEntities": {
+            "type": "integer"
+          },
           "instanceUploadBytes": {
             "type": "integer",
             "minimum": 0
@@ -14497,6 +14524,7 @@
           "batches",
           "instances",
           "sceneGatherMs",
+          "sceneGatherEntities",
           "instanceUploadBytes",
           "retainedMeshCpuBytes",
           "shadowDrawCalls",
@@ -18167,23 +18195,11 @@
           "maxTicks": {
             "type": "integer",
             "minimum": 0
-          },
-          "water": {
-            "type": "integer",
-            "minimum": 0,
-            "maximum": 65535
-          },
-          "warmth": {
-            "type": "integer",
-            "minimum": 0,
-            "maximum": 65535
           }
         },
         "required": [
           "targetTick",
-          "maxTicks",
-          "water",
-          "warmth"
+          "maxTicks"
         ]
       },
       "VegetationArtifactDiagnosticDto": {
@@ -19888,6 +19904,85 @@
           "fuel"
         ]
       },
+      "VegetationEcologyClockDto": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "running": {
+            "type": "boolean"
+          },
+          "tickMilliseconds": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "pendingMilliseconds": {
+            "type": "string"
+          },
+          "maxTicksPerSync": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "workers": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "water": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 65535
+          },
+          "warmth": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 65535
+          },
+          "ticksOwed": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "running",
+          "tickMilliseconds",
+          "pendingMilliseconds",
+          "maxTicksPerSync",
+          "workers",
+          "water",
+          "warmth",
+          "ticksOwed"
+        ]
+      },
+      "VegetationEcologyClockParams": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "running": {
+            "type": "boolean"
+          },
+          "tickMilliseconds": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "maxTicksPerSync": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "workers": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "water": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 65535
+          },
+          "warmth": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 65535
+          }
+        },
+        "required": []
+      },
       "VegetationEcologyRegionDto": {
         "type": "object",
         "additionalProperties": false,
@@ -19940,6 +20035,13 @@
           "ticksOwed": {
             "type": "string"
           },
+          "ticksAwaitingResidency": {
+            "type": "string"
+          },
+          "workers": {
+            "type": "integer",
+            "minimum": 0
+          },
           "checkpoint": {
             "type": "string"
           }
@@ -19951,6 +20053,8 @@
           "regionsAwaitingResidency",
           "ticksRun",
           "ticksOwed",
+          "ticksAwaitingResidency",
+          "workers",
           "checkpoint"
         ]
       },
@@ -19972,6 +20076,9 @@
             "type": "integer",
             "minimum": 0
           },
+          "clock": {
+            "$ref": "#/components/schemas/VegetationEcologyClockDto"
+          },
           "regions": {
             "type": "array",
             "items": {
@@ -19990,6 +20097,7 @@
           "simulationVersion",
           "checkpoint",
           "regionRadiusCells",
+          "clock",
           "regions",
           "cells"
         ]
@@ -25434,6 +25542,51 @@
           "referenceHeight",
           "heightExponent",
           "seed"
+        ]
+      },
+      "WindSource": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "kind": {
+            "type": "string",
+            "enum": [
+              "directional",
+              "point",
+              "vortex",
+              "wake",
+              "volume"
+            ]
+          },
+          "strength": {
+            "type": "number"
+          },
+          "radius": {
+            "type": "number"
+          },
+          "falloff": {
+            "type": "number"
+          },
+          "enabled": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "kind",
+          "strength",
+          "radius",
+          "falloff",
+          "enabled"
+        ]
+      },
+      "WindSourceKindDto": {
+        "type": "string",
+        "enum": [
+          "directional",
+          "point",
+          "vortex",
+          "wake",
+          "volume"
         ]
       },
       "WorldBoundsDto": {

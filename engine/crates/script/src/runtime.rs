@@ -1,17 +1,8 @@
-//! The play-session runtime: one VM, a class-table cache, and an ordered instance
-//! vector driven through start / tick / stop.
+//! The play-session runtime: one VM, a class-table cache, and an ordered instance vector driven
+//! through start / tick / stop.
 //!
-//! `start_scripts` creates the VM, registers the bindings, instantiates every
-//! `ScriptComponent` slot in `for_each` order, and runs `on_create`; `tick_scripts`
-//! runs every instance's `on_update(dt)` in order with pause-on-error; `stop_scripts`
-//! runs `on_destroy` with no scene bound, then drops everything and the VM. The class
-//! cache, the instance build with field injection, and the deferred destroy + relink are
-//! all here.
-//!
-//! The coroutine scheduler (`advance_scheduler` after each loop), inter-script messages
-//! (`dispatch_messages` draining the queue with payload-ref release), the input edges
-//! (lent through the session guard), the hierarchy/query bindings, the physics bridges,
-//! and `dispatch_contact` are wired here.
+//! Instances are created in scene `for_each` order and ticked in that order with pause-on-error;
+//! `stop_scripts` runs `on_destroy` with no scene bound before dropping the VM.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -37,17 +28,10 @@ use crate::vm::ScriptVm;
 /// registry ref to its `self` table. Within an entity, instances keep slot order; the
 /// vector order across entities is load-bearing (instances run top-to-bottom).
 struct ScriptInstance {
-    /// The owning entity (handle into the play scene). Carried metadata — the runtime
-    /// matches instances by uuid.
-    #[allow(dead_code)]
-    entity: Entity,
     /// The entity's uuid, cached so a contact/message dispatch can match by id.
     entity_uuid: Uuid,
-    /// The slot's script path relative to the project `src/` (for error reporting).
+    /// The slot's script path relative to the project `src/`, for error reporting.
     script_path: String,
-    /// The slot index within the entity's `Script` component (deterministic order).
-    #[allow(dead_code)]
-    slot_index: usize,
     /// The registry ref to the instance's `self` table.
     self_ref: RegistryKey,
 }
@@ -271,18 +255,15 @@ impl ScriptHost {
     ///
     /// A sensor Begin invokes `on_trigger_enter(self, other)`, a sensor End
     /// `on_trigger_exit(self, other)`, a solid Begin `on_contact(self, other, point,
-    /// normal)` (world space, passed as `sa.Vec3`); a solid End has no handler (v1 emits
-    /// it but routes nothing). The transition is dispatched in both directions
-    /// (A-then-B); a missing handler is a silent skip; the first failing handler halts
-    /// the dispatch and is returned (pause-on-error, like [`ScriptHost::tick_scripts`]).
-    /// `None` (no error) when there is no VM, no instance, or no handler for the
-    /// transition.
+    /// normal)` in world space as `sa.Vec3`. A solid End is emitted but routes to no handler.
     ///
-    /// The contact ring's events are seq-stamped POD (`entity_a`/`entity_b` uuids, the
-    /// `Begin`/`End` flag, `sensor`, `point`/`normal`); the host drains the ring before
-    /// `on_update` each tick and drives this per event. After the dispatch the
-    /// deferred structural ops flush and the queued messages dispatch (a contact handler
-    /// may `destroy`/`send`), exactly as a tick does.
+    /// The transition dispatches in both directions, A then B; a missing handler is a silent skip;
+    /// the first failing handler halts the dispatch and is returned, matching
+    /// [`ScriptHost::tick_scripts`]. `None` when there is no VM, no instance, or no handler.
+    ///
+    /// The host drains the contact ring before `on_update` each tick and drives this per event. After
+    /// the dispatch the deferred structural ops flush and the queued messages dispatch, exactly as a
+    /// tick does, because a contact handler may `destroy` or `send`.
     pub fn dispatch_contact(
         &mut self,
         scene: &mut Scene,
@@ -292,7 +273,7 @@ impl ScriptHost {
         if self.vm.is_none() || self.instances.is_empty() {
             return None;
         }
-        // v1 emits sensor enter/exit + solid Begin; a solid End has no handler.
+        // Sensor enter/exit and solid Begin route to a handler; a solid End does not.
         let (handler, with_manifold) = if contact.sensor {
             (
                 if contact.begin {
@@ -544,10 +525,8 @@ impl ScriptHost {
             .create_registry_value(self_table)
             .map_err(|e| Error::Runtime(e.to_string()))?;
         Ok(ScriptInstance {
-            entity: slot.entity,
             entity_uuid: slot.entity_uuid,
             script_path: slot.script_path.clone(),
-            slot_index: slot.slot_index,
             self_ref,
         })
     }
@@ -721,12 +700,10 @@ fn flush_structural_ops() {
     });
 }
 
-/// One slot collected from the scene before the session opens: the entity, its uuid,
-/// the slot index, the relative script path, the resolved full path, and the overrides.
+/// One slot collected from the scene before the session opens.
 struct CollectedSlot {
     entity: Entity,
     entity_uuid: Uuid,
-    slot_index: usize,
     script_path: String,
     full_path: PathBuf,
     overrides: JsonValue,
@@ -738,14 +715,13 @@ fn collect_slots(scene: &mut Scene, src_dir: &Path) -> Vec<CollectedSlot> {
     let mut slots = Vec::new();
     scene.for_each::<(&Script, Option<&IdComponent>), _>(|entity, (script, id)| {
         let entity_uuid = id.map_or(Uuid(0), |id| id.id);
-        for (slot_index, slot) in script.scripts.iter().enumerate() {
+        for slot in &script.scripts {
             if slot.script_path.is_empty() {
                 continue;
             }
             slots.push(CollectedSlot {
                 entity,
                 entity_uuid,
-                slot_index,
                 script_path: slot.script_path.clone(),
                 full_path: src_dir.join(&slot.script_path),
                 overrides: slot.overrides.clone(),

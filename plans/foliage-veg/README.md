@@ -4,6 +4,8 @@
 
 Start at [`READMESUMMARY.md`](READMESUMMARY.md) for where every phase stands and what the current
 hardware gates; [`READMEFABLE.md`](READMEFABLE.md) carries the full design record.
+[`AUDIT.md`](AUDIT.md) is an independent read of the code against every ticked box — where the
+phase files and the tree disagree, it says which one the code supports.
 
 This planset builds vegetation as a deterministic world system, not as a collection of foliage
 draw calls. Three vegetation-specific logical asset types describe plant families, biome rules,

@@ -1,11 +1,9 @@
-//! The command registry, the `EngineContext` live-state seam, dispatch, and the
-//! two builtin commands (`ping`, `help`).
+//! The command registry, the `EngineContext` live-state seam, dispatch, and the two builtin
+//! commands (`ping`, `help`).
 //!
-//! A [`CommandRegistry`] is a `Vec<Command>` (insertion order preserved, so `help`
-//! and the generated manifest iterate it in registration order) plus a
-//! `HashMap<&'static str, usize>` index. The typed [`CommandRegistry::register`]
-//! is the single place the wire encoding (serde-driven, decimal-string ids) is
-//! applied, so every later handler inherits it.
+//! Registration order is preserved, because it is the order `help` and the generated manifest
+//! report. The typed [`CommandRegistry::register`] is the single place the wire encoding is
+//! applied, so every handler inherits it.
 
 use std::any::TypeId;
 use std::collections::HashMap;
@@ -35,24 +33,6 @@ use crate::error::{Error, Result};
 /// A graph-compute backend that has qualified its active hardware profile.
 pub type VegetationComputeExecutor = Arc<dyn saffron_vegetation::GraphComputeExecutor>;
 
-/// The renderer seam every render-, scene-, and asset-domain command reaches
-/// through.
-///
-/// The concrete `Renderer` cannot be built headless (its swapchain WSI has no
-/// offscreen backing on lavapipe), so the borrow is taken behind this object-safe
-/// trait. The live implementation is the host's `HostControlRenderer`, which
-/// bundles the renderer with the host-owned one-off `Uploader` (the renderer owns
-/// none) so the GPU-upload / scene-render seam below can be handed to the asset
-/// loaders; a unit-test stub implements it over plain in-memory state. Growing
-/// this trait is the only renderer coupling the control plane has.
-///
-/// Beyond the render-domain query/toggle methods, three asset/scene-domain seams
-/// live here: **view-select** ([`ControlRenderer::set_active_view`] + the
-/// desired-size pair), **screenshot** ([`ControlRenderer::capture_viewport`]), and
-/// the **GPU-upload** access point ([`ControlRenderer::with_gpu_uploader`]) that
-/// hands a transient [`GpuUploader`] to the asset loaders (`import_texture`,
-/// `load_mesh_asset`, `ensure_preview_floor_mesh`, `resolve_material_asset`,
-/// `pick_entity`, …) the asset/scene handlers drive.
 /// One plant's captured wind prepass record joined with the response that produced it.
 pub struct PlantWindRecord {
     /// The GPU-scene instance slot the plant mirrors to.
@@ -64,6 +44,11 @@ pub struct PlantWindRecord {
     pub mechanics: [u32; 4],
 }
 
+/// The renderer seam every render-, scene-, and asset-domain command reaches through.
+///
+/// The concrete `Renderer` cannot be built headless, so the borrow is taken behind this
+/// object-safe trait: the host implements it over the live renderer plus its one-off
+/// [`GpuUploader`], and a unit-test stub implements it over in-memory state.
 pub trait ControlRenderer {
     /// The full per-frame draw + timing + telemetry snapshot.
     fn render_stats(&self) -> RenderStatsFull;
@@ -84,7 +69,6 @@ pub trait ControlRenderer {
     fn vegetation_breakdown(&self) -> saffron_assets::VegetationRenderBreakdown;
     /// The resident-population budgets whose breaches raise owner-named alarms.
     fn vegetation_budgets(&self) -> saffron_assets::VegetationBudgets;
-    /// Replaces those budgets.
     fn set_vegetation_budgets(&mut self, budgets: saffron_assets::VegetationBudgets);
     /// One resident plant's wind prepass record, captured from the GPU on demand, beside
     /// the authored family response the prepass was given. `None` when the plant is not
@@ -99,21 +83,17 @@ pub trait ControlRenderer {
 
     /// Whether clustered-forward light culling is on.
     fn clustered_enabled(&self) -> bool;
-    /// Toggles clustered-forward culling.
     fn set_clustered(&mut self, enabled: bool);
     /// Stages a world interaction impulse for the next frame's field step.
     fn submit_interaction_impulse(&mut self, impulse: saffron_rendering::InteractionImpulse);
     /// Whether the depth pre-pass is on.
     fn depth_prepass_enabled(&self) -> bool;
-    /// Toggles the depth pre-pass.
     fn set_depth_prepass(&mut self, enabled: bool);
     /// Whether the directional shadow map is on.
     fn shadows_enabled(&self) -> bool;
-    /// Toggles the directional shadow map.
     fn set_shadows(&mut self, enabled: bool);
     /// Whether image-based ambient lighting is on.
     fn ibl_enabled(&self) -> bool;
-    /// Toggles IBL ambient.
     fn set_ibl(&mut self, enabled: bool);
     /// Whether GTAO screen-space ambient occlusion is on (per the active quality tier).
     fn ssao_enabled(&self) -> bool;
@@ -154,29 +134,23 @@ pub trait ControlRenderer {
     fn set_viewport_power_state(&mut self, state: &str) -> bool;
     /// Whether DDGI multi-bounce GI is on.
     fn ddgi_enabled(&self) -> bool;
-    /// Toggles DDGI.
     fn set_ddgi(&mut self, enabled: bool);
     /// Whether SDF distance-field AO is occluding the analytic IBL.
     fn sky_occlusion_enabled(&self) -> bool;
-    /// Toggles SDF distance-field AO occlusion of the analytic IBL.
     fn set_sky_occlusion(&mut self, enabled: bool);
     /// Whether the Global Distance Field (the camera-centered cascade clipmap) is on.
     fn gdf_enabled(&self) -> bool;
-    /// Toggles the Global Distance Field — the far-field cone-march tap.
     fn set_gdf(&mut self, enabled: bool);
     /// Whether reflection probes contribute.
     fn reflection_probes_enabled(&self) -> bool;
-    /// Toggles reflection probes.
     fn set_reflection_probes(&mut self, enabled: bool);
     /// The captured reflection probes in slot order (the `list-probes` source).
     fn reflection_probes(&self) -> Vec<ReflectionProbe>;
     /// Whether the GPU skinning path is on.
     fn skinning_enabled(&self) -> bool;
-    /// Toggles GPU skinning.
     fn set_skinning(&mut self, enabled: bool);
     /// Whether the GPU displacement path is on.
     fn displacement_enabled(&self) -> bool;
-    /// Toggles GPU displacement.
     fn set_displacement(&mut self, enabled: bool);
     /// Sets the displacement-tessellation budget (dice cap / minimum factor / target edge length in
     /// pixels); `None` leaves a field unchanged, and the values are clamped to a sane range (cap ≤ 2048, integer).
@@ -201,7 +175,6 @@ pub trait ControlRenderer {
     fn set_restir(&mut self, enabled: bool);
     /// Whether screen-space reflections are on.
     fn ssr_enabled(&self) -> bool;
-    /// Toggles screen-space reflections.
     fn set_ssr(&mut self, enabled: bool);
     /// Whether ray-traced reflections are on.
     fn rt_reflections_enabled(&self) -> bool;
@@ -239,11 +212,9 @@ pub trait ControlRenderer {
     fn view_history_invalidation(&self) -> &'static str;
     /// Shadow pages a frame may render.
     fn vsm_page_budget(&self) -> u32;
-    /// Sets the per-frame shadow-page render budget.
     fn set_vsm_page_budget(&mut self, pages: u32);
     /// Missing-page requests one view class may raise per frame.
     fn page_request_budget(&self) -> u32;
-    /// Sets that budget.
     fn set_page_request_budget(&mut self, entries: u32);
     /// Cumulative GPU microseconds in out-of-graph structure builds and compactions.
     fn rt_accel_build_us(&self) -> u64;
@@ -271,9 +242,7 @@ pub trait ControlRenderer {
     /// The reclaimed-and-free bindless slot count.
     fn bindless_free_count(&self) -> u32;
 
-    /// The current debug render-output mode.
     fn view_mode(&self) -> ViewMode;
-    /// Selects the debug render-output mode.
     fn set_view_mode(&mut self, mode: ViewMode);
 
     /// The current AA mode name (`off` / `fxaa` / `taa` / `msaaN`).
@@ -294,7 +263,6 @@ pub trait ControlRenderer {
 
     /// The tonemap exposure in stops.
     fn exposure_ev(&self) -> f32;
-    /// Sets the tonemap exposure in stops.
     fn set_exposure(&mut self, ev: f32);
 
     /// Sets the scene-linear color grade (white balance, contrast, saturation, ASC-CDL) folded into
@@ -330,7 +298,6 @@ pub trait ControlRenderer {
     fn bloom_intensity(&self) -> f32;
     /// The bloom tent-upsample scatter radius (UV units).
     fn bloom_scatter(&self) -> f32;
-    /// The bloom tint (multiplies the composited bloom).
     fn bloom_tint(&self) -> [f32; 3];
     /// The bloom soft-knee prefilter threshold (`0.0` = thresholdless).
     fn bloom_threshold(&self) -> f32;
@@ -343,9 +310,7 @@ pub trait ControlRenderer {
     fn set_bloom_dirt_params(&mut self, intensity: f32, tint: [f32; 3]);
     /// The lens-dirt mask asset id (`0` = none).
     fn bloom_dirt_texture(&self) -> u64;
-    /// The lens-dirt mix fraction.
     fn bloom_dirt_intensity(&self) -> f32;
-    /// The lens-dirt tint.
     fn bloom_dirt_tint(&self) -> [f32; 3];
     /// Sets the anamorphic streak: the `enabled` toggle, the horizontal `ratio` squeeze, the streak
     /// `tint`, and the `intensity` add weight.
@@ -354,18 +319,14 @@ pub trait ControlRenderer {
     fn bloom_anamorphic_enabled(&self) -> bool;
     /// The anamorphic horizontal squeeze.
     fn bloom_anamorphic_ratio(&self) -> f32;
-    /// The anamorphic streak tint.
     fn bloom_anamorphic_tint(&self) -> [f32; 3];
-    /// The anamorphic streak add weight.
     fn bloom_anamorphic_intensity(&self) -> f32;
     /// Sets the per-upsample-step tint stack (empty disables per-mip tinting).
     fn set_bloom_mip_tint(&mut self, tint: Vec<[f32; 3]>);
-    /// The per-upsample-step tint stack.
     fn bloom_mip_tint(&self) -> Vec<[f32; 3]>;
 
     /// The current GPU profiler mode.
     fn profiler_mode(&self) -> ProfilerMode;
-    /// Selects the GPU profiler mode.
     fn set_profiler_mode(&mut self, mode: ProfilerMode);
     /// Whether timestamp queries are supported on the graphics queue.
     fn profiler_timestamps_supported(&self) -> bool;
@@ -387,9 +348,7 @@ pub trait ControlRenderer {
     ) -> u32;
     /// Finishes the armed capture and returns the spans + metadata.
     fn stop_profile_capture(&mut self) -> ProfileCapture;
-    /// The capture's mode.
     fn profile_capture_mode(&self) -> CaptureMode;
-    /// The capture state machine's current state.
     fn profile_capture_state(&self) -> CaptureState;
     /// Frames copied into the in-flight capture so far.
     fn profile_capture_captured_frames(&self) -> u32;
@@ -415,7 +374,6 @@ pub trait ControlRenderer {
     /// The active view's offscreen render height (device pixels).
     fn viewport_height(&self) -> u32;
 
-    /// Whether the device is a software rasterizer.
     fn software_gpu(&self) -> bool;
 
     /// Blocks until the GPU has finished every in-flight frame.
@@ -468,12 +426,9 @@ pub trait ControlRenderer {
 
     /// Runs `with` against a transient [`GpuUploader`] over the live renderer.
     ///
-    /// The upload seam borrows the renderer plus the host-owned one-off uploader for the
-    /// call's duration; it never escapes the closure. Every asset handler that resolves
-    /// or uploads an asset reaches the loaders through it — `import-texture`,
-    /// `instantiate-model`, `material-import`, the preview floor, and `pick` (which pairs
-    /// it with [`ControlRenderer::viewport_width`] / [`ControlRenderer::viewport_height`]
-    /// for the ray-cast aspect).
+    /// The seam borrows the renderer plus the host-owned one-off uploader for the call's duration,
+    /// and never escapes the closure. Every handler that resolves or uploads an asset reaches the
+    /// loaders through it.
     fn with_gpu_uploader(&mut self, with: &mut dyn FnMut(&dyn GpuUploader));
 
     /// Creates the qualified graph-compute backend for this renderer.
@@ -520,11 +475,9 @@ pub trait ControlRenderer {
 
 /// The slice of live engine state a command may touch.
 ///
-/// References only, assembled fresh each frame in `poll_control` and dropped at
-/// the end of the drain — never stored past it. Because the fields are distinct,
-/// a handler that needs `&mut` to two subsystems at once
-/// borrows them disjointly through the struct, no `RefCell` required. `physics`
-/// is the live play world or `None` in Edit / before the first play.
+/// References only, assembled fresh each frame in `poll_control` and dropped at the end of the
+/// drain. The fields are distinct, so a handler needing `&mut` to two subsystems borrows them
+/// disjointly through the struct.
 pub struct EngineContext<'a> {
     /// The OS / windowless window facade.
     pub window: &'a mut Window,
@@ -549,6 +502,8 @@ pub struct EngineContext<'a> {
     pub vegetation_promotion: Option<&'a mut saffron_runtime::VegetationPromotion>,
     /// The navigation contribution seam: published contributions and dirty regions.
     pub vegetation_navigation: Option<&'a mut saffron_runtime::VegetationNavigationSeam>,
+    /// The world simulation clock biology advances on.
+    pub vegetation_ecology: Option<&'a mut saffron_runtime::VegetationEcologyClock>,
     /// The vegetation runtime's compact telemetry.
     pub vegetation_telemetry: Option<&'a mut saffron_runtime::VegetationTelemetry>,
     /// The live play physics world, or `None` in Edit.
@@ -576,9 +531,8 @@ impl EngineContext<'_> {
     }
 }
 
-/// The boxed handler type: a closure run on the calling (main) thread that maps
-/// `(ctx, params)` to a result `Value` or a typed error. `!Send` and
-/// single-thread-confined.
+/// The boxed handler: a closure run on the calling (main) thread, mapping `(ctx, params)` to a
+/// result `Value` or a typed error. Single-thread-confined.
 type HandlerFn = Box<dyn Fn(&mut EngineContext<'_>, &Value) -> Result<Value>>;
 
 /// A registered control command: a name, one-line help, and its handler.
@@ -595,8 +549,7 @@ impl Command {
     ///
     /// # Errors
     ///
-    /// Propagates whatever the handler returns — a [`Error::Command`] business
-    /// failure or a [`Error::Params`] deserialize failure.
+    /// Propagates whatever the handler returns.
     pub fn run(&self, ctx: &mut EngineContext<'_>, params: &Value) -> Result<Value> {
         (self.run)(ctx, params)
     }
@@ -616,9 +569,8 @@ impl CommandRegistry {
         Self::default()
     }
 
-    /// Registers an untyped command whose handler receives the raw params
-    /// `Value`. `help` is the one builtin that needs this — it reflects over the
-    /// registry.
+    /// Registers an untyped command whose handler receives the raw params `Value`. `help` is the
+    /// one builtin that needs it, because it reflects over the registry.
     pub fn register_raw(
         &mut self,
         name: &'static str,
@@ -634,12 +586,11 @@ impl CommandRegistry {
         });
     }
 
-    /// Registers a typed command: deserialize `P` from the params `Value`, run the
-    /// typed handler, serialize `R` back to a `Value`.
+    /// Registers a typed command: deserialize `P` from the params `Value`, run the typed handler,
+    /// serialize `R` back to a `Value`.
     ///
-    /// This is the single site the frozen wire encoding is applied — the typed
-    /// DTOs carry the decimal-string-`u64` and kebab-case-enum derives, so every
-    /// handler registered this way inherits the contract for free.
+    /// The single site the wire encoding is applied: the typed DTOs carry the decimal-string-`u64`
+    /// and kebab-case-enum derives, so every handler registered this way inherits the contract.
     pub fn register<P, R>(
         &mut self,
         name: &'static str,
@@ -670,26 +621,22 @@ impl CommandRegistry {
         &self.rows
     }
 
-    /// Dispatches one parsed request envelope to a reply envelope: echo `id`, find
-    /// the command, run it, and build `{ id, ok, result | error }`.
-    ///
-    /// `id` echoes whatever the request carried (any JSON, absent → `null`);
-    /// `ok` is always present; exactly one of `result` / `error` accompanies it.
+    /// Dispatches one parsed request envelope to a reply envelope: echo `id`, find the command,
+    /// run it, and build `{ id, ok, result | error }`. Exactly one of `result` / `error` is
+    /// present; an absent request `id` echoes as `null`.
     pub fn dispatch(&self, ctx: &mut EngineContext<'_>, request: &Value) -> Value {
         let id = request.get("id").cloned().unwrap_or(Value::Null);
         let command = request.get("cmd").and_then(Value::as_str).unwrap_or("");
         let Some(row) = self.find(command) else {
             return failure_reply(id, Error::command(format!("unknown command '{command}'")));
         };
-        // `help` reflects over the live registry, so it is served here rather
-        // than from a captured snapshot that would go stale as later phases
-        // register their commands. The `help` row still exists (so it lists
-        // itself and resolves for the palette), it just has no standalone body.
+        // `help` reflects over the live registry rather than a snapshot, so it is served here;
+        // its registered row exists only so it lists itself and resolves for the palette.
         if command == "help" {
             return json!({ "id": id, "ok": true, "result": self.help_listing() });
         }
-        // While a project load is in flight the scene/catalog are mid-swap, so all but a tiny
-        // allow-list of commands are discarded with the busy error — never queued for replay.
+        // While a load is in flight the scene/catalog are mid-swap, so all but the allow-list is
+        // discarded with the busy error, never queued for replay.
         if ctx.scene_edit.project_phase == saffron_sceneedit::ProjectPhase::Loading
             && !is_loading_safe_command(command)
         {
@@ -702,8 +649,7 @@ impl CommandRegistry {
         }
     }
 
-    /// The `{ commands: [{ name, help }] }` listing in registration order — the
-    /// body of the `help` command.
+    /// The `{ commands: [{ name, help }] }` listing in registration order.
     fn help_listing(&self) -> Value {
         let commands: Vec<Value> = self
             .rows
@@ -719,13 +665,9 @@ pub(crate) fn failure_reply(id: Value, error: Error) -> Value {
     json!({ "id": id, "ok": false, "error": error.into_failure() })
 }
 
-/// `params[name]` if present, else the index-th element of `params["args"]`,
-/// else `Null`.
+/// `params[name]` if present, else the index-th element of `params["args"]`, else `Null`.
 ///
-/// This is the lenient read every handler shares so a command accepts either
-/// `--name value` (an object key) or a bare positional. Domain handlers use it
-/// to extract a selector before resolving it; the typed [`CommandRegistry::register`]
-/// wrapper consumes the object form directly.
+/// The lenient read a handler uses to accept either `--name value` or a bare positional.
 #[must_use]
 pub fn positional_or(params: &Value, name: &str, index: usize) -> Value {
     if let Some(value) = params.get(name) {
@@ -759,12 +701,8 @@ fn field_order<P: JsonSchema + 'static>() -> &'static [String] {
 }
 
 /// Folds a request's positional `args` array onto DTO `P`'s named fields before deserializing:
-/// `args[i]` fills the `i`-th declared field.
-///
-/// A named key always wins over its positional slot. With no `args` array the params pass
-/// through untouched, so the common object-form call costs nothing past the field-order lookup.
-/// This is the single site the positional-CLI-argument wire shape (what `sa <cmd> <a> <b>` and
-/// the e2e harness send as `{ args: [...] }`) is applied, so every typed command inherits it.
+/// `args[i]` fills the `i`-th declared field, and a named key always wins over its positional
+/// slot. The single site the `{ args: [...] }` wire shape is applied.
 fn fold_positional_args<P: JsonSchema + 'static>(params: &Value) -> Value {
     let Some(args) = params.get("args").and_then(Value::as_array) else {
         return params.clone();
@@ -783,8 +721,7 @@ fn fold_positional_args<P: JsonSchema + 'static>(params: &Value) -> Value {
     Value::Object(object)
 }
 
-/// Registers the builtin commands: `ping` then `help`, in that order, then the
-/// domain phases' `register_*_commands`.
+/// Registers the builtins `ping` and `help`, then every domain's `register_*_commands`.
 pub fn register_builtin_commands(reg: &mut CommandRegistry) {
     reg.register::<PingParams, PingResult>("ping", "liveness + engine info", |_ctx, _params| {
         Ok(PingResult {
@@ -795,18 +732,13 @@ pub fn register_builtin_commands(reg: &mut CommandRegistry) {
         })
     });
 
-    // `help` reflects over the live registry, so `dispatch` serves it directly
-    // from the registration order; the row registered here exists so `help`
-    // lists itself and resolves for the editor palette. Its registered body is
-    // never invoked.
+    // `dispatch` serves `help` from the live registry; this row exists only so `help` lists
+    // itself and resolves for the editor palette, and its body is never invoked.
     reg.register_raw("help", "list available commands", |_ctx, _params| {
         Ok(json!({ "commands": [] }))
     });
 
-    // The domain groups register in the frozen order render → scene → animation → physics
-    // → vegetation → asset. `help` and the manifest-completeness check iterate the registry as a set, so
-    // the asset group is the manifest tail (`get-project` … `quit`); the scene group lands
-    // between render and animation.
+    // The frozen group order: render, scene, animation, physics, vegetation, asset.
     crate::commands_render::register_render_commands(reg);
     crate::commands_scene::register_scene_commands(reg);
     crate::commands_animation::register_animation_commands(reg);
@@ -822,31 +754,23 @@ fn process_id() -> i32 {
     i32::try_from(std::process::id()).unwrap_or(0)
 }
 
-/// Whether a control command leaves the rendered image unchanged — the editor's per-frame
-/// reconcile/stats pollers and every pure query.
+/// Whether a control command leaves the rendered image unchanged.
 ///
-/// The reactive render loop ([`saffron_app::RedrawController`]) renders a frame for any command
-/// **not** listed here, so the classification errs toward rendering: a query missing from this set
-/// costs at most one redundant frame per poll, while a *mutating* command can never be mislabeled
-/// read-only (the default is "mutates"), so a static viewport never shows a stale frame. This is the
-/// single source of truth for the read-vs-mutate split; `poll` consults it after each dispatch.
+/// The reactive render loop renders a frame for any command *not* listed here, so the default is
+/// "mutates": a query missing from the set costs one redundant frame, while a mutation can never
+/// be mislabeled read-only and leave a stale image.
 #[must_use]
 pub fn is_read_only_command(name: &str) -> bool {
-    // Every `get-*` / `list-*` is a query by construction.
     if name.starts_with("get-") || name.starts_with("list-") {
         return true;
     }
     matches!(
         name,
-        // liveness + help
         "ping" | "help"
-        // telemetry the stats / profiler panels poll each interval
         | "render-stats" | "pass-timings" | "frame-history" | "profiler.capture-status"
-        // scene / entity / physics queries the reconcile poll runs every tick
         | "inspect" | "physics-state" | "physics-bodies"
         // ring-buffer drains: advance a read cursor, never the image
         | "drain-alarms" | "drain-contacts" | "drain-script-errors" | "drain-script-logs"
-        // asset / material / model introspection
         | "model-info" | "asset-references" | "asset-usages" | "probe-asset"
         | "material-get" | "material-list" | "viewport-native-info" | "thumbnail-cache"
         // spatial queries (cast a ray, read back a hit — no scene change). `pick` is excluded:
@@ -854,7 +778,6 @@ pub fn is_read_only_command(name: &str) -> bool {
         // viewport-click select must request a redraw under the reactive loop.
         | "raycast" | "shapecast" | "pick-skeleton-joint"
         | "spatial-cell" | "spatial-providers" | "spatial-sample" | "spatial-residency"
-        // biome graph compilation/schema and retained evaluation diagnostics do not change the scene
         | "vegetation-compile-biome" | "vegetation-node-schema"
         | "vegetation-preflight-region" | "vegetation-start-evaluation"
         | "vegetation-evaluation-status"
@@ -866,19 +789,16 @@ pub fn is_read_only_command(name: &str) -> bool {
         | "vegetation-combustion" | "vegetation-ecology-status" | "vegetation-telemetry"
         | "vegetation-state-export"
         | "plant-validate" | "plant-growth" | "plant-graph" | "plant-elements"
-        // project-load phase + progress the editor's loading screen polls each tick
         | "project-status"
     )
 }
 
-/// Commands that stay serviceable while a project load is in flight. Deliberately tiny: during a
-/// load the scene/catalog are mid-swap, so even reads (`inspect`, `list-entities`) could observe a
-/// torn state — they get the busy error and the editor retries them once `Ready`. The loading
-/// screen polls `project-status` for progress and offers `cancel-load` to abort; both must pass the
-/// gate they run under. `viewport-native-info` is here too: it reads only the (swap-independent)
-/// viewport surface, and the editor's readiness probe drives it to flip the engine to `ready` — a
-/// gate the project-load poll itself runs behind, so blocking it during a load would stall the very
-/// progress the load is trying to report.
+/// Commands that stay serviceable while a project load is in flight.
+///
+/// Deliberately tiny: mid-load even a read can observe a torn scene, so everything else gets the
+/// busy error and the editor retries once `Ready`. `project-status` and `cancel-load` drive the
+/// loading screen, and `viewport-native-info` reads only the swap-independent viewport surface
+/// that the editor's readiness probe polls.
 #[must_use]
 pub fn is_loading_safe_command(name: &str) -> bool {
     matches!(
@@ -898,7 +818,6 @@ mod tests {
     use super::*;
     use crate::test_support::{StubRenderer, with_stub};
 
-    /// Runs `body` against a fresh `EngineContext` over a default renderer stub.
     fn with_ctx<T>(body: impl FnOnce(&mut EngineContext<'_>) -> T) -> T {
         let mut renderer = StubRenderer::default();
         with_stub(&mut renderer, body)
@@ -923,20 +842,15 @@ mod tests {
         assert_eq!(result["pid"], json!(process_id()));
     }
 
-    /// Every command in the frozen protocol manifest (`saffron_protocol::COMMANDS`) has a
-    /// handler in the builtin registry — except `get-script-schema`, which the host registers
-    /// (it needs the Lua schema reader) — and the registry registers nothing the manifest does
-    /// not declare. This is the manifest-completeness contract (set equality, not order: the
-    /// registry iterates in registration order while the manifest table is the generation
-    /// order, and each domain's intra-order is locked by its own per-file order test). A
-    /// command added to the protocol table without a matching handler trips here.
+    /// The manifest-completeness contract, as set equality: every `saffron_protocol::COMMANDS`
+    /// row has a handler here except `get-script-schema` (the host registers it, since it needs
+    /// the Lua schema reader), and nothing is registered that the manifest does not declare.
     #[test]
     fn registry_covers_the_protocol_manifest() {
         use std::collections::BTreeSet;
         const HOST_REGISTERED: &[&str] = &["get-script-schema"];
         let reg = builtins();
-        // `help` is the reflective-registry builtin the manifest skips by design
-        // (`HELP_COMMAND`, never in `COMMANDS`), so it is not a manifest row.
+        // `help` is the reflective builtin the manifest skips by design, so it is not a row.
         let registered: BTreeSet<&str> = reg
             .rows()
             .iter()
@@ -966,8 +880,6 @@ mod tests {
         let reply = with_ctx(|ctx| reg.dispatch(ctx, &json!({ "cmd": "help" })));
         assert_eq!(reply["ok"], json!(true));
         let commands = reply["result"]["commands"].as_array().unwrap();
-        // ping is registered first, help second, then the render domain. The two
-        // builtins lead; render-stats opens the render group.
         assert!(commands.len() >= 3);
         assert_eq!(commands[0]["name"], json!("ping"));
         assert_eq!(commands[0]["help"], json!("liveness + engine info"));
@@ -980,7 +892,6 @@ mod tests {
     fn unknown_command_is_an_error_with_id_echoed() {
         let reg = builtins();
         let reply = with_ctx(|ctx| reg.dispatch(ctx, &json!({ "cmd": "nope" })));
-        // No id in the request → null in the reply.
         assert_eq!(reply["id"], Value::Null);
         assert_eq!(reply["ok"], json!(false));
         assert_eq!(reply["error"]["code"], json!("command"));
@@ -995,13 +906,11 @@ mod tests {
         with_ctx(|ctx| {
             ctx.scene_edit.project_phase = saffron_sceneedit::ProjectPhase::Loading;
 
-            // A mutating command is discarded with the busy code while Loading.
             let blocked = reg.dispatch(ctx, &json!({ "id": 1, "cmd": "add-entity" }));
             assert_eq!(blocked["ok"], json!(false));
             assert_eq!(blocked["error"]["code"], json!("busy-loading"));
             assert_eq!(blocked["id"], json!(1));
 
-            // Allow-listed liveness / identity commands stay serviceable.
             assert_eq!(
                 reg.dispatch(ctx, &json!({ "cmd": "ping" }))["ok"],
                 json!(true)
@@ -1015,8 +924,8 @@ mod tests {
 
     #[test]
     fn error_arm_emits_code_uniformly() {
-        // A params deserialize failure carries the `params` code, proving the `Err` arm emits a
-        // code for every business/params error, not just the busy gate.
+        // A params deserialize failure carries the `params` code, so the `Err` arm emits a code
+        // for every error, not just the busy gate.
         let reg = builtins();
         let reply = with_ctx(|ctx| {
             reg.dispatch(
@@ -1085,8 +994,6 @@ mod tests {
     fn typed_register_surfaces_a_params_deserialize_error() {
         let mut reg = CommandRegistry::new();
         reg.register::<Vec3Holder, Vec3Holder>("echo", "echo", |_ctx, p| Ok(p));
-        // `x` must be a number; a string fails the typed deserialize and becomes
-        // the envelope error rather than a panic.
         let reply =
             with_ctx(|ctx| reg.dispatch(ctx, &json!({ "cmd": "echo", "params": { "x": "nan" } })));
         assert_eq!(reply["ok"], json!(false));
@@ -1101,24 +1008,19 @@ mod tests {
     #[test]
     fn typed_register_folds_positional_args_onto_named_fields() {
         use saffron_protocol::CreateEntityParams;
-        // `create-entity` with a bare positional arg (the `sa create-entity foo` / e2e
-        // `{ args: ["foo"] }` form) folds `args[0]` onto the `name` field.
         let folded = fold_positional_args::<CreateEntityParams>(&json!({ "args": ["foo"] }));
         assert_eq!(folded, json!({ "args": ["foo"], "name": "foo" }));
-        // A named key wins over its positional slot.
         let named =
             fold_positional_args::<CreateEntityParams>(&json!({ "name": "kept", "args": ["x"] }));
         assert_eq!(named["name"], json!("kept"));
-        // No `args` array → untouched.
         let plain = fold_positional_args::<CreateEntityParams>(&json!({ "name": "n" }));
         assert_eq!(plain, json!({ "name": "n" }));
     }
 
     #[test]
     fn typed_register_rejects_an_invalid_positional_enum_value() {
-        // `set-aa nonsense` (`{ args: ["nonsense"] }`) folds onto `mode`, then fails the
-        // `AaModeDto` enum deserialize — the negative oracle the e2e asserts (bad input is
-        // rejected, not silently accepted as an absent optional).
+        // `set-aa nonsense` folds onto `mode` and then fails the `AaModeDto` deserialize: bad
+        // input is rejected, not silently accepted as an absent optional.
         let mut reg = CommandRegistry::new();
         register_builtin_commands(&mut reg);
         let reply = with_ctx(|ctx| {
@@ -1132,16 +1034,12 @@ mod tests {
 
     #[test]
     fn positional_or_prefers_named_then_args_then_null() {
-        // Named key wins.
         let named = json!({ "entity": 5, "args": [9] });
         assert_eq!(positional_or(&named, "entity", 0), json!(5));
-        // Falls back to the index-th positional arg.
         let positional = json!({ "args": [9, 10] });
         assert_eq!(positional_or(&positional, "entity", 1), json!(10));
-        // Neither present → null.
         let empty = json!({});
         assert_eq!(positional_or(&empty, "entity", 0), Value::Null);
-        // Out-of-range positional → null.
         assert_eq!(positional_or(&positional, "entity", 5), Value::Null);
     }
 }

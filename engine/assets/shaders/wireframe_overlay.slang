@@ -1,11 +1,13 @@
 // Lit Wireframe overlay: re-draws the scene geometry as edges (PolygonMode::LINE) in a flat
 // color over the already-shaded, tonemapped scene. Record-driven like every executor pass:
-// SV_VertexID carries the pulled index value (the pages arena is the index buffer),
-// SV_VulkanInstanceID the record index; geometry pulls through buffer device addresses. The
-// push constant is the camera viewProj. Depth-tested (LESS_OR_EQUAL, no write) against the
-// persisted 1× scene depth so hidden edges are occluded.
+// SV_VulkanVertexID carries the pulled index value plus the command's `vertexOffset` (the
+// D3D-flavoured SV_VertexID subtracts the offset back out, which loses a displaced row's arena
+// slice base), SV_VulkanInstanceID the record index; geometry pulls through buffer device
+// addresses. The push constant is the camera viewProj. Depth-tested (LESS_OR_EQUAL, no write)
+// against the persisted 1× scene depth so hidden edges are occluded.
 
 import global_gpu_data;
+import scene_micro_common;
 
 // The frame's semantic record stream (the active view's traversal output).
 [[vk::binding(4, 2)]] StructuredBuffer<GpuDrawRecord> executorRecords;
@@ -17,7 +19,8 @@ struct Push
 [[vk::push_constant]] Push pc;
 
 [shader("vertex")]
-float4 vertexMain(uint vertexIndex : SV_VertexID, uint recordIndex : SV_VulkanInstanceID) : SV_Position
+float4 vertexMain(
+    uint vertexIndex : SV_VulkanVertexID, uint recordIndex : SV_VulkanInstanceID) : SV_Position
 {
     let addresses = gpuSceneAddresses;
     let record = executorRecords[recordIndex];
@@ -51,6 +54,14 @@ float4 vertexMain(uint vertexIndex : SV_VertexID, uint recordIndex : SV_VulkanIn
         let node = gpuScenePageNode(addresses, page);
         let vertex = gpuScenePageVoxelVertex(addresses, page, node, vertexIndex);
         local = vertex.position;
+    }
+    else if (record.representation == GPU_REPRESENTATION_DISPLACED_MICRO)
+    {
+        // The amplification arena carries the displaced position, so the edge follows the
+        // surface the scene pass shaded rather than the undisplaced base mesh.
+        float3 microNormal;
+        float2 microUv;
+        gpuSceneDisplacedVertex(addresses, vertexIndex, false, local, microNormal, microUv);
     }
     else if (record.deformation.index != 0xFFFFFFFFu
         && (instance.deformation.index == record.deformation.index))

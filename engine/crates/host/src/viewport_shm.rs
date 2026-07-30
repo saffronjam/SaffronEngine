@@ -1,17 +1,12 @@
 //! Host-side wiring of the viewport shm publisher.
 //!
-//! The editor sets a per-view shm-segment environment variable
-//! (`SAFFRON_VIEWPORT_SHM_SCENE` / `SAFFRON_VIEWPORT_SHM_ASSET`); each named view publishes
-//! its rendered frames into its own POSIX-shm segment for the compositor-side presenter
-//! (`editor/shell/src/presenter.rs`) instead of presenting to the hidden swapchain. Both segments are
-//! created at startup so both panes have a ring the presenter can block-open; only the
-//! active view bumps a new sequence each frame.
+//! The editor names a segment per view (`SAFFRON_VIEWPORT_SHM_SCENE` / `SAFFRON_VIEWPORT_SHM_ASSET`)
+//! and each view publishes its frames into that POSIX-shm segment rather than to the hidden
+//! swapchain. Both segments are created at startup so both panes have a ring the presenter can
+//! block-open; only the active view bumps a sequence each frame.
 //!
-//! The byte-exact producer is [`saffron_rendering::ShmPublish`] (the mmap + seqlock +
-//! release fence). This module owns only the *selection*: which views to enable, under
-//! which segment names, from the environment. The view tokens are the FROZEN wire strings
-//! the reader's `View::from_wire` expects (`"scene"` / `"assetPreview"`), kept identical
-//! end-to-end.
+//! The view tokens are the frozen wire strings the reader's `View::from_wire` expects. The byte-exact
+//! producer is [`saffron_rendering::ShmPublish`]; this module owns only the selection.
 
 use saffron_rendering::ShmPublish;
 

@@ -1,20 +1,10 @@
-//! The 16 animation-domain control commands: playback state (get/play/set-playing/seek/
-//! set-loop/stop-preview), clip listing, the skeleton overlay (get/set/highlight + joint
-//! pick), the viewport debug overlays (get/set), the asset-preview options (show-floor), and
-//! foot-IK (get/set).
+//! The animation-domain control commands: playback state, clip listing, the skeleton overlay and
+//! joint pick, the viewport debug overlays, the asset-preview options, and foot IK.
 //!
-//! `get/set-debug-overlays` sit in this block per the frozen manifest order (between
-//! `set-skeleton-overlay` and `set-skeleton-highlight`), interleaved with the
-//! skeleton-overlay group. `set-asset-preview-options` likewise sits here per the
-//! manifest order (between `pick-skeleton-joint` and `get-foot-ik`); it reuses the
-//! preview-floor helpers from `commands_asset`.
-//!
-//! The handlers drive the per-rig [`AnimationPlayer`] and the overlay render state — a thin
-//! command surface over the animation-player runtime. A model's player / foot-IK / state may
-//! live on the container root or a rig descendant while the selection is any entity in the
-//! forest (e.g. a `Morph` mesh child), so every transport command resolves to the model's
-//! single authority via [`Scene::model_player`] first — never a leaf that would spawn a rival
-//! player.
+//! A model's player, foot-IK, and state may live on the container root or a rig descendant while
+//! the selection is any entity in the forest, so every transport command resolves the model's
+//! single authority through [`Scene::model_player`] rather than a leaf that would spawn a rival
+//! player. Command order within the block is the frozen manifest order.
 
 use saffron_geometry::{AnimClip, AnimPath, AnimTarget, AnimTrack};
 use saffron_protocol::{

@@ -65,7 +65,7 @@ The feature word travels with the resolved material-table row. Two surfaces can 
 
 ## Other PSO axes
 
-The vertex entry point is another PSO axis — the `executor` field of `PsoKey`, not a fragment specialization constant. Scene passes select `vertexMainExecutor`, which binds no vertex input: each draw record resolves its geometry through buffer device addresses, including the per-frame deformed buffers that hold compute-skinned and morphed vertices. The `vertexMain` entry binds a vertex-input stream and serves the tessellation seam's displaced draws.
+The geometry stage is another PSO axis — the `mesh_shader` field of `PsoKey`, not a fragment specialization constant. Every raster PSO binds no vertex input: each draw record resolves its geometry through buffer device addresses, whether that is the page arena, the per-frame deformed buffers holding compute-skinned and morphed vertices, or the displacement arena. `vertexMainExecutor` is the vertex-stage entry and `meshMainExecutor` the mesh-stage one, over the identical records.
 
 Wireframe is another PSO axis rather than shader specialization. It chooses `VK_POLYGON_MODE_LINE` when the device supports non-solid fill. Sample count and fixed-function blend state also belong to the pipeline key.
 

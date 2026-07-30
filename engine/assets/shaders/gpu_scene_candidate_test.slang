@@ -12,9 +12,10 @@ struct CandidateCase
     uint instanceSlot;
     uint primitive;
     float sampledAlpha;
-    uint reserved;
+    uint firstSubmesh;
     float2 barycentrics;
-    float2 reserved2;
+    uint geometryIndex;
+    uint reserved;
 };
 
 [[vk::binding(0, 0)]] RWStructuredBuffer<uint> output;
@@ -28,7 +29,12 @@ void computeMain(uint3 tid : SV_DispatchThreadID)
     let addresses = addressBlocks[0];
     let testCase = cases[tid.x];
     let surface = gpuSceneResolveCandidate(
-        addresses, testCase.instanceSlot, testCase.primitive, testCase.barycentrics);
+        addresses,
+        testCase.instanceSlot,
+        testCase.firstSubmesh,
+        testCase.geometryIndex,
+        testCase.primitive,
+        testCase.barycentrics);
 
     uint base = tid.x * 16u;
     output[base + 0u] = surface.valid ? 1u : 0u;

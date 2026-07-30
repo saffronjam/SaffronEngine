@@ -51,12 +51,12 @@ The preview is a `PreviewGhost`-tagged subtree instantiated into the authored sc
 | Drag payload + reader | `editor/src/components/AssetTile.tsx` | `ASSET_DND_MIME`, `AssetDragPayload`, `readAssetPayload` |
 | Viewport placement target | `editor/src/panels/ViewportPanel.tsx` | `ViewportPanel`, `clientPointToUv` |
 | Placement client calls | `editor/src/control/client.ts` | `previewAssetPlacement`, `commitAssetPlacement`, `clearAssetPlacement` |
-| Placement command | `engine/crates/control/src/commands_asset.rs` | `asset-placement`, `preview_asset_placement`, `commit_asset_placement` |
+| Placement command | `engine/crates/control/src/commands_asset/` | `asset-placement`, `preview_asset_placement`, `commit_asset_placement` |
 | Transient render state | `engine/crates/sceneedit/src/context.rs` | `PlacementPreview`, `SceneEditContext::placement_preview` |
-| Ghost render + placement ray | `engine/crates/assets/src/render_scene.rs` | `render_scene`, `pick_scene_surface`, `viewport_ray` |
+| Ghost render + placement ray | `engine/crates/assets/src/render_scene/` | `render_scene`, `pick_scene_surface`, `viewport_ray` |
 | Where it's mounted | `editor/src/components/fieldRenderer.tsx` | the `uuid` case in `renderField`, `FieldHint.asset` |
 | The write (client) | `editor/src/panels/InspectorPanel.tsx` | `sendWrite` (`assignAsset` / `setComponentField`) |
-| Assign (engine) | `engine/crates/control/src/commands_asset.rs` | `assign-asset` |
+| Assign (engine) | `engine/crates/control/src/commands_asset/` | `assign-asset` |
 
 ## Related
 

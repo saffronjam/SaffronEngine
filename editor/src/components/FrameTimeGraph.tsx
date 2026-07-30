@@ -1,10 +1,8 @@
-/// The live frame-time graph: a uPlot Canvas (not SVG/Recharts — the webview composites
-/// over the live engine viewport, so editor CPU is not free). The instance is created once;
-/// data is pushed imperatively via setData on a requestAnimationFrame tick, never through
-/// React state. It never plots raw per-frame samples (far too jittery) — it averages the
-/// chosen Range of accumulated `frameSeries` history into Window-sized buckets (≤ MAX_BUCKETS),
-/// draws the line as a monotone-cubic spline, and pins the Y axis to a sticky, nice-rounded,
-/// budget-anchored ceiling so it does not jump. A dashed budget line is drawn each frame.
+/// The live frame-time graph on a uPlot canvas — the webview composites over the live engine
+/// viewport, so editor CPU is not free. The instance is created once and data is pushed
+/// imperatively on a rAF tick, never through React state. Raw per-frame samples are far too jittery
+/// to plot, so the chosen range is averaged into buckets, drawn as a monotone-cubic spline against a
+/// sticky, budget-anchored Y ceiling that does not jump.
 import uPlot from "uplot";
 import "uplot/dist/uPlot.min.css";
 import { useEffect, useRef } from "react";

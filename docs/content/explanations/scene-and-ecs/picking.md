@@ -76,12 +76,12 @@ The control command performs one final ownership step: if the surface belongs to
 
 | What | File | Symbols |
 |---|---|---|
-| Ray construction and shared scene query | `engine/crates/assets/src/render_scene.rs` | `viewport_ray`, `query_scene_surface_ray`, `pick_scene_surface`, `pick_entity` |
+| Ray construction and shared scene query | `engine/crates/assets/src/render_scene/` | `viewport_ray`, `query_scene_surface_ray`, `pick_scene_surface`, `pick_entity` |
 | Static mesh surface adapter | `engine/crates/assets/src/mesh_surface.rs` | `StaticMeshSurfaceProvider`, `SurfaceField` |
-| Static-mesh hierarchy cache | `engine/crates/assets/src/load.rs` | `AssetServer::mesh_pick_bvh` |
+| Static-mesh hierarchy cache | `engine/crates/assets/src/load/` | `AssetServer::mesh_pick_bvh` |
 | Bounds and intersection math | `engine/crates/geometry/src/picking.rs` | `MeshBvh`, `raycast_hit`, `nearest_hit_transformed`, `ray_triangle_coordinates` |
 | Joint palette | `engine/crates/scene/src/hierarchy.rs` | `Scene::joint_matrices` |
-| Billboard priority and selection | `engine/crates/control/src/commands_scene.rs` | `pick_billboard`, `pick` |
+| Billboard priority and selection | `engine/crates/control/src/commands_scene/` | `pick_billboard`, `pick` |
 
 ## Related
 

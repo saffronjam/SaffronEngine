@@ -1,9 +1,7 @@
 //! The frozen wire strings for [`AssetType`] and [`Colorspace`].
 //!
-//! These name maps are a contract with the catalog cache, the `.smodel` META chunk,
-//! and the editor: the strings are written into `catalog.json`, the META `subAsset`
-//! records, and the `.smeta` sidecars, and read back by the scan. They live in one
-//! module so the bake, the scan, and the container codec all spell them identically.
+//! `catalog.json`, the `.smodel` META `subAsset` records, and the `.smeta` sidecars all store these
+//! strings, so bake, scan, and the container codec share one spelling of each.
 
 use saffron_scene::{AssetType, Colorspace, TextureRole};
 
@@ -128,7 +126,6 @@ mod tests {
         ] {
             assert_eq!(asset_type_from_name(asset_type_name(ty)), ty);
         }
-        // An unknown string is the Mesh default.
         assert_eq!(asset_type_from_name("nonsense"), AssetType::Mesh);
     }
 
@@ -142,7 +139,6 @@ mod tests {
         ] {
             assert_eq!(colorspace_from_name(colorspace_name(space)), space);
         }
-        // An unknown string is the Auto default.
         assert_eq!(colorspace_from_name("nonsense"), Colorspace::Auto);
     }
 
@@ -164,7 +160,6 @@ mod tests {
         ] {
             assert_eq!(texture_role_from_name(texture_role_name(role)), role);
         }
-        // An unknown string is the Unknown default.
         assert_eq!(texture_role_from_name("nonsense"), TextureRole::Unknown);
     }
 }

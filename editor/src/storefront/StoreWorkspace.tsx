@@ -1,12 +1,8 @@
-// The Store main tab: browse one store at a time. A store dropdown (top-left) picks which of the
-// project's enabled connectors to search; the centered search bar queries that store (Enter /
-// chip-commit only). A gear opens the provider-setup modal and an icon toggles the credits view.
-//
-// Which connectors a project uses persists in project.json's `stores` block (shared with the
-// team); each connector's secret lives only in the OS keyring (per machine). The selected store +
-// last query persist app-wide (localStorage) so reopening the Store returns you to where you left
-// off. Opening the Store with nothing enabled auto-opens the provider modal ("Add your first
-// provider"); disabling the store you're viewing auto-selects another enabled one.
+// The Store main tab: browse one store at a time. Which connectors a project uses persists in
+// project.json's `stores` block (team-shared); each connector's secret lives only in the OS keyring.
+// The selected store and last query persist app-wide so reopening the Store returns you to where you
+// left off. Opening it with nothing enabled auto-opens the provider modal; disabling the store you
+// are viewing auto-selects another enabled one.
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Award, Loader2, Settings } from "lucide-react";
 

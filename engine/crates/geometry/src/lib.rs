@@ -1,23 +1,14 @@
 //! glam math plus the CPU mesh/skin/vertex/ray types, the animation track/clip
-//! types, and the import-graph aggregates.
+//! types, the import-graph aggregates, the `.smesh`/`.sanim` byte formats, the
+//! picking math, the glTF/OBJ importers, and the stable sub-asset id hash.
 //!
-//! This crate adopts `glam` as the engine's math vocabulary with three locked
-//! decisions that cascade through every downstream crate:
+//! Two locked decisions cascade through every downstream crate:
 //!
-//! - **`Vec3` is 12 bytes, never `Vec3A`.** All format-bearing fields use
-//!   `Vec3`/`Vec4`/`Vec2`/`Mat4`, never the 16-byte SIMD `A` variants, so the
-//!   byte strides match the frozen disk/GPU layouts (`Vertex` = 32, etc.).
-//! - **Quaternion order is `xyzw`.** glam's `Quat` is the glTF storage order:
+//! - **`Vec3` is 12 bytes, never `Vec3A`.** Format-bearing fields use
+//!   `Vec3`/`Vec4`/`Vec2`/`Mat4`, never the 16-byte SIMD `A` variants, so the byte
+//!   strides match the frozen disk and GPU layouts.
+//! - **Quaternion order is `xyzw`.** glam's `Quat` is the glTF storage order, so
 //!   [`ImportedNode::rotation`] reads the four glTF floats in declaration order.
-//! - **No global depth flag.** The `[0, 1]` Vulkan clip depth is a per-projection
-//!   choice (`Mat4::perspective_rh`). No projection lives in this crate, so the rule
-//!   is recorded for downstream crates and not exercised here.
-//!
-//! Beyond the types it carries the byte formats (`.smesh`/`.sanim`), the picking
-//! math, the model importers (glTF via the `gltf` crate, OBJ via `tobj`), the raster
-//! image decoders (the `image` crate), and the stable sub-asset id hash.
-//!
-//! Depends on `saffron-core`.
 
 #![deny(unsafe_code)]
 
@@ -97,12 +88,12 @@ pub use types::{
 };
 pub use virtual_hierarchy::*;
 
-// Re-export glam so downstream crates share this crate's pinned math vocabulary
-// rather than depending on glam directly and risking a version split.
+// Re-exported so downstream crates share this crate's pinned math vocabulary rather
+// than depending on glam directly and risking a version split.
 pub use glam;
 
-/// The format-bearing strides, pinned at compile time. A stray `Vec3A` or a glam
-/// bump that changed a layout fails the build here, not at a torn-mesh runtime.
+/// The format-bearing strides, pinned at compile time: a stray `Vec3A` or a glam bump
+/// that moved a layout fails the build here rather than at a torn-mesh runtime.
 const _: () = assert!(size_of::<Vertex>() == 48, "Vertex must stay 48 bytes");
 const _: () = assert!(size_of::<Submesh>() == 16, "Submesh must stay 16 bytes");
 const _: () = assert!(
@@ -115,8 +106,7 @@ mod tests {
     use super::*;
     use glam::{Vec2, Vec3, Vec4};
 
-    /// A `const fn` that only compiles for a `Pod` type — proves the derive held
-    /// for each format struct without naming `unsafe`.
+    /// Only compiles for a `Pod` type, so it proves the derive held without naming `unsafe`.
     const fn assert_pod<T: bytemuck::Pod>() {}
 
     #[test]
@@ -175,8 +165,6 @@ mod tests {
 
     #[test]
     fn slice_cast_preserves_count_and_order() {
-        // A Vec of format structs casts to bytes and back as a slice — the wire the
-        // .smesh writer/reader uses (proves cast_slice is wired, no unsafe).
         let vertices = vec![
             Vertex {
                 position: Vec3::X,
@@ -199,7 +187,6 @@ mod tests {
 
     #[test]
     fn anim_byte_discriminants_are_pinned() {
-        // The on-disk byte values must stay fixed (the .sanim record stores them raw).
         assert_eq!(AnimPath::Translation as u8, 0);
         assert_eq!(AnimPath::Rotation as u8, 1);
         assert_eq!(AnimPath::Scale as u8, 2);
@@ -209,7 +196,6 @@ mod tests {
         assert_eq!(AnimInterp::CubicSpline as u8, 2);
         assert_eq!(AnimTarget::Bone as u8, 0);
         assert_eq!(AnimTarget::Node as u8, 1);
-        // The discriminant round-trips through `from_u8`; out-of-range is rejected.
         assert_eq!(AnimPath::from_u8(3).unwrap(), AnimPath::Weights);
         assert_eq!(AnimTarget::from_u8(1).unwrap(), AnimTarget::Node);
         assert!(AnimPath::from_u8(4).is_err());
@@ -217,21 +203,18 @@ mod tests {
     }
 
     #[test]
-    fn defaults_match_the_cpp_seed_values() {
-        // ImportedNode: parent -1 (root), identity rotation, unit scale.
+    fn import_defaults_are_root_identity_white_and_forward_z() {
         let node = ImportedNode::default();
         assert_eq!(node.parent, -1);
         assert_eq!(node.rotation, glam::Quat::IDENTITY);
         assert_eq!(node.scale, Vec3::ONE);
 
-        // ImportedMaterial: white base color, dielectric, fully rough.
         let material = ImportedMaterial::default();
         assert_eq!(material.base_color, Vec4::ONE);
         assert_eq!(material.metallic, 0.0);
         assert_eq!(material.roughness, 1.0);
         assert!(material.albedo.is_none());
 
-        // Ray: forward -Z, origin at the world center.
         let ray = Ray::default();
         assert_eq!(ray.origin, Vec3::ZERO);
         assert_eq!(ray.dir, Vec3::new(0.0, 0.0, -1.0));
@@ -239,8 +222,6 @@ mod tests {
 
     #[test]
     fn quat_reads_gltf_xyzw_in_declaration_order() {
-        // glam's xyzw is the glTF storage order, so the four source floats map
-        // straight through.
         let r = [0.1f32, 0.2, 0.3, 0.9];
         let q = glam::Quat::from_xyzw(r[0], r[1], r[2], r[3]);
         assert_eq!(q.x, r[0]);

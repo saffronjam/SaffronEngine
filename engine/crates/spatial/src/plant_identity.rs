@@ -30,9 +30,7 @@ pub struct PlantId([u8; 16]);
 impl PlantId {
     /// Decodes the canonical identity bytes and validates the encoded namespace.
     pub fn from_bytes(bytes: [u8; 16]) -> Result<Self> {
-        let id = Self(bytes);
-        id.namespace()?;
-        Ok(id)
+        Self::from_canonical_bytes(bytes)
     }
 
     /// Constructs an explicit authored identity from its stored 128-bit GUID payload.
@@ -59,7 +57,7 @@ impl PlantId {
         Self(payload)
     }
 
-    /// Returns the identity namespace encoded in the high two bits.
+    /// The identity namespace encoded in the high two bits.
     pub fn namespace(self) -> Result<PlantIdNamespace> {
         match (self.0[0] & NAMESPACE_MASK) >> 6 {
             0 => Ok(PlantIdNamespace::Procedural),

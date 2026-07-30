@@ -1,20 +1,9 @@
-//! The backend-neutral gizmo op/space (the single source of truth), the overlay gizmo's
-//! hover/drag state, and the pure-math hit-test / projection / drag the gizmo runs on.
+//! The gizmo op/space, the overlay gizmo's hover/drag state, and the pure-math hit-test,
+//! projection, and drag it runs on.
 //!
-//! [`GizmoOp`] / [`GizmoSpace`] are the canonical op + reference space, shared by the
-//! control TU and the native overlay. The [`NativeGizmoState`] `mode`/`space` are a
-//! per-frame *mirror* driven from those — never set directly; the mirror is synced from
-//! the source by [`SceneEditContext::sync_native_gizmo`].
-//!
-//! The free functions below ([`viewport_project`], [`pixel_to_ndc`], [`camera_position`],
-//! [`point_segment_distance`], [`ring_basis`], [`gizmo_axes`], [`handle_axis`],
-//! [`gizmo_plane_corners`], [`axis_color`]) are the pure-glam math shared by the SDL event
-//! sink and the gizmo-pointer control command, plus the overlay draw — no Rendering, no
-//! SDL. The context-operating pieces (hit-test, drag, snapshot, the smoothing steppers)
-//! are methods on [`SceneEditContext`]: [`SceneEditContext::hit_native_gizmo`],
-//! [`SceneEditContext::apply_native_gizmo_drag`],
-//! [`SceneEditContext::step_native_gizmo_drag`], and
-//! [`SceneEditContext::snapshot_native_gizmo_start`].
+//! [`GizmoOp`] / [`GizmoSpace`] are the canonical op and reference space, shared by the control TU
+//! and the native overlay. [`NativeGizmoState`]'s `mode`/`space` are a per-frame *mirror* of those:
+//! never set directly, only synced by [`SceneEditContext::sync_native_gizmo`].
 
 use glam::{Mat3, Mat4, Quat, Vec2, Vec3, Vec4};
 

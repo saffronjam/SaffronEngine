@@ -1,36 +1,11 @@
-//! Shared test comparators and the golden-byte diff helper.
+//! Shared test comparators and the golden-byte diff helper. The float tolerances that *are* the
+//! contract live here rather than being re-defined per test.
 //!
-//! Pulled in under `[dev-dependencies]` by the crates whose oracles assert against float
-//! tolerances (animation, geometry, physics, …). The tolerances that *are* the contract
-//! live in one place rather than re-defined per test.
-//!
-//! # Tolerances
-//!
-//! - [`EPS`] = `1e-4` — the general "values are equal" tolerance: sampled
-//!   translations/scales, playhead times, applied-delta endpoints, `quat_close`'s
-//!   double-cover margin.
-//! - [`IK_REACH_EPS`] = `1e-3` — two-bone IK lands its end effector on an in-range target
-//!   this close; also the bent-chain reach check.
-//! - [`IK_OVER_REACH_EPS`] = `1e-2` — an over-extended chain straightens and clamps to its
-//!   max reach this close; looser because the clamped solve only approximately straightens.
-//!
-//! # Where the helpers live
-//!
-//! Comparators are free functions ([`close`], [`assert_close`], [`quat_close`],
-//! [`assert_quat_close`]); the golden byte diff is [`golden`] / [`assert_golden`].
-//!
-//! # The on-disk golden snapshot harness
-//!
-//! [`assert_bytes_match_golden`] loads a committed fixture from `fixtures/golden/` (at the
-//! repo root), diffs `actual` against it with [`golden`], and on mismatch panics with the
-//! first-differing-offset hexdump. The fixtures are byte-exact reference artifacts, frozen
-//! once seeded — the detector for the silent byte-drift class (`.smesh`/`.smat`/`.sanim`
-//! byte shifts, std430 offset moves, shm header changes) that never throws and never fails
-//! validation.
-//!
-//! Setting `UPDATE_GOLDEN=1` rewrites the fixture from `actual` instead of asserting — the
-//! seed/reseed path, for an *intentional* format change that updates the one writer and the
-//! one fixture together, never to mask a real drift.
+//! [`assert_bytes_match_golden`] diffs `actual` against a committed fixture under the repo-root
+//! `fixtures/golden/` and panics with a first-differing-offset hexdump. It catches the silent
+//! byte-drift class — `.smesh`/`.smat` shifts, std430 offset moves, shm header changes — that never
+//! throws and never fails validation. `UPDATE_GOLDEN=1` reseeds the fixture instead of asserting,
+//! for an intentional format change that updates the writer and the fixture together.
 
 #![deny(unsafe_code)]
 

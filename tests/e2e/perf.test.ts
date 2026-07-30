@@ -51,9 +51,6 @@ test("render-stats reports throughput counters and the CPU/GPU split", async () 
   expect(stats.drawCalls).toBeGreaterThan(0);
   expect(stats.triangles).toBeGreaterThan(0);
   expect(stats.sceneGatherMs).toBeGreaterThanOrEqual(0);
-  // Steady scene: the GPU-scene mirror stages (near-)zero table bytes per frame —
-  // render preparation scales with changes, never with instance count.
-  expect(stats.instanceUploadBytes).toBeLessThan(65536);
   expect(stats.retainedMeshCpuBytes).toBeGreaterThan(0);
   expect(stats.shadowDrawCalls).toBeGreaterThanOrEqual(0);
   expect(stats.rtInstances).toBeGreaterThanOrEqual(0);
@@ -65,6 +62,51 @@ test("render-stats reports throughput counters and the CPU/GPU split", async () 
     expect(stats.profilerMode).not.toBe("off");
     expect(stats.gpuFrameMs).toBeGreaterThan(0);
   }
+});
+
+// Render preparation scales with what the frame CHANGED, not with what the scene holds. The claim
+// is only worth asserting comparatively: a bound on one scene's counter passes for an
+// implementation that walks every instance, whereas a small scene and a much larger one reporting
+// the same steady-frame cost cannot.
+test("steady-frame preparation cost does not grow with the scene", async () => {
+  // Polls until the loop reports the frame converged, then reads the steady-frame counters. A
+  // mutation re-cuts for a frame or two, so a sample taken mid-settle measures the change rather
+  // than the steady state.
+  async function settled(): Promise<RenderStats> {
+    for (let attempt = 0; attempt < 60; attempt += 1) {
+      const stats = await engine.call<RenderStats>("render-stats");
+      if (stats.converged && stats.sceneGatherEntities === 0) {
+        return stats;
+      }
+      await engine.settle(100);
+    }
+    return engine.call<RenderStats>("render-stats");
+  }
+
+  const small = await settled();
+  expect(small.sceneGatherEntities).toBe(0);
+  const smallUpload = small.instanceUploadBytes;
+
+  const added: string[] = [];
+  for (let i = 0; i < 64; i += 1) {
+    const entity = await engine.call<{ id: string }>("add-entity", { preset: "cube" });
+    added.push(entity.id);
+    await engine.call("set-transform", {
+      entity: entity.id,
+      translation: { x: i * 2 - 64, y: 0, z: -6 },
+    });
+  }
+  const large = await settled();
+  expect(large.instances).toBeGreaterThan(small.instances);
+  // The whole property: 65 instances cost the same steady frame as one.
+  expect(large.sceneGatherEntities).toBe(0);
+  expect(large.instanceUploadBytes).toBe(smallUpload);
+
+  for (const entity of added) {
+    await engine.call("destroy-entity", { entity });
+  }
+  await settled();
+  expect(engine.validationErrors()).toEqual([]);
 });
 
 test("pass-timings returns a non-empty per-pass breakdown", async () => {
@@ -99,7 +141,7 @@ test("disabling the profiler returns to baseline", async () => {
 describe("profiler capture", () => {
   let result: CaptureStopResult;
 
-  /// Arm a single-frame capture, poll the non-destructive status until ready, then drain.
+  // Arm a single-frame capture, poll the non-destructive status until ready, then drain.
   async function captureSingle(): Promise<CaptureStopResult> {
     await engine.call<CaptureStartResult>("profiler.capture-start", { mode: "single" });
     for (let i = 0; i < 60; i++) {

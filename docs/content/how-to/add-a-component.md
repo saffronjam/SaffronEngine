@@ -42,7 +42,8 @@ Add a new ECS component type. A single `register_component!` line wires up seria
    register_component!(reg, Health, "Health");
    ```
    There is no per-type UI draw hook: the engine renders no UI. The Inspector is the React/CEF frontend, which builds each field from the DTO catalog over the control plane. The macro defaults the serde to the type's `SceneSerialize` impl and synthesizes the structural fn-pointers (`has` / `add_default` / `remove` / `copy_to` / `serialize` / `deserialize`) into a `ComponentTraits` row. An optional trailing `bool` is `removable`, which is `false` for always-present types like `Name`, `Transform`, and `Relationship` (it defaults to `true`).
-4. Rebuild with `cargo build --workspace`.
+4. Mirror the body as a wire DTO in `saffron-protocol` (`scene_dto.rs`): the struct itself, an `Option<…>` field on `Components` and a variant on `ComponentBody` at the registry position, and the name in `COMPONENT_NAMES`. `inspect` is validated against `Components`, which admits no property it has no field for, and `the_component_dto_aggregate_matches_the_scene_registry` fails when the two name lists drift.
+5. Regenerate the protocol artifacts with `cargo run -p xtask -- gen-protocol`, then rebuild with `cargo build --workspace`.
 
 The stable name is the JSON key, the Inspector header, and the CLI token. Keep it consistent across all three.
 
@@ -65,9 +66,9 @@ The stable name is the JSON key, the Inspector header, and the CLI token. Keep i
 | The traits row + registry | `engine/crates/scene/src/registry.rs` | `ComponentTraits`, `ComponentRegistry::register` |
 | Where built-ins register | `engine/crates/scene/src/registry.rs` | `register_builtin_components`, `BUILTIN_COMPONENT_NAMES` |
 | Component structs | `engine/crates/scene/src/component.rs` | the component value structs |
-| The per-type serde | `engine/crates/scene/src/serde.rs` | `SceneSerialize` impls (`to_json` / `load_json`) |
+| The per-type serde | `engine/crates/scene/src/serde/` | `SceneSerialize` impls (`to_json` / `load_json`) |
 | Generic add/get/has/remove | `engine/crates/scene/src/scene.rs` | `add_component`, `with_component`, `has_component` |
-| CLI add/set/inspect | `engine/crates/control/src/commands_scene.rs` | `register_scene_commands` (`add-component`, `set-component`, `inspect`) |
+| CLI add/set/inspect | `engine/crates/control/src/commands_scene/` | `register_scene_commands` (`add-component`, `set-component`, `inspect`) |
 
 ## Related
 

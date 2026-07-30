@@ -72,11 +72,12 @@ by the frames-in-flight depth — a slot reports its last use):
 
 | Counter | Meaning |
 |---|---|
-| `drawCalls` | draw records the traversal emitted, plus tessellation-seam draws |
+| `drawCalls` | draw records the traversal emitted |
 | `batches` | live executor draw buckets (distinct shader + PSO-bin combos) |
 | `instances` | instances the visibility cull kept |
 | `triangles` | triangles the emitted records rasterize |
-| `sceneGatherMs` | CPU time spent gathering the frame facts + deformation work |
+| `sceneGatherMs` | CPU time spent deriving the frame's deformation work and ray instances |
+| `sceneGatherEntities` | instances that derivation touched (zero on a steady scene, whatever its size) |
 | `instanceUploadBytes` | GPU-scene table bytes staged this frame ((near-)zero when idle) |
 | `retainedMeshCpuBytes` | mirrored-mesh host bytes retained for exact surface queries |
 | `shadowDrawCalls` | counted-indirect draws recorded across the frame's virtual-shadow pages |

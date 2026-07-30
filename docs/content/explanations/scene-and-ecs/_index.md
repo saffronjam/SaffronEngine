@@ -27,7 +27,7 @@ needs editing when a component is added.
 | `spatial-world` | exact world positions, hierarchical cells, surface fields, deterministic numerics, facet residency | `spatial/src/lib.rs` · `WorldCellKey` · `SurfaceField` |
 | `vegetation-state` | Runtime cells, facet residency, queries, and strict persistence | `vegetation/src/runtime_world.rs` · `VegetationWorld`, `reduce_mutations` |
 | `plant-promotion` | Transient entity views for macro plants, and state write-back | `runtime/src/vegetation_promotion.rs` · `VegetationPromotion`, `PlantOrigin` |
-| `ecology-catchup` | Fixed ecology ticks, dependency regions, and budgeted catch-up | `vegetation/src/ecology_region.rs` · `advance_region` |
+| `ecology-catchup` | The world simulation clock, fixed ecology ticks, dependency regions, and budgeted catch-up | `vegetation/src/ecology_region.rs` · `runtime/src/vegetation_ecology.rs` · `advance_region` |
 | `vegetation-navigation` | Obstacle/cost contributions and dirty-region delivery | `runtime/src/vegetation_navigation.rs` · `VegetationNavigationSeam` |
 | `vegetation-telemetry` | Compact stage times and work counters, no per-instance readback | `runtime/src/vegetation_telemetry.rs` · `VegetationTelemetry` |
 | `wind-field` | One deterministic sampled wind field every consumer reads identically | `wind/src/lib.rs` · `WindProfile`, `sample` |

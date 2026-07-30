@@ -103,9 +103,9 @@ bounds.
   `previous = false` and the motion pass rebuilds the previous-time blade (replacing the
   zero-motion `prevLocal = local`) — blade motion vectors carry the exact wind term. Wind words
   ride `MicroFieldPush` (112→160 B, matching the visibility push's 160 B precedent); placement and
-  survivor counts stay bend-independent so count and scatter agree. Gates: shaders + clippy 0,
-  rendering 296 lib tests, e2e vegetation-graph 264 + wind 21 expects validation-clean, docs 3×
-  clean (plant-rendering.md documents the bake).)*
+  survivor counts stay bend-independent so count and scatter agree. Covered by the rendering crate's
+  lib tests and the `vegetation-graph`/`wind` e2e files, validation-clean; `plant-rendering.md`
+  documents the bake.)*
 - [x] Deform assembly parts without expanding authored structure; compute tight node/cluster swept
   bounds rather than inflating whole-tree bounds.
   *(Assembly parts deform INDIVIDUALLY with no authored-structure expansion: the branch mode
@@ -138,13 +138,15 @@ bounds.
 - [x] Share one result with depth, main, motion, selection, fixed shadows, aggregate voxels, and later
   VSM/RT. No shader independently re-evaluates wind.
   *(The prepass is the single evaluation: every raster pass applies the stored record through
-  `gpuSceneWindSway` at its world-compose line — `transformExecutorVertex` (mesh), executor depth,
-  gbuffer, point shadow, the `add_shadow_pass` executor stream, wireframe overlay (selection), and
-  the aggregate-voxel branch (same instance-local application). Motion applies the stored
+  `gpuSceneWindDeform` (`global_gpu_data.slang`) at its world-compose line: `mesh.slang`'s
+  `executorVertexOutput` feeding `transformExecutorVertex`, which serves the shaded pass and the whole
+  depth family (prepass, shadow pages, survivors); `gbuffer.slang`; `motion.slang`;
+  `wireframe_overlay.slang` (selection); and the aggregate-voxel branch through the same
+  instance-local application. Motion applies the stored
   previous-time sway (`windTime.y`), so motion vectors carry the exact wind term; the visibility
-  cull + retest add the record's `boundsInflation`. Gates: rendering 296 lib tests + e2e
-  vegetation-graph/wind validation-clean. The RT mirror draws the undeformed arenas (deformed
-  instances ride the unmirrored sentinel), per the "later VSM/RT" clause.)*
+  cull + retest add the record's `boundsInflation`. Covered by the rendering crate's lib tests and
+  the `vegetation-graph`/`wind` e2e files, validation-clean. The RT mirror draws the undeformed arenas
+  (deformed instances ride the unmirrored sentinel), per the "later VSM/RT" clause.)*
 - [x] Reduce far deformation state by screen-space error/modal aggregation. Never abruptly stop wind
   or snap to bind pose at distance.
   *(The modal design IS the reduction: deformation state is O(instances) — one 96 B record
@@ -175,7 +177,7 @@ bounds.
 - [x] Sample the field inside the same vegetation deformation provider; no trample material/shader.
   *(The wind prepass samples `gpuSceneInteractionSample` at each instance root into the sway
   record's interaction words (previous carried forward in the record — the field is stateful) and
-  `gpuSceneWindSway` applies wind·weight² + interaction·weight; micro blades fold the root sample
+  `gpuSceneWindDeform` applies wind·weight² + interaction·weight; micro blades fold the root sample
   into both baked bend words in the scatter. No material or per-pass shader path exists.)*
 - [x] Keep cosmetic predicted bend separate from persistent crushed/cleared/damaged disturbance
   mutations. Persistent masks flow through the Phase-2 reducer.
@@ -299,7 +301,7 @@ bounds.
   time a query to the frame the camera crossed a cascade edge. `vegetation-wind-record` carries the
   per-plant `interactionReset` beside it for the one-plant question.
   PROVEN BY `a camera jump across a cascade edge marks the plants reactive; standing still does not`
-  (`vegetation-mechanics`, 9/9), which asserts BOTH halves: a still camera grows the total by exactly
+  (`vegetation-mechanics`), which asserts BOTH halves: a still camera grows the total by exactly
   zero, a 40 m jump across cascade 0's 64 m window grows it, and the count stops growing once the
   camera rests again — a flag that were simply always set fails the first and third. Mutation-checked
   by forcing the comparison false: the jump then grows the total by 0 and the test fails on it.)*
@@ -319,7 +321,7 @@ bounds.
   question and ruinous every frame — the constraint the Phase 15 no-per-frame-readback box also
   states. Already in: the Wind Vectors editor overlay, `sa sample-wind`, `renderedPhenotype` on the
   runtime plant wire, the vegetation bounds overlay.
-  Gates: `just schema` 250/250, e2e `vegetation-mechanics` 7/7 validation-clean.
+  Covered by e2e `vegetation-mechanics`, validation-clean.
   NOT COVERED: turbulence spectra as a decomposed per-octave view (the octave count and roughness
   are authored and reported, but no per-octave breakdown exists), and a whole-field interaction
   capture as opposed to the per-instance samples above.)*
@@ -455,10 +457,10 @@ bounds.
 - [x] Standard gate, platform validation/visual tests, and wind/phenology docs are green.
   *(The standard gate (build + shaders + clippy + suites + e2e validation-clean + docs 3×) is green
   at every slice seal on MoltenVK; wind-field/plant-rendering/persistent-gpu-scene/cloud docs are
-  current. THE NVIDIA LEG IS GREEN TOO (2026-07-26, `NVIDIA GeForce RTX 3070 Ti`): `just engine`,
-  `just prepare-for-commit`, `just schema` 249/249, `just test`, and `just e2e` 341/341 all EXIT=0,
-  with every render-touching e2e asserting `validationErrors()` empty.
-  THE VISUAL TEST IS NOW BUILT: `tests/e2e/vegetation-wind-visual.test.ts` (2/2) cooks a real cell,
+  current. THE NVIDIA LEG IS GREEN TOO (`NVIDIA GeForce RTX 3070 Ti`): `just engine`,
+  `just prepare-for-commit`, `just schema`, `just test`, and `just e2e` all EXIT=0, with every
+  render-touching e2e file asserting `validationErrors()` empty.
+  THE VISUAL TEST IS BUILT: `tests/e2e/vegetation-wind-visual.test.ts` cooks a real cell,
   waits for residency, and measures MOTION OVER TIME rather than calm-versus-gale — each wind state
   is sampled twice across the same settle and compared to itself, so the calm pair is the control.
   Measured: a still field gives **0.0001** mean absolute per-channel difference between consecutive

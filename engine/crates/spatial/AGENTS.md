@@ -18,9 +18,8 @@ Its `lib.rs` states the scope rule:
 | `coordinate` | `WorldCellKey`, `WorldPosition`, `QuantizedLocalPosition`, `WorldBounds`, the grid constants |
 | `random` | `philox4x32_10`, `RandomStream`, `RandomDomain` |
 | `plant_identity` | `PlantId`, `PlantIdNamespace` |
-| `residency` | `ResidencyFacet`, `ResidencyManager`, `GenerationToken`, `SpatialSource`, `SpatialJobQueue` |
+| `residency` | `ResidencyFacet`, `ResidencyManager`, `GenerationToken`, `SpatialSource`, `ResidencySnapshot::admission_order` |
 | `surface` | The `SurfaceField` provider contract and its field/query vocabulary |
-| `fixture` | `SpatialFixture::canonical()` seam cases and `FOREST_BASELINE_SPEC`, shared with vegetation tests |
 
 Dependencies are `glam` and `thiserror` — nothing from Saffron. Keep it that way: a Saffron
 dependency here inverts the DAG and every crate below it.
@@ -80,6 +79,4 @@ dependency here inverts the DAG and every crate below it.
 Inline `#[cfg(test)] mod tests` per module; no `tests/` directory, no dev-dependencies, no on-disk
 fixtures. Determinism is asserted with pinned literals (the Philox zero vector against the published
 Random123 value, the stream sample goldens, the cell-key boundary encodings) and with invariance
-tests that reverse or reshuffle inputs and compare canonical bytes. `fixture.rs` holds the shared
-seam cases both this crate and `saffron-vegetation` test against, plus `FOREST_BASELINE_SPEC`, which
-names the production scale the design targets.
+tests that reverse or reshuffle inputs and compare canonical bytes.

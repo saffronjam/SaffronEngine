@@ -60,10 +60,10 @@ The procedural weather path suits broad, repeatable cloud systems. Hero clouds c
 | Static field bakes | `engine/assets/shaders/cloud_noise_base.slang` · `cloud_noise_detail.slang` · `cloud_curl.slang` | `computeMain` |
 | Weather resolve | `engine/assets/shaders/cloud_weather.slang` | `computeMain` |
 | Shared density | `engine/assets/shaders/clouds.slang` | `sampleCloudDensity`, `cloudHeightGradient`, `cloudRemap` |
-| Persistent GPU state | `engine/crates/rendering/src/clouds.rs` | `Clouds`, `CloudRenderSettings`, `CloudParams` |
-| Density view | `engine/crates/rendering/src/renderer.rs` · `engine/assets/shaders/cloud_density_debug.slang` | `ViewMode::CloudDensity`, `add_cloud_passes` |
+| Persistent GPU state | `engine/crates/rendering/src/clouds/` | `Clouds`, `CloudRenderSettings`, `CloudParams` |
+| Density view | `engine/crates/rendering/src/renderer/` · `engine/assets/shaders/cloud_density_debug.slang` | `ViewMode::CloudDensity`, `add_cloud_passes` |
 | Scene state | `engine/crates/scene/src/environment.rs` | `CloudSettings` |
-| Control command | `engine/crates/protocol/src/dto.rs` · `engine/crates/control/src/commands_scene.rs` | `SetCloudsParams`, `set-clouds` |
+| Control command | `engine/crates/protocol/src/dto/` · `engine/crates/control/src/commands_scene/` | `SetCloudsParams`, `set-clouds` |
 
 ## Related
 

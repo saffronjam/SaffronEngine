@@ -1,10 +1,9 @@
 // GI occluder scatter: turns the reach view's visible list into this frame's SDF
 // occluder instances, on device. One thread per reach-visible instance walks the
 // prototype's baked-field range and appends one occluder per field whose world AABB
-// meets the reach window — the same per-field tightness the CPU gather had, without a
-// CPU gather. The consumers (the GDF cull/composite and the DDGI near-field march)
-// read the output where the CPU-uploaded list used to be, with the count in the meta
-// words because a GPU-produced count cannot ride a push constant.
+// meets the reach window, so every field stays as tight as a CPU gather would make it.
+// The consumers — the GDF cull/composite and the DDGI near-field march — read the count
+// from the meta words, since a GPU-produced count cannot ride a push constant.
 //
 // Set 0: b0 = the reach view's counters (word 0 is its visible count), b1 = its
 // visible slot list, b2 = the SdfInstance output region for this frame slot, b3 = the

@@ -47,18 +47,18 @@ pub struct ControlPollContext<'a> {
     pub vegetation_promotion: Option<&'a mut saffron_runtime::VegetationPromotion>,
     /// The navigation contribution seam.
     pub vegetation_navigation: Option<&'a mut saffron_runtime::VegetationNavigationSeam>,
+    /// The world simulation clock biology advances on.
+    pub vegetation_ecology: Option<&'a mut saffron_runtime::VegetationEcologyClock>,
     /// The vegetation runtime's compact telemetry.
     pub vegetation_telemetry: Option<&'a mut saffron_runtime::VegetationTelemetry>,
     /// Live play-mode physics world, absent in edit mode.
     pub physics: Option<&'a mut World>,
 }
 
-/// Owns the command registry and the listening socket. The registry is built
-/// once at startup (it has no per-frame mutation); the `EngineContext` is rebuilt
-/// each frame in [`ControlContext::poll`].
+/// Owns the command registry and the listening socket. The registry is built once at startup; the
+/// `EngineContext` is rebuilt each frame in [`ControlContext::poll`].
 ///
-/// A bind failure is non-fatal: the context is constructed with `server: None`
-/// and runs inactive, so the engine still runs without a control socket.
+/// A bind failure is non-fatal: the context runs inactive with `server: None`.
 pub struct ControlContext {
     registry: CommandRegistry,
     server: Option<ControlServer>,
@@ -110,11 +110,8 @@ impl ControlContext {
         self.server.is_some()
     }
 
-    /// Closes the listening socket (dropping its [`ControlServer`]) so it stops serving.
-    ///
-    /// The host calls this during teardown to release the socket promptly, before the
-    /// renderer is dropped; the registry stays so a late palette/manifest read still
-    /// resolves. Idempotent.
+    /// Closes the listening socket so it stops serving, keeping the registry so a late
+    /// palette/manifest read still resolves. Idempotent.
     pub fn shutdown(&mut self) {
         self.server = None;
         self.vegetation_jobs.shutdown();
@@ -143,11 +140,9 @@ impl ControlContext {
         self.registry.register(name, help, handler);
     }
 
-    /// Seeds the project-load inbox from the editor-set environment once at startup: `SAFFRON_PROJECT`
-    /// opens/creates a named project, else `SAFFRON_SCRATCH_PROJECT` makes a per-shell scratch
-    /// project, else a working-directory `project.json` opens; otherwise nothing is seeded and the
-    /// host waits for the editor's picker. The load itself runs non-blocking through
-    /// [`Self::advance_project_load`] on the first frames — startup never blocks.
+    /// Seeds the project-load inbox from the editor-set environment once at startup. The load runs
+    /// non-blocking through [`Self::advance_project_load`] on the first frames, so startup never
+    /// blocks.
     pub fn bootstrap_project_from_env(&mut self, scene_edit: &mut SceneEditContext) {
         crate::commands_asset::bootstrap_project_from_env(scene_edit);
     }
@@ -166,15 +161,11 @@ impl ControlContext {
         self.loader.advance(renderer, scene_edit, assets)
     }
 
-    /// Drains and runs any pending control requests on the calling (main) thread.
-    /// Call once per frame with the live subsystem borrows. A no-op when the socket
-    /// failed to bind.
+    /// Drains and runs any pending control requests on the calling (main) thread. Call once per
+    /// frame with the live subsystem borrows; a no-op when the socket failed to bind.
     ///
-    /// `physics` is the live play world (non-owning) or `None` in Edit.
-    ///
-    /// Returns `true` when at least one **mutating** command ran this drain (anything not
-    /// [`is_read_only_command`] that completed `ok`), so the host can request a viewport redraw
-    /// while a static scene's read-only pollers leave the GPU idle.
+    /// `true` when at least one mutating command completed `ok` this drain, so the host can request
+    /// a viewport redraw while a static scene's read-only pollers leave the GPU idle.
     pub fn poll(&mut self, context: ControlPollContext<'_>) -> bool {
         let ControlPollContext {
             window,
@@ -188,6 +179,7 @@ impl ControlContext {
             vegetation_collision,
             vegetation_promotion,
             vegetation_navigation,
+            vegetation_ecology,
             vegetation_telemetry,
             physics,
         } = context;
@@ -243,6 +235,7 @@ impl ControlContext {
             vegetation_collision,
             vegetation_promotion,
             vegetation_navigation,
+            vegetation_ecology,
             vegetation_telemetry,
             physics,
             vegetation_jobs: &mut self.vegetation_jobs,

@@ -1,14 +1,10 @@
-//! The hierarchy and transform core: local/world matrix composition, the
-//! parent-uuid → handle cache rebuild, the per-frame world-transform write, the
-//! skinning joint palette, the sanctioned reparent, and the numerically-stable ZYX
-//! Euler extraction.
+//! The hierarchy and transform core: matrix composition, the parent-uuid → handle cache rebuild,
+//! the per-frame world-transform write, the skinning joint palette, and the reparent.
 //!
-//! This is the pure-CPU math the renderer, animation, and gizmo all sit on top of. Two
-//! pieces are hand-rolled rather than delegated to glam because glam's conventions do not
-//! match the engine's: the Euler-XYZ → quaternion composition in [`transform_matrix`] and
-//! the numerically-stable Rz·Ry·Rx extraction in [`quat_to_euler_zyx`]. Getting either
-//! wrong silently corrupts every gizmo-rotate and reparent-rebase that round-trips a
-//! quaternion through the `Transform`'s Euler, so both carry dedicated round-trip tests.
+//! [`transform_matrix`]'s Euler-XYZ → quaternion composition and [`quat_to_euler_zyx`]'s
+//! Rz·Ry·Rx extraction are hand-rolled because glam's `EulerRot` conventions do not match the
+//! engine's. Getting either wrong silently corrupts every gizmo-rotate and reparent-rebase that
+//! round-trips a quaternion through the `Transform`'s Euler.
 
 use glam::{Mat3, Mat4, Quat, Vec3};
 
@@ -41,10 +37,8 @@ pub struct CameraView {
 /// The local matrix `T · R · S` for a [`Transform`], with `R` built from the Euler-XYZ
 /// triple.
 ///
-/// The Euler → quaternion step is hand-rolled rather than delegated to glam's
-/// `Quat::from_euler`, whose `EulerRot` conventions do not match the engine's for a generic
-/// (non-axis-aligned) rotation. This is the single place the authored Euler becomes a
-/// rotation, so the convention here is load-bearing across the whole engine.
+/// The single place the authored Euler becomes a rotation, so the convention here is load-bearing
+/// across the whole engine.
 #[must_use]
 pub fn transform_matrix(transform: &Transform) -> Mat4 {
     Mat4::from_translation(transform.translation)
@@ -52,13 +46,8 @@ pub fn transform_matrix(transform: &Transform) -> Mat4 {
         * Mat4::from_scale(transform.scale)
 }
 
-/// A quaternion from an Euler-XYZ triple in the engine's GLM-compatible convention.
-///
-/// The half-angle product, which is the inverse of [`quat_to_euler_zyx`] up to the
-/// degenerate gimbal case.
-/// The scene owns this convention so consumers ([`Transform`]-reading animation rest
-/// poses) build the rest rotation identically to [`transform_matrix`] rather than
-/// re-deriving the Euler order.
+/// A quaternion from an Euler-XYZ triple in the engine's convention — the half-angle product,
+/// inverse of [`quat_to_euler_zyx`] up to the degenerate gimbal case.
 #[must_use]
 pub fn quat_from_euler_xyz(euler: Vec3) -> Quat {
     let c = Vec3::new(
@@ -80,12 +69,10 @@ pub fn quat_from_euler_xyz(euler: Vec3) -> Quat {
 
 /// A quaternion in the engine's stable Rz·Ry·Rx Euler convention (radians, XYZ order).
 ///
-/// glam's `Quat::to_euler` is unstable at yaw ±90° (its asin/atan2 split poisons
-/// pitch/roll), so this hand-rolls the `Rz·Ry·Rx` matrix extraction. The degenerate branch is implicit in the
-/// `atan2` formulation: at the gimbal pole the recovered triple differs from the input
-/// triple but reproduces the same rotation matrix, which is exactly what the
-/// reparent-rebase needs. This is the one place a quaternion becomes a [`Transform`]
-/// Euler.
+/// glam's `Quat::to_euler` is unstable at yaw ±90° (its asin/atan2 split poisons pitch/roll), so
+/// this hand-rolls the `Rz·Ry·Rx` matrix extraction. At the gimbal pole the recovered triple
+/// differs from the input triple but reproduces the same rotation matrix, which is what the
+/// reparent-rebase needs.
 #[must_use]
 pub fn quat_to_euler_zyx(q: Quat) -> Vec3 {
     let m = Mat4::from_quat(q);
@@ -115,8 +102,7 @@ impl Scene {
     /// when present (composed from its quaternion directly, no Euler round-trip), else
     /// the authored [`Transform`].
     ///
-    /// Preferring the override keeps the rest pose pristine under non-destructive Edit
-    /// preview. Returns identity when the entity carries neither.
+    /// Preferring the override keeps the rest pose pristine under non-destructive Edit preview.
     #[must_use]
     pub fn local_matrix(&self, entity: Entity) -> Mat4 {
         if let Ok(pose) = self.component::<PoseOverride>(entity) {
@@ -214,7 +200,6 @@ impl Scene {
             let _ = self.add_component(e, Relationship::default());
         }
 
-        // Clear the caches before rebuilding.
         self.for_each::<&mut Relationship, _>(|_, rel| {
             rel.parent_handle = None;
             rel.children.clear();
@@ -967,9 +952,8 @@ mod tests {
             "parented camera views from its world position"
         );
 
-        // Research gate (CPU half): joint_matrices() must produce world_bone *
-        // inverse_bind in joint order, identity at bind pose, and never compose the
-        // skinned node's own transform.
+        // `joint_matrices()` must produce world_bone * inverse_bind in joint order, identity at
+        // bind pose, and never compose the skinned node's own transform.
         let joint_root = scene.create_entity("JointRoot");
         let joint_tip = scene.create_entity("JointTip");
         set_translation(&mut scene, joint_root, Vec3::new(1.0, 0.0, 0.0));

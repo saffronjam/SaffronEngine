@@ -1,19 +1,18 @@
 // Acceleration-structure telemetry: what the structures cost, and which representation each
 // instance selected.
 //
-// `blasCount` alone says how many structures exist and nothing about what they cost or how they
-// were built. These fields carry the rest: storage bytes for both tiers, the scratch held for
-// their builds, the pre-compaction figure the same structures would have occupied, and the
-// per-representation counts (static build / skinned refit / tessellated rebuild).
+// `blasCount` says how many structures exist and nothing about what they cost. These fields carry
+// the rest: storage bytes for both tiers, the scratch held for their builds, the pre-compaction
+// figure the same structures would have occupied, and the per-representation counts (static build,
+// skinned refit, tessellated rebuild).
 //
-// The load-bearing assertion is the SHARING one. Byte totals are deduplicated by device address,
-// because a structure shared by N instances would otherwise be charged N times — which reports
-// instancing as memory growth, the exact opposite of what sharing does. Adding instances of an
-// existing mesh must therefore move the instance count and leave the byte total alone.
+// The load-bearing assertion is sharing. Byte totals are deduplicated by device address, because a
+// structure shared by N instances would otherwise be charged N times, reporting instancing as memory
+// growth. Adding instances of an existing mesh must move the instance count and leave the byte total
+// alone.
 //
-// COMPACTION IS ASSERTED AS AN INEQUALITY, not a saving. `blasBuiltBytes >= blasBytes` always
-// holds; whether the difference is positive depends on the driver, which is free to decline to
-// shrink a structure. Asserting a saving would be asserting a driver policy.
+// Compaction is asserted as an inequality: `blasBuiltBytes >= blasBytes` always holds, and whether
+// the difference is positive depends on the driver, which is free to decline to shrink a structure.
 
 import { afterAll, beforeAll, expect, test } from "bun:test";
 import type { RenderStatsDto } from "@saffron/protocol";

@@ -135,9 +135,9 @@ recreation.
 | Scene frame slots | `engine/crates/rendering/src/frame.rs` | `MAX_FRAMES_IN_FLIGHT`, `FrameData`, `FrameRing` |
 | Present frame slots and blit | `engine/crates/rendering/src/present.rs` | `PresentSync`, `PresentSlot`, `record_present_blit` |
 | Per-image presentation state | `engine/crates/rendering/src/swapchain.rs` | `Swapchain`, `render_finished`, `image_in_flight`, `set_image_in_flight` |
-| Offscreen begin and submit | `engine/crates/rendering/src/renderer.rs` | `begin_offscreen_frame`, `render_scene_offscreen` |
-| Acquire, blit, and present | `engine/crates/rendering/src/renderer.rs` | `begin_present_frame`, `present_active_view_to_swapchain` |
-| View extent changes | `engine/crates/rendering/src/renderer.rs`, `engine/crates/rendering/src/view_target.rs` | `set_viewport_desired_size`, `apply_render_extent`, `ViewTarget::resize`, `build_aa_targets_preserving_temporal` |
+| Offscreen begin and submit | `engine/crates/rendering/src/renderer/` | `begin_offscreen_frame`, `render_scene_offscreen` |
+| Acquire, blit, and present | `engine/crates/rendering/src/renderer/` | `begin_present_frame`, `present_active_view_to_swapchain` |
+| View extent changes | `engine/crates/rendering/src/renderer/`, `engine/crates/rendering/src/view_target/` | `set_viewport_desired_size`, `apply_render_extent`, `ViewTarget::resize`, `build_aa_targets_preserving_temporal` |
 | Window resize bridge | `engine/crates/app/src/lib.rs` | `FrameHost::resized` |
 
 ## Related

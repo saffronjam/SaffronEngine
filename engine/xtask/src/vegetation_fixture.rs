@@ -35,16 +35,14 @@ const TRUNK_OBJ_PATH: &str = "models/e2e-birch.obj";
 const BIOME: Uuid = Uuid(7_300_002);
 const MAP: Uuid = Uuid(7_300_003);
 const DEFAULT_MATERIAL: Uuid = Uuid(1);
-/// The seasonal family's second (crown) slot. Distinct from the default slot — the asset
-/// validator requires unique slot ids — and absent from the catalog, so it resolves through
-/// the imported OBJ material.
+/// The seasonal family's crown slot. The asset validator requires unique slot ids, and this one
+/// is absent from the catalog, so it resolves through the imported OBJ material.
 const CANOPY_MATERIAL: Uuid = Uuid(7_300_012);
 const AUTHORED_LAYER: u128 = 0x1111_2222_3333_4444_5555_6666_7777_8888;
 const BIOME_INSTANCE: u128 = 0x9999_aaaa_bbbb_cccc_dddd_eeee_ffff_0001;
 
-/// One authored-package recipe: the canonical phase-3 fixture plus the stress matrix
-/// rows (density, mixed multi-cell woodland with negative cells, extreme scale, and a
-/// rapid-traversal cell run). Content only — no vendor performance numbers.
+/// One authored-package recipe: the canonical fixture plus the stress-matrix rows (density, a
+/// mixed multi-cell woodland spanning negative cells, extreme scale, rapid traversal).
 struct Recipe {
     file: &'static str,
     stress: Option<&'static str>,
@@ -292,10 +290,9 @@ fn write_recipe(recipe: &Recipe, path: &Path) -> Result<()> {
         .with_context(|| format!("publish vegetation E2E fixture {}", path.display()))
 }
 
-/// A watertight 1×8×1 m box trunk with per-face normals and UVs — the smallest
-/// renderable geometry the plant compiler accepts. With `canopy`, a second material
-/// run adds a crown box above the trunk, so the family cooks as two submeshes with
-/// two material slots — the multi-object shape the phenotype fixtures need.
+/// A watertight 1x8x1 m box trunk with per-face normals and UVs, the smallest geometry the plant
+/// compiler accepts. `canopy` adds a second material run above it, so the family cooks as two
+/// submeshes with two material slots.
 fn trunk_obj(height: i32, canopy: bool) -> String {
     let mut obj = String::new();
     if canopy {
@@ -382,14 +379,13 @@ fn trunk_obj(height: i32, canopy: bool) -> String {
     obj
 }
 
-/// The material library the canopy trunk references: two named materials, so the OBJ's
-/// two `usemtl` runs survive import as two submeshes with two material slots.
+/// Two named materials, so the OBJ's two `usemtl` runs import as two submeshes.
 fn trunk_mtl() -> String {
     "newmtl material_0\nKd 0.55 0.45 0.35\nnewmtl material_1\nKd 0.85 0.55 0.20\n".to_owned()
 }
 
-/// The OBJ importer's default material element for the trunk file — the id derives
-/// from the model key (the file stem) the same way the model importer bakes sub-assets.
+/// The OBJ importer's default material element for the trunk file. The id derives from the model
+/// key exactly as the model importer bakes sub-assets.
 fn trunk_material_selector() -> PlantSourceSelector {
     PlantSourceSelector::Element {
         id: u128::from(

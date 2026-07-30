@@ -60,7 +60,7 @@ sa save-environment-profile --name 'Summer clouds'
 | Tone, Color, and Effects | `editor/src/panels/PostProcessPanel.tsx` | `PostProcessPanel`, `onTonemap`, `writeGrade`, `writeBloom` |
 | Dock defaults | `editor/src/state/dockLayout.ts` | `defaultSceneLayout`, `DEFAULT_LEAF` |
 | Profile storage | `engine/crates/assets/src/environment_profile.rs` | `builtin_environment_profiles`, `save_environment_profile`, `update_environment_profile` |
-| Profile commands | `engine/crates/control/src/commands_scene.rs` | `list-environment-profiles`, `apply-environment-profile` |
+| Profile commands | `engine/crates/control/src/commands_scene/` | `list-environment-profiles`, `apply-environment-profile` |
 
 ## Related
 

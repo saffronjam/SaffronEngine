@@ -1,4 +1,4 @@
-// Depth-aware (bilateral) 5x5 blur of the raw GTAO map — the plan's spatial-denoise step.
+// Depth-aware (bilateral) 5x5 blur of the raw GTAO map.
 // Weights neighbors by view-Z similarity (read from the G-buffer .a) so the blur does not
 // bleed AO across depth discontinuities. Set 0: 0 = raw AO sampler, 1 = G-buffer sampler,
 // 2 = denoised AO storage (r8).

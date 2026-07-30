@@ -1,12 +1,8 @@
 //! Catalog ↔ JSON serde (entries and folder lists).
 //!
-//! The catalog is the live id → `{name, type, path, …}` table the renderer and pick
-//! read from. It serializes into the regenerable catalog cache and the `project.json`
-//! `assets` block, so the byte shape is a frozen contract:
-//! every row carries `id`/`name`/`type`/`path`/`folder`/`hdr`/`linear`, and the
-//! optional `duration`/`tracks`/`container`/`chunk`/`colorspace`/`rigged` fields are
-//! omitted when default so a standalone row stays minimal. The reader is lenient
-//! (unknown keys ignored, missing keys default).
+//! The shape is the `project.json` `assets` block, so it is a frozen contract: every row carries
+//! `id`/`name`/`type`/`path`/`folder`/`hdr`/`linear`, every other field is omitted when default, and
+//! the reader is lenient (unknown keys ignored, missing keys default).
 
 use saffron_core::Uuid;
 use saffron_json::{Value, json_bool_or, json_f32_or, json_string_or, json_u64_or, uuid_to_json};
@@ -18,11 +14,6 @@ use crate::names::{
 };
 
 /// Serializes a catalog's entries to the `assets` JSON array.
-///
-/// Each row always carries `id`/`name`/`type`/`path`/`folder`/`hdr`/`linear`. The
-/// container linkage (`container`/`chunk`), the texture `colorspace`, the animation
-/// `duration`/`tracks`, and the `rigged` flag are emitted only when non-default, so a
-/// standalone row carries only the fields it uses.
 #[must_use]
 pub fn catalog_to_json(catalog: &AssetCatalog) -> Value {
     let mut assets = Vec::with_capacity(catalog.entries.len());
@@ -77,11 +68,8 @@ pub fn catalog_to_json(catalog: &AssetCatalog) -> Value {
     Value::Array(assets)
 }
 
-/// Rebuilds a catalog's entries from an `assets` JSON array.
-///
-/// Clears the catalog's entries + index first, then re-inserts every well-formed row
-/// (an `id` of `0` or a non-object element is skipped). Lenient: missing keys take
-/// their defaults, unknown keys are ignored.
+/// Rebuilds a catalog's entries from an `assets` JSON array, skipping a non-object row or an
+/// `id` of `0`.
 pub fn catalog_from_json(catalog: &mut AssetCatalog, assets: &Value) {
     catalog.entries.clear();
     catalog.by_id.clear();
@@ -181,8 +169,7 @@ pub fn catalog_folders_to_json(catalog: &AssetCatalog) -> Value {
     )
 }
 
-/// Rebuilds a catalog's folder list from a JSON string array. Non-string elements are
-/// skipped.
+/// Rebuilds a catalog's folder list from a JSON string array, skipping non-string elements.
 pub fn catalog_folders_from_json(catalog: &mut AssetCatalog, folders: &Value) {
     catalog.folders.clear();
     let Some(records) = folders.as_array() else {
@@ -199,8 +186,6 @@ pub fn catalog_folders_from_json(catalog: &mut AssetCatalog, folders: &Value) {
 mod tests {
     use super::*;
 
-    /// A model parent + embedded sub-assets + a standalone asset round-trips through JSON
-    /// with container linkage, chunk index, and colorspace intact.
     #[test]
     fn catalog_model_and_sub_asset_linkage_round_trips() {
         let mut catalog = AssetCatalog::default();
@@ -271,7 +256,6 @@ mod tests {
         });
         let json = catalog_to_json(&catalog);
         let row = &json.as_array().unwrap()[0];
-        // A standalone, Auto-colorspace, non-rigged texture row omits the optional keys.
         assert!(row.get("container").is_none());
         assert!(row.get("chunk").is_none());
         assert!(row.get("colorspace").is_none());
@@ -328,8 +312,6 @@ mod tests {
             ..AssetEntry::default()
         });
 
-        // `list-assets` serializes the catalog; the source/license attribution must survive
-        // to disk and back for the editor's credits view.
         let mut restored = AssetCatalog::default();
         catalog_from_json(&mut restored, &catalog_to_json(&catalog));
         let attribution = restored

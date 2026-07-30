@@ -32,10 +32,9 @@ pub struct PageDemandView {
     pub view_proj: saffron_geometry::glam::Mat4,
     /// Minimum corner of the window a GI or reflection ray can reach.
     ///
-    /// Streaming used to be driven by the camera alone, which quietly assumed nothing off-screen
-    /// needed to be resident. A march gathers from behind the eye and a reflection shows what the
-    /// camera cannot, so a page inside this window is read whether or not it is visible — and a
-    /// non-resident one is a hole in the gather rather than a missing pixel.
+    /// A march gathers from behind the eye and a reflection shows what the camera cannot, so a
+    /// page inside this window is read whether or not it is visible — and a non-resident one is a
+    /// hole in the gather rather than a missing pixel.
     pub gi_min: saffron_geometry::glam::Vec3,
     /// Maximum corner of the reachable window.
     pub gi_max: saffron_geometry::glam::Vec3,
@@ -413,9 +412,9 @@ impl PageResidency {
                 "page publication requires a ready payload".to_owned(),
             ));
         };
-        // A fault is the whole round trip: the frame the page was demanded to the moment its payload
-        // is resident. Timing it at publication rather than at the worker's return is deliberate —
-        // what a stutter costs is when the geometry can be drawn, not when the bytes arrived.
+        // A fault is the whole round trip: the frame the page was demanded to the moment its
+        // payload is resident. What a stutter costs is when the geometry can be drawn, not when
+        // the bytes arrived, so the timing closes at publication rather than at the worker's return.
         if let Some(requested) = entry.requested_at.take() {
             self.faults += 1;
             self.fault_latency_us += requested.elapsed().as_micros() as u64;
@@ -588,9 +587,8 @@ mod tests {
         assert_eq!(residency.stats().faults, 0);
     }
 
-    /// The two demand sources share one numeric space, and the whole point of the bands
-    /// is that a miss outranks a prediction. Nothing else in the tree compares them, so
-    /// the ordering would drift silently the first time either side is retuned.
+    /// The two demand sources share one numeric space, and a miss must outrank a prediction.
+    /// Nothing else in the tree compares them, so retuning either side could drift silently.
     #[test]
     fn every_missed_page_outranks_every_predicted_one() {
         for class in crate::SceneViewClass::ALL {

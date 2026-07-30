@@ -1,16 +1,11 @@
 //! An e2e harness: boots the `saffron-host` binary headless and drives its control socket from
-//! Cargo.
+//! Cargo, for engine-side tests wanting a strongly-typed DTO assertion or a fixture shared with a
+//! unit test in the same crate.
 //!
-//! It exists for engine-side regression tests that want a strongly-typed DTO assertion or a fixture
-//! shared with a unit test in the same crate.
-//!
-//! The wire is the shared [`saffron_control_client::Client`] and the DTOs are the shared
-//! `saffron-protocol` types, so this harness and the `sa` CLI cannot drift on framing or the `Uuid`
-//! decimal-string encoding.
-//!
-//! Boot isolation: each [`TestEngine`] launches the host on a per-run control socket, rendering
-//! offscreen so no compositor is involved on any platform. It honors `SAFFRON_ANIMA_BIN` so it can
-//! run against an alternate host binary.
+//! The wire is the shared [`saffron_control_client::Client`] over the shared `saffron-protocol`
+//! types, so this harness and the `sa` CLI cannot drift on framing or the `Uuid` decimal-string
+//! encoding. Each [`TestEngine`] launches the host on a per-run control socket, rendering offscreen
+//! so no compositor is involved on any platform.
 
 #![deny(unsafe_code)]
 
@@ -25,9 +20,8 @@ use saffron_control_client::{Client, Error as WireError};
 use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
 
-/// The message marker the engine's debug messenger emits for a validation-layer issue. A
-/// line counts as a validation *error* when this appears with an `ERROR`-level `vulkan`
-/// head (the compact log line is `<ts>  ERROR  vulkan  [validation] …`).
+/// The marker the engine's debug messenger emits for a validation-layer issue. A line counts as a
+/// validation *error* when this appears with an `ERROR`-level `vulkan` head.
 const VALIDATION_MARKER: &str = "[validation]";
 
 /// The id-bearing keys the decimal-string-u64 contract scans for. A value under any of these keys
@@ -46,12 +40,11 @@ const ID_KEYS: [&str; 9] = [
 ];
 
 /// Scans a raw reply line's `result` region for the id-bearing keys and requires each value to be a
-/// quoted decimal string that round-trips as a u64, or the literal `null`. Returns one message per
-/// offending token (empty = clean).
+/// quoted decimal string that round-trips as a u64, or the literal `null`. One message per offending
+/// token.
 ///
-/// It works on the *raw bytes* deliberately: a parsed [`Value`] coerces a JSON number into a
-/// `Number` before this could see it, erasing the quoted-vs-bare distinction this is built to
-/// catch.
+/// It works on the raw bytes because a parsed [`Value`] coerces a JSON number into a `Number`,
+/// erasing the quoted-vs-bare distinction this catches.
 #[must_use]
 pub fn assert_raw_u64(raw: &str, label: &str) -> Vec<String> {
     let mut errors = Vec::new();
@@ -65,7 +58,6 @@ pub fn assert_raw_u64(raw: &str, label: &str) -> Vec<String> {
         while let Some(rel) = result[search_from..].find(&needle) {
             let key_end = search_from + rel + needle.len();
             search_from = key_end;
-            // Step over the colon (and any whitespace) to the value token.
             let after_key = result[key_end..].trim_start();
             let Some(after_colon) = after_key.strip_prefix(':') else {
                 continue;
@@ -98,7 +90,7 @@ pub fn assert_raw_u64(raw: &str, label: &str) -> Vec<String> {
 /// quote) or a run up to the next `,`, `}`, `]`, or whitespace.
 fn value_token(value: &str) -> &str {
     if let Some(rest) = value.strip_prefix('"') {
-        // A quoted string: include the closing quote (ids carry no escapes).
+        // Ids carry no escapes, so the first quote closes the token.
         if let Some(close) = rest.find('"') {
             return &value[..close + 2];
         }
@@ -150,14 +142,13 @@ pub enum Error {
 /// The crate result alias bound to this crate's [`Error`].
 pub type Result<T> = std::result::Result<T, Error>;
 
-/// A spawned child plus the reader thread draining its stdout+stderr into a shared buffer.
+/// A spawned child plus the threads draining its stdout+stderr into a shared buffer.
 struct Captured {
     child: Child,
     readers: Vec<JoinHandle<()>>,
 }
 
 impl Captured {
-    /// Spawns the reader threads that append the child's stdout+stderr into `buffer`.
     fn capture(mut child: Child, buffer: &Arc<Mutex<String>>) -> Self {
         let mut readers = Vec::new();
         if let Some(stdout) = child.stdout.take() {
@@ -169,7 +160,7 @@ impl Captured {
         Self { child, readers }
     }
 
-    /// SIGTERM the child and join its reader threads (they end on the pipe closing).
+    /// SIGTERM the child and join its reader threads, which end when the pipe closes.
     fn terminate(mut self) {
         let _ = self.child.kill();
         let _ = self.child.wait();
@@ -179,7 +170,7 @@ impl Captured {
     }
 }
 
-/// Drains `source` line-appending into `buffer` until EOF; one thread per pipe.
+/// Drains `source` into `buffer` until EOF; one thread per pipe.
 fn spawn_reader(
     mut source: impl Read + Send + 'static,
     buffer: Arc<Mutex<String>>,
@@ -200,8 +191,8 @@ fn spawn_reader(
     })
 }
 
-/// A booted engine plus a typed control client. Always [`shutdown`](TestEngine::shutdown) it (the
-/// `Drop` impl is a backstop that kills the children if a test panics before calling it).
+/// A booted engine plus a typed control client. Always [`shutdown`](TestEngine::shutdown) it; the
+/// `Drop` impl is only a backstop for a test that panics first.
 pub struct TestEngine {
     client: Client,
     host: Option<Captured>,
@@ -228,16 +219,13 @@ impl TestEngine {
         let control_socket = format!("/tmp/saffron-e2e-{stamp}.sock");
         let log = Arc::new(Mutex::new(String::new()));
 
-        // A per-run app-data root under the temp dir, so a booted project (e.g.
-        // `SAFFRON_SCRATCH_PROJECT`) writes its `userdata/` there and never pollutes the source
-        // tree — `cargo test` runs the host with the crate as cwd, where the default relative
-        // `appdata/` would otherwise land. The caller can still override `SAFFRON_APPDATA_DIR`.
+        // `cargo test` runs the host with the crate as cwd, so the default relative `appdata/`
+        // would land in the source tree. The caller can still override `SAFFRON_APPDATA_DIR`.
         let appdata_dir = std::env::temp_dir().join(format!("saffron-e2e-appdata-{stamp}"));
 
-        // The host renders offscreen and reads back — no surface, so no compositor is needed
-        // and device selection is free to take the discrete GPU. A windowed boot would have to
-        // qualify on present support, which a headless compositor's surface denies to a
-        // discrete adapter, silently demoting the whole suite to the software rasterizer.
+        // Rendering offscreen means no surface, so device selection is free to take the discrete
+        // GPU. A windowed boot must qualify on present support, which a headless compositor's
+        // surface denies to a discrete adapter, silently demoting the suite to llvmpipe.
         let mut command = Command::new(engine_binary());
         command
             .env("SAFFRON_CONTROL_SOCK", &control_socket)
@@ -316,21 +304,20 @@ impl TestEngine {
         })
     }
 
-    /// The control-socket path this engine answers on (per-run, isolated).
+    /// The per-run control-socket path this engine answers on.
     #[must_use]
     pub fn control_socket(&self) -> &str {
         &self.control_socket
     }
 
-    /// Everything the engine has written to stdout+stderr so far (a snapshot of the captured log).
+    /// A snapshot of everything the engine has written to stdout+stderr so far.
     #[must_use]
     pub fn log(&self) -> String {
         current_log(&self.log)
     }
 
-    /// The validation-layer error lines (empty = clean): the debug messenger prints them as
-    /// `<ts>  ERROR  vulkan  [validation] …`. A line qualifies when `[validation]` appears
-    /// with an `ERROR`-level `vulkan` head — robust to the subsystem column's padding.
+    /// The validation-layer error lines. A line qualifies when `[validation]` appears with an
+    /// `ERROR`-level `vulkan` head, which tolerates the subsystem column's padding.
     #[must_use]
     pub fn validation_errors(&self) -> Vec<String> {
         current_log(&self.log)
@@ -351,28 +338,26 @@ impl TestEngine {
         Ok(self.client.call(cmd, params)?)
     }
 
-    /// Sends one control command and returns its raw `result` [`Value`] (the untyped path, for
-    /// commands without a convenient DTO or when only a field or two matters).
+    /// Sends one control command and returns its raw `result` [`Value`].
     pub fn call_raw(&mut self, cmd: &str, params: Value) -> Result<Value> {
         Ok(self.client.call_raw(cmd, params)?)
     }
 
-    /// Sends one control command and returns the raw reply line verbatim — the byte-exact path the
-    /// decimal-string-u64 contract probe ([`assert_raw_u64`]) needs (a parsed [`Value`] already
-    /// erases the quoted-vs-bare distinction it is built to catch).
+    /// Sends one control command and returns the raw reply line verbatim, for the byte-exact
+    /// decimal-string-u64 probe ([`assert_raw_u64`]).
     pub fn call_raw_text(&mut self, cmd: &str, params: Value) -> Result<String> {
         Ok(self.client.call_raw_text(cmd, params)?)
     }
 
-    /// Lets the engine run a few render frames so deferred GPU work + validation surface.
+    /// Lets the engine run a few render frames so deferred GPU work and validation surface.
     pub fn settle(&self, duration: Duration) {
         std::thread::sleep(duration);
     }
 
-    /// Tears down cleanly: ask the engine to `quit`, terminate its child processes, and join the
-    /// capture threads. Idempotent — a second call (or the `Drop` backstop) is a no-op.
+    /// Asks the engine to `quit`, terminates its children, and joins the capture threads.
+    /// Idempotent.
     pub fn shutdown(&mut self) {
-        // Best-effort graceful quit; the engine may already be gone or race the socket close.
+        // Best effort: the engine may already be gone, or race the socket close.
         let _ = self.client.call_raw("quit", json!({}));
         if let Some(host) = self.host.take() {
             host.terminate();
@@ -384,7 +369,7 @@ impl TestEngine {
 
 impl Drop for TestEngine {
     fn drop(&mut self) {
-        // Backstop for a test that panics before `shutdown`: never leak a child process.
+        // Never leak a child process when a test panics before `shutdown`.
         if self.host.is_some() {
             self.shutdown();
         }
@@ -435,13 +420,12 @@ fn configure_macos_host(command: &mut Command) {
 }
 
 /// The host binary to spawn: `SAFFRON_ANIMA_BIN` if set, else the `saffron-host` sibling of this
-/// test binary under `target/<profile>/`.
+/// test binary.
 fn engine_binary() -> PathBuf {
     if let Ok(path) = std::env::var("SAFFRON_ANIMA_BIN") {
         return PathBuf::from(path);
     }
-    // The test binary lives in `target/<profile>/deps/`; the host is two levels up, in
-    // `target/<profile>/saffron-host`.
+    // The test binary lives in `target/<profile>/deps/`, so the host is two levels up.
     if let Ok(exe) = std::env::current_exe()
         && let Some(profile_dir) = exe.parent().and_then(|deps| deps.parent())
     {
@@ -450,12 +434,11 @@ fn engine_binary() -> PathBuf {
     PathBuf::from("saffron-host")
 }
 
-/// Whether `child` has exited (a non-blocking `try_wait`).
+/// Whether `child` has exited, without blocking.
 fn host_has_exited(captured: &mut Captured) -> bool {
     matches!(captured.child.try_wait(), Ok(Some(_)))
 }
 
-/// A snapshot copy of the shared capture buffer.
 fn current_log(buffer: &Arc<Mutex<String>>) -> String {
     buffer.lock().map(|g| g.clone()).unwrap_or_default()
 }
@@ -476,19 +459,18 @@ fn wait_for(timeout: Duration, mut ready: impl FnMut() -> bool) -> bool {
 mod tests {
     use super::assert_raw_u64;
 
-    /// The decimal-string-u64 detector is live, not vacuous: it accepts a quoted decimal-string id
-    /// (the encoding `saffron-protocol`'s `Uuid` adapter emits) and **bites** a number-encoded id
-    /// (what a plain serde `u64` would emit, the single most dangerous silent wire failure).
+    /// The detector accepts the quoted decimal-string id `saffron-protocol`'s `Uuid` adapter emits
+    /// and bites the number-encoded id a plain serde `u64` would emit.
     #[test]
     fn assert_raw_u64_accepts_decimal_strings_and_bites_numbers() {
-        // Positive: a u64 past 2^53 emitted as a quoted decimal string passes clean.
+        // A u64 past 2^53 as a quoted decimal string passes clean.
         let good = r#"{"ok":true,"result":{"id":"1099511627776","name":"Cube"}}"#;
         assert!(
             assert_raw_u64(good, "good").is_empty(),
             "a correct decimal-string id must pass"
         );
 
-        // Negative: the same id as a bare JSON number is caught (the gate bites).
+        // The same id as a bare JSON number is caught.
         let bad = r#"{"ok":true,"result":{"id":1099511627776,"name":"Cube"}}"#;
         let errors = assert_raw_u64(bad, "bad");
         assert_eq!(
@@ -530,11 +512,9 @@ mod tests {
         }
     }
 
-    /// The scan is anchored to the `result` region: an id-shaped token before `"result"` (in the
-    /// envelope's `id` request-echo, say) is ignored.
+    /// The scan is anchored to the `result` region, so the envelope's `id` request-echo is ignored.
     #[test]
     fn assert_raw_u64_ignores_tokens_before_result() {
-        // A bare-number `id` in the pre-`result` region must not trip the detector.
         let raw = r#"{"id":7,"ok":true,"result":{"id":"7"}}"#;
         assert!(
             assert_raw_u64(raw, "pre-result").is_empty(),
@@ -542,8 +522,7 @@ mod tests {
         );
     }
 
-    /// A reply with no `result` key (a malformed or error envelope) yields no id findings — the
-    /// detector never panics on a missing region.
+    /// A reply with no `result` key yields no findings rather than panicking.
     #[test]
     fn assert_raw_u64_handles_missing_result() {
         let raw = r#"{"ok":false,"error":"boom"}"#;

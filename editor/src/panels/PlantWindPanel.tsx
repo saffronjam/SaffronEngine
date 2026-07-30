@@ -1,14 +1,7 @@
-/// The Plant workspace's wind and interaction preview: drive the field the previewed plant is
-/// standing in and watch it answer.
-///
-/// This is a render surface rather than a readout, and the distinction is the point. A table of
-/// stiffness and drag tells an author what they typed; a plant leaning under a gale tells them what
-/// they authored. The controls here write the real wind field and the real interaction field — the
-/// same ones a scene uses — so the preview is the plant, not a model of it.
-///
-/// Wind speed comes as named conditions as well as a slider: the comparison an author is making is
-/// between still and a gale, not between neighbouring tenths, and a stiff sapling that moves like a
-/// supple reed only shows itself when the field is strong enough to separate them.
+/// The Plant workspace's wind and interaction preview. The controls write the real wind and
+/// interaction fields — the same ones a scene uses — so the preview is the plant, not a model of it.
+/// Wind speed offers named conditions as well as a slider, because a stiff sapling only separates
+/// from a supple reed once the field is strong enough.
 import { useCallback, useState } from "react";
 import { client } from "../control/client";
 import { errorText, notifyError } from "../lib/flash";

@@ -16,8 +16,8 @@ import type {
   SetColorGradingResult,
 } from "@saffron/protocol";
 
-/// The neutral identity grade — every write spreads this so a test overrides only the fields it
-/// exercises (the wire also fills missing fields from the same neutral default).
+// The neutral identity grade — every write spreads this so a test overrides only the fields it
+// exercises (the wire also fills missing fields from the same neutral default).
 const NEUTRAL: SetColorGradingParams = {
   temperature: 6500,
   tint: 0,
@@ -38,7 +38,7 @@ const NEUTRAL: SetColorGradingParams = {
   creativeLutIntensity: 0,
 };
 
-/// Writes an `N³` `.cube` creative look (a mild warm shift) to a temp file and returns its path.
+// Writes an `N³` `.cube` creative look (a mild warm shift) to a temp file and returns its path.
 function writeCube(size: number): string {
   const dir = mkdtempSync(join(tmpdir(), "sa-cube-"));
   const path = join(dir, `warm${size}.cube`);

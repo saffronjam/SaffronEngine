@@ -116,7 +116,7 @@ masked material at 1× shares the plain opaque PSO; the permutation exists only 
 | Count selection + clamp | `aa.rs`, `device.rs` | `Aa::set`, `Aa::sample_count`, `clamp_sample_count`, `Device::supported_sample_counts` |
 | Scene attachment + resolve wiring | `renderer.rs` | `record_scene_graph`, `scene_output`, `add_scene_resolve_pass` |
 | Resolve in the graph | `render_graph.rs` | `RgAttachment.resolve`, `derive_pass_barriers` |
-| Sample count in PSOs | `pipelines.rs` | `PsoKey`, `Pipelines::set_sample_count`, `Pipelines::request_mesh_pipeline` |
+| Sample count in PSOs | `pipelines.rs` | `PsoKey`, `Pipelines::set_sample_count`, `Pipelines::request_executor_mesh_pipeline` |
 | Alpha-to-coverage cutout | `mesh.slang`, `coverage.slang` | `fragmentMain`, `sampleCanonicalCoverage` |
 
 ## Related

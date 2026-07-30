@@ -6,20 +6,23 @@ GPU scene mirror, and the whole vegetation cooking and artifact-store layer. It 
 `saffron-geometry` (byte codecs), `saffron-rendering` (`GpuMesh`/`GpuTexture` + the bindless table),
 and `saffron-scene` (the catalog types and the ECS world).
 
-Vegetation is the largest single area here — roughly 11,700 lines across seven files, plus heavy
-coupling in `gpu_scene_mirror.rs`. The value contracts it cooks belong to `saffron-vegetation`
-(`engine/crates/vegetation/AGENTS.md`); this crate is where they meet the filesystem and the GPU.
+Vegetation is the largest single area here, plus heavy coupling in `gpu_scene_mirror/`. The value
+contracts it cooks belong to `saffron-vegetation` (`engine/crates/vegetation/AGENTS.md`); this crate
+is where they meet the filesystem and the GPU.
 
 ## Layout
 
-| Area | Files |
+Every area that outgrew one file is a directory module (`mod.rs` plus cohesive siblings), so the
+crate's public surface is unchanged by where an item lives.
+
+| Area | Modules |
 |---|---|
-| Server core | `lib.rs` (the `AssetServer`, caches, reserved ids), `cache.rs`, `load.rs`, `catalog.rs`, `scan.rs` |
-| Project + import | `project.rs`, `import.rs`, `model.rs`, `manage.rs`, `spawn.rs` |
-| Materials | `material.rs`, `render_material.rs`, `graph.rs`, `codegen.rs`, `thumbnail.rs` |
-| Render drive | `render_scene.rs` (the highest-coupling driver, plus `pick_entity`), `gpu_scene_mirror.rs`, `mesh_surface.rs`, `journal.rs`, `page_stream.rs` |
-| Vegetation cooking | `vegetation.rs`, `vegetation_cooker.rs`, `plant_cook.rs`, `cook_reader.rs`, `plant_render.rs` |
-| Vegetation artifacts | `vegetation_store.rs`, `vegetation_export.rs` |
+| Server core | `lib.rs` (the `AssetServer`, caches, reserved ids), `cache.rs`, `catalog.rs`, `load/` (`mesh`, `texture`, `builtin`), `scan/` (`reconcile`, `sidecar`, `texture`, `roles`) |
+| Project + import | `project.rs`, `import/` (`bake`, `meta`), `model.rs`, `manage/` (`extract`, `reimport`, `references`, `clean`, `material_import`, `container`), `spawn.rs` |
+| Materials | `material/` (`codec`, `overrides`, `io`), `render_material.rs`, `graph.rs`, `codegen.rs`, `thumbnail/` (`job`, `hash`, `cache`) |
+| Render drive | `render_scene/` (`frame`, `gather`, `pick`, `celestial`), `gpu_scene_mirror/`, `mesh_surface.rs`, `journal.rs`, `page_stream.rs` |
+| Vegetation cooking | `vegetation/`, `vegetation_cooker/`, `plant_cook/`, `cook_reader.rs`, `plant_render.rs` |
+| Vegetation artifacts | `vegetation_store/`, `vegetation_state.rs`, `vegetation_export.rs` |
 
 ## Rules that are easy to break
 
@@ -31,7 +34,7 @@ coupling in `gpu_scene_mirror.rs`. The value contracts it cooks belong to `saffr
   runs the resource's `Drop`, frees the VMA allocation, and returns the bindless slot. An in-flight
   frame may still reference an `Arc<GpuTexture>`, so the *caller* must `wait_gpu_idle` first. This
   is call-site discipline that `Drop` ordering cannot enforce.
-- **`gpu_scene_mirror.rs` also retains device `Arc`s.** It caches `Arc<GpuMesh>` and
+- **`gpu_scene_mirror/` also retains device `Arc`s.** It caches `Arc<GpuMesh>` and
   `Arc<GpuTexture>` per entry, so a teardown that clears the uploader and the asset caches but
   leaves the mirror populated keeps `DeviceResources` alive past instance destroy — which surfaces
   as a MoltenVK abort at `vkDestroyInstance`, far from the cause. Clear every cache that holds
@@ -53,19 +56,29 @@ coupling in `gpu_scene_mirror.rs`. The value contracts it cooks belong to `saffr
 - **The store is content-addressed and lives beside `assets/`, not inside it.**
   `project_vegetation_cache_root` resolves to `<project>/cache/vegetation/`, and
   `VegetationArtifactKind` maps the five namespaces to `plants/`, `cells/`, `manifests/`,
-  `cook-graphs/`, and `baselines/`. Publication is atomic (`AtomicWriteFile`).
-- **Any packaging path must copy that directory.** It is outside `assets/`, so a packager that
-  copies only `assets/` produces a player that binds no manifest and comes up bare — with nothing in
-  the tree catching it.
+  `cook-graphs/`, and `work-payloads/`. Publication is atomic (`AtomicWriteFile`).
+- **Persistent state has its own root and never enters the store.** `VegetationStateStore`
+  (`project_vegetation_state_root` → `<project>/state/vegetation/baselines/`) owns the one thing here
+  that no authored source reproduces. Everything in the artifact cache is rebuildable byte for byte,
+  so it may be deleted at any time; a baseline is a snapshot of runtime mutations, so putting it under
+  the cache root would make clearing a cache destroy authored work. Nothing that publishes or reads a
+  baseline may resolve it through `VegetationArtifactStore` —
+  `deleting_the_artifact_cache_loses_no_authored_or_persistent_bytes` in `vegetation_state.rs` is the
+  tripwire, and it removes the cache root on disk.
+- **Any packaging path must copy both roots.** They are outside `assets/`, so a packager that copies
+  only `assets/` produces a player that binds no manifest and comes up bare, and one that copies only
+  the cache produces a world that boots untouched — with nothing in the tree catching either.
 - **The export closure comes from the manifest, never from a directory scan.**
   `vegetation_export_closure` walks generation root → manifest → every compiled family and cell the
-  manifest names. A scan copies every generation the project ever cooked, including superseded ones,
+  manifest names, and reports the durable state separately in `state_files` because it lands under a
+  different root. A scan copies every generation the project ever cooked, including superseded ones,
   and quietly multiplies package size.
 - **An artifact's filename is the hash of its bytes**, so `verify_vegetation_artifacts` is a rehash
   and needs no side table that could itself rot. Only content-addressed kinds are rehashed: a
-  generation root and a baseline are *keyed* by what they belong to, and rehashing them reports
-  every baseline as corrupt. **Repair deletes rather than rewrites** — the bytes are the only copy,
-  and the cooker's cache-miss path is what reproduces them.
+  generation root is *keyed* by the map it belongs to, and rehashing it reports every root as corrupt.
+  **Repair deletes rather than rewrites** — the bytes are the only copy, and the cooker's cache-miss
+  path is what reproduces them. Verification never touches `state_files`: a baseline is the only copy
+  of something no cook reproduces, so "delete the corrupt one" is the wrong repair for it.
 - **A baseline is keyed by its manifest, one per generation.** A second baseline for the same
   generation is an ambiguity nothing resolves. A baseline that does not decode against its
   generation is a hard error at publish and at bind, not a warning.
@@ -77,9 +90,10 @@ coupling in `gpu_scene_mirror.rs`. The value contracts it cooks belong to `saffr
 
 ## Tests
 
-Inline `#[cfg(test)] mod tests` plus dedicated `*_tests.rs` modules (`scan_tests`, `project_tests`,
-`spawn_tests`, `import_tests`), and one integration test, `tests/smat_golden_snapshot.rs`, which
-uses the repo's on-disk golden mechanism (`saffron-test-support::assert_bytes_match_golden`) —
-unlike `saffron-vegetation`, which keeps its goldens as inline literals. Device-backed tests need
-the Vulkan environment; `cargo test` without it silently skips them, so a green run proves nothing
-about the GPU paths.
+**One convention: a module's tests are an inline `#[cfg(test)] mod tests { … }` in the file that
+owns the items, and fixtures shared across a directory module's siblings live in its
+`test_support.rs`.** No `#[path]` redirection, no `*_tests.rs` sidecars, no second name for the
+fixture module. One integration test, `tests/smat_golden_snapshot.rs`, uses the repo's on-disk
+golden mechanism (`saffron-test-support::assert_bytes_match_golden`) — unlike `saffron-vegetation`,
+which keeps its goldens as inline literals. Device-backed tests need the Vulkan environment;
+`cargo test` without it silently skips them, so a green run proves nothing about the GPU paths.

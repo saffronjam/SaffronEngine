@@ -111,7 +111,7 @@ pub fn register_vegetation_commands(reg: &mut CommandRegistry) {
                 params.level,
                 resolved.graph.limits.max_output_cells,
             )
-            .map_err(|error| Error::command(error.to_string()))?;
+            .map_err(Error::command)?;
             let inputs = assemble_biome_graph_evaluation_job(
                 ctx.assets,
                 &resolved,
@@ -458,7 +458,7 @@ pub fn register_vegetation_commands(reg: &mut CommandRegistry) {
             // Unresolved authored overrides: rows in the changed cells' AnchorOverride
             // chunks whose plant is absent from the newer manifest's macro set.
             let root = saffron_assets::load_vegetation_map_root(ctx.assets, map)
-                .map_err(|error| Error::command(error.to_string()))?;
+                .map_err(Error::command)?;
             let mut result_cells = Vec::new();
             for ((cell, added, removed, moved), (_, to_points)) in
                 cells.into_iter().zip(changed_cells)
@@ -475,7 +475,7 @@ pub fn register_vegetation_commands(reg: &mut CommandRegistry) {
                     .map(|reference| reference.key)
                     .collect();
                 let chunks = saffron_assets::load_vegetation_map_chunks(ctx.assets, map, &keys)
-                    .map_err(|error| Error::command(error.to_string()))?;
+                    .map_err(Error::command)?;
                 let mut conflicts = Vec::new();
                 for chunk in &chunks {
                     let saffron_vegetation::VegetationMapChunkPayload::AnchorOverride(payload) =
@@ -566,13 +566,12 @@ fn cook_scope_cells(
     match scope {
         VegetationCookScopeDto::All => {
             world_cells_covering_bounds(map.bounds, map.root.chunk_layout.level, max_cells)
-                .map_err(|error| Error::command(error.to_string()))
+                .map_err(Error::command)
         }
         VegetationCookScopeDto::Bounds { bounds, level } => {
             let bounds = intersect_bounds(parse_bounds(bounds)?, map.bounds)
                 .ok_or_else(|| Error::command("cook bounds do not intersect the map"))?;
-            world_cells_covering_bounds(bounds, *level, max_cells)
-                .map_err(|error| Error::command(error.to_string()))
+            world_cells_covering_bounds(bounds, *level, max_cells).map_err(Error::command)
         }
         VegetationCookScopeDto::Cells { cells } => {
             if u64::try_from(cells.len()).unwrap_or(u64::MAX) > max_cells {
@@ -882,14 +881,14 @@ fn candidate_identity(value: &VegetationCandidateIdentityDto) -> Result<Candidat
 fn parse_bounds(value: &WorldBoundsDto) -> Result<WorldBounds> {
     let minimum = parse_i128_lanes(&value.min_ticks, "bounds.minTicks")?;
     let maximum = parse_i128_lanes(&value.max_ticks_exclusive, "bounds.maxTicksExclusive")?;
-    WorldBounds::new(minimum, maximum).map_err(|error| Error::command(error.to_string()))
+    WorldBounds::new(minimum, maximum).map_err(Error::command)
 }
 
 fn parse_cell(value: &WorldCellDto) -> Result<WorldCellKey> {
     let x = parse_i64(&value.coordinates[0], "cell.coordinates[0]")?;
     let y = parse_i64(&value.coordinates[1], "cell.coordinates[1]")?;
     let z = parse_i64(&value.coordinates[2], "cell.coordinates[2]")?;
-    WorldCellKey::new(x, y, z, value.level).map_err(|error| Error::command(error.to_string()))
+    WorldCellKey::new(x, y, z, value.level).map_err(Error::command)
 }
 
 fn parse_i128_lanes(values: &[String; 3], field: &str) -> Result<[i128; 3]> {

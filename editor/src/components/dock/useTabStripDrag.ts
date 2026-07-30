@@ -1,14 +1,11 @@
-/// The tab-strip drag machine, extracted verbatim from the titlebar's view tabs and
-/// parameterized so every strip (the main view tabs and the compact dock strips) shares
-/// one implementation. Pointer-capture drag with a 4 px latch, a single centers snapshot
-/// at drag start, a transform-only live reorder preview (neighbors shift by the dragged
-/// tab's width), click-vs-drag activation, and a WAAPI FLIP settle on drop. The model is
-/// never mutated until drop, so every cancel path is free.
+/// The tab-strip drag machine, shared by the main view tabs and the compact dock strips:
+/// pointer-capture drag with a 4 px latch, one centers snapshot at drag start, a transform-only live
+/// reorder preview, click-vs-drag activation, and a WAAPI FLIP settle on drop. The model is never
+/// mutated until drop, so every cancel path is free.
 ///
-/// For `domain: "dock"` strips with a `leafId`, the machine also tears out: once the pointer
-/// escapes the strip band vertically it hands the drag to `dockDrag` (a cursor ghost + a
-/// drop overlay), and on release commits via `onDrop` instead of `onReorder`. Tear-out keeps
-/// the same pointer capture, so the source strip keeps driving the drag the whole time.
+/// For a dock strip with a `leafId` the machine also tears out: once the pointer escapes the strip
+/// band vertically it hands the drag to `dockDrag` and commits via `onDrop` instead of `onReorder`.
+/// Tear-out keeps the same pointer capture, so the source strip drives the drag throughout.
 import { useLayoutEffect, useRef, useState } from "react";
 import type { CSSProperties, PointerEvent } from "react";
 import type { DockNodeId, DockPanelId, DropTarget } from "../../state/dockLayout";

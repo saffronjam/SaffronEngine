@@ -85,12 +85,12 @@ sa render-stats -o json | jq .viewMode
 | What | File | Symbols |
 |---|---|---|
 | Overlay state and project JSON | `engine/crates/sceneedit/src/overlay.rs` | `DebugOverlayOptions`, `debug_overlays_to_json`, `debug_overlays_from_json` |
-| World-space line builders | `engine/crates/host/src/overlay.rs` | `build_debug_overlays`, `build_collider_overlays`, `build_scene_edit_overlay` |
+| World-space line builders | `engine/crates/host/src/overlay/` | `build_debug_overlays`, `build_collider_overlays`, `build_scene_edit_overlay` |
 | Grid pass and shader | `engine/crates/rendering/src/overlay.rs` · `engine/assets/shaders/grid.slang` | `record_grid`, `Renderer::set_show_grid` |
-| View-mode state | `engine/crates/rendering/src/renderer.rs` | `ViewMode`, `Renderer::set_view_mode`, `ViewMode::debug_channel` |
+| View-mode state | `engine/crates/rendering/src/renderer/` | `ViewMode`, `Renderer::set_view_mode`, `ViewMode::debug_channel` |
 | Surface-channel evaluation | `engine/assets/shaders/lighting.slang` | `debugViewChannel`, `evalViewMode` |
 | Overlay commands | `engine/crates/control/src/commands_animation.rs` | `get-debug-overlays`, `set-debug-overlays` |
-| View-mode command | `engine/crates/control/src/commands_render.rs` | `set-view-mode` |
+| View-mode command | `engine/crates/control/src/commands_render/` | `set-view-mode` |
 | Editor controls | `editor/src/panels/RenderPanel.tsx` · `editor/src/panels/Topbar.tsx` | `DEBUG_OVERLAYS`, `ViewModeMenu` |
 | View-mode registry | `editor/src/lib/view-modes.ts` | `VIEW_MODES`, `VIEW_MODE_BY_VALUE` |
 

@@ -1,65 +1,49 @@
 // Wind visibly moves cooked vegetation, and moves nothing else.
 //
-// Every other wind assertion in the suite is structural: `sample-wind` returns a field, the sway
-// record reaches the GPU, the deformation is applied at one place. None of them look at a pixel, so
-// none would notice a wind path that computes a correct record and never displaces a vertex — the
-// exact failure a visual test exists to catch.
+// Every other wind assertion is structural, so none would notice a path that computes a correct
+// sway record and never displaces a vertex.
 //
-// THE MEASUREMENT IS MOTION OVER TIME, not calm-versus-gale. Comparing one calm frame to one gale
-// frame conflates displacement with any other difference the two states carry. Instead each state
-// is sampled twice, separated by the same settle, and the two are compared to themselves:
-//
-//   calm  → two captures → must be near-identical (nothing is moving)
-//   gale  → two captures → must differ (the canopy is moving)
-//
-// The calm pair is therefore the control, and it is a real one: it fails if the frame is unstable
-// for any reason at all — TAA that never converges, an animation left running, a nondeterministic
-// pass — which would otherwise make the gale assertion pass for the wrong reason.
+// The measurement is motion over time, not calm versus gale: comparing one calm frame to one gale
+// frame conflates displacement with every other difference the two states carry. Each state is
+// sampled twice across the same settle and compared to itself — the calm pair must be
+// near-identical, the gale pair must differ. The calm pair is the control, and it fails if the frame
+// is unstable for any reason (TAA that never converges, an animation left running, a
+// nondeterministic pass), which would otherwise make the gale assertion pass for the wrong reason.
 //
 // Wind only displaces instances carrying `GPU_SCENE_INSTANCE_FLAG_WIND`, which the mirror sets on
-// vegetation points alone. A cooked cell is therefore required; a cube in the wind is motionless by
-// design, not by defect.
+// vegetation points alone, so a cooked cell is required and a cube in the wind is motionless by
+// design.
 
 import { afterAll, beforeAll, expect, test } from "bun:test";
-import { readFileSync } from "node:fs";
-import { dirname, join } from "node:path";
-import { fileURLToPath } from "node:url";
-import type {
-  EntityRef,
-  ImportVegetationAssetResult,
-  VegetationCookJobDto,
-  VegetationRuntimeQueryResult,
-} from "@saffron/protocol";
+import type { VegetationRuntimeQueryResult } from "@saffron/protocol";
 import type { Engine } from "./harness.ts";
-import { Cleaner, bootEngine, captureViewport, prepareScene, trackEntity } from "./test-utils.ts";
-import { authoredAssets, awaitCook, installTrunkObj, type VegetationFixture } from "./vegetation-utils.ts";
+import { Cleaner, bootEngine, captureViewport, prepareScene } from "./test-utils.ts";
+import {
+  BOUNDS,
+  bindVegetationField,
+  cookCells,
+  importVegetationPackage,
+  loadFixture,
+} from "./vegetation-utils.ts";
 import { decodeRgb8Png, meanAbsoluteDifference } from "./image.ts";
 
-const HERE = dirname(fileURLToPath(import.meta.url));
-const FIXTURE_PATH = join(HERE, "fixtures", "vegetation-phase3.json");
-const CELL = { coordinates: ["0", "0", "0"], level: 0 } as const;
-const BOUNDS = {
-  minTicks: ["0", "0", "0"],
-  maxTicksExclusive: ["262144", "262144", "262144"],
-} as const;
-
-/// The camera pose that frames the cooked cell's canopy.
+// The camera pose that frames the cooked cell's canopy.
 const CAMERA = { position: { x: 16, y: 4, z: 22 }, yaw: 0, pitch: 0 };
 
-/// Mean absolute per-channel difference (0-255) two captures of a *still* scene may differ by.
-/// A settled frame measures 0.0001 here, so this is three orders of magnitude of headroom for
-/// temporal accumulation — and still far below what a swaying canopy produces.
+// Mean absolute per-channel difference (0-255) two captures of a *still* scene may differ by.
+// A settled frame measures 0.0001 here, so this is three orders of magnitude of headroom for
+// temporal accumulation — and still far below what a swaying canopy produces.
 const STILL_TOLERANCE = 0.01;
 
-/// The same difference a *moving* canopy must at least reach. The gale measures 0.408 with this
-/// framing, roughly 3,500x the still frame, so the floor sits well clear of both.
+// The same difference a *moving* canopy must at least reach. The gale measures 0.408 with this
+// framing, roughly 3,500x the still frame, so the floor sits well clear of both.
 const MOTION_FLOOR = 0.1;
 
 const cleaner = new Cleaner();
 let engine: Engine;
 
-/// Captures two frames of the current wind state, separated by a settle, and returns how far the
-/// second moved from the first.
+// Captures two frames of the current wind state, separated by a settle, and returns how far the
+// second moved from the first.
 async function motionOver(tag: string): Promise<number> {
   const first = decodeRgb8Png(await captureViewport(engine, cleaner, `${tag}-a`));
   await engine.settle(500);
@@ -71,29 +55,10 @@ beforeAll(async () => {
   engine = await bootEngine(cleaner, { SAFFRON_SCRATCH_PROJECT: "1" });
   await prepareScene(engine, { width: 480, height: 270 });
 
-  const fixture = JSON.parse(readFileSync(FIXTURE_PATH, "utf8")) as VegetationFixture;
-  const sources = authoredAssets(cleaner, fixture, "wind-visual");
-  await installTrunkObj(engine, fixture);
-  for (const path of [sources.plant, sources.biome, sources.map]) {
-    await engine.call<ImportVegetationAssetResult>("import-vegetation-asset", { path });
-  }
-  const world = trackEntity(
-    cleaner,
-    engine,
-    await engine.call<EntityRef>("create-entity", { name: "Wind visual vegetation" }),
-  );
-  await engine.call("add-component", { entity: world.id, component: "VegetationField" });
-  await engine.call("set-component", {
-    entity: world.id,
-    component: "VegetationField",
-    json: { map: fixture.map, enabled: true },
-  });
-  const cook = await engine.call<VegetationCookJobDto>("vegetation-cook", {
-    map: fixture.map,
-    scope: { kind: "cells", cells: [CELL] },
-    workers: 1,
-  });
-  await awaitCook(engine, cook.job);
+  const fixture = loadFixture("vegetation-phase3");
+  await importVegetationPackage(engine, cleaner, fixture, "wind-visual");
+  const world = await bindVegetationField(engine, cleaner, fixture, "Wind visual vegetation");
+  await cookCells(engine, fixture.map);
 
   // Deliberately NOT in play mode: play renders the scene's primary camera, so `set-camera`
   // (the editor camera) would be ignored and every frame below would be the same picture of

@@ -80,7 +80,7 @@ map path.
   transmission/thickness pairs, `aggregate_transmittance(derived, thickness)` returns the sheet's
   transmission within 1e-3, and the degenerate cases (opaque matter, zero thickness) resolve solid.
   `occupancy_follows_the_densest_sheet_and_solid_wins` was rewritten around derived densities rather
-  than authored bits. `just e2e` 341/341, `just test` EXIT=0.
+  than authored bits.
   THE TRANSITION IS NOW MEASURED, not inferred. Doing it needed a lever the engine lacked: the cut
   is chosen inside the traversal by projected appearance error, so the only way to reach the
   aggregate form was to fly the camera out — which shrinks the subject at the same moment it
@@ -92,55 +92,35 @@ map path.
   from `SAFFRON_CUT_OVERRIDE` (`coarse`/`fine`), read once at construction, so a test boots two
   hosts that differ in exactly that and nothing else: same camera, same scene, same lighting, wind
   pinned calm.
-  `tests/e2e/vegetation-representation-parity.test.ts` (2/2): the two cuts are **8.97** mean
+  `tests/e2e/vegetation-representation-parity.test.ts`: the two cuts are **8.97** mean
   absolute per-channel difference apart — genuinely different pictures, asserted so the comparison
   cannot pass on an override that did nothing — while mean frame brightness differs by only
   **2.93** of a 6 budget. Different silhouette and detail, the same amount of light, which is
   precisely the claim: an aggregate voxel whose occupancy disagreed with the transmission of the
   leaves it replaces would move that second number. Indirect irradiance, sky visibility and the
   reflection cone all march the same `sdfExtinctionStep` with this occupancy and so ride the same
-  result. `just e2e` 343/343.)
+  result.)
 - [x] Parameterize GI/reflection culling through the same hierarchy and residency demand rather than
   rebuilding plant-specific lists.
-  (AUDITED 2026-07-26, and the claim is FALSE — but not in the direction the box anticipates. The
-  screen-space consumers are fine: SSR, SSGI and `gi_resolve` read only the camera G-buffer, so they
-  inherit hierarchy culling transitively. The world-space ones are not. DDGI, the global SDF/GDF,
-  DFAO, specular occlusion, RT reflections and the ReSTIR resolve all run off **two separate
-  per-frame CPU-gathered flat lists** — `sdf_instances` and `rt_instances`, both built in
-  `gather_static_frame_facts` (`render_scene.rs`) by an unculled full-ECS scan
-  `scene.for_each::<(&Transform, &MeshComponent), _>` with no frustum, HZB, LOD cut, or residency
-  gate. `set_sdf_scene` memcpys into an SSBO hard-capped at `MAX_SDF_INSTANCES = 4096` and silently
-  clamps past it, so occluders vanish from GI with no hierarchy to coarsen into; `gdf_cull.slang` is
-  a one-thread-per-instance linear scan and `sdf.slang::sdfSample` is O(N) at every march step.
-  Page-residency demand comes only from `gpuSceneRequestPage` in `scene_traversal.slang`, whose
-  traversal passes are camera and VSM only, and no GI or reflection consumer contributes a byte of
-  demand. **Correction to an earlier note here:** that note said `PageResidency::demand` has zero
-  production callers. It has one — `gpu_scene_mirror.rs:796`, inside `drive_page_streaming`, reached
-  from `sync_renderer_world`, which is the production entry point for the host and player frame
-  loops. Its prioritizer (`gpu_scene_mirror.rs:740-798`) is CPU-side and camera-only, which is the
-  real gap and the natural place a GI-shaped demand view plugs in.
+  (SCREEN-SPACE CONSUMERS INHERIT THE CAMERA CUT TRANSITIVELY: SSR, SSGI and `gi_resolve` read only
+  the camera G-buffer. The world-space ones — DDGI, the global SDF/GDF, DFAO, specular occlusion, RT
+  reflections and the ReSTIR resolve — consume the reach view and the occluder scatter below.
   THE CUT MUST NOT BE THE CAMERA FRUSTUM. Worth stating before anyone reaches for the obvious fix:
-  GI occluders shadow visible surfaces from off-screen, so frustum-culling these lists removes
+  GI occluders shadow visible surfaces from off-screen, so frustum-culling these sets removes
   occluders that legitimately contribute and darkens nothing that should be dark. The correct gate
   is the GDF cascade window — an occluder outside the furthest cascade cannot affect any march —
   plus the traversal cut and residency demand the box names.
-  THE FAILURE MODE IF THE GATE IS WRONG IS SILENT — occluders disappear from GI and no validation
-  layer or test notices, which is why `sdfInstancesDropped` (below) was worth landing first.
-  THE CUT IS NOW APPLIED, at the right granularity for what it can soundly claim.
-  `gi_occluder_bounds(eye)` (`global_sdf.rs`) returns the coarsest cascade's window dilated by one
-  cascade-0 extent, and `gather_static_frame_facts` skips any occluder whose world AABB misses it.
-  The dilation is not slop: the cascades re-centre later in the frame than the gather runs, so the
-  margin covers a frame of camera motion instead of racing that ordering. Reported as
-  `sdfInstancesCulled` on `render-stats`, deliberately named apart from `sdfInstancesDropped` —
-  culling is a claim about reach, dropping is geometry lost to capacity, and only the first is sound.
-  Proven by `gi_bounds_keep_occluders_behind_the_eye_and_drop_unreachable_ones`, whose load-bearing
-  case is the one a frustum cull gets backwards: an occluder DIRECTLY BEHIND the eye must survive,
-  because it still shadows what the eye sees.
-  A NOTE FOR WHOEVER TRIES TO OBSERVE THIS END TO END: builtin presets are uploaded with no SDF bake
-  (`upload_mesh(..., None)`), so a scene of cubes and spheres contributes nothing to this list and
-  the counter cannot move. An e2e assertion needs a project mesh with a baked field. That is why the
-  proof here is a unit test over the cut rather than a scene-level one.
-  GI NOW CONTRIBUTES PAGE-RESIDENCY DEMAND, which was half of what this note said was missing.
+  THE FAILURE MODE IF THE GATE IS WRONG IS SILENT: occluders disappear from GI and no validation
+  layer or test notices, which is why `sdfInstancesDropped` is on `render-stats` at all.
+  `gi_occluder_bounds(eye)` (`global_sdf.rs`) is the window — the coarsest cascade's, dilated by one
+  cascade-0 extent. The dilation is not slop: the cascades re-centre later in the frame than the cut
+  runs, so the margin covers a frame of camera motion instead of racing that ordering. `render-stats`
+  names culling apart from dropping — culling is a claim about reach, dropping is geometry lost to
+  capacity, and only the first is sound.
+  A NOTE FOR WHOEVER TRIES TO OBSERVE THIS END TO END: builtin presets are uploaded with
+  `SdfSource::None`, so a scene of cubes and spheres contributes no occluder and the counter cannot
+  move. An e2e assertion needs a project mesh with a baked field or a cooked plant.
+  GI CONTRIBUTES PAGE-RESIDENCY DEMAND.
   `PageDemandView` carries the reachable window beside the camera, and the streaming scorer ranks
   in three tiers instead of on-screen or not: visible content wins outright, a page a march or a
   reflection reads outranks one nothing consults, and the two flags do not compound. Before this a
@@ -148,73 +128,55 @@ map path.
   march against pages that had never been demanded, a hole in the gather rather than a missing
   pixel. `gi_reachable_pages_outrank_pages_nothing_reads` pins the ordering as an inequality rather
   than as three magic constants, so retuning the weights cannot silently invert it.
-  STILL OPEN: the lists are CPU-gathered per frame rather than produced by the traversal. Routing
-  them through the hierarchy needs a `GpuDrawRecord` to `SdfInstance` translation and a box-window
-  cull mode, and neither exists — the translation is a JOIN rather than a rename, since the record
-  is twelve handle words with no transform and no bounds while an `SdfInstance` needs a world→local
-  matrix, both AABBs, occupancy, a bindless index and three brick locators.
-  BOTH LISTS ARE NOW CUT, which closes the asymmetry this note used to record. `rt_instances` is
+  BOTH SETS ARE CUT AGAINST ONE WINDOW. `rt_instances` is
   gated against the same cascade window as `sdf_instances`, and so are the vegetation ray instances
   the mirror splices in — a resident cell reaches far past what any ray does, and splicing its
   plants in wholesale was the last ungated half. Reported as `rtInstancesCulled`, named apart from
   a drop for the same reason `sdfInstancesCulled` is: culling is a claim about REACH and is sound,
   while an instance lost to capacity is geometry silently missing from reflections.
-  ONE PREDICATE, NOT TWO. `gi_window_intersects` is shared by both cuts rather than each repeating
+  ONE PREDICATE, NOT TWO. `window_intersects` (`gpu_scene_mirror/facts.rs`) is shared by both cuts
+  rather than each repeating
   the comparison, so they cannot drift into disagreeing about what reachable means — which would
   surface as a reflection and a cone trace gathering from different sets of occluders.
   `the_ray_cut_keeps_what_a_ray_can_reach_and_drops_what_it_cannot` pins the cases that matter: an
   occluder DIRECTLY BEHIND THE EYE survives (the one a frustum cull gets backwards), one outside
   the coarsest cascade drops, a straddling one is kept because the cut may only drop what it can
   prove unreachable, and a scaled instance is judged on its world extent rather than its local one.
-  ALSO PRECISE, SINCE "unculled full-ECS scan" IS NOW HALF TRUE: the *scan* is still unculled — every
-  entity is collected into a `Vec` before any cut — but the SDF *upload* is culled. The cost the box
-  cares about is the scan, and it has not moved.
-  ONE CONCRETE DEFECT FROM THAT AUDIT IS FIXED, though the rearchitecture is not: the 4096-instance
-  clamp is no longer invisible. It warned to the log, which nothing can assert on; `render-stats` now
-  carries `sdfInstancesDropped`, so a scene that silently loses GI occluders fails a test instead of
-  looking correct. Covered by `tests/e2e/rt-telemetry.test.ts` (6/6). This does not touch the box's
-  actual claim — the lists are still unculled full-ECS scans and GI still contributes no residency
-  demand — it makes the failure observable while that remains true.
-  THE FINDING THAT MATTERED FOR THIS PLANSET, now half-resolved: the flat lists do not *rebuild* a
-  plant-specific list — they **excluded vegetation entirely**. Vegetation is mirrored straight into
-  the persistent GPU scene by `GpuSceneMirror::sync_vegetation`, and micro-field blades are
-  reconstructed GPU-side in `add_micro_field_passes`, so neither reached the CPU scan.
-  RAY TRACING IS FIXED. `GpuSceneMirror::vegetation_ray_instances` derives ray instances from the
-  RETAINED plant state — not the sync delta, which would have published a plant once and then lost it
-  on the next unchanged frame — and a multi-prototype family expands into one TLAS instance per use
-  over per-prototype structures. Plants now cast ray-traced shadows; `tests/e2e/vegetation-rt.test.ts`
-  asserts resident plants move `rtInstances` and bring their own bottom-level structures.
-  STILL EXCLUDED: the GDF/DDGI occluder list. No plant, grass blade, or micro-field instance becomes
-  an `SdfInstance`, so vegetation still casts no GI occlusion. Grass is also still absent from ray
-  tracing, since blades exist only as GPU-reconstructed micro candidates with no CPU-side instance to
-  publish.
-  Closing this box means moving the world-space consumers onto the traversal cut, not tidying the
-  existing lists.
-  THE GPU-SIDE REACH VIEW NOW EXISTS, which is the half of that the CPU gate could not do.
+  THE 4096-INSTANCE CLAMP IS NOT INVISIBLE: `sdfInstancesDropped` reports it on `render-stats`, so a
+  scene that loses GI occluders to capacity fails a test instead of looking correct. Covered by
+  `tests/e2e/rt-telemetry.test.ts`.
+  VEGETATION REACHES BOTH SETS. It never enters the ECS — the mirror syncs it straight into the
+  persistent GPU scene and micro-field blades are reconstructed GPU-side in `add_micro_field_passes` —
+  so it takes its own route. `GpuSceneMirror::vegetation_ray_instances` derives ray instances from the
+  RETAINED plant state, not the sync delta, which would have published a plant once and then lost it
+  on the next unchanged frame; a multi-prototype family expands into one TLAS instance per use over
+  per-prototype structures. `tests/e2e/vegetation-rt.test.ts` asserts resident plants move
+  `rtInstances` and bring their own bottom-level structures. Grass stays out of ray tracing: blades
+  exist only as GPU-reconstructed micro candidates with no instance to publish.
+  THE GPU-SIDE REACH VIEW is what the CPU gate could not do.
   `SCENE_VISIBILITY_PASS_REACH` is a third pass kind over the same instance sweep: no projection, no
   pyramid, no retest list — an instance survives iff its world sphere meets the box
   `gi_occluder_bounds(eye)` returns, the same function the CPU cut calls, so the two cannot drift.
-  `Renderer::gi_view` runs it while the distance field does and walks the hierarchy in demand-only
+  The renderer's `gi_view` runs it while the distance field does and walks the hierarchy in demand-only
   mode (`SceneTraversalPush::demand_only`), so the pages a gather reads are demanded without a draw
   record being emitted for a view that draws nothing. Reported as `giReachVisible` / `giReachCulled`
   and asserted in `tests/e2e/visibility-counters.test.ts`, whose load-bearing half walks the camera
   a hundred kilometres away and requires the count to MOVE — a reach cull that never rejects reads
   exactly like one that is not wired up.
-  DEMAND IS NOW PRICED BY WHO MISSED. `gpuSceneRequestPage` carries a `SceneViewClass` ordinal, so
+  DEMAND IS PRICED BY WHO MISSED. `gpuSceneRequestPage` carries a `SceneViewClass` ordinal, so
   the CPU can tell a camera miss from a shadow-page miss from a gather miss instead of giving every
   one `u64::MAX / 2`; the bands sit above `PAGE_DEMAND_PREDICTED_CEILING`, so an actual miss
   outranks every predicted score. Eviction is least-recently-demanded first and then by the
   cheapest reader, and a page's priority is REPLACED on a later frame rather than accumulated —
   a running maximum would let one camera glance protect a page over the image forever, and
   `a_page_nobody_asks_for_goes_before_one_a_gather_still_reads` fails on exactly that mutation.
-  THE REQUEST BUFFER IS PARTITIONED BY CLASS, which the reach view forced and which was
-  latently wrong before it. Every view in the frame appends missing-page requests — the camera,
-  up to twelve shadow-page views, and now a reach view sweeping a hundred-metre box — and they
-  all shared one 4096-entry FIFO ordered by nothing but the atomic race. A gather could crowd
-  out the camera, and the camera's requests are the ones that are holes in the image. Now each
-  class owns a count word and a region, so what a class loses follows from its own volume;
-  because the region IS the class, the entry is one word again rather than the (slot, class)
-  pair the first cut of this work introduced. Overflow is no longer silent either: the count
+  THE REQUEST BUFFER IS PARTITIONED BY CLASS. Every view in the frame appends missing-page requests —
+  the camera, up to twelve shadow-page views, and a reach view sweeping a hundred-metre box. One
+  shared FIFO ordered by nothing but the atomic race would let a gather crowd out the camera, whose
+  requests are the ones that are holes in the image, so each
+  class owns a count word and a region and what a class loses follows from its own volume;
+  because the region IS the class, the entry is one word rather than a (slot, class)
+  pair. Overflow is not silent either: the count
   word already ran past the ceiling, so the drain reports the difference as `requestsDropped`
   with a per-class `requestOverflowClasses` mask. `page-request-budget` lowers the effective
   per-class ceiling so the path is reachable at all — the `vsm-page-budget` precedent — and
@@ -222,11 +184,11 @@ map path.
   the budget would leave the two halves reading different memory.
   `a_flooded_class_loses_only_its_own_requests` is the proof and it dies the moment the drain
   reads one shared region.
-  THE PLANT BLIND SPOT IN THE CPU PRIORITIZER IS CLOSED: `drive_page_streaming`'s frontier scorer
-  walks `world_state.plants` alongside `world_state.instances` in one loop. Vegetation never enters
-  the ECS and is where most of the paged geometry actually is, so the scorer had been ranking the
-  smaller half of the scene and leaving the larger half to demand-on-miss.
-  THE SCATTER IS BUILT AND THE CPU LIST IS GONE (2026-07-28). The dead seam is dead no longer:
+  THE CPU PRIORITIZER RANKS PLANTS TOO: `drive_page_streaming`'s frontier scorer walks
+  `world_state.plants` alongside `world_state.instances` in one loop. Vegetation never enters the ECS
+  and is where most of the paged geometry is, so a scorer that walked instances alone would rank the
+  smaller half of the scene and leave the larger half to demand-on-miss.
+  THE OCCLUDER SET IS SCATTERED ON THE GPU:
   `GlobalGpuData::sdfs` (a `GpuSdfTableRecord` per baked field: grid bounds, encode clamp, bindless
   slot, dims) plus a `prototype_sdfs` arena, `GpuScenePrototypeGpuRecord::sdf` replaced by
   `sdfRange: GpuArenaRange` — RANGE-SHAPED, one occluder per field, because the tightness is what
@@ -238,9 +200,8 @@ map path.
   `GpuMaterialTableRecord`, stride unchanged at 64 — and appends `SdfInstance`s into per-frame-slot
   regions with the count in meta words, because a GPU-produced count cannot ride a push constant.
   `gdf_cull` and the DDGI near-field march read the count from those words (light-set binding 15 /
-  cull-set binding 2); `set_sdf_scene`, `record_sdf_culled`, the trait methods, and the whole SDF
-  block of `gather_static_frame_facts` are deleted in the same change. `sdfInstancesCulled` /
-  `sdfInstancesDropped` keep their DTO fields, sourced from the meta readback — culled is now the
+  cull-set binding 2). No CPU occluder upload survives beside it — the scatter is the only producer.
+  `sdfInstancesCulled` / `sdfInstancesDropped` are sourced from the meta readback, culled being the
   scatter's per-field window reject count.
   ONE HONEST TRADE, recorded rather than hidden: the GDF near cascade's moved-occluder dirty
   regions diffed CPU-side AABBs that no longer exist, so cascade 0 joins the same staggered
@@ -250,7 +211,7 @@ map path.
   machinery (`set_instances`, `cur_aabbs`/`prev_aabbs`, `aabb_changed`) is deleted with its caller.
   GLOBAL_GPU_DATA_ABI_VERSION bumped to 2; the byte-lock and slang-lock tests cover the new record
   and the widened material record.
-  PLANTS NOW BAKE FIELDS (2026-07-28, the last piece). A `DistanceField` compiled section
+  PLANTS BAKE FIELDS. A `DistanceField` compiled section
   (`PLANT_COMPILED_ARTIFACT_VERSION` 3 → 4) derives a family-space SDST field from the coarsest
   aggregate voxel brick's occupancy — the same grid the aggregate raster form draws, so a march
   occludes against what the coarse cut shows, and family space is what makes it correct for
@@ -273,27 +234,11 @@ map path.
   `derive_parity_occupancy(transmission_mean, thickness_mean)` from the brick moments. Probe
   numbers: fine/coarse energy delta 25.8 with the defects, 2.88 with the fix — the historical
   parity was 2.93. `vegetation-representation-parity` and the `vegetation-churn` trample test are
-  the regression guards; both pass.
-  THREE FACTS FOUND 2026-07-27 that bound what closing it costs, none of which the notes above knew.
-  THE SEAM ALREADY EXISTS AND IS DEAD. The persistent GPU scene declares a whole SDF table —
-  `GpuSceneSdfRecord`, `GpuSceneUploadTarget::Sdf`, a `SceneSdfTable` storage with its own growth
-  and staging path, the `sceneSdfs` address-block word, and `prototype.sdf` on the GPU record — and
-  NOTHING WRITES IT. Every construction site in `gpu_scene_mirror.rs` passes `sdf: None`, so the
-  table is empty in every frame the engine has ever rendered. That is the routing seam the box
-  wants, declared and unused, which by this repo's own rule is a tail that must be populated or
-  deleted. Populating it is the box; deleting it would delete the box's destination.
-  IT NEEDS A RANGE, NOT A HANDLE. `prototype.sdf` is one optional handle while a mesh contributes
-  ONE OCCLUDER PER BAKED FIELD — `mesh_ref.sdfs()` is a list, one tight field per primitive and per
-  spatial chunk of an oversized one, and the tightness is the point (many small fields cull
-  independently). So the schema change is `materialRange`-shaped, not a rename.
-  PLANTS COOK NO DISTANCE FIELD, which is the concrete cause behind the "STILL EXCLUDED" line above
-  rather than an oversight in the mirror. `PlantCompiledSectionKind` has fifteen members and none of
-  them is a field; a plant's coarse representation is `VoxelHierarchy` — occupancy and material
-  moments, not signed distance. And there is no second door into GI: `gdf_composite.slang` composites
+  the regression guards.
+  THERE IS ONE DOOR INTO GI AND EVERY OCCLUDER GOES THROUGH IT: `gdf_composite.slang` composites
   exclusively by walking `SdfInstance`s through `sampleMdfBrick`, so an occluder is a brick-backed
-  field or it is nothing. Vegetation GI occlusion therefore costs a new cook stage that derives a
-  field from the aggregate voxel occupancy, plus the upload path to publish it as a `GpuSdf` — it is
-  not reachable by wiring alone, which is what the earlier notes implied.)
+  field or it is nothing — which is why a plant's coarse `VoxelHierarchy` occupancy has to become a
+  cooked field rather than a second kind of occluder.)
 
 ## Portable KHR ray tracing policy
 
@@ -332,8 +277,8 @@ map path.
   any steady frame, which silently removed every plant from the TLAS. It also places
   single-prototype families, which are cooked as plain meshes; requiring the assembly form dropped
   them, and the fixture happens to be exactly that shape.
-  Measured by `tests/e2e/vegetation-rt.test.ts` (3/3): a resident cell moves `rtInstances` 1 → **5**
-  and `blasCount` 1 → **2**, with `blasBytes` rising and validation clean. `just e2e` 350/350.)
+  Measured by `tests/e2e/vegetation-rt.test.ts`: a resident cell moves `rtInstances` 1 → **5**
+  and `blasCount` 1 → **2**, with `blasBytes` rising and validation clean.)
   (HARDWARE NOW PRESENT — this box needs code, not a machine. The RTX 3070 Ti advertises
   `VK_KHR_acceleration_structure`, `VK_KHR_ray_query`, `VK_KHR_deferred_host_operations`,
   `VK_EXT_opacity_micromap` and `VK_NV_cluster_acceleration_structure`, and `Device::new` resolves
@@ -426,7 +371,7 @@ map path.
   then `preview thumbnail render: ... ERROR_DEVICE_LOST`; the main loop stops, so the control socket
   stops answering and the contract test reports `timeout calling list-assets` — the first call after
   the device died, not the cause.
-  HEADLESS ALONE IS NOT THE TRIGGER: `just e2e` boots 67 offscreen hosts for 390 tests and never
+  HEADLESS ALONE IS NOT THE TRIGGER: `just e2e` boots an offscreen host per test file and never
   hits it. Three minimal offscreen probes also pass — a scratch project plus `import-model`, the
   same plus `play`, and the same plus `get-thumbnail` — so it needs more than any of those.
   THE TRIGGERING CALL IS NAMED, by tracing every command the contract test issues: `save-project`,
@@ -507,7 +452,7 @@ map path.
   creation, and resolves the `ext::opacity_micromap::Device` dispatch. Surfaced as
   `Capabilities::opacity_micromap` / `Device::omm_supported()` / `Device::omm_dispatch()` and as
   `ommSupported` on `render-stats`. Measured `ommSupported = true` on the RTX 3070 Ti with the device
-  coming up validation-clean, asserted by `tests/e2e/rt-telemetry.test.ts` (5/5) — which does not
+  coming up validation-clean, asserted by `tests/e2e/rt-telemetry.test.ts` — which does not
   assert the capability's *value* (it is device-dependent) but does assert it is reported, that it
   never claims true without ray tracing, and that enabling it raised no validation message.
   **THE DERIVATION IS NOW BUILT AND PROVEN; ATTACHMENT IS NOT.**
@@ -581,15 +526,7 @@ map path.
   ONE BUG THIS FOUND, worth keeping: `VirtualHierarchyMaterial::from_surface` hardcoded
   `opacity_micromap: false` for every `MaterialSurface::Standard`, so masked standard materials —
   half the scope this box names — derived nothing, silently, with the whole suite green. It now
-  permits OMM exactly when the alpha classification is `Masked`.
-  The note below predates all of this.
-  WAS ABSENT, IN FOUR NAMED PLACES: `derive_opacity_micromap` has zero
-  production callers (every call site is a test); `MeshBlasGeometry.micromap` is `None` at both
-  production sites, so the chain that exists is never fed; there is no cook stage emitting the
-  derivation into the `RayTracing` section; and the BLAS is one geometry per structure, so opacity
-  cannot vary per submesh even once a micromap arrives. The device's
-  `maxOpacity4StateSubdivisionLevel` is also never read, so policy is unclamped by the limit that
-  makes an over-subdivided row a device-loss rather than a validation message.)
+  permits OMM exactly when the alpha classification is `Masked`.)
 - [x] Add optional `VK_NV_cluster_acceleration_structure` and partitioned-AS execution over canonical
   cluster/page data only after KHR correctness; no NVIDIA-specific plant representation.
   (BOTH HALVES ARE BUILT AND PROVEN ON THE RTX 3070 Ti. The partitioned half is at the end of this
@@ -665,21 +602,18 @@ map path.
   validation message, so the whitelist cannot hide a real one.)
 - [x] Track BLAS/TLAS build/update/compaction time, memory, selected representation, OMM hit classes,
   and page demand without copying vendor performance thresholds.
-  (FIVE OF SIX CLAUSES ARE BUILT; the box stays open on COMPACTION TIME alone.
-  BUILD/UPDATE TIME LANDED, and it cost far less than this note once implied. The render graph
-  already brackets every pass in timestamps, and the BLAS refits shared one pass with the TLAS
-  build whose body took a `NestedScopeRecorder` and threw it away. `record_tlas_build_plan` now
+  (BUILD/UPDATE TIME rides the render graph's per-pass timestamps. `record_tlas_build_plan`
   splits into `record_blas_refits` and `record_tlas_build` under two named child scopes, so
   `blas-refit` and `tlas-build` time separately. That split is the point: refits scale with
   deforming instances and the TLAS with total instance count, and one combined number could not
   say which moved.
-  OMM HIT CLASSES LANDED. `Micromap` already carried its derivation classes for telemetry;
+  OMM HIT CLASSES: `Micromap` carries its derivation classes, and
   `distinct_micromap_classes` sums them across the frame's instances — deduplicated by handle, for
   the same reason the BLAS bytes are, since instances of one mesh share its micromaps and charging
   per instance would report sharing as work. On the wire as `ommMicromaps`, `ommOpaque`,
   `ommTransparent`, `ommUnknown`. THE UNKNOWN COUNT IS THE OPERATIONAL ONE: micromaps present with
   everything unknown removed no classifier work at all, and reads as healthy unless it is reported.
-  COMPACTION AND INITIAL-BUILD TIME NOW HAVE THEIR OWN POOL. Those two run outside the graph on the
+  COMPACTION AND INITIAL-BUILD TIME HAVE THEIR OWN POOL. Those two run outside the graph on the
   uploader's private one-off submits, so no pass scope reaches them; a two-timestamp query pool on
   the uploader brackets each and accumulates into the shared `DeviceResources`, which is the one
   thing the uploader and the renderer both hold. On the wire as `accelBuildUs`.
@@ -691,7 +625,6 @@ map path.
   a right one would fail. A device with no timestamp support measures nothing rather than reporting
   a fabricated zero, and a failed query read is dropped for the same reason — zero reads as a fast
   build rather than as an unmeasured one.
-  The three-of-six note below predates all of this.
   MEMORY: `AccelerationStructure` carries its own `size`, and `Rt` sums the distinct structures each
   frame into `blasBytes` / `tlasBytes` / `rtScratchBytes` on `render-stats`. Bottom-level bytes are
   deduplicated by device address for the same reason `distinct_blas_count` is — a structure shared by
@@ -701,20 +634,16 @@ map path.
   115,072 kept, a **54.8% saving**, with TLAS 12,672 and scratch 6,912.
   SELECTED REPRESENTATION: `skinnedBlasCount` (refit) and `tessellatedBlasCount` (full rebuild) are
   reported beside the static `blasCount`, so a deforming scene is distinguishable from a static one.
-  Covered by `tests/e2e/rt-telemetry.test.ts` (4/4), whose load-bearing case adds six instances of an
+  Covered by `tests/e2e/rt-telemetry.test.ts`, whose load-bearing case adds six instances of an
   existing mesh and asserts the byte total does **not** move.
-  STILL OPEN: (1) build/update/compaction TIME — no timing sink exists on the build path, and CPU
-  wall-clock around a submit-and-wait would measure the wait, not the build; this wants GPU
-  timestamps. (2) OMM HIT CLASSES — and the reason is now narrower than this note used to say. The
-  derivation IS built: `derive_opacity_micromap` produces `MicromapClasses` (opaque / transparent /
-  unknown), `record_micromap_build` records `vkCmdBuildMicromapsEXT`, and
-  `a_derived_micromap_builds_validation_clean` proves both on the RTX 3070 Ti. What is missing is the
-  ATTACHMENT: `MeshBlasGeometry::micromap` is the seam, and nothing in the frame path fills it —
-  `record_micromap_build` has no production caller, so no micromap is retained per frame and there
-  are no classes a counter could read. Adding the counter now would ship a word that is always zero,
-  which reads as "this frame had no unknown micro-triangles" rather than "nothing attached a
-  micromap". (3) PAGE DEMAND — no GI or reflection consumer contributes demand, as the
-  GI/reflection culling box records; there is no demand to attribute.)
+  ATTACHMENT IS AT THE UPLOAD SEAM, which is what makes the class counts nonzero: `build_cooked_micromaps`
+  builds a cooked family's micromaps on their own submit before the structure build reads them by device
+  address, `GpuMesh` retains them so they outlive every structure referencing them, and
+  `MeshBlasGeometry::micromap` carries the one belonging to each submesh — one geometry per submesh,
+  because a single-geometry structure holds one class and one masked submesh would otherwise force the
+  coverage classifier onto every other.
+  PAGE DEMAND: the GI reach traversal runs as `SceneViewClass::Gi`, so its missing-page requests reach
+  the same ring the camera and shadow-page views feed, tagged with the view class that asked.)
 
 ## Acceptance
 
@@ -950,8 +879,8 @@ map path.
   calls `build_coarse_root_brick(bounds, material)` with `occupancy = u16::MAX`, deriving the brick
   from BOUNDS ALONE, where `build_voxel_brick` beside it voxelizes real indices. Passing the mesh
   down and voxelizing it (`build_voxel_brick(brick_id, bounds, mesh, &mesh.indices, ..)`) compiles
-  clean, keeps all 686 tests green, and STILL does not restore the picture — with or without the
-  error fold above.
+  clean, keeps the workspace suites green, and STILL does not restore the picture — with or without
+  the error fold above.
   THE COOKED TREES, WALKED, ARE THESE — and they are the clearest statement of the difference:
 
       one material    node 1  root      voxel  err 4294967295 (saturated)  children [0]
@@ -968,7 +897,7 @@ map path.
   reports 0, and the brick's CONTENTS never enter the selector's decision at all.
   A THIRD FIX WAS TRIED AND ALSO BACKED OUT: making the aggregate's error saturate outright, the way
   the family root's does. The cooked tree then shows node 2 at 4294967295 — verified by walking it —
-  all 686 tests stay green, and the picture is STILL unchanged.
+  the workspace suites stay green, and the picture is STILL unchanged.
   SO THE COOKED APPEARANCE ERROR IS NOT WHAT DECIDES THIS AT RUNTIME. That is the assumption all
   three fixes shared and it is now falsified: an aggregate that saturates is still not refined past.
   AND `scene_traversal.slang` SAYS WHY. Refinement is gated on three things, not one:
@@ -1013,8 +942,8 @@ map path.
   object after the first folded onto the first one's geometry.
   THE FIX IS THE MAP PER MODEL, and it is landed with
   `each_object_in_a_multi_object_obj_keeps_its_own_vertices` pinning it. Determinism is unaffected
-  (the ordered map is what the module exists for). Validated: 686 geometry/assets/vegetation Rust
-  tests, e2e `vegetation` 47/47, `assets`, and `material` all green.
+  (the ordered map is what the module exists for). Validated across the geometry, assets and
+  vegetation crate suites and the `vegetation` e2e files.
   THE BLAST RADIUS IS WIDER THAN THIS BOX: every multi-object OBJ the engine has ever imported was
   silently collapsing its later objects onto the first — correct index counts, correct submeshes,
   and geometry drawn on top of itself. Only single-object OBJs were ever right, which is why nothing

@@ -47,9 +47,12 @@ vertex-only executor PSO per pass for every opaque/masked bucket.
 
 ## Vertex pulling
 
-The übershader's `vertexMainExecutor` entry runs with no vertex input state: `SV_VertexID` is
-the pulled index value from the pages arena, `SV_VulkanInstanceID` is the record index. The
-vertex loads its record, resolves the instance transform and material through the
+The übershader's `vertexMainExecutor` entry runs with no vertex input state:
+`SV_VulkanVertexID` is the pulled index value plus the command's `vertexOffset`,
+`SV_VulkanInstanceID` is the record index. Both semantics are the Vulkan-flavoured ones on
+purpose — Slang's `SV_VertexID`/`SV_InstanceID` follow D3D and subtract the draw's base
+values back out, which for a displaced row would discard its slice base in the amplification
+arena. The vertex loads its record, resolves the instance transform and material through the
 [address block](../../frame-and-render-graph/persistent-gpu-scene/), and pulls positions
 through buffer device addresses — the static vertex arena for a rigid instance, the
 per-frame deformed buffer for a [skinned or morphing](../../frame-and-render-graph/compute-skinning/)
@@ -75,42 +78,49 @@ bucket masks to a zero draw, so each blend PSO replays the whole global order. T
 translucent scope draws each slice with its bucket's blend PSO (depth-test on, depth-write
 off), counted by the transparent counter word.
 
-## Deformation and the tessellation seam
+## Deformation and displacement
 
-The scene driver walks the ECS once per frame for *frame facts* only: the world AABB (the
-shadow-frustum fit), the SDF occluder list, the RT instance inputs, and one
-`DeformationWork` item per skinned, morphing, or displaced instance. It submits the work and
-the concatenated joint palette through `Renderer::submit_gpu_scene_deformations`, which wires
-the skin/morph compute dispatches; the deformed outputs are pulled by the executor vertex
-path.
+The scene driver's per-frame job is the frame's ray instances and one `DeformationWork` item
+per skinned, morphing, or displaced instance. Neither costs a scene walk. Every per-instance
+fact — world bounds, the opacity class its materials resolve to, the displacement they select
+— is derived by the [GPU-scene mirror](../../frame-and-render-graph/persistent-gpu-scene/)
+when the journal last touched that entity, and the mirror hands the driver its cached ray cut
+whole while nothing has moved and the reach window has not stepped. What is resolved live is
+what no journal covers: joint palettes and morph weights, whose ECS queries visit only the
+entities carrying them. The driver submits the work and the concatenated joint palette through
+`Renderer::submit_gpu_scene_deformations`, which wires the skin/morph compute dispatches; the
+deformed outputs are pulled by the executor vertex path.
 
-A displaced (`HeightMode::Displacement`) instance draws through the *tessellation seam*: its
-material carries `GPU_MATERIAL_TABLE_FLAG_TESSELLATED`, the traversal skips its records, and
-every pass replays a per-instance `TessSceneDraw` — an indirect draw over the frame's
-amplified transient geometry, the renderer's only vertex-input path (see
+A displaced (`HeightMode::Displacement`) instance owns a row in the frame's amplification
+arena. The traversal emits one record naming that row instead of walking the instance's base
+hierarchy, and the binner turns it into a counted-indirect command from the row's draw seed —
+the same binned cut and the same draw call shape as every other representation (see
 [displacement](../../frame-and-render-graph/compute-displacement/)).
 
 ## Stats
 
 The frame's counters derive from the visibility readback: `drawCalls` is the emitted record
-count (plus tess-seam draws), `instances` the cull survivors, `triangles` the traversal's
-per-record index counts over three, `batches` the live bucket count. The control plane
-exposes them, and `instanceUploadBytes` reports the GPU-scene table bytes staged this frame —
-(near-)zero on a steady scene:
+count, `instances` the cull survivors, `triangles` the traversal's per-record index counts
+over three, `batches` the live bucket count. Two more report what preparation cost:
+`instanceUploadBytes` is the GPU-scene table bytes staged this frame, and
+`sceneGatherEntities` the instances the driver derived facts for. Both read zero on a steady
+scene of any size, which is the measurable form of "preparation scales with changes":
 
 ```sh
 sa render-stats
-# { "drawCalls": 12, "batches": 2, "instances": 2, "triangles": 24, "instanceUploadBytes": 0, ... }
+# { "drawCalls": 12, "batches": 2, "instances": 2, "triangles": 24,
+#   "instanceUploadBytes": 0, "sceneGatherEntities": 0, ... }
 ```
 
 ## In the code
 
 | What | File | Symbols |
 |---|---|---|
-| Frame facts + deformation work | `assets/src/render_scene.rs` | `render_scene`, `gather_static_frame_facts`, `gather_skinned_frame_facts` |
+| Frame facts + deformation work | `assets/src/render_scene/{frame,gather}.rs` | `render_scene`, `gather_static_frame_facts`, `gather_skinned_frame_facts` |
+| Cached per-instance facts + ray cut | `assets/src/gpu_scene_mirror/{facts,resolve}.rs` | `InstanceFacts`, `ray_instances`, `mirrored_instance`, `displaced_static_entities` |
 | Buckets + visibility lists | `rendering/src/visibility.rs` | `build_executor_buckets`, `ExecutorBucket`, `SceneVisibilityView`, `ExecutorDrawInputs` |
-| Pass recorders | `rendering/src/scene_pass.rs` | `record_executor_buckets`, `record_executor_depth_family`, `record_executor_transparent_stream` |
-| Tess-seam draws | `rendering/src/scene_pass.rs`; `rendering/src/draw_list.rs` | `record_tess_scene_draws`, `record_tess_depth_draws`, `TessSceneDraw` |
+| Pass recorders | `rendering/src/scene_pass.rs` | `record_executor_buckets`, `record_executor_depth_family`, `record_executor_transparent_stream`, `bucket_index_buffer` |
+| Displacement arena | `rendering/src/tessellation.rs`; `rendering/src/renderer/tessellation_prep.rs` | `DisplacedFrameAddresses`, `DisplacedRow`, `access_displaced_arena` |
 | Deformation driver | `rendering/src/renderer.rs`; `rendering/src/instancing.rs` | `submit_gpu_scene_deformations`, `DeformationWork`, `gather_instance_deformation` |
 | Executor vertex path | `assets/shaders/mesh.slang` | `vertexMainExecutor` |
 | Binning + sort kernels | `assets/shaders/` | `scene_bin_count/seed/scatter.slang`, `scene_transparent_keys.slang`, `scene_transparent_reorder.slang` |

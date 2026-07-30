@@ -1,9 +1,6 @@
 //! The control-plane passthrough: the one socket round-trip the whole shell IPC is built on.
-//! Newline-delimited JSON over the per-PID unix socket; the engine's `ok:false` reply becomes
-//! the shared typed failure object. It is
-//! shell-agnostic (`UnixStream` + `serde_json`); the caller is the CEF
-//! query handler, wired next). Consumed by the CEF message-router query handler and by the
-//! lifecycle/teardown path (Phase 6).
+//! Newline-delimited JSON over the per-PID unix socket; the engine's `ok:false` reply becomes the
+//! shared typed failure object.
 
 use saffron_protocol::ControlFailureDto;
 use serde::Serialize;
@@ -77,7 +74,6 @@ impl std::error::Error for ControlError {}
 
 /// The one socket round-trip helper the whole bridge is built on. Surfaces the engine's `ok:false`
 /// reply as the exact shared typed failure object.
-#[allow(dead_code)] // wired to the CEF message-router query handler next
 pub fn control_request_with_params(
     socket_path: &str,
     command: &str,
@@ -146,7 +142,7 @@ pub fn control_request_with_params(
     }
 }
 
-#[allow(dead_code)] // wired to the lifecycle/teardown path (Phase 6)
+/// A parameterless round trip.
 pub fn control_request(socket_path: &str, command: &str) -> Result<Value, ControlError> {
     control_request_with_params(socket_path, command, json!({}))
 }
@@ -229,11 +225,10 @@ mod tests {
         let _ = std::fs::remove_file(&sock);
     }
 
-    /// Phase 9 §3: the `CONTROL_IO` single-flight must survive concurrent callers. A burst of threads
-    /// hits `control_request_with_params` at once against a server that widens each handler's window
-    /// and tracks peak concurrency; if the lock serializes connect+write+read as intended, the server
-    /// never sees more than one request in flight (a broken lock would let the burst overlap and, in
-    /// the real engine, pile into its per-frame drain and trip the 5s read timeout).
+    /// The `CONTROL_IO` single-flight must survive concurrent callers: a burst of threads hits
+    /// `control_request_with_params` at once against a server that widens each handler's window and
+    /// tracks peak concurrency. A broken lock would let the burst overlap and, against the real
+    /// engine, pile into its per-frame drain and trip the 5 s read timeout.
     #[test]
     fn control_io_serializes_a_concurrent_burst() {
         use std::sync::Arc;

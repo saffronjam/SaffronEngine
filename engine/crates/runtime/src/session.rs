@@ -1,14 +1,9 @@
-//! [`RuntimeSession`]: the shared play-mode simulation spine — build the Jolt world from a
-//! scene, then each frame advance animation, step physics, dispatch contacts, and tick
-//! scripts. One code path, consumed by both the editor host (its play mode) and the
-//! standalone `saffron-player`.
+//! [`RuntimeSession`]: build the Jolt world from a scene, then each frame advance animation, step
+//! physics, dispatch contacts, and tick scripts.
 //!
-//! The session owns the simulation subsystems (animation runtime, script VM, registry) and
-//! operates on a `&mut Scene` and `&mut AssetServer` handed in per call — it owns neither, so
-//! the host can drive its editor-owned play scene and the player its own scene through the
-//! same methods. The live Jolt [`World`] lives behind an `Rc<RefCell<Option<…>>>` cell shared
-//! with the script bridge (so an `sa.raycast` re-enters the world mid-tick); everything else
-//! is a plain owned field, so the borrow dance the editor seam once needed is gone.
+//! The live Jolt [`World`] sits behind an `Rc<RefCell<Option<…>>>` cell shared with the script
+//! bridge, which is what lets an `sa.raycast` re-enter the world mid-tick. Everything else is a
+//! plain owned field.
 
 use std::cell::RefCell;
 use std::path::Path;
@@ -32,9 +27,10 @@ use crate::bridge::{
 };
 use crate::vegetation::VegetationRuntimeScheduler;
 use crate::vegetation_collision::{VegetationCollisionReport, VegetationCollisionResidency};
+use crate::vegetation_ecology::VegetationEcologyClock;
 use crate::vegetation_family::PlantFamilyCache;
-use crate::vegetation_navigation::{VegetationNavigationReport, VegetationNavigationSeam};
-use crate::vegetation_promotion::{VegetationPromotion, VegetationPromotionReport};
+use crate::vegetation_navigation::VegetationNavigationSeam;
+use crate::vegetation_promotion::VegetationPromotion;
 use crate::{
     VegetationRuntimeBindingStatus, VegetationRuntimeError, VegetationRuntimeUnavailableReason,
 };
@@ -86,6 +82,8 @@ pub struct RuntimeSession {
     vegetation_families: PlantFamilyCache,
     /// Published navigation contributions and the dirty world regions they moved.
     vegetation_navigation: VegetationNavigationSeam,
+    /// The world simulation clock biology advances on, fed by the play step.
+    vegetation_ecology: VegetationEcologyClock,
     vegetation_telemetry: crate::VegetationTelemetry,
 }
 
@@ -133,6 +131,7 @@ impl RuntimeSession {
             vegetation_promotion: VegetationPromotion::default(),
             vegetation_families: PlantFamilyCache::default(),
             vegetation_navigation: VegetationNavigationSeam::default(),
+            vegetation_ecology: VegetationEcologyClock::default(),
             vegetation_telemetry: crate::VegetationTelemetry::default(),
         }
     }
@@ -227,6 +226,11 @@ impl RuntimeSession {
     /// The world borrow is scoped and released before any script runs, so a contact /
     /// `on_update` handler may `sa.raycast` back into the world through the bridge.
     pub fn step(&mut self, scene: &mut Scene, dt: f32, input: &mut ScriptInputState) {
+        // The world simulation clock biology runs on: this step is what "the world advanced" means,
+        // so it is what earns ecology ticks. The ticks themselves execute at the vegetation
+        // synchronization point, where the bound world and its residency are in hand.
+        self.vegetation_ecology.accumulate(dt);
+
         // Snapshot this frame's animated poses for the ragdoll motors (cheap when no rig is
         // driven; meaningful only with a live VM + rigs).
         if self.script_vm_active {
@@ -326,6 +330,8 @@ impl RuntimeSession {
         self.vegetation_collision.reset();
         self.vegetation_promotion.reset();
         self.vegetation_families.clear();
+        // Simulated time the ended session accumulated is not the next one's.
+        self.vegetation_ecology.rebind();
         self.pose_targets.clear();
         self.log_sink.borrow_mut().clear();
         self.error_sink.clear();
@@ -390,9 +396,6 @@ impl RuntimeSession {
         Rc::clone(&self.vegetation)
     }
 
-    /// Reconciles the exact cooked generation, shared spatial demand, and bounded cell-load
-    /// workers, then synchronizes the collision facet: every physics-resident cell generation's
-    /// batched Jolt proxies are created/removed against the live play world at this one point.
     /// The vegetation runtime's compact telemetry.
     #[must_use]
     pub fn vegetation_telemetry(&self) -> &crate::VegetationTelemetry {
@@ -404,6 +407,9 @@ impl RuntimeSession {
         &mut self.vegetation_telemetry
     }
 
+    /// Reconciles the exact cooked generation, shared spatial demand, and bounded cell-load workers,
+    /// then synchronizes the collision facet: every physics-resident cell generation's batched Jolt
+    /// proxies are created and removed against the live play world at this one point.
     pub fn synchronize_vegetation(
         &mut self,
         scene: &mut Scene,
@@ -426,17 +432,40 @@ impl RuntimeSession {
         match scheduled {
             Ok(status) => {
                 self.vegetation_status = status;
+                let bound_now = vegetation_ref
+                    .as_ref()
+                    .map(|world| world.manifest_identity());
+                if bound_now != bound_identity {
+                    // A different generation is bound, so the accumulated simulated time and the
+                    // ticks the last catch-up left owed belong to a world that is gone.
+                    self.vegetation_ecology.rebind();
+                }
+                // Biology advances before the facets derive from it, so a tick's committed
+                // generation is the one collision, navigation, and promotion see this frame.
+                let mut ecology_fault = None;
+                if let Some(vegetation) = vegetation_ref.as_mut()
+                    && self
+                        .vegetation_ecology
+                        .wants_advance(vegetation.ecology_ground_revision())
+                {
+                    let clock = &mut self.vegetation_ecology;
+                    let telemetry = &mut self.vegetation_telemetry;
+                    match telemetry.stage(crate::VegetationStage::Ecology, || {
+                        clock.advance(vegetation)
+                    }) {
+                        Ok(report) => telemetry.record_ecology_ticks(report.ticks_run),
+                        Err(error) => ecology_fault = Some(error),
+                    }
+                }
                 let mut world_ref = self.physics.borrow_mut();
                 // A rebind replaced the bound generation, so any entity view describes plants of
                 // a world that no longer exists.
-                if bound_identity.is_some()
-                    && vegetation_ref
-                        .as_ref()
-                        .map(|world| world.manifest_identity())
-                        != bound_identity
-                {
+                if bound_identity.is_some() && bound_now != bound_identity {
                     self.vegetation_promotion.abandon(scene, world_ref.as_mut());
                 }
+                // The clock owns the declared influence, so the facets read region readiness at the
+                // same radius a tick reads its halo at.
+                let influence = self.vegetation_ecology.influence();
                 match (world_ref.as_mut(), vegetation_ref.as_mut()) {
                     (mut world, Some(vegetation)) => {
                         // Promotion commits first: the collision pass below then sees the
@@ -456,14 +485,14 @@ impl RuntimeSession {
                         if let Some(world) = world {
                             let collision = &mut self.vegetation_collision;
                             telemetry.stage(crate::VegetationStage::Collision, || {
-                                collision.advance(vegetation, world, assets, families);
+                                collision.advance(vegetation, world, assets, families, influence);
                             });
                         }
                         // Navigation publishes from the same committed state, after promotion has
                         // decided which plants are moving.
                         let navigation = &mut self.vegetation_navigation;
                         telemetry.stage(crate::VegetationStage::Navigation, || {
-                            navigation.advance(vegetation, assets, families);
+                            navigation.advance(vegetation, assets, families, influence);
                         });
                     }
                     (Some(world), None) => {
@@ -478,7 +507,12 @@ impl RuntimeSession {
                     }
                 }
                 self.vegetation_telemetry.commit();
-                Ok(())
+                // The facets reconciled against the state that is committed; the fault surfaces
+                // after them so a stuck catch-up does not also strand collision bodies.
+                match ecology_fault {
+                    Some(error) => Err(VegetationRuntimeError::Vegetation(error)),
+                    None => Ok(()),
+                }
             }
             Err(error) => {
                 self.vegetation_status = VegetationRuntimeBindingStatus::Unavailable {
@@ -491,38 +525,33 @@ impl RuntimeSession {
         }
     }
 
-    /// The promotion authority and the navigation seam, borrowed disjointly for one control-plane
-    /// drain (a command may touch either). The vegetation authority itself comes from
-    /// [`vegetation_cell`](Self::vegetation_cell), so all three borrow independently.
+    /// The promotion authority, the navigation seam, the ecology clock, and the telemetry, borrowed
+    /// disjointly for one control-plane drain (a command may touch any of them). The vegetation
+    /// authority itself comes from [`vegetation_cell`](Self::vegetation_cell), so they all borrow
+    /// independently.
     pub fn vegetation_control_authorities(
         &mut self,
     ) -> (
         &mut VegetationPromotion,
         &mut VegetationNavigationSeam,
+        &mut VegetationEcologyClock,
         &mut crate::VegetationTelemetry,
     ) {
         (
             &mut self.vegetation_promotion,
             &mut self.vegetation_navigation,
+            &mut self.vegetation_ecology,
             &mut self.vegetation_telemetry,
         )
     }
 
-    /// Current navigation-seam counters.
+    /// The world simulation clock biology advances on.
     #[must_use]
-    pub fn vegetation_navigation_report(&self) -> VegetationNavigationReport {
-        self.vegetation_navigation.report()
+    pub fn vegetation_ecology_clock(&self) -> &VegetationEcologyClock {
+        &self.vegetation_ecology
     }
 
-    /// Current promotion counters, present only while a live play world can own entity views.
-    #[must_use]
-    pub fn vegetation_promotion_report(&self) -> Option<VegetationPromotionReport> {
-        self.physics.borrow().as_ref()?;
-        Some(self.vegetation_promotion.report())
-    }
-
-    /// Current collision-facet counters (resident cells/bodies, lifetime create/remove totals),
-    /// present only while a live play world can carry the bodies.
+    /// Current collision-facet counters, present only while a live play world can carry the bodies.
     #[must_use]
     pub fn vegetation_collision_report(&self) -> Option<VegetationCollisionReport> {
         self.physics.borrow().as_ref()?;

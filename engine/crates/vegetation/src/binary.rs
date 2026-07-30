@@ -1,9 +1,51 @@
 //! Shared canonical big-endian primitives for vegetation-derived formats.
 
 use saffron_core::Uuid;
-use saffron_spatial::{WorldBounds, WorldCellKey};
+use saffron_spatial::{FieldChannel, WorldBounds, WorldCellKey};
 
 use crate::{Error, Result};
+
+/// The canonical `(tag, user)` pair every vegetation format writes for a field channel.
+pub(crate) fn field_channel_tag(channel: FieldChannel) -> (u8, u64) {
+    match channel {
+        FieldChannel::Altitude => (0, 0),
+        FieldChannel::Slope => (1, 0),
+        FieldChannel::Curvature => (2, 0),
+        FieldChannel::Concavity => (3, 0),
+        FieldChannel::Drainage => (4, 0),
+        FieldChannel::Moisture => (5, 0),
+        FieldChannel::Temperature => (6, 0),
+        FieldChannel::Precipitation => (7, 0),
+        FieldChannel::Sunlight => (8, 0),
+        FieldChannel::Exposure => (9, 0),
+        FieldChannel::WaterDistance => (10, 0),
+        FieldChannel::WaterDepth => (11, 0),
+        FieldChannel::SignedBlocker => (12, 0),
+        FieldChannel::SplineDistance => (13, 0),
+        FieldChannel::User(value) => (14, value),
+    }
+}
+
+pub(crate) fn field_channel_from_tag(tag: u8, user: u64) -> Option<FieldChannel> {
+    Some(match (tag, user) {
+        (0, 0) => FieldChannel::Altitude,
+        (1, 0) => FieldChannel::Slope,
+        (2, 0) => FieldChannel::Curvature,
+        (3, 0) => FieldChannel::Concavity,
+        (4, 0) => FieldChannel::Drainage,
+        (5, 0) => FieldChannel::Moisture,
+        (6, 0) => FieldChannel::Temperature,
+        (7, 0) => FieldChannel::Precipitation,
+        (8, 0) => FieldChannel::Sunlight,
+        (9, 0) => FieldChannel::Exposure,
+        (10, 0) => FieldChannel::WaterDistance,
+        (11, 0) => FieldChannel::WaterDepth,
+        (12, 0) => FieldChannel::SignedBlocker,
+        (13, 0) => FieldChannel::SplineDistance,
+        (14, value) => FieldChannel::User(value),
+        _ => return None,
+    })
+}
 
 pub(crate) struct BinaryWriter {
     bytes: Vec<u8>,

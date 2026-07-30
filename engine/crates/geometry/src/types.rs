@@ -1,9 +1,8 @@
 //! The pure-value CPU types every downstream crate builds on: the mesh vocabulary,
 //! the picking ray, the animation track/clip types, and the import-graph aggregates.
 //!
-//! The format-bearing structs (`Vertex`, `Submesh`, `VertexSkin`) are `#[repr(C)]`
-//! Pod with byte strides pinned by [`super::tests`]. All format fields use glam's
-//! 12-byte `Vec3` (never the 16-byte SIMD `Vec3A`), so the strides stay fixed.
+//! The format-bearing structs (`Vertex`, `Submesh`, `VertexSkin`) are `#[repr(C)]` Pod with
+//! pinned byte strides, so their fields use glam's 12-byte `Vec3`, never the SIMD `Vec3A`.
 
 use bytemuck::{Pod, Zeroable};
 use glam::{Mat4, Quat, Vec2, Vec3, Vec4};
@@ -14,12 +13,8 @@ use crate::error::{Error, Result};
 /// UV-aligned tangent.
 ///
 /// Exactly 48 bytes — the `.smesh` on-disk vertex stride and the GPU vertex buffer layout.
-/// `tangent` is `[f32; 4]` (raw, like [`VertexSkin::weights`]) so the struct stays 4-byte
-/// aligned — `xyz` is the object-space tangent, `w` is the ±1 bitangent handedness (glTF
-/// convention: `bitangent = w · cross(normal, tangent)`). The importers compute it (or read
-/// the glTF `TANGENT` accessor) via [`compute_tangents`]; it lets a UV-space vector field —
-/// a normal map's frame or vector displacement — be transformed by a true, UV-aligned TBN
-/// rather than an arbitrary branchless basis.
+/// `tangent` is a raw `[f32; 4]` so the struct stays 4-byte aligned: `xyz` is the object-space
+/// tangent and `w` the ±1 bitangent handedness (glTF's `bitangent = w · cross(normal, tangent)`).
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Pod, Zeroable)]
 pub struct Vertex {
@@ -52,14 +47,9 @@ pub struct Submesh {
 
 /// Per-vertex skin influences: a second stream parallel to [`Mesh::vertices`].
 ///
-/// Exactly 24 bytes (the `.smesh` v2 skin stride and the GPU skin-stream stride).
-/// Kept out of [`Vertex`] so the unskinned layout and the v1 `.smesh` stay intact;
-/// an empty skin stream means the mesh is unskinned.
-///
-/// `weights` is a raw `[f32; 4]` rather than glam's `Vec4`: glam's `Vec4` is
-/// 16-byte SIMD-aligned, which would pad this struct to 32 bytes and break the
-/// stride — the same reason format-bearing 3-vectors use `Vec3`, not `Vec3A`.
-/// The 24-byte stride is the load-bearing invariant; the array is its expression.
+/// Exactly 24 bytes — the `.smesh` skin stride and the GPU skin-stream stride. An empty skin
+/// stream means the mesh is unskinned. `weights` is a raw `[f32; 4]` because glam's `Vec4` is
+/// 16-byte SIMD-aligned and would pad the struct to 32, breaking the stride.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Pod, Zeroable)]
 pub struct VertexSkin {
@@ -70,9 +60,6 @@ pub struct VertexSkin {
 }
 
 /// The canonical CPU-side mesh every importer converts into.
-///
-/// Not `#[repr(C)]`: it is the in-memory aggregate the byte formats serialize *from*,
-/// not a byte layout itself.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Mesh {
     /// The interleaved vertex stream.
@@ -88,10 +75,6 @@ pub struct Mesh {
 /// into its vertices, then Gram-Schmidt-orthonormalizes the tangent against the normal. A
 /// degenerate vertex (no usable UVs, a zero-area triangle) falls back to a stable branchless
 /// basis from the normal so every tangent is finite and unit-length.
-///
-/// The importers call this after building positions/normals/uvs; the glTF importer instead keeps
-/// a provided `TANGENT` accessor (already UV-aligned with handedness) and only computes when the
-/// asset omits it.
 pub fn compute_tangents(mesh: &mut Mesh) {
     let n = mesh.vertices.len();
     let mut tan = vec![Vec3::ZERO; n];
@@ -121,7 +104,6 @@ pub fn compute_tangents(mesh: &mut Mesh) {
     }
     for (i, v) in mesh.vertices.iter_mut().enumerate() {
         let normal = v.normal.normalize_or_zero();
-        // Gram-Schmidt: drop the normal component, then normalize.
         let mut tangent = (tan[i] - normal * normal.dot(tan[i])).normalize_or_zero();
         if tangent.length_squared() < 1e-8 || !tangent.is_finite() {
             // No usable UV gradient: any consistent perpendicular frame (Duff et al. 2017).
@@ -146,10 +128,8 @@ pub fn compute_tangents(mesh: &mut Mesh) {
 /// One sparse per-vertex morph contribution: the position+normal delta applied at full
 /// weight.
 ///
-/// Exactly 28 bytes (`4 + 12 + 12`, no trailing pad): the leading `u32` keeps the two
-/// 12-byte `Vec3`s 4-byte aligned, and the struct's own alignment is 4. The on-disk
-/// `.smesh` morph stride and the GPU morph-delta stride. No tangent delta is stored — the
-/// engine [`Vertex`] has no tangent stream, so the deform shader re-derives the tangent by
+/// Exactly 28 bytes (`4 + 12 + 12`, no trailing pad) — the `.smesh` morph stride and the GPU
+/// morph-delta stride. No tangent delta is stored; the deform shader re-derives the tangent by
 /// Gram-Schmidt against the morphed normal.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Pod, Zeroable)]
@@ -214,30 +194,21 @@ pub struct MeshCounts {
     pub index_count: u32,
 }
 
-/// The channel an [`AnimTrack`] targets.
-///
-/// `#[repr(u8)]`: the discriminants are the pinned on-disk byte values
-/// (`Translation = 0`, `Rotation = 1`, `Scale = 2`, `Weights = 3`).
+/// The channel an [`AnimTrack`] targets; the discriminants are the pinned on-disk bytes.
 #[repr(u8)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum AnimPath {
-    /// The target's translation.
     #[default]
     Translation = 0,
-    /// The target's rotation.
     Rotation = 1,
-    /// The target's scale.
     Scale = 2,
     /// Morph-target weights (N per keyframe; the count is the track's `morph_count`).
     Weights = 3,
 }
 
 impl AnimPath {
-    /// Maps an on-disk discriminant byte back to the enum.
-    ///
-    /// An out-of-range byte is rejected with [`Error::BadLayout`] rather than
-    /// transmuted, so a malformed `.sanim` track record can never produce UB
-    /// (the crate's `#![deny(unsafe_code)]` holds).
+    /// Maps an on-disk discriminant byte back to the enum, rejecting anything out of range
+    /// with [`Error::BadLayout`].
     pub fn from_u8(byte: u8) -> Result<Self> {
         match byte {
             0 => Ok(Self::Translation),
@@ -249,11 +220,8 @@ impl AnimPath {
     }
 }
 
-/// What kind of thing an [`AnimTrack`] drives.
-///
-/// `#[repr(u8)]`: the discriminants are the pinned on-disk byte values
-/// (`Bone = 0`, `Node = 1`). A morph-weight track is `Node` + [`AnimPath::Weights`];
-/// there is no separate morph-weight target arm.
+/// What kind of thing an [`AnimTrack`] drives; the discriminants are the pinned on-disk bytes.
+/// A morph-weight track is `Node` plus [`AnimPath::Weights`], not a target arm of its own.
 #[repr(u8)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum AnimTarget {
@@ -265,11 +233,8 @@ pub enum AnimTarget {
 }
 
 impl AnimTarget {
-    /// Maps an on-disk discriminant byte back to the enum.
-    ///
-    /// An out-of-range byte is rejected with [`Error::BadLayout`] rather than
-    /// transmuted, so a malformed `.sanim` track record can never produce UB
-    /// (the crate's `#![deny(unsafe_code)]` holds).
+    /// Maps an on-disk discriminant byte back to the enum, rejecting anything out of range
+    /// with [`Error::BadLayout`].
     pub fn from_u8(byte: u8) -> Result<Self> {
         match byte {
             0 => Ok(Self::Bone),
@@ -279,16 +244,13 @@ impl AnimTarget {
     }
 }
 
-/// The interpolation a sampler applies between keyframes.
-///
-/// `#[repr(u8)]`: the discriminants are the pinned on-disk byte values
-/// (`Step = 0`, `Linear = 1`, `CubicSpline = 2`).
+/// The interpolation a sampler applies between keyframes; the discriminants are the pinned
+/// on-disk bytes.
 #[repr(u8)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum AnimInterp {
-    /// Hold the previous keyframe value (no interpolation).
+    /// Hold the previous keyframe value.
     Step = 0,
-    /// Linear interpolation between keyframes.
     #[default]
     Linear = 1,
     /// Cubic-spline interpolation; values store 3x (in-tangent, value, out-tangent).
@@ -296,11 +258,8 @@ pub enum AnimInterp {
 }
 
 impl AnimInterp {
-    /// Maps an on-disk discriminant byte back to the enum.
-    ///
-    /// An out-of-range byte is rejected with [`Error::BadLayout`] rather than
-    /// transmuted, so a malformed `.sanim` track record can never produce UB
-    /// (the crate's `#![deny(unsafe_code)]` holds).
+    /// Maps an on-disk discriminant byte back to the enum, rejecting anything out of range
+    /// with [`Error::BadLayout`].
     pub fn from_u8(byte: u8) -> Result<Self> {
         match byte {
             0 => Ok(Self::Step),
@@ -402,8 +361,7 @@ pub struct ImportedSkin {
 
 /// One imported material texture: the encoded (png/jpg) bytes plus their extension.
 ///
-/// Carried as an `Option<TextureSource>`, so "is the texture present?" and the payload
-/// are one field and a presence flag can never disagree with the bytes.
+/// Carried as an `Option<TextureSource>`, so presence and payload are one field.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct TextureSource {
     /// The encoded image bytes (png/jpg), as read from an external file or embedded.
@@ -426,9 +384,6 @@ pub enum AlphaMode {
 }
 
 /// One material extracted from a model: the PBR factors and any optional textures.
-///
-/// Each optional texture is an `Option<TextureSource>`, so a presence flag can never
-/// disagree with the bytes.
 #[derive(Clone, Debug, PartialEq)]
 pub struct ImportedMaterial {
     /// The source material name (the stable key for its baked sub-id).
@@ -482,12 +437,8 @@ impl Default for ImportedMaterial {
     }
 }
 
-/// The skin payload of a skinned model.
-///
-/// Carried as one `Option<SkinPayload>` on [`ImportedModel`]: present means skinned,
-/// and the skin-only fields travel together, so no presence flag can disagree. The
-/// node forest and clips are not here — they are top-level on [`ImportedModel`],
-/// decoded for skinned and unskinned alike.
+/// The skin payload of a skinned model, carried as one `Option<SkinPayload>` on
+/// [`ImportedModel`] so the skin-only fields travel together.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct SkinPayload {
     /// Per-vertex skin influences, parallel to the skinned node's [`Mesh::vertices`].
@@ -500,8 +451,7 @@ pub struct SkinPayload {
 /// The in-memory import graph a source model (`.gltf`/`.glb`/`.obj`) translates into.
 ///
 /// Mesh ownership is uniform: every mesh lives node-local on an [`ImportedNode`] in
-/// [`ImportedModel::nodes`]. There is no top-level mesh — OBJ and single-skinned-mesh
-/// imports route their geometry through a node too.
+/// [`ImportedModel::nodes`], OBJ and single-skinned-mesh imports included.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct ImportedModel {
     /// The imported node forest; mesh-bearing nodes carry a node-local `mesh`.
@@ -518,12 +468,8 @@ pub struct ImportedModel {
     /// has no blend shapes. Mesh-global: the target names ride the mesh-level
     /// `extras.targetNames` and the weight vector is shared across the mesh's primitives.
     pub morph: Option<MorphData>,
-    /// What the source file says produced it, verbatim, and what it says about reuse.
-    ///
-    /// A studio's plant export usually names its authoring tool, and some tools' licences require
-    /// attribution. Recording what the file states — rather than inferring a licence from a tool
-    /// name — is what lets the attribution survive a reimport without the engine making a legal
-    /// judgement.
+    /// What the source file states about its authoring tool and reuse terms, verbatim, so an
+    /// attribution survives reimport without the engine inferring a licence.
     pub origin: ImportedOrigin,
 }
 
@@ -538,8 +484,7 @@ pub struct ImportedOrigin {
 
 impl ImportedModel {
     /// The model's primary mesh: the skinned mesh node's mesh when rigged, else the first
-    /// mesh-bearing node's mesh. `None` if the model carries no geometry. Used by the
-    /// single-mesh upload paths (preview/gizmo models) that predate the node forest.
+    /// mesh-bearing node's mesh. `None` if the model carries no geometry.
     #[must_use]
     pub fn primary_mesh(&self) -> Option<&Mesh> {
         if let Some(skin) = &self.skin {
@@ -577,11 +522,8 @@ pub struct DecodedImageFloat {
     pub height: u32,
 }
 
-/// A material texture slot's semantic role.
-///
-/// The import-options colorspace policy keys on it (albedo/emissive → sRGB color;
-/// the rest → linear data), so one source of truth decides how a baked or scanned
-/// texture is interpreted.
+/// A material texture slot's semantic role. The import colorspace policy keys on it —
+/// albedo and emissive are sRGB color, the rest linear data.
 #[repr(u8)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum MaterialMapRole {

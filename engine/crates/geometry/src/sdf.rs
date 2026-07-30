@@ -1,21 +1,17 @@
-//! The per-mesh signed distance field: the sparse `SDST` v3 byte image (indirection
-//! volume + brick atlas + coarse coverage volume) and the grid-derivation +
-//! brick-compaction helpers the GPU jump-flood bake reads back through.
+//! The per-mesh signed distance field: the sparse `SDST` byte image (indirection volume,
+//! brick atlas, coarse coverage volume) and the grid-derivation and brick-compaction
+//! helpers the GPU jump-flood bake reads back through.
 //!
-//! A uniform local-space *fine* grid spans the mesh AABB plus a small pad; each fine
-//! voxel holds the signed distance to the surface (negative inside, positive outside),
-//! encoded `R16_SNORM` against a `max_dist` clamp. The fine grid is **not** stored
-//! densely. Instead it is compacted into 8³ **bricks** (7 unique voxels + 1 shared
-//! border so trilinear is seam-continuous across a brick boundary): an *indirection
-//! volume* (`R32_UINT`, one texel per brick → an atlas brick index or [`SDF_EMPTY_BRICK`])
-//! plus a *brick atlas* (`R16_SNORM`, only the occupied bricks). A 128–192-axis Sponza
-//! field stays in the low tens of MB instead of the ~14 MB a dense 192³ would cost.
+//! A uniform local-space fine grid spans the mesh AABB plus a small pad; each fine voxel
+//! holds the signed distance to the surface, negative inside, encoded `R16_SNORM` against a
+//! `max_dist` clamp. The grid is compacted into 8³ bricks — 7 unique voxels plus 1 shared
+//! border, so trilinear reconstruction is seam-continuous across a brick boundary — behind
+//! an indirection volume (`R32_UINT`, one texel per brick holding an atlas index or
+//! [`SDF_EMPTY_BRICK`]) plus a brick atlas (`R16_SNORM`) carrying only occupied bricks.
 //!
-//! The bake itself runs on the GPU at mesh-upload time (`saffron-rendering`); this module
-//! owns the format and the CPU brick-compaction ([`Sdf::from_dense_field`]) the readback
-//! feeds, plus the grid derivation ([`bake_grid`]). [`MeshBvh::nearest_signed_distance`]
-//! stays as the format/sign unit-test oracle via [`bake_sparse_reference`] (test-only) —
-//! it is never on a production path.
+//! The bake runs on the GPU at mesh-upload time; this module owns the format, the CPU
+//! brick-compaction the readback feeds ([`Sdf::from_dense_field`]), and the grid derivation
+//! ([`bake_grid`]).
 
 use bytemuck::{Pod, Zeroable};
 use glam::Vec3;
@@ -25,9 +21,9 @@ use crate::error::{Error, Result};
 /// `SDST` byte-image version. Bumped when the header or brick encoding changes.
 pub const SDF_FORMAT_VERSION: u32 = 4;
 
-/// Prefiltered mip levels of the brick atlas (UE's `NumMips` default). Mip 0 is the fine
-/// field; each coarser mip halves the voxel resolution and is band-limited by a conservative
-/// min-|d| reduction so a widening cone reads an alias-free distance at range.
+/// Prefiltered mip levels of the brick atlas. Mip 0 is the fine field; each coarser mip
+/// halves the voxel resolution and is band-limited by a conservative min-|d| reduction so a
+/// widening cone reads an alias-free distance at range.
 pub const SDF_MIP_COUNT: u32 = 3;
 
 /// The four-byte magic at the head of an `SDST` chunk / sidecar.
@@ -49,14 +45,12 @@ const SDF_PAD_FRACTION: f32 = 0.1;
 /// The `R16_SNORM` encode clamp is this multiple of the voxel size: distances beyond it
 /// saturate to ±1. A few voxels of range is all the penumbra trace samples.
 const SDF_MAX_DIST_VOXELS: f32 = 4.0;
-/// Target fine-grid resolution: voxels per world metre (times the asset's
-/// `resolution_scale`), capped at [`SDF_MAX_GRID_AXIS`] on the longest axis. ~29 cm
-/// voxels at the cap for a 37 m Sponza.
+/// Target fine-grid resolution: voxels per world metre, times the asset's
+/// `resolution_scale`, capped at [`SDF_MAX_GRID_AXIS`] on the longest axis.
 pub const SDF_VOXELS_PER_METRE: f32 = 4.0;
 /// The smallest fine-grid axis: a thin/flat or tiny mesh still gets a usable field.
 pub const SDF_MIN_GRID_AXIS: u32 = 8;
-/// The largest fine-grid axis (UE's "distance field resolution scale" ceiling), raised
-/// from the v1 dense cap of 64 — the densification that resolves wall blobs.
+/// The largest fine-grid axis.
 pub const SDF_MAX_GRID_AXIS: u32 = 128;
 /// The largest fine-grid axis for a single SDF chunk's *core* (before the pad apron). A
 /// primitive whose AABB exceeds this at the target resolution is spatially partitioned by
@@ -66,8 +60,8 @@ pub const SDF_MAX_GRID_AXIS: u32 = 128;
 pub const SDF_CHUNK_CORE_VOXELS: u32 = 64;
 /// The hard cap on spatial-chunk subdivisions per axis. Bounds the field/slot count and the
 /// bake cost regardless of the mesh's local unit scale — a mesh authored in centimetres would
-/// otherwise ask for hundreds of chunks per axis (the `SDF_VOXELS_PER_METRE` target assumes
-/// metre-scale local coordinates). `4³ = 64` cells is the toji-modular-Sponza order.
+/// otherwise ask for hundreds of chunks per axis, since the `SDF_VOXELS_PER_METRE` target
+/// assumes metre-scale local coordinates.
 pub const SDF_MAX_CHUNKS_PER_AXIS: u32 = 4;
 /// A fine voxel at or above this encoded value counts as "far outside, no surface
 /// nearby" for the empty-brick classification (≈ +0.998 of `max_dist`).
@@ -190,12 +184,7 @@ pub fn sdf_chunk_cores(lo: Vec3, hi: Vec3, resolution_scale: f32) -> Vec<(Vec3, 
     cores
 }
 
-/// The fixed-layout header at the head of an `SDST` v3 byte image (112 bytes, LE).
-///
-/// Carries the fine voxel `dims`, the brick `indirection_dims` + atlas brick tiling
-/// (`atlas_bricks`), the padded local bounds, the encode clamp, the brick geometry
-/// (`brick_size`/`brick_useful`), the occupied brick count, the prefiltered atlas
-/// `mip_count`, and the coarse `coverage_dims`.
+/// The fixed-layout header at the head of an `SDST` byte image (112 bytes, little-endian).
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Pod, Zeroable)]
 pub struct SdfHeader {
@@ -297,7 +286,6 @@ impl Sdf {
         for bz in 0..indir[2] {
             for by in 0..indir[1] {
                 for bx in 0..indir[0] {
-                    // Gather the brick's 8³ voxels (brick-major, X-fastest).
                     let mut cells =
                         [i16::MAX; (SDF_BRICK_SIZE * SDF_BRICK_SIZE * SDF_BRICK_SIZE) as usize];
                     let mut empty = true;
@@ -560,7 +548,7 @@ impl Sdf {
         f32::from(raw) / 32767.0 * self.header.max_dist
     }
 
-    /// Frames the field into an `SDST` v3 byte image: the 112-byte header, the indirection
+    /// Frames the field into an `SDST` byte image: the 112-byte header, the indirection
     /// volume (`u32`), the brick atlas (`i16`), then the coverage volume (`i16`),
     /// little-endian. Coarser atlas mips are derived on load, not stored.
     #[must_use]
@@ -578,7 +566,7 @@ impl Sdf {
         bytes
     }
 
-    /// Decodes an `SDST` v3 byte image.
+    /// Decodes an `SDST` byte image.
     ///
     /// # Errors
     ///
@@ -720,9 +708,9 @@ mod tests {
     use crate::picking::MeshBvh;
     use saffron_test_support::close;
 
-    /// A CPU reference bake (the format/analytic/sign oracle, **test only**): samples each
-    /// fine voxel center with [`MeshBvh::nearest_signed_distance`] over `dims`, then
-    /// compacts via [`Sdf::from_dense_field`]. Never on a production path.
+    /// A CPU reference bake used as the format, analytic, and sign oracle: samples each fine
+    /// voxel centre with [`MeshBvh::nearest_signed_distance`], then compacts through
+    /// [`Sdf::from_dense_field`].
     pub(crate) fn bake_sparse_reference(
         positions: &[Vec3],
         indices: &[u32],
@@ -962,9 +950,6 @@ mod tests {
 
     #[test]
     fn small_aabb_is_one_chunk_large_aabb_subdivides() {
-        // A primitive small enough to resolve in one grid bakes exactly one field (the common
-        // per-primitive case); a primitive wider than the core-voxel budget tiles into chunks
-        // that cover the AABB and keep the target voxel size instead of coarsening at the cap.
         let one = sdf_chunk_cores(Vec3::splat(-1.0), Vec3::splat(1.0), 1.0);
         assert_eq!(one.len(), 1);
         assert_eq!(one[0], (Vec3::splat(-1.0), Vec3::splat(1.0)));
@@ -995,13 +980,11 @@ mod tests {
         let bytes = sdf_set_to_bytes(&[a.clone(), b.clone()]);
         let back = sdf_set_from_bytes(&bytes).expect("set decodes");
         assert_eq!(back, vec![a, b]);
-        // An empty set is valid (a mesh whose every primitive baked no occupied bricks).
         assert!(
             sdf_set_from_bytes(&sdf_set_to_bytes(&[]))
                 .unwrap()
                 .is_empty()
         );
-        // A corrupt magic is rejected, not silently mis-parsed.
         let mut bad = bytes.clone();
         bad[0] = b'X';
         assert!(matches!(sdf_set_from_bytes(&bad), Err(Error::BadMagic)));

@@ -6,7 +6,7 @@ math = false
 
 # Control commands
 
-The control plane exposes 252 typed commands over its local Unix socket. This table follows the frozen order in `saffron_protocol::COMMANDS`; the generated OpenRPC methods use the same names, parameter DTOs, and result DTOs.
+The control plane exposes 253 typed commands over its local Unix socket. This table follows the frozen order in `saffron_protocol::COMMANDS`; the generated OpenRPC methods use the same names, parameter DTOs, and result DTOs.
 
 `register_builtin_commands` installs `ping`, the reflective `help` command, and the render, scene, animation, physics, and asset handlers. The host adds `get-script-schema` because its handler depends on the script crate. A registry test compares the registered names with `COMMANDS` as sets, with that host-owned command accounted for explicitly.
 
@@ -206,6 +206,7 @@ sa -o json set-transform --entity 42 --translation '{"x":0,"y":1,"z":0}'
 | `vegetation-state-import` | `VegetationStateImportParams` | `VegetationStateSnapshotDto` | verify and atomically import one exact runtime vegetation state snapshot |
 | `vegetation-advance-ecology` | `VegetationAdvanceEcologyParams` | `VegetationEcologyReportDto` | advance biological time and catch dependency regions up to it |
 | `vegetation-ecology-status` | `EmptyParams` | `VegetationEcologyStatusDto` | where biological time stands, region by region, with the checkpoint identity |
+| `vegetation-ecology-clock` | `VegetationEcologyClockParams` | `VegetationEcologyClockDto` | vegetation-ecology-clock {running?, tickMilliseconds?, maxTicksPerSync?, workers?, water?, warmth?} — the world clock biology advances on (omit to read) |
 | `vegetation-combustion` | `VegetationCombustionParams` | `VegetationCombustionDto` | sample fuel, moisture, health, occupancy, and what is alight in a volume |
 | `vegetation-usd-skeletons` | `UsdSkeletonsParams` | `UsdSkeletonsResult` | vegetation-usd-skeletons {path} — the UsdSkel skeletons a USD stage declares |
 | `vegetation-wind-record` | `VegetationWindRecordParams` | `VegetationWindRecordResult` | vegetation-wind-record {cell, plant} — one plant's GPU wind prepass record |
@@ -296,11 +297,11 @@ sa -o json set-transform --entity 42 --translation '{"x":0,"y":1,"z":0}'
 
 | What | File | Symbols |
 |---|---|---|
-| Typed command inventory | `engine/crates/protocol/src/command.rs` | `COMMANDS`, `CommandSpec` |
+| Typed command inventory | `engine/crates/protocol/src/command/` | `COMMANDS`, `CommandSpec` |
 | Generated schema | `schemas/control/openrpc.generated.json` | `methods`, `components.schemas` |
 | Registry and dispatch | `engine/crates/control/src/registry.rs` | `register_builtin_commands`, `CommandRegistry::dispatch` |
 | Registry completeness test | `engine/crates/control/src/registry.rs` | `registry_covers_the_protocol_manifest` |
-| Host-owned script command | `engine/crates/host/src/layer.rs` | `register_script_schema_command` |
+| Host-owned script command | `engine/crates/host/src/layer/` | `register_script_schema_command` |
 | CLI argument mapping | `engine/crates/sa/src/main.rs` | `build_params`, `coerce` |
 | Socket envelope | `engine/crates/control-client/src/lib.rs` | `request_envelope`, `Client` |
 

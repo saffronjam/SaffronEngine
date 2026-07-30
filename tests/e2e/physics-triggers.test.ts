@@ -1,4 +1,4 @@
-// Phase 4 of the physics plan: collision layers + sensors + the contact-event ring. A dynamic box
+// Collision layers + sensors + the contact-event ring. A dynamic box
 // falls through a Sensor collider and past it; drain-contacts surfaces a seq-cursored begin then end
 // for the pair (sensor: true). The Debris layer collides with the world but not other debris.
 

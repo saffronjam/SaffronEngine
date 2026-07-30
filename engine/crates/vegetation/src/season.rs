@@ -57,11 +57,11 @@ pub fn season_in_window(phase_mille: u16, window: (u16, u16)) -> bool {
     }
 }
 
-/// The phenotype an instance renders, from typed lifecycle state and the seasonal
-/// signal — never inferred from an active mesh. Dead/stump lifecycles take the Dead
-/// role, senescent takes the Senescent role, and a healthy plant takes the first
-/// phenotype whose seasonal window contains the current phase; the cooked phenotype
-/// is the fallback throughout. `phenotypes` yields `(id, role, authored window)`.
+/// The phenotype an instance renders, from typed lifecycle state and the seasonal signal.
+///
+/// Dead and stump lifecycles take the Dead role, senescent the Senescent role, and anything
+/// else the first phenotype whose seasonal window contains the current phase; the cooked
+/// phenotype is the fallback throughout. `phenotypes` yields `(id, role, authored window)`.
 pub fn resolve_rendered_phenotype(
     phenotypes: impl Iterator<Item = (u32, PhenotypeRole, Option<(u16, u16)>)> + Clone,
     cooked: u32,
@@ -105,7 +105,6 @@ mod tests {
         assert!((495..=505).contains(&north_jul), "{north_jul}");
         let south_jan = season_phase_mille(2026, 1, 1, -30.0);
         assert_eq!(south_jan, 500);
-        // A leap year keeps December inside the year.
         assert!(season_phase_mille(2024, 12, 31, 0.0) < 1000);
     }
 
@@ -128,7 +127,6 @@ mod tests {
         );
         assert_eq!(resolve(PlantLifecycle::Dead, 100), 2);
         assert_eq!(resolve(PlantLifecycle::Stump, 100), 2);
-        // No matching role falls back to the cooked phenotype.
         let healthy_only = [(7, PhenotypeRole::Healthy, None)];
         assert_eq!(
             resolve_rendered_phenotype(healthy_only.iter().copied(), 7, PlantLifecycle::Dead, 0),

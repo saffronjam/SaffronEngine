@@ -136,7 +136,7 @@ Every resolved submesh material lowers to one 256-byte `MaterialParamsData` reco
 | `aggregate_normal1` | Normal moments XZ and YZ |
 
 The renderer hashes these records by their raw bytes and interns identical values into one per-frame
-table entry. `InstanceData.texture.w` carries the resulting material index. Editing one entity's
+table entry. The resident material record's `parameterIndex` carries the resulting material index. Editing one entity's
 override therefore creates a distinct record only when its resolved bytes differ.
 
 Feature bits gate optional shader work for normal, emissive, occlusion, parallax, alpha clipping,

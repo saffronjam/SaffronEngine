@@ -1,14 +1,6 @@
-/// The Vegetation Telemetry panel: where the runtime's time and memory go, and which content is
-/// over budget.
-///
-/// The engine already published all of this — `vegetation-telemetry` has been on the wire and
-/// reachable from `sa` for a while — but nothing in the editor called it, so the numbers only
-/// existed for someone who already suspected a problem and knew the command. A panel is what turns
-/// them into something noticed.
-///
-/// Two halves, deliberately: the stage times say WHERE the frame's vegetation work went, and the
-/// budgets say WHOSE content is responsible when it is too much. A stage time alone tells you
-/// residency is slow; the owner column tells you which cell to open.
+/// Where the vegetation runtime's time and memory go, and which content is over budget. Two halves,
+/// deliberately: the stage times say WHERE the frame's vegetation work went, and the budgets say
+/// WHOSE content is responsible when it is too much.
 import { useCallback, useEffect, useState } from "react";
 import { client } from "../control/client";
 import { errorText, notifyError } from "../lib/flash";

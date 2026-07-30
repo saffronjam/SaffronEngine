@@ -1,10 +1,7 @@
-/// A single-axis drag-scrub number field. Pointer-capture on the wrapper scrubs the
-/// value by `clientX` delta * step; the `NumericInput` swallows its own pointer so
-/// typing in the box never starts a scrub, and only commits a parsed value on blur
-/// (never per-keystroke). Optional `track` renders a 0..1-style slider fill behind
-/// the value for `slider` fields. Renders drag-local state (useScrubValue) so the
-/// readout never waits on the wire; the panel owns coalescing and drag-gating
-/// (onDragStart/onDragEnd bracket a scrub).
+/// A single-axis drag-scrub number field: pointer capture on the wrapper scrubs by `clientX` delta ×
+/// step, while the `NumericInput` swallows its own pointer so typing never starts a scrub. Renders
+/// drag-local state so the readout never waits on the wire; the panel owns coalescing and
+/// drag-gating.
 import { useRef } from "react";
 import { cn } from "@/lib/utils";
 import { useScrubValue } from "@/lib/useScrubValue";

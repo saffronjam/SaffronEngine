@@ -1,20 +1,10 @@
-//! The windowed standalone host's present path: blit the post-processed offscreen
-//! viewport image onto the acquired swapchain image, then present.
+//! The windowed standalone host's present path: blit the post-processed offscreen viewport image
+//! onto the acquired swapchain image, then present.
 //!
-//! The present-only host renders the scene + native overlay into the per-view offscreen
-//! color exactly as the editor host does, then — instead of publishing the BGRA8
-//! read-back to shared memory —
-//! `vkCmdBlitImage`s that offscreen straight onto the acquired swapchain image and
-//! presents. So the standalone window shows the identical frame the editor would, with no
-//! second render path.
-//!
-//! The blit is a separate, second submit after [`crate::Renderer::render_scene_offscreen`]
-//! (which records + submits the scene into the offscreen and signals a per-slot
-//! "scene-finished" semaphore in this mode). The present submit waits on both that
-//! semaphore (the offscreen is rendered) and the acquire's image-available semaphore (the
-//! swapchain image is owned), records the layout transitions + the blit, signals the
-//! swapchain image's render-finished semaphore, and presents. Every barrier is explicit so
-//! the validation layer stays silent on both llvmpipe and a discrete GPU.
+//! The blit is a second submit after [`crate::Renderer::render_scene_offscreen`], which signals a
+//! per-slot scene-finished semaphore in this mode. The present submit waits on that semaphore and
+//! on the acquire's image-available semaphore, records the layout transitions + the blit, signals
+//! the swapchain image's render-finished semaphore, and presents.
 
 use ash::vk;
 

@@ -111,7 +111,7 @@ credits.
 | Fragment bridge + callback | `oauth_loopback.rs` | `handle_conn`, `page` |
 | Login command | `editor/shell/src/store_commands.rs` | `connector_login` |
 | Sketchfab connector | `sketchfab.rs` | `Sketchfab`, `license_from` |
-| Attribution DTO | `engine/crates/protocol/src/dto.rs` | `AssetAttributionDto`, `AssetEntryDto` |
+| Attribution DTO | `engine/crates/protocol/src/dto/` | `AssetAttributionDto`, `AssetEntryDto` |
 | Credits view | `StoreCredits.tsx` | `StoreCredits` |
 
 ## Related

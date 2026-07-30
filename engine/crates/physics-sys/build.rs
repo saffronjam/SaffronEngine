@@ -22,15 +22,13 @@
 
 use std::path::{Path, PathBuf};
 
-// The flag set is shared with the crate's tests so the determinism contract is asserted under
-// `cargo test` without coupling the test to `cc`. `src/lib.rs` declares the same file as a
-// `mod`; this `include!` brings it into the build-script crate.
+// `src/lib.rs` declares the same file as a `mod`, so the tests assert the flag set without
+// depending on `cc`.
 include!("src/jolt_build_flags.rs");
 
-/// Pinned-source fetch: download Jolt 5.3.0's official release tarball, verify it against the
-/// embedded SHA-256, and extract it into the gitignored vendor cache. Pure-std orchestration —
-/// `curl` and `tar` (present in the build toolbox) do the transport and unpack; the checksum is
-/// computed here so verification has no external dependency and is identical on every host.
+/// Downloads Jolt's pinned release tarball, verifies it against the embedded SHA-256, and extracts
+/// it into the gitignored vendor cache. `curl` and `tar` do the transport and unpack; the checksum
+/// is computed in pure std so verification is identical on every host.
 mod fetch {
     use std::path::Path;
     use std::process::Command;
@@ -45,25 +43,21 @@ mod fetch {
     pub const ARCHIVE_URL: &str =
         "https://github.com/jrouwe/JoltPhysics/archive/refs/tags/v5.3.0.tar.gz";
 
-    /// SHA-256 of the release tarball at [`ARCHIVE_URL`], computed once from the canonical
-    /// download. The fetch fails closed if the bytes on the wire do not match this, so a tampered
-    /// or truncated download can never reach the compiler. Re-derive with `sha256sum` only when
-    /// intentionally bumping [`VERSION`].
+    /// SHA-256 of the tarball at [`ARCHIVE_URL`]. The fetch fails closed on a mismatch, so a
+    /// tampered or truncated download never reaches the compiler. Re-derive with `sha256sum` when
+    /// bumping [`VERSION`].
     pub const ARCHIVE_SHA256: &str =
         "e7f9621e480646c434150e1fbe3a9410f4ec4b04ffe54791e0678326b741b918";
 
-    /// The directory the tarball extracts into, relative to the extraction root. GitHub's tag
-    /// tarballs unpack to `<repo>-<tag>/`, which is exactly the vendor cache leaf, so the extract
-    /// lands the tree directly at the path `build.rs` compiles.
+    /// The directory the tarball extracts into. GitHub's tag tarballs unpack to `<repo>-<tag>/`,
+    /// which is exactly the vendor cache leaf, so the tree lands where `build.rs` compiles it.
     pub const ARCHIVE_TOP_DIR: &str = "JoltPhysics-5.3.0";
 
-    /// Fetch + verify + extract Jolt into `vendor_dir` if `jolt_root` (its
-    /// `vendor/JoltPhysics-5.3.0/` leaf) is not already populated. Idempotent: a populated cache is
-    /// left untouched, so this costs nothing after the first build and the cache outlives
-    /// `cargo clean`.
+    /// Fetches, verifies, and extracts Jolt into `vendor_dir` unless `jolt_root` is already
+    /// populated. The cache outlives `cargo clean`; only `just clean-deps` removes it.
     pub fn ensure_vendored_jolt(vendor_dir: &Path, jolt_root: &Path) -> Result<(), String> {
-        // `jolt_root/Jolt` is the library subtree the compile walks; treat its presence as "the
-        // cache is good". A partially-extracted tree is repaired by `just clean-deps` + rebuild.
+        // `jolt_root/Jolt` is the subtree the compile walks. A partially-extracted tree is
+        // repaired by `just clean-deps` and a rebuild.
         if jolt_root.join("Jolt").is_dir() {
             return Ok(());
         }
@@ -82,8 +76,7 @@ mod fetch {
         verify_sha256(&archive, ARCHIVE_SHA256)?;
         extract(&archive, vendor_dir)?;
 
-        // The tarball's top-level dir already equals the cache leaf; confirm the compile target
-        // materialized rather than trusting `tar`'s exit code alone.
+        // Confirm the compile target materialized rather than trusting `tar`'s exit code.
         if !jolt_root.join("Jolt").is_dir() {
             return Err(format!(
                 "extracted {ARCHIVE_TOP_DIR} but {} is missing — the release layout changed",
@@ -91,13 +84,11 @@ mod fetch {
             ));
         }
 
-        // The archive is a transient; the extracted tree is the cache.
         let _ = std::fs::remove_file(&archive);
         Ok(())
     }
 
-    /// Download `url` to `dest` via `curl`. Any non-success (including a missing network) surfaces
-    /// the cold-start hint so a fresh clone knows the explicit entry point.
+    /// Downloads `url` to `dest` via `curl`, surfacing the cold-start hint on any failure.
     fn download(url: &str, dest: &Path) -> Result<(), String> {
         let status = Command::new("curl")
             .args([
@@ -150,8 +141,7 @@ mod fetch {
         Ok(())
     }
 
-    /// Verify `path`'s SHA-256 equals `expected` (lowercase hex). The hash is computed here, in
-    /// pure std, so verification needs no crate and is bit-identical on every platform.
+    /// Verifies `path`'s SHA-256 equals `expected` (lowercase hex).
     fn verify_sha256(path: &Path, expected: &str) -> Result<(), String> {
         let bytes = std::fs::read(path)
             .map_err(|e| format!("reading downloaded archive {}: {e}", path.display()))?;
@@ -167,8 +157,7 @@ mod fetch {
         Ok(())
     }
 
-    /// Lowercase-hex SHA-256 of `data`. A direct, self-contained FIPS 180-4 implementation —
-    /// fixed algorithm, no crate, so it adds no dependency and no determinism risk of its own.
+    /// Lowercase-hex SHA-256 of `data`, a self-contained FIPS 180-4 implementation.
     fn sha256_hex(data: &[u8]) -> String {
         const K: [u32; 64] = [
             0x428a_2f98,
@@ -334,17 +323,14 @@ fn emit_link_directives(flags: &JoltBuildFlags) {
         // at link time.
         println!("cargo::rustc-link-lib=pthread");
     }
-    // The shim and Jolt are C++; the consuming crate must link the C++ runtime. On the
-    // toolbox's clang/libc++ target that is libc++ (+ its abi). `cc` links the chosen stdlib
-    // for the compiled object set, but the final Rust link needs it named explicitly.
+    // `cc` links the chosen stdlib for the compiled objects, but the final Rust link needs the
+    // C++ runtime named explicitly.
     println!("cargo::rustc-link-lib=c++");
     println!("cargo::rustc-link-lib=c++abi");
 }
 
-/// The Jolt 5.3.0 source root in the gitignored vendor cache. Populated on demand by
-/// `fetch::ensure_vendored_jolt` from the pinned, checksum-verified release tarball — the source
-/// is never stored in this repo. A Jolt bump is a replay-format migration, never a silent
-/// dependency update.
+/// The Jolt source root in the gitignored vendor cache, populated on demand by
+/// `fetch::ensure_vendored_jolt`. A Jolt bump is a replay-format migration.
 fn vendored_jolt_root() -> PathBuf {
     vendor_dir().join(fetch::ARCHIVE_TOP_DIR)
 }
@@ -354,9 +340,8 @@ fn vendor_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("vendor")
 }
 
-/// Gather every `.cpp` under the fetched `Jolt/` library tree. Jolt guards all
-/// platform/feature-specific code internally with the preprocessor, so the full set compiles
-/// unconditionally given the right defines.
+/// Every `.cpp` under the fetched `Jolt/` tree. Jolt guards platform-specific code with the
+/// preprocessor, so the full set compiles given the right defines.
 fn jolt_sources(jolt_lib_dir: &Path) -> Vec<PathBuf> {
     let mut sources = Vec::new();
     collect_cpp(jolt_lib_dir, &mut sources);
@@ -383,10 +368,8 @@ fn collect_cpp(dir: &Path, out: &mut Vec<PathBuf>) {
 }
 
 fn main() {
-    // Pick the determinism flag set for the target CPU architecture (the SSE and NEON variants
-    // carry the identical `JPH_CROSS_PLATFORM_DETERMINISTIC` contract; only the instruction-set
-    // selection differs). `CARGO_CFG_TARGET_ARCH` is the target's arch even under cross-compiles,
-    // where the build script's own `cfg!(target_arch)` would report the host's.
+    // `CARGO_CFG_TARGET_ARCH` is the target's arch even under a cross-compile, where the build
+    // script's own `cfg!(target_arch)` would report the host's.
     let target_arch = std::env::var("CARGO_CFG_TARGET_ARCH")
         .expect("CARGO_CFG_TARGET_ARCH is always set for a build script");
     let flags = JoltBuildFlags::for_arch(&target_arch);
@@ -394,9 +377,6 @@ fn main() {
     let jolt_lib_dir = jolt_root.join("Jolt");
     let shim_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("shim");
 
-    // Fetch + verify + extract the pinned Jolt source into the gitignored cache if it is not
-    // already there. A clean error (with the `just fetch-deps` hint) surfaces when the network is
-    // unavailable.
     if let Err(err) = fetch::ensure_vendored_jolt(&vendor_dir(), &jolt_root) {
         panic!("{err}");
     }
@@ -408,22 +388,16 @@ fn main() {
         jolt_lib_dir.display()
     );
 
-    // Re-run when the shim, bridge, or flag table changes. The fetched Jolt tree is content-pinned
-    // (tag + checksum), so it is intentionally NOT a `rerun-if-changed` input: it never changes
-    // without an explicit version bump here, and watching a 400-file cache would needlessly stat
-    // it every build.
+    // The fetched Jolt tree is content-pinned by tag and checksum, so it is not a
+    // `rerun-if-changed` input: it cannot change without a version bump in this file.
     println!("cargo::rerun-if-changed={}", shim_dir.display());
     println!("cargo::rerun-if-changed=src/bridge.rs");
     println!("cargo::rerun-if-changed=src/jolt_build_flags.rs");
 
-    // Jolt + the shim + the `cxx`-generated glue compile into one static archive. `cxx_build::bridge`
-    // parses `src/bridge.rs`, generates the C++ glue header/source, and hands back a `cc::Build`
-    // already pointed at them and at the generated-include dir (so the shim's
-    // `#include "saffron-physics-sys/src/bridge.rs.h"` resolves). The Jolt TUs are added to the
-    // *same* build so the shim's references to Jolt symbols resolve within one archive — two
-    // archives would impose a static-link order the shim's Jolt refs cannot satisfy. Every TU sees
-    // the identical determinism + `JPH_*` defines (an ABI skew between shim and Jolt is silent
-    // corruption), so the flags apply to the whole build.
+    // Jolt, the shim, and the `cxx`-generated glue compile into ONE static archive: two archives
+    // would impose a static-link order the shim's Jolt references cannot satisfy. Every TU must
+    // see the identical `JPH_*` defines, because an ABI skew between shim and Jolt is silent
+    // memory corruption.
     let mut build = cxx_build::bridge("src/bridge.rs");
     apply_flags(&flags, &mut build);
     build.include(&jolt_root);
@@ -436,8 +410,8 @@ fn main() {
 
     emit_link_directives(&flags);
 
-    // Surface the determinism contract to the crate as a cfg, so `#[test]` can confirm the
-    // build actually carried the flags rather than trusting the data table alone.
+    // The cfg lets a `#[test]` confirm the build carried the flags, not just that the data table
+    // lists them.
     println!("cargo::rustc-check-cfg=cfg(jolt_deterministic)");
     if flags
         .defines

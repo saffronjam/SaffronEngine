@@ -1,13 +1,49 @@
 // Shared vegetation e2e vocabulary: the generated fixture shape, authored-asset
-// installation into a temp dir, and the cook/evaluation wait loops.
+// installation into a temp dir, world bring-up, and the cook/evaluation wait loops.
 
 import { expect } from "bun:test";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
-import type { VegetationCookStatusDto, VegetationEvaluationStatusDto } from "@saffron/protocol";
+import { fileURLToPath } from "node:url";
+import type {
+  EntityRef,
+  ImportVegetationAssetResult,
+  VegetationCookJobDto,
+  VegetationCookStatusDto,
+  VegetationEvaluationStatusDto,
+  VegetationRuntimeCellResult,
+} from "@saffron/protocol";
 import { EngineCallError, type Engine } from "./harness.ts";
-import type { Cleaner } from "./test-utils.ts";
+import { trackEntity, type Cleaner } from "./test-utils.ts";
+
+const FIXTURE_DIR = join(dirname(fileURLToPath(import.meta.url)), "fixtures");
+
+// Integer ticks per metre — the fixed-point world unit the placement pipeline is exact in.
+export const TICKS_PER_METER = 4096;
+
+// The level-zero cell at the world origin, which every fixture cooks into.
+export const CELL = { coordinates: ["0", "0", "0"], level: 0 } as const;
+
+// Region bounds spanning `meters` from the origin on every axis.
+export function regionBounds(meters: number) {
+  const extent = String(meters * TICKS_PER_METER);
+  return {
+    minTicks: ["0", "0", "0"],
+    maxTicksExclusive: [extent, extent, extent],
+  } as const;
+}
+
+// The region the canonical (4 m cell) fixtures place into.
+export const BOUNDS = regionBounds(64);
+
+// The region the woodland/canopy (64 m cell) fixtures place into.
+export const WIDE_BOUNDS = regionBounds(1024);
+
+// Reads a generated fixture by file stem from `fixtures/`.
+export function loadFixture(stem: string): VegetationFixture {
+  return JSON.parse(readFileSync(join(FIXTURE_DIR, `${stem}.json`), "utf8")) as VegetationFixture;
+}
 
 export interface VegetationMapObjectFixture {
   contentHash: string;
@@ -35,8 +71,8 @@ export interface VegetationFixture {
   expectedAccepted: string;
 }
 
-/// Writes the fixture's plant/biome/map assets (plus map chunk objects) into a fresh
-/// temp dir the cleaner removes, returning the three asset paths.
+// Writes the fixture's plant/biome/map assets (plus map chunk objects) into a fresh
+// temp dir the cleaner removes, returning the three asset paths.
 export function authoredAssets(
   cleaner: Cleaner,
   fixture: VegetationFixture,
@@ -60,7 +96,7 @@ export function authoredAssets(
   return assets;
 }
 
-/// Writes the fixture's trunk OBJ into the live project's assets folder.
+// Writes the fixture's trunk OBJ into the live project's assets folder.
 export async function installTrunkObj(engine: Engine, fixture: VegetationFixture) {
   const status = await engine.call<{ path: string }>("project-status");
   const projectRoot = status.path.endsWith("project.json") ? dirname(status.path) : status.path;
@@ -70,6 +106,88 @@ export async function installTrunkObj(engine: Engine, fixture: VegetationFixture
   if (fixture.trunkMtlHex && fixture.trunkMtlPath) {
     const mtlPath = join(projectRoot, "assets", fixture.trunkMtlPath);
     writeFileSync(mtlPath, Buffer.from(fixture.trunkMtlHex, "hex"));
+  }
+}
+
+// Installs the fixture's authored assets + trunk geometry and imports all three into the
+// live project, returning the source paths.
+export async function importVegetationPackage(
+  engine: Engine,
+  cleaner: Cleaner,
+  fixture: VegetationFixture,
+  tag: string,
+): Promise<Record<"plant" | "biome" | "map", string>> {
+  const sources = authoredAssets(cleaner, fixture, tag);
+  await installTrunkObj(engine, fixture);
+  for (const path of [sources.plant, sources.biome, sources.map]) {
+    await engine.call<ImportVegetationAssetResult>("import-vegetation-asset", { path });
+  }
+  return sources;
+}
+
+// Creates the world entity carrying the fixture's enabled `VegetationField`.
+export async function bindVegetationField(
+  engine: Engine,
+  cleaner: Cleaner,
+  fixture: VegetationFixture,
+  name: string,
+): Promise<EntityRef> {
+  const world = trackEntity(
+    cleaner,
+    engine,
+    await engine.call<EntityRef>("create-entity", { name }),
+  );
+  await engine.call("add-component", { entity: world.id, component: "VegetationField" });
+  await engine.call("set-component", {
+    entity: world.id,
+    component: "VegetationField",
+    json: { map: fixture.map, enabled: true },
+  });
+  return world;
+}
+
+// Cooks the named cells of a map on one worker and waits for the job to complete.
+export async function cookCells(
+  engine: Engine,
+  map: string,
+  cells: readonly unknown[] = [CELL],
+): Promise<VegetationCookStatusDto> {
+  const cook = await engine.call<VegetationCookJobDto>("vegetation-cook", {
+    map,
+    scope: { kind: "cells", cells },
+    workers: 1,
+  });
+  return awaitCook(engine, cook.job);
+}
+
+// Waits until the runtime reports `cell` resident with at least the expected macro plants
+// (and, when asked, at least one micro field tile).
+export async function awaitResidentCell(
+  engine: Engine,
+  expectedPlants: number,
+  options: { microTiles?: boolean; timeoutMs?: number } = {},
+): Promise<VegetationRuntimeCellResult> {
+  const deadline = Date.now() + (options.timeoutMs ?? 30_000);
+  for (;;) {
+    let resident: VegetationRuntimeCellResult | undefined;
+    try {
+      resident = await engine.call<VegetationRuntimeCellResult>("vegetation-runtime-cell", {
+        cell: CELL,
+      });
+    } catch {
+      // The cell is not resident yet.
+    }
+    if (
+      resident &&
+      Number(resident.macroPlants) >= expectedPlants &&
+      (!options.microTiles || Number(resident.microTiles) > 0)
+    ) {
+      return resident;
+    }
+    if (Date.now() >= deadline) {
+      throw new Error("timeout waiting for the resident vegetation cell");
+    }
+    await engine.settle(50);
   }
 }
 

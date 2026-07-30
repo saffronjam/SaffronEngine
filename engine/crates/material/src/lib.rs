@@ -5,8 +5,8 @@
 use saffron_core::Uuid;
 use saffron_spatial::{DecisionScalar, UnitInterval};
 
-// The surface vocabulary is stated in these two scalar types, so a consumer of a
-// `MaterialSurface` needs them without also depending on `saffron-spatial`.
+// Re-exported so a consumer of `MaterialSurface` gets its scalar vocabulary without
+// depending on `saffron-spatial`.
 pub use saffron_spatial::{DecisionScalar as SurfaceScalar, UnitInterval as SurfaceUnit};
 
 /// Material validation failure.
@@ -335,27 +335,23 @@ impl ThinSheetFoliageParameters {
 /// The Beer–Lambert extinction coefficient every aggregate march applies, in reciprocal metres:
 /// fully dense porous matter transmits about 5% of the light entering one metre of it.
 ///
-/// One number shared by the cook that derives a voxel's occupancy and the shader that marches
-/// through it (`sdfExtinctionStep` in `sdf.slang`). A voxel injected against one coefficient and
-/// sampled against another would change brightness at the triangle↔voxel transition, which is
-/// exactly the artifact the shared constant rules out.
+/// The cook that derives a voxel's occupancy and the shader that marches through it
+/// (`sdfExtinctionStep` in `sdf.slang`) must use this same number, or brightness shifts at the
+/// triangle-to-voxel transition.
 pub const AGGREGATE_EXTINCTION_PER_METER: f32 = 3.0;
 
-/// The energy that survives `distance_m` metres of aggregate matter at `occupancy` density — the
-/// Rust counterpart of the shader's extinction step.
+/// The energy that survives `distance_m` metres of aggregate matter at `occupancy` density.
 #[must_use]
 pub fn aggregate_transmittance(occupancy: f32, distance_m: f32) -> f32 {
     (-AGGREGATE_EXTINCTION_PER_METER * occupancy.max(0.0) * distance_m.max(0.0)).exp()
 }
 
 /// The occupancy density an aggregate voxel needs so that marching through `thickness_m` of it
-/// transmits `transmission` — the energy the triangle stack it replaces would have let through.
+/// transmits `transmission`, the energy the triangle stack it stands for lets through.
 ///
-/// This is the inverse of [`aggregate_transmittance`], and it is what keeps a plant's indirect
-/// irradiance, sky visibility, and reflection response continuous as it crosses from triangles to
-/// its aggregate voxel: both sides describe the same optical depth rather than two authored
-/// guesses. Opaque matter (`transmission <= 0`) is solid; a vanishing thickness is solid too,
-/// since no finite density can absorb across no distance.
+/// The inverse of [`aggregate_transmittance`]: both sides describe the same optical depth, which
+/// is what keeps indirect irradiance, sky visibility, and reflection response continuous across
+/// the triangle-to-voxel transition. Opaque matter and a vanishing thickness both read as solid.
 #[must_use]
 pub fn parity_occupancy(transmission: f32, thickness_m: f32) -> f32 {
     let transmission = transmission.clamp(0.0, 1.0);
@@ -399,17 +395,12 @@ mod tests {
         assert!(params.validate().is_err());
     }
 
-    /// The transition invariant: a voxel whose occupancy came from the triangle stack's measured
-    /// transmission transmits that same energy when marched. Without this, a plant changes
-    /// brightness at the moment it becomes an aggregate.
     #[test]
     fn voxel_occupancy_round_trips_the_triangle_stack_transmission() {
-        // Cascade voxel edges, finest to coarsest, against transmissions the coefficient can
-        // express across them.
         for &extent in &[0.25_f32, 0.5, 1.0, 4.0] {
             for &transmission in &[0.9_f32, 0.6, 0.35, 0.1] {
                 let occupancy = parity_occupancy(transmission, extent);
-                // Anything that saturated is outside the representable range by construction.
+                // Saturation puts the pair outside the representable range by construction.
                 if occupancy >= 1.0 {
                     continue;
                 }
@@ -422,22 +413,14 @@ mod tests {
         }
     }
 
-    /// Matter too dense to describe at the shared coefficient saturates rather than reporting a
-    /// density above one, and degenerate inputs read as solid.
     #[test]
     fn parity_occupancy_saturates_and_treats_degenerate_input_as_solid() {
-        // 2% transmission across a 1 cm voxel needs far more extinction than the coefficient
-        // allows, so it saturates solid rather than leaking light.
         assert_eq!(parity_occupancy(0.02, 0.01), 1.0);
         assert_eq!(parity_occupancy(0.0, 1.0), 1.0);
         assert_eq!(parity_occupancy(0.5, 0.0), 1.0);
-        // Fully transmitting matter is empty.
         assert_eq!(parity_occupancy(1.0, 1.0), 0.0);
     }
 
-    /// The Rust constant and the shader's `sdfExtinctionStep` must be the same number: a voxel
-    /// injected against one coefficient and marched against another shifts brightness exactly at
-    /// the transition this parity exists to hide.
     #[test]
     fn the_extinction_coefficient_matches_the_shader() {
         let source = include_str!("../../../assets/shaders/sdf.slang");

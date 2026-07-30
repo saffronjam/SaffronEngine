@@ -1,20 +1,16 @@
-//! OpenUSD `PointInstancer` interchange, over the USDA text form.
+//! OpenUSD `PointInstancer` and `UsdSkel` interchange, over the USDA text form.
 //!
-//! A `PointInstancer` is USD's answer to the same problem a Houdini scatter solves: many placements of
-//! a few prototypes, held in parallel arrays rather than in the prim hierarchy. Reading it needs no
-//! USD runtime — the text form states the arrays directly, and the subset a plant scatter uses is
-//! small and stable.
-//!
-//! Two USD conventions are easy to get wrong and are handled explicitly. A `quath`/`quatf`
-//! orientation is **WXYZ**, not the XYZW every other seam here uses. And `invisibleIds` is a sparse
-//! mask over the instancer's own `ids`, not over array positions, so an instancer that reorders its
-//! arrays keeps masking the same instances.
+//! Reading it needs no USD runtime: the text form states the arrays a plant scatter or rig uses
+//! directly, and that subset is small and stable. Two USD conventions are easy to get wrong and are
+//! handled explicitly. A `quath`/`quatf` orientation is **WXYZ**, not the XYZW every other seam here
+//! uses. And `invisibleIds` is a sparse mask over the instancer's own `ids`, not over array
+//! positions, so an instancer that reorders its arrays keeps masking the same instances.
 
 use std::collections::{BTreeMap, BTreeSet};
 
 use saffron_core::Uuid;
 
-use crate::{Error, PointInstance, PointInterchange, PointPrototype, Result};
+use crate::{Error, PointInstance, PointInterchange, PointPrototype, Result, interchange::lanes};
 
 /// Attributes of a `PointInstancer` this vocabulary expresses.
 const KNOWN: [&str; 6] = [
@@ -24,6 +20,14 @@ const KNOWN: [&str; 6] = [
     "protoIndices",
     "ids",
     "invisibleIds",
+];
+
+/// Attributes of a `Skeleton` this vocabulary expresses.
+const KNOWN_SKELETON: [&str; 3] = ["joints", "bindTransforms", "restTransforms"];
+
+/// The row-major identity, the transform a skeleton that declares none implies.
+const IDENTITY4: [f64; 16] = [
+    1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0,
 ];
 
 /// Reads every `PointInstancer` in a USDA document as one interchange payload.
@@ -48,7 +52,7 @@ pub fn read_usd_point_instancers(
     let mut unsupported = BTreeSet::new();
     let mut found = false;
 
-    for body in point_instancer_bodies(text) {
+    for (_, body) in prim_bodies(text, "PointInstancer") {
         found = true;
         let statements = statements(&body);
         for name in statements.keys() {
@@ -84,15 +88,17 @@ pub fn read_usd_point_instancers(
             .get("prototypes")
             .map(|value| relationship_targets(value))
             .unwrap_or_default();
-        for path in &paths {
-            let name = path.rsplit('/').next().unwrap_or(path).to_owned();
-            let family = *families
-                .get(&name)
-                .ok_or_else(|| field("prototypes.family"))?;
-            prototypes.push(PointPrototype { name, family });
-        }
         if paths.is_empty() {
             return Err(field("prototypes"));
+        }
+        for path in &paths {
+            let name = path.rsplit('/').next().unwrap_or(path).to_owned();
+            prototypes.push(crate::interchange::resolve_prototype(
+                "usd point instancer",
+                "prototypes.family",
+                name,
+                families,
+            )?);
         }
 
         for (index, position) in positions.iter().enumerate() {
@@ -107,15 +113,15 @@ pub fn read_usd_point_instancers(
                 .ok_or_else(|| field("protoIndices"))?;
             instances.push(PointInstance {
                 prototype,
-                position: lanes3(position, 0.0),
+                position: lanes(position, 0.0),
                 orientation: orientations
                     .as_ref()
                     .and_then(|values| values.get(index))
-                    .map_or([0.0, 0.0, 0.0, 1.0], |lanes| wxyz_to_xyzw(lanes)),
+                    .map_or([0.0, 0.0, 0.0, 1.0], |row| wxyz_to_xyzw(row)),
                 scale: scales
                     .as_ref()
                     .and_then(|values| values.get(index))
-                    .map_or([1.0; 3], |lanes| lanes3(lanes, 1.0)),
+                    .map_or([1.0; 3], |row| lanes(row, 1.0)),
                 stable_id: stable_id.unsigned_abs(),
                 // A masked instance is not a plant. It keeps its identity in the source, so
                 // unmasking it later brings back the same plant rather than a new one.
@@ -132,9 +138,6 @@ pub fn read_usd_point_instancers(
         unsupported: unsupported.into_iter().collect(),
     })
 }
-
-/// Attributes of a `Skeleton` this vocabulary expresses.
-const KNOWN_SKELETON: [&str; 3] = ["joints", "bindTransforms", "restTransforms"];
 
 /// One `UsdSkel` skeleton read from a USDA stage.
 #[derive(Clone, Debug, PartialEq)]
@@ -166,14 +169,8 @@ pub struct UsdJoint {
     pub bind: [f64; 16],
 }
 
-/// Reads every `UsdSkel` skeleton in a USDA document.
-///
-/// The structural half of a plant import: a `PointInstancer` says where copies stand, and a
-/// skeleton says how one bends. Both are read from the same text form, because the arrays a plant
-/// needs are stated directly and a second reader over a USD runtime would be a second truth about
-/// the same file.
-///
-/// Attributes outside the expressible set are reported per skeleton rather than dropped.
+/// Reads every `UsdSkel` skeleton in a USDA document, with the attributes outside the expressible
+/// set reported rather than dropped.
 ///
 /// # Errors
 ///
@@ -245,15 +242,64 @@ pub fn read_usd_skeletons(text: &str) -> Result<(Vec<UsdSkeleton>, Vec<String>)>
     Ok((skeletons, unsupported.into_iter().collect()))
 }
 
-/// The row-major identity, the transform a skeleton that declares none implies.
-const IDENTITY4: [f64; 16] = [
-    1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0,
-];
+/// Writes one interchange payload as a USDA `PointInstancer`.
+///
+/// The arrays a reader needs and nothing else: prototypes as relationship targets under the
+/// instancer, then positions, orientations in USD's WXYZ order, scales, prototype indices, and ids.
+#[must_use]
+pub fn write_usd_point_instancer(payload: &PointInterchange) -> String {
+    let tuple3 = |row: [f64; 3]| format!("({}, {}, {})", row[0], row[1], row[2]);
+    let mut text = String::from("#usda 1.0\n(\n    upAxis = \"Y\"\n)\n\n");
+    text.push_str("def PointInstancer \"Plants\"\n{\n");
+    text.push_str("    rel prototypes = [\n");
+    for prototype in &payload.prototypes {
+        text.push_str(&format!("        </Plants/{}>,\n", prototype.name));
+    }
+    text.push_str("    ]\n");
+    for prototype in &payload.prototypes {
+        text.push_str(&format!(
+            "    def Xform \"{}\"\n    {{\n    }}\n",
+            prototype.name
+        ));
+    }
+    let array = |name: &str, lane: &dyn Fn(&PointInstance) -> String| -> String {
+        let values: Vec<String> = payload.instances.iter().map(lane).collect();
+        format!("    {name} = [{}]\n", values.join(", "))
+    };
+    text.push_str(&array("point3f[] positions", &|instance| {
+        tuple3(instance.position)
+    }));
+    text.push_str(&array("quatf[] orientations", &|instance| {
+        let row = instance.orientation;
+        format!("({}, {}, {}, {})", row[3], row[0], row[1], row[2])
+    }));
+    text.push_str(&array("float3[] scales", &|instance| {
+        tuple3(instance.scale)
+    }));
+    text.push_str(&array("int[] protoIndices", &|instance| {
+        instance.prototype.to_string()
+    }));
+    text.push_str(&array("int64[] ids", &|instance| {
+        instance.stable_id.to_string()
+    }));
+    let masked: Vec<String> = payload
+        .instances
+        .iter()
+        .filter(|instance| !instance.active)
+        .map(|instance| instance.stable_id.to_string())
+        .collect();
+    if !masked.is_empty() {
+        text.push_str(&format!(
+            "    int64[] invisibleIds = [{}]\n",
+            masked.join(", ")
+        ));
+    }
+    text.push_str("}\n");
+    text
+}
 
 /// The index of `index`'s parent: the longest declared path that is a proper prefix of its own.
-///
-/// USD states a skeleton's hierarchy in the path tokens rather than in a parent array, and a
-/// prefix comparison alone would make `/Root/Hip` the parent of `/Root/HipGuard`, so the boundary
+/// A prefix comparison alone would make `/Root/Hip` the parent of `/Root/HipGuard`, so the boundary
 /// must fall on a path separator.
 fn parent_joint(paths: &[String], index: usize) -> Option<usize> {
     let own = paths.get(index)?.trim_end_matches('/');
@@ -273,160 +319,13 @@ fn parent_joint(paths: &[String], index: usize) -> Option<usize> {
 
 /// The contents of every double-quoted token in a value, in order.
 fn quoted_tokens(value: &str) -> Vec<String> {
-    let mut found = Vec::new();
-    let mut rest = value;
-    while let Some(open) = rest.find('"') {
-        let after = &rest[open + 1..];
-        let Some(close) = after.find('"') else {
-            break;
-        };
-        found.push(after[..close].to_owned());
-        rest = &after[close + 1..];
-    }
-    found
-}
-
-/// The scalars of every innermost parenthesised group, in order.
-///
-/// The tuple scanner above stops at the first `)`, which is correct for a flat list of points and
-/// wrong for a `matrix4d`, whose rows nest inside an outer pair. This one tracks the most recent
-/// `(` and emits a group only when nothing nested inside it.
-fn leaf_rows(value: &str) -> Vec<Vec<f64>> {
-    let mut rows = Vec::new();
-    let mut start: Option<usize> = None;
-    for (offset, character) in value.char_indices() {
-        match character {
-            '(' => start = Some(offset + 1),
-            ')' => {
-                if let Some(open) = start.take() {
-                    rows.push(
-                        value[open..offset]
-                            .split(',')
-                            .filter_map(|entry| entry.trim().parse::<f64>().ok())
-                            .collect(),
-                    );
-                }
-            }
-            _ => {}
-        }
-    }
-    rows
-}
-
-/// Every `matrix4d` in a value, row-major as USD writes them.
-///
-/// USD nests a matrix as four parenthesised rows inside one outer pair, so the row scanner yields
-/// the rows and every four consecutive ones are a matrix. A partial trailing group is dropped
-/// rather than padded — a half-read transform is worse than a missing one.
-fn matrices(value: &str) -> Vec<[f64; 16]> {
-    let rows = leaf_rows(value);
-    let mut found = Vec::new();
-    for chunk in rows.chunks(4) {
-        if chunk.len() != 4 || chunk.iter().any(|row| row.len() != 4) {
-            break;
-        }
-        let mut matrix = [0.0; 16];
-        for (index, row) in chunk.iter().enumerate() {
-            matrix[index * 4..index * 4 + 4].copy_from_slice(&row[..4]);
-        }
-        found.push(matrix);
-    }
-    found
-}
-
-/// Writes one interchange payload as a USDA `PointInstancer`.
-///
-/// The arrays a reader needs and nothing else: prototypes as relationship targets under the
-/// instancer, then positions, orientations in USD's WXYZ order, scales, prototype indices, and ids.
-#[must_use]
-pub fn write_usd_point_instancer(payload: &PointInterchange) -> String {
-    let tuple3 = |lanes: [f64; 3]| format!("({}, {}, {})", lanes[0], lanes[1], lanes[2]);
-    let mut text = String::from("#usda 1.0\n(\n    upAxis = \"Y\"\n)\n\n");
-    text.push_str("def PointInstancer \"Plants\"\n{\n");
-    text.push_str("    rel prototypes = [\n");
-    for prototype in &payload.prototypes {
-        text.push_str(&format!("        </Plants/{}>,\n", prototype.name));
-    }
-    text.push_str("    ]\n");
-    for prototype in &payload.prototypes {
-        text.push_str(&format!(
-            "    def Xform \"{}\"\n    {{\n    }}\n",
-            prototype.name
-        ));
-    }
-    let join = |values: Vec<String>| values.join(", ");
-    text.push_str(&format!(
-        "    point3f[] positions = [{}]\n",
-        join(
-            payload
-                .instances
-                .iter()
-                .map(|instance| tuple3(instance.position))
-                .collect()
-        )
-    ));
-    text.push_str(&format!(
-        "    quatf[] orientations = [{}]\n",
-        join(
-            payload
-                .instances
-                .iter()
-                .map(|instance| {
-                    let lanes = instance.orientation;
-                    format!("({}, {}, {}, {})", lanes[3], lanes[0], lanes[1], lanes[2])
-                })
-                .collect()
-        )
-    ));
-    text.push_str(&format!(
-        "    float3[] scales = [{}]\n",
-        join(
-            payload
-                .instances
-                .iter()
-                .map(|instance| tuple3(instance.scale))
-                .collect()
-        )
-    ));
-    text.push_str(&format!(
-        "    int[] protoIndices = [{}]\n",
-        join(
-            payload
-                .instances
-                .iter()
-                .map(|instance| instance.prototype.to_string())
-                .collect()
-        )
-    ));
-    text.push_str(&format!(
-        "    int64[] ids = [{}]\n",
-        join(
-            payload
-                .instances
-                .iter()
-                .map(|instance| instance.stable_id.to_string())
-                .collect()
-        )
-    ));
-    let masked: Vec<String> = payload
-        .instances
-        .iter()
-        .filter(|instance| !instance.active)
-        .map(|instance| instance.stable_id.to_string())
-        .collect();
-    if !masked.is_empty() {
-        text.push_str(&format!("    int64[] invisibleIds = [{}]\n", join(masked)));
-    }
-    text.push_str("}\n");
-    text
-}
-
-/// The brace-balanced body of every `def PointInstancer` in the document.
-fn point_instancer_bodies(text: &str) -> Vec<String> {
-    prim_bodies(text, "PointInstancer")
-        .into_iter()
-        .map(|(_, body)| body)
-        .collect()
+    let mut parts = value.split('"');
+    parts.next();
+    std::iter::from_fn(|| {
+        let token = parts.next()?;
+        parts.next().map(|_| token.to_owned())
+    })
+    .collect()
 }
 
 /// The `(name, body)` of every `def <kind>` prim in a USDA document, outermost first.
@@ -527,23 +426,46 @@ fn record(statement: &str, into: &mut BTreeMap<String, String>) {
     into.insert(name.to_owned(), right.trim().to_owned());
 }
 
-/// Parenthesized tuples in one array value.
+/// The scalars of every innermost parenthesised group, in order. Tracking the most recent `(` and
+/// emitting a group only when nothing nested inside it reads a flat list of points and a
+/// `matrix4d`'s nested rows with one scanner.
 fn tuples(value: &str) -> Vec<Vec<f64>> {
+    let mut rows = Vec::new();
+    let mut start: Option<usize> = None;
+    for (offset, character) in value.char_indices() {
+        match character {
+            '(' => start = Some(offset + 1),
+            ')' => {
+                if let Some(open) = start.take() {
+                    rows.push(
+                        value[open..offset]
+                            .split(',')
+                            .filter_map(|entry| entry.trim().parse::<f64>().ok())
+                            .collect(),
+                    );
+                }
+            }
+            _ => {}
+        }
+    }
+    rows
+}
+
+/// Every `matrix4d` in a value, row-major as USD writes them. USD nests a matrix as four
+/// parenthesised rows inside one outer pair, so every four consecutive rows are a matrix. A partial
+/// trailing group is dropped rather than padded — a half-read transform is worse than a missing one.
+fn matrices(value: &str) -> Vec<[f64; 16]> {
+    let rows = tuples(value);
     let mut found = Vec::new();
-    let mut cursor = 0;
-    while let Some(open) = value[cursor..].find('(') {
-        let open = cursor + open;
-        let Some(close) = value[open..].find(')') else {
+    for chunk in rows.chunks(4) {
+        if chunk.len() != 4 || chunk.iter().any(|row| row.len() != 4) {
             break;
-        };
-        let close = open + close;
-        found.push(
-            value[open + 1..close]
-                .split(',')
-                .filter_map(|lane| lane.trim().parse::<f64>().ok())
-                .collect(),
-        );
-        cursor = close + 1;
+        }
+        let mut matrix = [0.0; 16];
+        for (index, row) in chunk.iter().enumerate() {
+            matrix[index * 4..index * 4 + 4].copy_from_slice(&row[..4]);
+        }
+        found.push(matrix);
     }
     found
 }
@@ -560,38 +482,28 @@ fn scalars(value: &str) -> Vec<f64> {
 
 /// Prim paths inside `</…>` relationship targets.
 fn relationship_targets(value: &str) -> Vec<String> {
-    let mut found = Vec::new();
-    let mut cursor = 0;
-    while let Some(open) = value[cursor..].find('<') {
-        let open = cursor + open;
-        let Some(close) = value[open..].find('>') else {
-            break;
-        };
-        let close = open + close;
-        found.push(value[open + 1..close].trim().to_owned());
-        cursor = close + 1;
-    }
-    found
-}
-
-/// Three lanes of a tuple, padded with `fallback`.
-fn lanes3(lanes: &[f64], fallback: f64) -> [f64; 3] {
-    std::array::from_fn(|axis| lanes.get(axis).copied().unwrap_or(fallback))
+    value
+        .split('<')
+        .skip(1)
+        .filter_map(|rest| rest.split_once('>'))
+        .map(|(path, _)| path.trim().to_owned())
+        .collect()
 }
 
 /// A USD WXYZ quaternion as the XYZW form every other seam here uses.
-fn wxyz_to_xyzw(lanes: &[f64]) -> [f64; 4] {
+fn wxyz_to_xyzw(row: &[f64]) -> [f64; 4] {
     [
-        lanes.get(1).copied().unwrap_or(0.0),
-        lanes.get(2).copied().unwrap_or(0.0),
-        lanes.get(3).copied().unwrap_or(0.0),
-        lanes.first().copied().unwrap_or(1.0),
+        row.get(1).copied().unwrap_or(0.0),
+        row.get(2).copied().unwrap_or(0.0),
+        row.get(3).copied().unwrap_or(0.0),
+        row.first().copied().unwrap_or(1.0),
     ]
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::interchange::test_dimensions;
 
     const STAGE: &str = r#"#usda 1.0
 (
@@ -641,9 +553,10 @@ def PointInstancer "Trees"
         assert!((payload.instances[1].scale[2] - 2.0).abs() < 1.0e-9);
         // WXYZ in, XYZW out: the source's leading w lane ends up last.
         let turned = payload.instances[1].orientation;
+        let quarter = std::f64::consts::FRAC_1_SQRT_2;
         assert!(turned[0].abs() < 1.0e-9 && turned[2].abs() < 1.0e-9);
-        assert!((turned[1] - 0.70710678).abs() < 1.0e-6);
-        assert!((turned[3] - 0.70710678).abs() < 1.0e-6);
+        assert!((turned[1] - quarter).abs() < 1.0e-6);
+        assert!((turned[3] - quarter).abs() < 1.0e-6);
         // The mask is keyed by id, not by array position.
         assert_eq!(
             payload
@@ -688,30 +601,9 @@ def PointInstancer "Trees"
     /// untouched: identities come from the source's ids, not from a slot, so nothing renumbers.
     #[test]
     fn masking_one_instance_leaks_no_other_identity() {
-        let scalar = |value: f64| saffron_spatial::DecisionScalar::from_f64(value).unwrap();
         let dimensions = BTreeMap::from([
-            (
-                77,
-                crate::PlantDimensions {
-                    height: scalar(6.0),
-                    trunk_radius: scalar(0.2),
-                    crown_radius: [scalar(2.0); 2],
-                    root_radius: [scalar(1.0); 2],
-                    local_bounds_min: [scalar(-2.0), scalar(0.0), scalar(-2.0)],
-                    local_bounds_max: [scalar(2.0), scalar(6.0), scalar(2.0)],
-                },
-            ),
-            (
-                78,
-                crate::PlantDimensions {
-                    height: scalar(4.0),
-                    trunk_radius: scalar(0.1),
-                    crown_radius: [scalar(1.0); 2],
-                    root_radius: [scalar(1.0); 2],
-                    local_bounds_min: [scalar(-1.0), scalar(0.0), scalar(-1.0)],
-                    local_bounds_max: [scalar(1.0), scalar(4.0), scalar(1.0)],
-                },
-            ),
+            (77, test_dimensions(6.0, 2.0)),
+            (78, test_dimensions(4.0, 1.0)),
         ]);
         // The stage masks id 22. Unmasking it must add exactly one plant, changing no other.
         let masked = read_usd_point_instancers(STAGE, &families()).expect("read");
@@ -797,11 +689,11 @@ def SkelRoot "BirchRig"
         assert_eq!(unsupported, vec!["blendShapes".to_owned()]);
     }
 
+    /// `Root/Trunk` is a string prefix of `Root/TrunkGuard`, and treating it as the parent would
+    /// hang a sibling limb off the wrong joint — an error that survives every count and length check
+    /// and only shows up as geometry bending the wrong way.
     #[test]
     fn a_joint_parent_is_a_path_boundary_not_a_string_prefix() {
-        // `Root/Trunk` is a string prefix of `Root/TrunkGuard`, and treating it as the parent
-        // would hang a sibling limb off the wrong joint — an error that survives every count and
-        // length check and only shows up as geometry bending the wrong way.
         let (skeletons, _) = read_usd_skeletons(SKEL_STAGE).expect("the stage reads");
         let joints = &skeletons[0].joints;
         assert_eq!(joints[0].parent, None, "the root has no parent");
@@ -810,10 +702,10 @@ def SkelRoot "BirchRig"
         assert_eq!(joints[3].parent, Some(1), "the branch hangs off the trunk");
     }
 
+    /// The parallel arrays are the whole contract: a short one read positionally would bind joints
+    /// to transforms that belong to other joints.
     #[test]
     fn a_skeleton_with_mismatched_arrays_is_refused() {
-        // The parallel arrays are the whole contract. A short one read positionally would bind
-        // joints to transforms that belong to other joints.
         let short = SKEL_STAGE.replace(
             "            ( (1, 0, 0, 0), (0, 1, 0, 0), (0, 0, 1, 0), (0, 4, 0, 1) )\n",
             "",
@@ -821,9 +713,9 @@ def SkelRoot "BirchRig"
         assert!(read_usd_skeletons(&short).is_err());
     }
 
+    /// A point scatter with no rig is ordinary, not broken.
     #[test]
     fn a_stage_with_no_skeleton_reads_as_empty_rather_than_failing() {
-        // A point scatter with no rig is ordinary, not broken.
         let (skeletons, unsupported) = read_usd_skeletons(STAGE).expect("a rigless stage reads");
         assert!(skeletons.is_empty());
         assert!(unsupported.is_empty());

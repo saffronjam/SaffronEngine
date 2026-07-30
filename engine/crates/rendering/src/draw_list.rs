@@ -1,17 +1,16 @@
-//! The per-frame deformation + tess-seam state ([`SceneDrawList`]), the resolved
-//! material vocabulary ([`SubmeshMaterial`]), and the [`RenderStats`] counters.
+//! The per-frame deformation state ([`FrameDeformation`]), the resolved material
+//! vocabulary ([`SubmeshMaterial`]), and the [`RenderStats`] counters.
 //!
 //! A skinned instance deforms into its slice of the frame's deformed-vertex buffer
 //! (the [`SkinDispatch`] the `skin` compute pass replays); the executor vertex path
 //! then pulls the slice through its device address. The [`DeformedRtInstance`] list
-//! rides for the RT refit BLAS; the [`TessSceneDraw`] list is the tessellation seam's
-//! per-pass draws.
+//! rides for the RT refit BLAS.
 
 use std::sync::Arc;
 
 use ash::vk;
 use saffron_core::{BlendMode, HeightMode};
-use saffron_geometry::glam::{Mat3, Mat4, Vec2, Vec3, Vec4};
+use saffron_geometry::glam::{Mat4, Vec2, Vec3, Vec4};
 use saffron_material::AlphaClassification;
 
 use crate::resources::{GpuMesh, GpuTexture};
@@ -141,7 +140,7 @@ pub struct SubmeshMaterial {
     /// adaptive-tessellation passes, which amplify each base triangle into a displaced micro-grid).
     pub height_mode: HeightMode,
     /// Alpha/blend mode: opaque, masked (alpha-clip discard below [`SubmeshMaterial::alpha_cutoff`]),
-    /// or translucent (routed to the sorted, blended translucent draw list).
+    /// or translucent (routed to the GPU-sorted, blended translucent stream).
     pub blend_mode: BlendMode,
     /// The alpha-clip cutoff threshold (used by [`BlendMode::Masked`]).
     pub alpha_cutoff: f32,
@@ -187,53 +186,6 @@ impl Default for SubmeshMaterial {
     fn default() -> Self {
         Self::defaults()
     }
-}
-
-/// `transpose(inverse(mat3(model)))` extended to a `Mat4` — the normal matrix the
-/// instance row carries so non-uniform scale leaves normals orthogonal to the surface.
-pub fn normal_matrix(model: Mat4) -> Mat4 {
-    Mat4::from_mat3(Mat3::from_mat4(model).inverse().transpose())
-}
-
-/// One tessellation-seam draw: a displaced instance's mesh PSO plus its per-frame
-/// amplified indirect-draw handles. The visibility traversal skips displacing
-/// materials' records; each raster pass replays these draws after its executor
-/// buckets (own VB/IB binds — the tess PSOs keep vertex input).
-#[derive(Clone)]
-pub struct TessSceneDraw {
-    /// The instance's mesh PSO (vertex input over the amplified 48-byte stream).
-    pub pso: Arc<crate::Pipeline>,
-    /// The instance's row in the frame instance SSBO (the `firstInstance` the
-    /// GPU-seeded indirect command carries).
-    pub base_instance: u32,
-    /// Slot-0 cull mode (the amplified draw covers the whole mesh).
-    pub cull: vk::CullModeFlags,
-    /// Whether the slot-0 material alpha-blends (the scene draws it in the
-    /// translucent scope; depth passes skip it).
-    pub blend: bool,
-    /// The amplified VB/IB + GPU-seeded args, `None` until the tess prep resolves
-    /// the frame's transients.
-    pub draw: Option<TessDraw>,
-}
-
-/// The per-frame handles a tessellated (`HeightMode::Displacement`) batch draws through — the
-/// amplified geometry the Phase-4 emit kernel wrote into `RenderGraphResources`. Filled by
-/// [`crate::Renderer`]'s `record_tess_prep` once the per-frame transients are acquired (the base
-/// instance links a batch to its tessellated slice), then read by the raster passes' indirect draw.
-#[derive(Clone, Copy)]
-pub struct TessDraw {
-    /// The transient VB holding this frame's amplified micro-vertices (48 B stride).
-    pub vertex_buffer: vk::Buffer,
-    /// The transient VB holding the PREVIOUS frame's micro-vertex positions (same layout + stride), for
-    /// the motion prepass's prev-position stream — the geomorph slide the emit kernel wrote with last
-    /// frame's per-edge factors. Equal to `vertex_buffer` only when the two carry identical positions.
-    pub prev_vertex_buffer: vk::Buffer,
-    /// The transient IB holding the generated index stream (u32).
-    pub index_buffer: vk::Buffer,
-    /// The indirect-args buffer (one `VkDrawIndexedIndirectCommand` per instance, 20 B stride).
-    pub args_buffer: vk::Buffer,
-    /// Byte offset of this batch's command in `args_buffer` (= `instance_row * 20`).
-    pub args_offset: u64,
 }
 
 /// One skinned mesh-instance's frame deformation facts: where its palette and deformed
@@ -288,21 +240,15 @@ pub struct MorphDispatch {
     pub deformed_offset: u32,
 }
 
-/// One deforming mesh-instance (skinned or morph) the TLAS references via its own per-frame
-/// refit BLAS. The BLAS geometry is the post-deform vertex slice; `world_transform` places
-/// it in the TLAS. For a skinned (or skin+morph) instance the deformed vertices are already
-/// in world space (the palette is `worldBone * inverseBind` and the skin kernel omits the
-/// model matrix), so `world_transform` is identity; for an unskinned-morph instance the
-/// deformed vertices are in mesh-local space, so `world_transform` is the node world matrix.
-/// A tessellated (`HeightMode::Displacement`) instance's per-frame slice into the amplified transient
-/// VB/IB, for building its BLAS. Unlike the skinned path (a 1:1 remap of the base mesh, refit in place),
-/// a tessellated instance mints variable topology every frame, so its BLAS is a full rebuild over these
-/// buffers. Filled mid-render by `record_tess_prep` (the transients don't exist at draw-list build time).
+/// A tessellated ([`HeightMode::Displacement`]) instance's per-frame slice into the amplified
+/// transient VB/IB, for building its BLAS. A tessellated instance mints variable topology every
+/// frame, so its BLAS is a full rebuild over these buffers rather than the skinned path's in-place
+/// refit. Filled mid-render, once the transients exist.
 ///
-/// These point at the **coarse** (secondary-ray) amplified geometry — a separate, lower-density run of the
-/// tessellation chain (Phase 10, Q2 RT coarsening: coarser LOD target + smaller dice cap) — not the fine
-/// buffers the raster passes draw. The coarse mesh is still Phong-smoothed, displaced, and watertight; the
-/// smaller worst case makes the per-frame BLAS BUILD far cheaper for shadow / GI / reflection rays.
+/// These point at the **coarse** (secondary-ray) amplified geometry — a separate, lower-density run
+/// of the tessellation chain — not the fine buffers the raster passes draw. The coarse mesh is still
+/// Phong-smoothed, displaced, and watertight; the smaller worst case makes the per-frame BLAS build
+/// far cheaper for shadow / GI / reflection rays.
 #[derive(Clone, Copy)]
 pub struct TessRtSlice {
     /// The transient VB holding this frame's amplified micro-vertices (48 B stride).
@@ -319,6 +265,9 @@ pub struct TessRtSlice {
     pub worst_case_prims: u32,
 }
 
+/// One deforming mesh-instance (skinned, morph, or tessellated) the TLAS references via its own
+/// per-frame BLAS. The geometry is the post-deform vertex slice; `world_transform` places it in
+/// the TLAS.
 #[derive(Clone)]
 pub struct DeformedRtInstance {
     /// Keys the grow-only per-instance refit / rebuild BLAS.
@@ -340,12 +289,11 @@ pub struct DeformedRtInstance {
     pub tess: Option<TessRtSlice>,
 }
 
-/// The frame's deformation + tess-seam state, built by
+/// The frame's deformation state, built by
 /// [`crate::Renderer::submit_gpu_scene_deformations`] and read by the deform, raster,
-/// and RT passes (the executor draws themselves come from the GPU scene's visibility
-/// traversal).
+/// and RT passes (the draws themselves come from the GPU scene's visibility traversal).
 #[derive(Default)]
-pub struct SceneDrawList {
+pub struct FrameDeformation {
     /// The camera view-projection (the per-frame vertex push constant).
     pub view_proj: Mat4,
     /// Per skinned mesh-instance: the compute work the `skin` pass dispatches before any
@@ -361,7 +309,7 @@ pub struct SceneDrawList {
     /// to write the morphed base into the deformed buffer. Empty when no morph instances.
     pub morph_dispatches: Vec<MorphDispatch>,
     /// The parallel prev-pose morph dispatches (prev weights → prev-deformed), read only
-    /// by the motion pass. Wired in Phase 5; the field lands here so the shape is complete.
+    /// by the motion pass.
     pub prev_morph_dispatches: Vec<MorphDispatch>,
     /// Per deforming instance (skin or morph): the entity + deformed offset the RT refit
     /// BLAS reads + the TLAS placement. Empty unless an RT consumer is armed.
@@ -370,17 +318,14 @@ pub struct SceneDrawList {
     /// prep passes (factor/scan/finalize) consume in the deform scope. The amplified transient
     /// geometry they emit is what every raster + RT consumer reads for a displaced mesh.
     pub tess_buckets: Vec<crate::tessellation::TessBucket>,
-    /// The tessellation seam's draws: one per displaced instance, replayed by every
-    /// raster pass after its executor buckets.
-    pub tess_draws: Vec<TessSceneDraw>,
     /// Textures pinned live for the frame (their bindless indices are referenced by
     /// the instance SSBO, so the `Arc`s must outlive the GPU read).
     pub live_textures: Vec<Arc<GpuTexture>>,
-    /// `true` once a draw list has been built this frame.
+    /// `true` once this frame's deformation state has been built.
     pub valid: bool,
 }
 
-impl SceneDrawList {
+impl FrameDeformation {
     /// A recording-only copy (the `Arc`s cloned cheaply) with no `live_textures` — the
     /// texture pins stay on the owning list until the frame's fence is waited next, so
     /// they outlive the GPU read.
@@ -394,7 +339,6 @@ impl SceneDrawList {
             deformed_rt_instances: self.deformed_rt_instances.clone(),
             // The prep passes run in the deform scope off the owning list, never a recording copy.
             tess_buckets: Vec::new(),
-            tess_draws: self.tess_draws.clone(),
             skinned_deformations: Vec::new(),
             live_textures: Vec::new(),
             valid: self.valid,
@@ -407,8 +351,7 @@ impl SceneDrawList {
 /// preparation stays O(changes), not O(draws).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct RenderStats {
-    /// GPU-emitted indirect draw commands (the traversal's record count) plus the
-    /// tessellation seam's draws.
+    /// GPU-emitted indirect draw commands (the traversal's record count).
     pub draw_calls: u32,
     /// Live executor draw buckets (distinct shader + PSO-bin combos).
     pub batches: u32,

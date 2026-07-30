@@ -1,9 +1,6 @@
-//! The cooked vegetation closure an exported package needs.
-//!
-//! A player never reads an authored `.splant`, `.sbiome`, or `.svegmap`. It binds a map's current
-//! generation from the artifact store and streams the cells that generation names. So an export has to
-//! carry the store's closure — the generation root, its manifest, and every compiled family and cell
-//! the manifest names — and nothing else from it.
+//! The cooked vegetation closure an exported package needs: the generation root, its
+//! manifest, every compiled family and cell the manifest names, and the durable starting state
+//! keyed by it.
 //!
 //! The closure is computed from the manifest rather than from a directory scan. A scan would copy every
 //! artifact the project ever cooked, including generations that were superseded, which is how a package
@@ -16,12 +13,13 @@ use saffron_core::Uuid;
 use saffron_vegetation::VegetationBaseManifest;
 
 use crate::error::{Error, Result};
+use crate::vegetation_state::VegetationStateStore;
 use crate::vegetation_store::{VegetationArtifactKind, VegetationArtifactStore};
 
-/// One file the closure carries, as a path relative to the artifact-store root.
+/// One file the closure carries, as a path relative to the root of the store it came from.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub struct VegetationExportFile {
-    /// Path relative to the store root, which is where it must land in the package.
+    /// Path relative to its store root, which is where it must land in the package.
     pub relative: PathBuf,
     /// Bytes on disk.
     pub bytes: u64,
@@ -44,10 +42,8 @@ pub struct VegetationExportMap {
     pub baseline: bool,
     /// Macro plants across every cell the manifest names.
     pub macro_plants: u64,
-    /// Stored bytes per cell facet, in canonical section order.
-    ///
-    /// Read from each cell's table of contents rather than by decoding it: a size report that decodes
-    /// every section costs as much as loading the world it is reporting on.
+    /// Stored bytes per cell facet, in canonical section order, read from each cell's table
+    /// of contents rather than by decoding it.
     pub facet_bytes: Vec<VegetationExportFacet>,
 }
 
@@ -65,8 +61,11 @@ pub struct VegetationExportFacet {
 /// The complete cooked vegetation closure for one export.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct VegetationExportClosure {
-    /// Files to copy, in canonical order, each relative to the artifact-store root.
+    /// Derived artifacts to copy, in canonical order, each relative to the artifact-store root.
     pub files: Vec<VegetationExportFile>,
+    /// Durable persistent-state files to copy, in canonical order, each relative to the state-store
+    /// root. They travel separately because they land outside the package's disposable cache.
+    pub state_files: Vec<VegetationExportFile>,
     /// One entry per map that had a current generation.
     pub maps: Vec<VegetationExportMap>,
     /// Total bytes the closure carries.
@@ -86,14 +85,16 @@ impl VegetationExportClosure {
 /// # Errors
 ///
 /// [`Error::Io`] when the store cannot be read, and a vegetation error when a manifest fails to
-/// decode — a package built on an unreadable manifest would fail at the player's first frame instead
-/// of at export.
+/// decode.
 pub fn vegetation_export_closure(
     store: &VegetationArtifactStore,
+    state: &VegetationStateStore,
     maps: impl IntoIterator<Item = Uuid>,
 ) -> Result<VegetationExportClosure> {
     let root = store.root().to_path_buf();
+    let state_root = state.root().to_path_buf();
     let mut files: BTreeSet<VegetationExportFile> = BTreeSet::new();
+    let mut state_files: BTreeSet<VegetationExportFile> = BTreeSet::new();
     let mut summaries = Vec::new();
     for map in maps {
         let Some(hash) = store.current_manifest_hash(map)? else {
@@ -114,12 +115,7 @@ pub fn vegetation_export_closure(
             &store.path(VegetationArtifactKind::Manifest, hash),
             &mut files,
         )?;
-        // The generation's starting state, when the author published one.
-        let baseline = take(
-            &root,
-            &store.path(VegetationArtifactKind::Baseline, hash),
-            &mut files,
-        )?;
+        let baseline = take(&state_root, &state.baseline_path(hash), &mut state_files)?;
         let mut missing = 0;
         let mut macro_plants = 0_u64;
         let mut facets: BTreeMap<u16, (u64, u64)> = BTreeMap::new();
@@ -137,7 +133,6 @@ pub fn vegetation_export_closure(
                 continue;
             }
             macro_plants += cell.macro_count;
-            // The table of contents alone: every section's stored size without reading a payload.
             let reader = store.open_cell(cell.artifact_hash)?;
             for section in &reader.index().sections {
                 let entry = facets.entry(section.kind as u16).or_insert((0, 0));
@@ -168,9 +163,15 @@ pub fn vegetation_export_closure(
         });
     }
     let files: Vec<VegetationExportFile> = files.into_iter().collect();
-    let total_bytes = files.iter().map(|file| file.bytes).sum();
+    let state_files: Vec<VegetationExportFile> = state_files.into_iter().collect();
+    let total_bytes = files
+        .iter()
+        .chain(&state_files)
+        .map(|file| file.bytes)
+        .sum();
     Ok(VegetationExportClosure {
         files,
+        state_files,
         maps: summaries,
         total_bytes,
     })
@@ -206,14 +207,16 @@ mod tests {
         root
     }
 
-    /// A map with no cooked generation contributes nothing and is not an error: a project can be
-    /// exported before its vegetation is cooked, and the warning belongs to the caller.
+    /// A project can be exported before its vegetation is cooked, and the warning belongs to
+    /// the caller.
     #[test]
     fn a_map_without_a_generation_contributes_nothing() {
         let root = scratch("no-generation");
         let store = VegetationArtifactStore::new(&root);
-        let closure = vegetation_export_closure(&store, [Uuid(7)]).expect("closure");
+        let state = VegetationStateStore::new(root.join("state"));
+        let closure = vegetation_export_closure(&store, &state, [Uuid(7)]).expect("closure");
         assert!(closure.files.is_empty());
+        assert!(closure.state_files.is_empty());
         assert!(closure.maps.is_empty());
         assert_eq!(closure.total_bytes, 0);
         assert!(
@@ -243,7 +246,8 @@ mod tests {
             "the stray file is on disk"
         );
         // …but a closure over a map with no generation never looks at it.
-        let closure = vegetation_export_closure(&store, [Uuid(7)]).expect("closure");
+        let state = VegetationStateStore::new(root.join("state"));
+        let closure = vegetation_export_closure(&store, &state, [Uuid(7)]).expect("closure");
         assert!(
             !closure
                 .files
@@ -306,25 +310,23 @@ impl VegetationVerifyReport {
 /// Verifies every artifact the given maps' current generations name, optionally removing the corrupt
 /// ones so the next cook republishes them.
 ///
-/// Content addressing makes this cheap and exact: an artifact's file name *is* the hash of its bytes,
-/// so verification is a rehash rather than a comparison against a side table that could itself rot.
-///
-/// Repair deletes rather than rewrites. There is nothing to rewrite from — the bytes are the only copy
-/// — and the cooker's cache-miss path is already the thing that produces them.
+/// An artifact's file name *is* the hash of its bytes, so verification is a rehash rather than a
+/// comparison against a side table that could itself rot. Repair deletes rather than rewrites:
+/// the bytes are the only copy, and the cooker's cache-miss path is what reproduces them.
 ///
 /// # Errors
 ///
 /// [`Error::Io`] when the store cannot be read or a corrupt file cannot be removed.
 pub fn verify_vegetation_artifacts(
     store: &VegetationArtifactStore,
+    state: &VegetationStateStore,
     maps: impl IntoIterator<Item = Uuid>,
     repair: bool,
 ) -> Result<VegetationVerifyReport> {
-    let closure = vegetation_export_closure(store, maps)?;
+    let closure = vegetation_export_closure(store, state, maps)?;
     let root = store.root().to_path_buf();
     let mut report = VegetationVerifyReport::default();
     for map in &closure.maps {
-        // A manifest naming an artifact the store lacks is a fault the closure already counted.
         for _ in 0..map.missing {
             report.faults.push(VegetationArtifactFault {
                 relative: PathBuf::from(format!("manifests/{}", map.manifest_identity)),
@@ -333,8 +335,8 @@ pub fn verify_vegetation_artifacts(
         }
     }
     for file in &closure.files {
-        // Only the content-addressed kinds carry their hash in the name; a generation root and a
-        // baseline are keyed by what they belong to, so there is nothing to rehash them against.
+        // Only the content-addressed kinds carry their hash in the name; a generation root is keyed
+        // by the map it belongs to, so there is nothing to rehash it against.
         let Some(expected) = content_addressed_identity(&file.relative) else {
             continue;
         };
@@ -379,15 +381,15 @@ mod verify_tests {
     use super::*;
     use crate::vegetation_store::VegetationArtifactStore;
 
-    /// Content addressing makes verification exact: a byte flipped in a cell artifact no longer
-    /// hashes to the name it sits under, and repair removes it so the next cook republishes it.
+    /// A byte flipped in a cell artifact stops hashing to the name it sits under, and repair
+    /// removes it so the next cook republishes it.
     #[test]
     fn a_flipped_byte_is_found_and_repaired() {
         let root = std::env::temp_dir().join("saffron-veg-verify");
         let _ = std::fs::remove_dir_all(&root);
         let store = VegetationArtifactStore::new(&root);
 
-        // A content-addressed file whose bytes no longer match its name.
+        // A content-addressed file whose bytes disagree with its name.
         let hash = saffron_vegetation::ContentHash::of(b"cooked cell");
         let path = store.path(VegetationArtifactKind::Cell, hash);
         std::fs::create_dir_all(path.parent().expect("cell directory")).expect("create");
@@ -406,17 +408,10 @@ mod verify_tests {
             content_addressed_identity(Path::new("generations/7.current")),
             None
         );
-        assert_eq!(
-            content_addressed_identity(
-                Path::new("baselines")
-                    .join(format!("{hash}.svegstate"))
-                    .as_path()
-            ),
-            None
-        );
 
         // With no generation there is nothing to verify, which is not a fault.
-        let report = verify_vegetation_artifacts(&store, [Uuid(7)], false).expect("verify");
+        let state = VegetationStateStore::new(root.join("state"));
+        let report = verify_vegetation_artifacts(&store, &state, [Uuid(7)], false).expect("verify");
         assert!(report.is_sound());
         assert_eq!(report.checked, 0);
         let _ = std::fs::remove_dir_all(&root);

@@ -1,6 +1,7 @@
 import lighting;
 import global_gpu_data;
 import scene_bin_common;
+import scene_micro_common;
 
 // The unlit permutation stays a consumer spec constant so the PSO can specialize it (constant_id 0);
 // keeping it out of the module avoids relying on spec-constant export across the link.
@@ -100,12 +101,6 @@ SurfaceData evalSurface(MaterialInput m)
     return s;
 }
 
-[shader("vertex")]
-VertexOutput vertexMain(VertexInput input, uint instanceIndex : SV_VulkanInstanceID)
-{
-    return transformVertex(input, instanceIndex);
-}
-
 // The frame's semantic record stream (the active view's traversal output); the executor
 // vertex path below indexes it by firstInstance.
 [[vk::binding(4, 2)]] StructuredBuffer<GpuDrawRecord> executorRecords;
@@ -136,13 +131,11 @@ float3 executorDecodeNormal(uint packed)
     return normalize(n);
 }
 
-// Indexed-MDI executor vertex path: SV_VertexID is the pulled index value (the pages
-// arena is the index buffer), SV_VulkanInstanceID is the record index the bin scatter
-// stored in firstInstance. Geometry pulls through buffer device addresses; the emitted
-// interface is `VertexOutput`, so every fragment entry shades identically.
 // The whole per-vertex body, shared by the indexed and mesh executor entries below. Agreement
 // between the two executors is vertex-for-vertex or it is nothing, so there is one copy of this
-// arithmetic and both entries call it.
+// arithmetic and both entries call it. Geometry pulls through buffer device addresses and the
+// emitted interface is `VertexOutput`, so every fragment entry shades identically.
+//
 // Takes the record *index* rather than the record: passing `GpuDrawRecord` by value across a
 // function boundary makes Slang emit a natural-layout copy of the struct, which then collides
 // with the std430 layout the buffer-device-address pointers below require, and the module fails
@@ -187,6 +180,14 @@ VertexOutput executorVertexOutput(uint recordIndex, uint vertexIndex)
         local = vertex.position;
         localNormal = executorDecodeNormal(vertex.normalOct);
         uv = float2(0.0);
+    }
+    else if (record.representation == GPU_REPRESENTATION_DISPLACED_MICRO)
+    {
+        // The amplification arena already carries the displaced local position and the
+        // normal the emit kernel derived from the displaced surface, so the vertex is
+        // final: `vertexIndex` is the absolute micro-vertex slot (the draw's vertexOffset
+        // added the row's slice base).
+        gpuSceneDisplacedVertex(addresses, vertexIndex, false, local, localNormal, uv);
     }
     else if (record.deformation.index != 0xFFFFFFFFu
         && (instance.deformation.index == record.deformation.index))
@@ -241,11 +242,13 @@ VertexOutput executorVertexOutput(uint recordIndex, uint vertexIndex)
         record.transition);
 }
 
-// Indexed-MDI executor vertex path: SV_VertexID is the pulled index value (the pages arena is
-// the index buffer), SV_VulkanInstanceID is the record index the bin scatter stored in
-// firstInstance.
+// Indexed-MDI executor vertex path: SV_VulkanVertexID is the pulled index value plus the
+// command's `vertexOffset` (the D3D-flavoured SV_VertexID subtracts the offset back out, which
+// loses a displaced row's arena slice base), SV_VulkanInstanceID is the record index the bin
+// scatter stored in firstInstance.
 [shader("vertex")]
-VertexOutput vertexMainExecutor(uint vertexIndex : SV_VertexID, uint recordIndex : SV_VulkanInstanceID)
+VertexOutput vertexMainExecutor(
+    uint vertexIndex : SV_VulkanVertexID, uint recordIndex : SV_VulkanInstanceID)
 {
     return executorVertexOutput(recordIndex, vertexIndex);
 }
@@ -284,22 +287,23 @@ void meshMainExecutor(
 
     // `firstIndex` offsets the PAGES arena, not the global index arena — the indexed path binds
     // `gpu_data.pages` as its index buffer and the scatter derives `firstIndex` from a page byte
-    // offset. Reading `addresses.indices` here rasterizes nothing.
-    uint* indexBlob = (uint*)(gpuSceneAddresses.pageBytes);
+    // offset. Reading `addresses.indices` here rasterizes nothing. A displaced row's stream is
+    // the amplification arena instead, the buffer the indexed path binds for that bucket.
+    let displaced =
+        executorRecords[command.firstInstance].representation == GPU_REPRESENTATION_DISPLACED_MICRO;
+    uint* indexBlob = (uint*)(
+        displaced ? gpuSceneAddresses.displacedIndices : gpuSceneAddresses.pageBytes);
     let triangle = firstTriangle + threadIndex;
     let base = threadIndex * 3u;
     for (uint corner = 0u; corner < 3u; ++corner)
     {
-        let vertexIndex = indexBlob[command.firstIndex + triangle * 3u + corner];
+        // The fixed-function path adds `vertexOffset` to every fetched index; the mesh stage
+        // must do it itself, and it is zero for every stream except the arena.
+        let vertexIndex = indexBlob[command.firstIndex + triangle * 3u + corner]
+            + uint(command.vertexOffset);
         verts[base + corner] = executorVertexOutput(command.firstInstance, vertexIndex);
     }
     tris[threadIndex] = uint3(base, base + 1u, base + 2u);
-}
-
-[shader("vertex")]
-VertexOutput vertexMainSkinned(SkinnedVertexInput input, uint instanceIndex : SV_VulkanInstanceID)
-{
-    return transformVertexSkinned(input, instanceIndex);
 }
 
 // Depth-prepass fragment: depth-only (the pass binds no color attachment), doing solely the
@@ -359,7 +363,7 @@ float reactiveCoverageFragment(VertexOutput input) : SV_Target
 // degenerate off-screen point, so it rasterizes nothing.
 [shader("vertex")]
 VertexOutput vertexMainReactiveTransition(
-    uint vertexIndex : SV_VertexID, uint recordIndex : SV_VulkanInstanceID)
+    uint vertexIndex : SV_VulkanVertexID, uint recordIndex : SV_VulkanInstanceID)
 {
     let record = executorRecords[recordIndex];
     if (record.representation != GPU_REPRESENTATION_MICRO_BLADE && record.transition == 0u

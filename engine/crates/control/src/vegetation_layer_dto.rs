@@ -49,7 +49,7 @@ fn bounds(value: &saffron_protocol::WorldBoundsDto) -> Result<WorldBounds> {
         *low = parse_i128(&value.min_ticks[axis], "bounds.minTicks")?;
         *high = parse_i128(&value.max_ticks_exclusive[axis], "bounds.maxTicksExclusive")?;
     }
-    WorldBounds::new(minimum, maximum).map_err(|error| Error::command(error.to_string()))
+    WorldBounds::new(minimum, maximum).map_err(Error::command)
 }
 
 fn position(ticks: &[String; 3]) -> Result<WorldPosition> {
@@ -57,7 +57,7 @@ fn position(ticks: &[String; 3]) -> Result<WorldPosition> {
     for (slot, value) in global.iter_mut().zip(ticks) {
         *slot = parse_i128(value, "globalTicks")?;
     }
-    WorldPosition::from_global_ticks(global).map_err(|error| Error::command(error.to_string()))
+    WorldPosition::from_global_ticks(global).map_err(Error::command)
 }
 
 fn channel(value: &FieldChannelDto) -> Result<FieldChannel> {
@@ -400,7 +400,7 @@ fn cell_from_dto(value: &saffron_protocol::WorldCellDto) -> Result<saffron_spati
             .map_err(|_| Error::command("cell coordinate is not an i64"))?;
     }
     saffron_spatial::WorldCellKey::new(coordinates[0], coordinates[1], coordinates[2], value.level)
-        .map_err(|error| Error::command(error.to_string()))
+        .map_err(Error::command)
 }
 
 /// Decodes one wire layer row into the authored layer algebra.

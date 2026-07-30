@@ -42,18 +42,16 @@ fn angle_opposite(adj0: f32, adj1: f32, opp: f32) -> f32 {
     cos_a.acos()
 }
 
-/// World-space delta rotations for a two-bone chain so its end effector reaches
-/// `target`, with the mid joint twisted toward `pole_vector`.
+/// World-space delta rotations for a two-bone chain so its end effector reaches `target`, with the
+/// mid joint twisted toward `pole_vector`.
 ///
-/// The returned quaternions are world-space DELTA rotations: pre-multiply each
-/// onto the joint's current world rotation, then strip the parent world rotation,
-/// to land in local space (the caller does that). Pure law-of-cosines solve
-/// (ozz IKTwoBoneJob / UE two-bone): straighten + re-bend the knee to the reach
-/// angle, swing the chain onto the target, then twist the bend plane onto the pole.
+/// The returned quaternions are world-space *delta* rotations: the caller pre-multiplies each onto the
+/// joint's current world rotation, then strips the parent world rotation to land in local space. A
+/// law-of-cosines solve after ozz's `IKTwoBoneJob` — re-bend the knee to the reach angle, swing the
+/// chain onto the target, then twist the bend plane onto the pole.
 ///
-/// Total over its domain — the reach clamp and `max(len, 1e-6)` floors keep every
-/// `acos`/division valid — so it returns the result directly rather than a
-/// `Result`. A target on the root (`reach < 1e-6`) returns identity rotations.
+/// Total over its domain: the reach clamp and the `max(len, 1e-6)` floors keep every `acos` and
+/// division valid, so there is no `Result`. A target on the root returns identity rotations.
 pub fn solve_two_bone_ik(
     root: Vec3,
     mid: Vec3,

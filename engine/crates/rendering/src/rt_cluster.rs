@@ -1,13 +1,12 @@
 //! Cluster-acceleration-structure execution over canonical cooked triangle clusters.
 //!
-//! On a device with `VK_NV_cluster_acceleration_structure`, an assembly prototype's
-//! bottom-level structure is composed from its cooked clusters: one CLAS per
-//! [`PortableTriangleCluster`]-shaped input, then one bottom-level structure over the CLAS
-//! references, both through the extension's indirect two-op batch. The inputs are the same
-//! canonical clusters every device cooks — no NVIDIA-specific representation exists — and
-//! the produced structure slots into TLAS packing by device address exactly like a KHR
-//! build. This module and `device.rs` are the only importers of the transcribed
-//! `vk_nv_cluster` bindings; a third file appearing in that grep is the review tripwire.
+//! On a device with `VK_NV_cluster_acceleration_structure`, an assembly prototype's bottom-level
+//! structure is composed from its cooked clusters: one CLAS per [`PortableTriangleCluster`]-shaped
+//! input, then one bottom-level structure over the CLAS references, both through the extension's
+//! indirect two-op batch. The inputs are the same canonical clusters every device cooks, and the
+//! produced structure slots into TLAS packing by device address exactly like a KHR build.
+//!
+//! Only this module and `device.rs` may import the transcribed [`crate::vk_nv_cluster`] bindings.
 
 use std::sync::Arc;
 

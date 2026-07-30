@@ -1,10 +1,8 @@
 //! The project-file `renderSettings` block: the renderer's render-panel state as JSON.
 //!
-//! The save path serializes the AA mode, exposure, and the feature toggles; the load path
-//! applies a saved block, leaving any missing field at its current value and applying the
-//! RT toggles only where the device supports ray tracing (so a project authored on an RT
-//! machine loads cleanly on a software one). One block, one schema — the project document
-//! round-trips it unchanged through save/load.
+//! The load path leaves any missing field at its current value and applies the RT toggles only
+//! where the device supports ray tracing, so a project authored on an RT machine loads cleanly on a
+//! software one.
 
 use serde_json::{Value, json};
 

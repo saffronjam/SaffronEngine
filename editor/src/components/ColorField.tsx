@@ -1,10 +1,7 @@
-/// Color field for Vec3 (color3) / Vec4 (color4) float channels. Channels are
-/// LINEAR floats in 0..1 on the wire. The swatch opens a Popover with a
-/// saturation/hue (and alpha) canvas; per-channel numeric inputs keep HDR-range and
-/// alpha editable beyond the 0..1 the canvas exposes. Renders drag-local state
-/// (useScrubValue) so the canvas tracks the pointer exactly — the round trip
-/// through store and wire never gates the handle. The panel owns coalescing and
-/// drag-gating.
+/// Color field for Vec3/Vec4 channels, which are LINEAR floats in 0..1 on the wire. The swatch opens
+/// a saturation/hue (and alpha) canvas; per-channel numeric inputs keep HDR range and alpha editable
+/// beyond what the canvas exposes. Renders drag-local state so the canvas tracks the pointer
+/// exactly; the panel owns coalescing and drag-gating.
 import { RgbaColorPicker, RgbColorPicker } from "react-colorful";
 import { VectorEditor } from "./VectorEditor";
 import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";

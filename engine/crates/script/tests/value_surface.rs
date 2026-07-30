@@ -1,5 +1,4 @@
-//! VM-level coverage of the `sa.Vec3` value type and the no-scene binding table:
-//! every operator/method/free-function evaluated in a sandboxed VM matches the
+//! Every `sa.Vec3` operator, method, and free function evaluated in a sandboxed VM against the
 //! value `glam` computes directly.
 
 use glam::Vec3;

@@ -1,4 +1,4 @@
-// Phase 3 of the physics plan: the five collision shapes + PhysicsMaterial + shape-aware auto-fit.
+// The five collision shapes + PhysicsMaterial + shape-aware auto-fit.
 // Sphere/Capsule are analytic (sized from the mesh AABB); ConvexHull/Mesh are cooked from the
 // entity's .smesh vertices. Auto-fit sizes whatever shape the collider holds; fit-collider re-fits
 // on demand. A Mesh collider on a Dynamic body is rejected (Jolt MeshShape is Static/Kinematic only).

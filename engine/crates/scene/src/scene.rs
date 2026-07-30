@@ -1,9 +1,7 @@
 //! The wrapped ECS world, the `Entity` handle, and the `Scene` access surface.
 //!
-//! The ECS crate behind the world (`hecs` by default) is an *internal* detail: every
-//! downstream crate goes through [`Scene`] and [`Entity`], never through `hecs::`
-//! directly. That is what keeps the fallback to `bevy_ecs` a one-crate change. `Entity`
-//! is a bare handle, but every consumer goes through the `Scene` methods.
+//! The ECS crate behind the world is an internal detail: every downstream crate goes through
+//! [`Scene`] and [`Entity`], never through `hecs::` directly.
 
 use std::any::TypeId;
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -259,14 +257,7 @@ impl Scene {
         self.with_component::<C, _>(entity, |c| *c)
     }
 
-    /// Iterates every entity carrying the query components, invoking `f` with the
-    /// entity handle and its component references.
-    ///
-    /// `Q` is a tuple of component references — `(&Transform,)`, `(&Transform, &mut
-    /// Camera)` — so the callback receives `(Entity, &C…)` or `(Entity, &mut C…)`
-    /// exactly as the query tuple spells. Iteration order is unspecified; roots-first
-    /// ordering comes from the hierarchy walk, not the view.
-    /// The resolved local wind sources: every enabled [`WindSource`] entity,
+    /// The resolved local wind sources: every enabled [`WindSource`](crate::WindSource) entity,
     /// anchored at its world position with its world +Z as the forward axis.
     #[must_use]
     pub fn local_wind_sources(&mut self) -> Vec<saffron_wind::LocalWindSource> {
@@ -293,6 +284,12 @@ impl Scene {
         sources
     }
 
+    /// Iterates every entity carrying the query components, invoking `f` with the entity handle and
+    /// its component references.
+    ///
+    /// `Q` is a tuple of component references — `(&Transform,)`, `(&Transform, &mut Camera)` — so the
+    /// callback receives `(Entity, &C…)` exactly as the query tuple spells. Iteration order is
+    /// unspecified; roots-first ordering comes from the hierarchy walk, not the view.
     pub fn for_each<Q, F>(&mut self, mut f: F)
     where
         Q: Query,
@@ -682,14 +679,12 @@ mod tests {
             .map(|i| scene.create_entity(format!("e{i}")))
             .collect();
 
-        // Every freshly created handle is valid.
         for &e in &entities {
             assert!(scene.valid(e));
         }
         assert_eq!(scene.len(), 5);
         assert!(!scene.is_empty());
 
-        // for_each over the seeded IdComponent counts exactly the created entities.
         let mut seen = 0;
         scene.for_each::<&IdComponent, _>(|e, _id| {
             assert!(scene_contains(&entities, e));
@@ -697,7 +692,6 @@ mod tests {
         });
         assert_eq!(seen, 5);
 
-        // Destroying one removes exactly that entity; the rest stay valid.
         let doomed = entities[2];
         scene.destroy_entity(doomed);
         assert!(!scene.valid(doomed));
@@ -706,7 +700,6 @@ mod tests {
             assert_eq!(scene.valid(e), e != doomed);
         }
 
-        // Destroying a stale handle is a harmless no-op.
         scene.destroy_entity(doomed);
         assert_eq!(scene.len(), 4);
     }
@@ -728,7 +721,6 @@ mod tests {
         assert_eq!(scene.find_entity_by_uuid(id_a), Some(a));
         assert_eq!(scene.find_entity_by_uuid(id_b), Some(b));
 
-        // An id no live entity carries resolves to None, not a dangling handle.
         let absent = Uuid(7);
         assert!(scene.find_entity_by_uuid(absent).is_none());
     }
@@ -829,7 +821,6 @@ mod tests {
 
         scene.remove_component::<Health>(e);
         assert!(!scene.has_component::<Health>(e));
-        // Reading an absent component is a typed miss, not a panic.
         assert!(matches!(
             scene.component::<Health>(e),
             Err(crate::Error::MissingComponent)

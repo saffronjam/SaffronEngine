@@ -1,13 +1,13 @@
-/// The Ecology Timeline panel: pause, step, and run over the world's biological clock, with the
-/// dependency regions and their catch-up state beside it.
+/// Pause, step, and run over the world's biological clock, with the dependency regions and their
+/// catch-up state beside it.
 ///
-/// Biological time only moves forward, and it moves by executing ticks — there is no analytical
-/// fast-forward to scrub against. So the controls here are step and run, never a seek bar: a slider
-/// that could drag the clock backwards would promise something the simulation cannot do.
+/// Biological time only moves forward, by executing ticks — there is no analytical fast-forward, so
+/// the controls are step and run rather than a seek bar. A region only advances while every cell it
+/// spans is resident, so the table separates "caught up" (work still owed) from "waiting on
+/// residency" (ground that has not loaded).
 ///
-/// A region only advances while every cell it spans is resident, so the table separates "caught up"
-/// from "waiting on residency". Those are different problems: the first is work still owed, the second
-/// is ground that has not loaded.
+/// The world clock is what makes biology advance with the world; step and run are the authoring
+/// surface over the same ticks. Stopping the clock stops both, which is what a pause has to mean.
 import { useCallback, useEffect, useRef, useState } from "react";
 import { client } from "../control/client";
 import { errorText, notifyError } from "../lib/flash";
@@ -37,6 +37,50 @@ function Stat({ label, value }: { label: string; value: React.ReactNode }) {
   );
 }
 
+/// One sampled weather channel as `UnitInterval` bits. Edits commit on blur or Enter rather than per
+/// keystroke: every commit is a control round-trip, and the socket services one at a time.
+function WeatherField({
+  label,
+  value,
+  onCommit,
+}: {
+  label: string;
+  value: number | null;
+  onCommit: (value: number) => void;
+}) {
+  const [draft, setDraft] = useState<string | null>(null);
+  const commit = () => {
+    if (draft === null) {
+      return;
+    }
+    const parsed = Number(draft);
+    setDraft(null);
+    if (Number.isFinite(parsed) && parsed !== value) {
+      onCommit(Math.min(65535, Math.max(0, Math.round(parsed))));
+    }
+  };
+  return (
+    <div className="flex flex-col gap-1">
+      <Label className="text-[11px] text-muted-foreground">{label}</Label>
+      <Input
+        className="h-7 font-mono text-[11px]"
+        type="number"
+        min={0}
+        max={65535}
+        disabled={value === null}
+        value={draft ?? value ?? 0}
+        onChange={(event) => setDraft(event.target.value)}
+        onBlur={commit}
+        onKeyDown={(event) => {
+          if (event.key === "Enter") {
+            commit();
+          }
+        }}
+      />
+    </div>
+  );
+}
+
 /// A world cell as the engine addresses it.
 function cellLabel(cell: { coordinates: string[]; level: number }): string {
   return `${cell.coordinates.join(", ")} L${cell.level}`;
@@ -51,11 +95,10 @@ export function EcologyTimelinePanel() {
   const [status, setStatus] = useState<EcologyStatus | null>(null);
   const [report, setReport] = useState<EcologyReport | null>(null);
   const [running, setRunning] = useState(false);
-  const [water, setWater] = useState(32768);
-  const [warmth, setWarmth] = useState(32768);
   // A ref rather than state: the run loop reads it between calls, and a stale closure would keep
   // stepping after the user pressed pause.
   const runningRef = useRef(false);
+  const clock = status?.clock ?? null;
 
   const refresh = useCallback(async () => {
     try {
@@ -69,6 +112,19 @@ export function EcologyTimelinePanel() {
     void refresh();
   }, [refresh]);
 
+  const configure = useCallback(
+    async (params: Parameters<typeof client.vegetationEcologyClock>[0]) => {
+      try {
+        await client.vegetationEcologyClock(params);
+      } catch (err) {
+        notifyError(errorText(err));
+        return;
+      }
+      await refresh();
+    },
+    [refresh],
+  );
+
   const advance = useCallback(
     async (ticks: number) => {
       const current = status?.worldTick ?? "0";
@@ -78,8 +134,6 @@ export function EcologyTimelinePanel() {
           await client.vegetationAdvanceEcology({
             targetTick: next,
             maxTicks: Math.min(ticks, MAX_TICKS_PER_CALL),
-            water,
-            warmth,
           }),
         );
       } catch (err) {
@@ -89,7 +143,7 @@ export function EcologyTimelinePanel() {
       await refresh();
       return true;
     },
-    [refresh, status?.worldTick, warmth, water],
+    [refresh, status?.worldTick],
   );
 
   const run = useCallback(async () => {
@@ -135,33 +189,36 @@ export function EcologyTimelinePanel() {
           Refresh
         </Button>
       </div>
+      <div className="flex items-center gap-1">
+        <Button
+          size="sm"
+          variant={clock?.running ? "secondary" : "default"}
+          disabled={clock === null}
+          onClick={() => void configure({ running: !clock?.running })}
+        >
+          {clock?.running ? "Stop clock" : "Start clock"}
+        </Button>
+        <span className="font-mono text-[11px] text-muted-foreground">
+          {clock === null ? "—" : `1 tick / ${clock.tickMilliseconds} ms of play`}
+        </span>
+      </div>
       <div className="grid grid-cols-2 gap-2">
-        <div className="flex flex-col gap-1">
-          <Label className="text-[11px] text-muted-foreground">Water</Label>
-          <Input
-            className="h-7 font-mono text-[11px]"
-            type="number"
-            min={0}
-            max={65535}
-            value={water}
-            onChange={(event) => setWater(Number(event.target.value))}
-          />
-        </div>
-        <div className="flex flex-col gap-1">
-          <Label className="text-[11px] text-muted-foreground">Warmth</Label>
-          <Input
-            className="h-7 font-mono text-[11px]"
-            type="number"
-            min={0}
-            max={65535}
-            value={warmth}
-            onChange={(event) => setWarmth(Number(event.target.value))}
-          />
-        </div>
+        <WeatherField
+          label="Water"
+          value={clock?.water ?? null}
+          onCommit={(water) => void configure({ water })}
+        />
+        <WeatherField
+          label="Warmth"
+          value={clock?.warmth ?? null}
+          onCommit={(warmth) => void configure({ warmth })}
+        />
       </div>
       <Separator />
       <div className="flex flex-col gap-0.5">
         <Stat label="World tick" value={status?.worldTick ?? "—"} />
+        <Stat label="Clock" value={clock === null ? "—" : clock.running ? "running" : "stopped"} />
+        <Stat label="Owed by the clock" value={clock?.ticksOwed ?? "—"} />
         <Stat label="Rule set" value={status?.simulationVersion ?? "—"} />
         <Stat label="Region radius" value={`${status?.regionRadiusCells ?? "—"} cells`} />
         <Stat label="Regions" value={regions.length} />

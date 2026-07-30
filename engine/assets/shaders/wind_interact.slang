@@ -4,7 +4,7 @@
 // into texel velocity, and integrate the damped oscillator back toward rest. The
 // header's cascade centres are rewritten from the push so samplers agree with the
 // texels the same frame.
-import global_gpu_data;
+import wind;
 
 // One swept impulse: a world-space XZ disc pushing along `direction` and pressing
 // the ground down by `depress`, with a smooth falloff over `radius`.

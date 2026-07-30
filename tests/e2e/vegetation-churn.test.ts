@@ -14,35 +14,27 @@
 // discriminating: the push moves the frame by ~0.97 and it settles back to ~0.21.
 
 import { afterAll, beforeAll, expect, test } from "bun:test";
-import { readFileSync } from "node:fs";
-import { dirname, join } from "node:path";
-import { fileURLToPath } from "node:url";
 import type {
-  EntityRef,
-  ImportVegetationAssetResult,
   RenderStatsDto,
-  VegetationCookJobDto,
   VegetationRuntimeQueryResult,
 } from "@saffron/protocol";
 import type { Engine } from "./harness.ts";
-import { Cleaner, bootEngine, captureViewport, prepareScene, trackEntity } from "./test-utils.ts";
+import { Cleaner, bootEngine, captureViewport, prepareScene } from "./test-utils.ts";
 import { decodeRgb8Png, meanAbsoluteDifference } from "./image.ts";
-import { authoredAssets, awaitCook, installTrunkObj, type VegetationFixture } from "./vegetation-utils.ts";
+import {
+  WIDE_BOUNDS,
+  bindVegetationField,
+  cookCells,
+  importVegetationPackage,
+  loadFixture,
+} from "./vegetation-utils.ts";
 
-const HERE = dirname(fileURLToPath(import.meta.url));
-const FIXTURE_PATH = join(HERE, "fixtures", "vegetation-stress-woodland.json");
-const CELL = { coordinates: ["0", "0", "0"], level: 0 } as const;
-const BOUNDS = {
-  minTicks: ["0", "0", "0"],
-  maxTicksExclusive: ["4194304", "4194304", "4194304"],
-} as const;
-
-/// The framing the stress suite established for a woodland cell: cells are 64 m apart and this
-/// parks the camera over cell (0,0,0) looking into it.
+// The framing the stress suite established for a woodland cell: cells are 64 m apart and this
+// parks the camera over cell (0,0,0) looking into it.
 const CAMERA = { position: { x: 32, y: 8, z: 44 }, yaw: 0, pitch: -10 } as const;
 
-/// Mean absolute per-channel difference (0-255) a settled frame may drift by. Temporal accumulation
-/// accounts for a small residue; a shadow left at a stale silhouette does not fit inside it.
+// Mean absolute per-channel difference (0-255) a settled frame may drift by. Temporal accumulation
+// accounts for a small residue; a shadow left at a stale silhouette does not fit inside it.
 const CONVERGENCE_TOLERANCE = 0.3;
 
 const cleaner = new Cleaner();
@@ -53,29 +45,10 @@ beforeAll(async () => {
   engine = await bootEngine(cleaner, { SAFFRON_SCRATCH_PROJECT: "1" });
   await prepareScene(engine, { width: 480, height: 270 });
 
-  const fixture = JSON.parse(readFileSync(FIXTURE_PATH, "utf8")) as VegetationFixture;
-  const sources = authoredAssets(cleaner, fixture, "churn");
-  await installTrunkObj(engine, fixture);
-  for (const path of [sources.plant, sources.biome, sources.map]) {
-    await engine.call<ImportVegetationAssetResult>("import-vegetation-asset", { path });
-  }
-  const world = trackEntity(
-    cleaner,
-    engine,
-    await engine.call<EntityRef>("create-entity", { name: "Churn vegetation" }),
-  );
-  await engine.call("add-component", { entity: world.id, component: "VegetationField" });
-  await engine.call("set-component", {
-    entity: world.id,
-    component: "VegetationField",
-    json: { map: fixture.map, enabled: true },
-  });
-  const cook = await engine.call<VegetationCookJobDto>("vegetation-cook", {
-    map: fixture.map,
-    scope: { kind: "cells", cells: [CELL] },
-    workers: 1,
-  });
-  await awaitCook(engine, cook.job);
+  const fixture = loadFixture("vegetation-stress-woodland");
+  await importVegetationPackage(engine, cleaner, fixture, "churn");
+  const world = await bindVegetationField(engine, cleaner, fixture, "Churn vegetation");
+  await cookCells(engine, fixture.map);
 
   // After the cook: residency is camera-driven, so the view has to be in place before the cell can
   // become resident.
@@ -85,7 +58,7 @@ beforeAll(async () => {
   const deadline = Date.now() + 40_000;
   for (;;) {
     const hits = await engine.call<VegetationRuntimeQueryResult>("vegetation-runtime-query", {
-      query: { kind: "bounds", bounds: BOUNDS },
+      query: { kind: "bounds", bounds: WIDE_BOUNDS },
     });
     if (hits.hits.length > 0) {
       plants = hits.hits.map((hit) => hit.plant.plant);

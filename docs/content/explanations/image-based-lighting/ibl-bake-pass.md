@@ -78,12 +78,12 @@ Scene lighting enables global IBL when both `Ibl::use_ibl` and `Ibl::ready` are 
 
 | What | File | Symbols |
 |---|---|---|
-| Persistent resources | `engine/crates/rendering/src/ibl.rs` | `Ibl::new`, `LiveCapture`, `Ibl::write_mesh_set` |
-| Startup and environment submission | `engine/crates/rendering/src/ibl.rs` | `Ibl::bake`, `Ibl::submit_refresh`, `BakeScratch` |
-| Live graph capture | `engine/crates/rendering/src/ibl.rs` | `Ibl::add_live_capture_passes`, `Ibl::resolve_live_layouts` |
-| Re-bake decision | `engine/crates/rendering/src/ibl.rs` | `Ibl::request_env_bake`, `should_rebake` |
-| Scene source resolution | `engine/crates/assets/src/render_scene.rs` | `drive_env_bake` |
-| Runtime control | `engine/crates/control/src/commands_render.rs` | `set-ibl` |
+| Persistent resources | `engine/crates/rendering/src/ibl/` | `Ibl::new`, `LiveCapture`, `Ibl::write_mesh_set` |
+| Startup and environment submission | `engine/crates/rendering/src/ibl/` | `Ibl::bake`, `Ibl::submit_refresh`, `BakeScratch` |
+| Live graph capture | `engine/crates/rendering/src/ibl/` | `Ibl::add_live_capture_passes`, `Ibl::resolve_live_layouts` |
+| Re-bake decision | `engine/crates/rendering/src/ibl/` | `Ibl::request_env_bake`, `should_rebake` |
+| Scene source resolution | `engine/crates/assets/src/render_scene/` | `drive_env_bake` |
+| Runtime control | `engine/crates/control/src/commands_render/` | `set-ibl` |
 
 ## Related
 

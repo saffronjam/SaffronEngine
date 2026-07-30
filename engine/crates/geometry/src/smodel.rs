@@ -3,20 +3,16 @@
 //! (STEX), materials (SMAT), animations (SANM), thumbnail (THMB), and a front-loaded
 //! metadata chunk (META) into one file.
 //!
-//! The header/TOC are reinterpreted with **safe** `bytemuck` over `#[repr(C)]` Pod
-//! structs, so the crate's `#![deny(unsafe_code)]` holds.
-//!
 //! Load-bearing framing rules:
 //!
-//! - **META front-loading.** The META chunk (if present) is placed first after the TOC
-//!   and recorded in `meta_offset`/`meta_length`, so a prefix read reaches the metadata
-//!   without scanning payloads. Everything else keeps the caller's order.
-//! - **16-byte payload alignment.** Each payload offset is `align16`'d; the TOC starts
-//!   at `size_of::<SModelHeader>()` and the first payload at `align16(toc_offset + toc_bytes)`.
-//! - **`total_length` vs file size validation** on read, plus the chunk-table-in-bounds
-//!   and no-overlap checks (sort the payload ranges by offset, reject if any starts
-//!   before the previous ends). These are the silent-corruption guards.
-//! - **Lazy chunk reads.** [`ContainerReader`] holds the path + header + TOC and reads a
+//! - **META front-loading.** The META chunk, when present, is placed first after the TOC and
+//!   recorded in `meta_offset`/`meta_length`, so a prefix read reaches the metadata without
+//!   scanning payloads. Everything else keeps the caller's order.
+//! - **16-byte payload alignment.** Each payload offset is `align16`'d; the TOC starts at
+//!   `size_of::<SModelHeader>()` and the first payload at `align16(toc_offset + toc_bytes)`.
+//! - **Framing validation on read.** `total_length` against the file size, the chunk table in
+//!   bounds, and no overlapping payload ranges.
+//! - **Lazy chunk reads.** [`ContainerReader`] holds the path, header, and TOC, and reads a
 //!   chunk's `[offset, offset + length)` span from disk on demand.
 
 use std::fs;

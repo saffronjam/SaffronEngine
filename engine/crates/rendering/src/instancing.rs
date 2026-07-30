@@ -1,12 +1,12 @@
 //! The per-frame instance set (set 2) storage and the deformation gather/wiring.
 //!
 //! [`Instancing`] owns, per frame-in-flight, the instance descriptor set: the
-//! tessellation seam's instance rows (binding 0), the joint palette (binding 1), the
+//! joint palette, the
 //! global material-parameter arena (binding 2, rebound by the renderer each frame),
 //! the GPU-scene address block (binding 3), and the frame's semantic record stream
 //! (binding 4). [`gather_instance_deformation`] collects each deforming instance's
 //! skin/morph/tessellation work; [`Instancing::wire_gathered_deformations`] uploads
-//! the palettes and wires the dispatches onto the frame's [`SceneDrawList`]. The
+//! the palettes and wires the dispatches onto the frame's [`FrameDeformation`]. The
 //! deformed buffers + dispatch pool live in [`crate::skinning::Skinning`].
 
 use ash::vk;
@@ -15,19 +15,16 @@ use saffron_geometry::glam::{Mat4, UVec4, Vec4};
 
 use crate::descriptors::Descriptors;
 use crate::draw_list::{
-    DeformedRtInstance, MorphDispatch, SceneDrawList, SkinDispatch, SubmeshMaterial,
+    DeformedRtInstance, FrameDeformation, MorphDispatch, SkinDispatch, SubmeshMaterial,
 };
 use crate::frame::MAX_FRAMES_IN_FLIGHT;
-use crate::gpu_types::{InstanceData, MaterialParamsData};
+use crate::gpu_types::MaterialParamsData;
 use crate::resources::{Buffer, DeviceResources, GpuMesh};
 use crate::skinning::{SkinBucket, SkinBufferSet, Skinning, clamp_to_set_budget};
 use crate::tessellation::{TESS_MAX_INSTANCES, TessBucket};
 use crate::{Device, Result};
 
 use std::sync::Arc;
-
-/// Initial instance-buffer capacity (in [`InstanceData`] elements).
-const INITIAL_INSTANCE_CAPACITY: u32 = 256;
 
 /// Initial joint-palette capacity (in [`Mat4`] matrices).
 const INITIAL_JOINT_CAPACITY: u32 = 128;
@@ -56,8 +53,6 @@ pub struct ActiveTarget {
 /// binding the instance + material + current-palette SSBOs.
 struct FrameInstancing {
     set: vk::DescriptorSet,
-    instances: Option<Buffer>,
-    instance_capacity: u32,
     /// The current joint palette (set 2, binding 1): `worldBone * inverseBind` per joint.
     joints: Option<Buffer>,
     joint_capacity: u32,
@@ -72,10 +67,10 @@ struct FrameInstancing {
     active_capacity: u32,
 }
 
-/// The per-frame instance + material storage and the draw-list batcher.
+/// The per-frame material-parameter storage and the instance descriptor sets.
 ///
 /// Built once in [`Instancing::new`] (it allocates one instance set per frame slot),
-/// then mutated only through the deformation wiring + tess-row uploads taking
+/// then mutated only through the deformation wiring taking
 /// `&mut self` plus the device / descriptors. Each [`Buffer`] is a [`crate::Buffer`]
 /// Drop type holding the allocator `Arc`, so the SSBOs free without a live `&Device`.
 pub struct Instancing {
@@ -83,7 +78,7 @@ pub struct Instancing {
     frames: Vec<FrameInstancing>,
 }
 
-/// One deforming instance's frame facts, independent of any draw list: the inputs the
+/// One deforming instance's frame facts: the inputs the
 /// skin/morph/tessellation wiring needs (animation evaluation stays CPU simulation).
 pub struct DeformationWork {
     /// The mesh supplying static + skin/morph streams.
@@ -102,20 +97,13 @@ pub struct DeformationWork {
     pub model: Mat4,
     /// Displacement-tessellation facts when the instance displaces.
     pub displace: Option<DisplaceInfo>,
-    /// The shared PSO base (shader + unlit) for the instance's tess-seam draw.
-    /// Meaningful only when [`DeformationWork::displace`] is set.
-    pub material: crate::Material,
-    /// The resolved submesh materials the tess-seam instance row packs. Empty unless
-    /// the instance displaces.
-    pub submesh_materials: Vec<SubmeshMaterial>,
-    /// The global material-parameter arena index of the instance's slot-0 material
-    /// (the mesh fragments index the arena at set 2, binding 2). Meaningful only for
-    /// a displacing instance's tess-seam row.
-    pub parameter_index: u32,
+    /// The instance's slot in the persistent GPU scene's instance table, or
+    /// [`crate::RT_UNMIRRORED_INSTANCE`] when it is not mirrored. The visibility
+    /// traversal looks a displaced instance's amplification row up by this slot.
+    pub instance_slot: u32,
 }
 
-/// The frame's gathered deformation outputs, shared by the draw-list batcher and the
-/// record-driven frame driver.
+/// The frame's gathered deformation outputs, consumed by the record-driven frame driver.
 #[derive(Default)]
 pub struct DeformationGather {
     /// Per skinned instance: the palette + deformed-slice wiring.
@@ -156,11 +144,8 @@ pub struct TessGatherParams {
 }
 
 /// Gathers one deforming instance's skin/morph/tess work into `gather`, advancing the
-/// deformed cursor exactly as the draw-list batcher does. Returns the instance's
-/// deformed-ring base vertex, or `None` when it claims no slice (not skinned and no
-/// above-threshold morph targets). `base_instance` pairs a tessellation bucket with its
-/// draw batch mid-render.
-#[allow(clippy::too_many_arguments)]
+/// frame's deformed-ring cursor. Returns the instance's deformed-ring base vertex, or
+/// `None` when it claims no slice (not skinned and no above-threshold morph targets).
 pub fn gather_instance_deformation(
     gather: &mut DeformationGather,
     skinning: &mut Skinning,
@@ -168,7 +153,6 @@ pub fn gather_instance_deformation(
     joints: &[Mat4],
     prev_joints: &mut [Mat4],
     params: TessGatherParams,
-    base_instance: u32,
 ) -> Option<u32> {
     let (morph_active, scatter_count) = match work.mesh.morph() {
         Some(morph) if !work.morph_weights.is_empty() => {
@@ -257,7 +241,7 @@ pub fn gather_instance_deformation(
         if work.mesh.conditioning().is_some() {
             gather.tess_buckets.push(TessBucket {
                 mesh: Arc::clone(&work.mesh),
-                base_instance,
+                instance_slot: work.instance_slot,
                 entity: if params.rt_skinned { work.entity } else { 0 },
                 model: work.model,
                 height_index: info.height_index,
@@ -296,8 +280,6 @@ impl Instancing {
             let set = descriptors.allocate_set(descriptors.instance_set_layout())?;
             frames.push(FrameInstancing {
                 set,
-                instances: None,
-                instance_capacity: 0,
                 joints: None,
                 joint_capacity: 0,
                 prev_joints: None,
@@ -318,89 +300,22 @@ impl Instancing {
         self.frames[frame].set
     }
 
-    /// Uploads the tessellation seam's per-instance rows: row `i` serves the frame's
-    /// displaced instance `i` (its tess bucket's `base_instance`), packing the slot-0
-    /// material (the amplified draw covers the whole mesh as one indirect draw) and
-    /// pinning its textures into `list.live_textures`.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`crate::Error`] when the instance or material SSBO fails to grow.
-    #[allow(clippy::too_many_arguments)]
-    pub fn upload_tess_instance_rows(
-        &mut self,
-        descriptors: &Descriptors,
-        skinning: &mut Skinning,
-        frame: usize,
-        rows: &[(u64, Mat4, &[SubmeshMaterial], u32)],
-        default_texture_index: u32,
-        coverage_temporal_phase: u32,
-        list: &mut SceneDrawList,
-    ) -> Result<()> {
-        if rows.is_empty() {
-            return Ok(());
-        }
-        let mut data: Vec<InstanceData> = Vec::with_capacity(rows.len());
-        for (entity, model, materials, parameter_index) in rows {
-            // This frame's previous model: the entity's cached last-frame world
-            // matrix, or the current one when new/uncached (no ghost on frame 1).
-            let prev_model = if *entity != 0 {
-                let prev = skinning.prev_model(*entity).unwrap_or(*model);
-                skinning.commit_model(*entity, *model);
-                prev
-            } else {
-                *model
-            };
-            let material = materials
-                .first()
-                .cloned()
-                .unwrap_or_else(SubmeshMaterial::defaults);
-            let (_, albedo_index, mr_index) = resolve_material_params(
-                &material,
-                default_texture_index,
-                coverage_temporal_phase,
-                &mut list.live_textures,
-            );
-            data.push(InstanceData {
-                model: *model,
-                normal_matrix: crate::normal_matrix(*model),
-                prev_model,
-                base_color: material.base_color,
-                // .w indexes the global material-parameter arena (set 2, binding 2).
-                texture: UVec4::new(albedo_index, 0, mr_index, *parameter_index),
-                pbr: Vec4::new(material.metallic, material.roughness, 0.0, 0.0),
-                emissive: (material.emissive * material.emissive_strength).extend(0.0),
-            });
-        }
-        self.ensure_instance_capacity(descriptors, frame, data.len() as u32)?;
-        upload_into(
-            self.frames[frame]
-                .instances
-                .as_mut()
-                .expect("instance buffer"),
-            bytemuck::cast_slice(&data),
-        );
-        Ok(())
-    }
-
     /// Uploads the frame's palettes and wires the gathered skin/morph/tessellation
-    /// work into `list` — the shared consumer half behind both the draw-list batcher
-    /// and the record-driven frame driver.
+    /// work into `list`, the deformation state the frame's compute and raster passes read.
     #[allow(clippy::too_many_arguments)]
     pub fn wire_gathered_deformations(
         &mut self,
-        descriptors: &Descriptors,
         skinning: &mut Skinning,
         frame: usize,
         gather: DeformationGather,
         joints: &[Mat4],
         prev_joints: Vec<Mat4>,
-        list: &mut SceneDrawList,
+        list: &mut FrameDeformation,
     ) -> Result<()> {
-        // Upload the current joint palette (set 2, binding 1) + the previous palette
-        // (fed to the prev skin dispatch). Only when the scene supplied a palette.
+        // Upload the current joint palette + the previous one (fed to the prev skin
+        // dispatch). Only when the scene supplied a palette.
         if !joints.is_empty() {
-            self.ensure_joint_capacity(descriptors, frame, joints.len() as u32)?;
+            self.ensure_joint_capacity(frame, joints.len() as u32)?;
             upload_into(
                 self.frames[frame].joints.as_mut().expect("joint buffer"),
                 bytemuck::cast_slice(joints),
@@ -491,7 +406,7 @@ impl Instancing {
                 .extend(morph_rt.into_iter().filter(|s| s.entity != 0));
         }
 
-        // Feed the displaced instances' RT entries into the draw list. They ride the
+        // Feed the displaced instances' RT entries into the deformation frame. They ride the
         // transient tessellation buffers (their `tess` slice is filled mid-render by
         // `record_tess_prep`), not the deformed ring — but the deformed buffers must
         // exist for any deform work this frame, so size them to the deform cursor
@@ -523,7 +438,7 @@ impl Instancing {
         deformed_cursor: u32,
         skin_buckets: &mut Vec<SkinBucket>,
         skinned_rt: &mut Vec<DeformedRtInstance>,
-        list: &mut SceneDrawList,
+        list: &mut FrameDeformation,
     ) -> Result<()> {
         let kept = clamp_to_set_budget(skin_buckets.len());
         skin_buckets.truncate(kept);
@@ -569,39 +484,9 @@ impl Instancing {
         Ok(())
     }
 
-    /// Ensures the frame's instance SSBO holds at least `count` [`InstanceData`]
-    /// elements, growing to the next power of two (never shrinking) and rewriting its
-    /// descriptor (set 2, binding 0).
-    fn ensure_instance_capacity(
-        &mut self,
-        descriptors: &Descriptors,
-        frame: usize,
-        count: u32,
-    ) -> Result<()> {
-        if self.frames[frame].instances.is_some() && self.frames[frame].instance_capacity >= count {
-            return Ok(());
-        }
-        let capacity = grow_capacity(
-            self.frames[frame].instance_capacity,
-            INITIAL_INSTANCE_CAPACITY,
-            count,
-        );
-        let size = u64::from(capacity) * size_of::<InstanceData>() as u64;
-        let buffer = make_mapped_storage_buffer(&self.resources, size)?;
-        descriptors.write_storage_buffer(self.frames[frame].set, 0, buffer.handle(), buffer.size());
-        self.frames[frame].instances = Some(buffer);
-        self.frames[frame].instance_capacity = capacity;
-        Ok(())
-    }
-
     /// Ensures the frame's joint palette holds at least `count` [`Mat4`] matrices (same
-    /// grow-only policy), rewriting its descriptor (set 2, binding 1).
-    fn ensure_joint_capacity(
-        &mut self,
-        descriptors: &Descriptors,
-        frame: usize,
-        count: u32,
-    ) -> Result<()> {
+    /// grow-only policy). The skin dispatch sets bind it per instance.
+    fn ensure_joint_capacity(&mut self, frame: usize, count: u32) -> Result<()> {
         if self.frames[frame].joints.is_some() && self.frames[frame].joint_capacity >= count {
             return Ok(());
         }
@@ -612,7 +497,6 @@ impl Instancing {
         );
         let size = u64::from(capacity) * size_of::<Mat4>() as u64;
         let buffer = make_mapped_storage_buffer(&self.resources, size)?;
-        descriptors.write_storage_buffer(self.frames[frame].set, 1, buffer.handle(), buffer.size());
         self.frames[frame].joints = Some(buffer);
         self.frames[frame].joint_capacity = capacity;
         Ok(())
@@ -937,7 +821,6 @@ fn make_mapped_storage_buffer(
 mod tests {
     use super::*;
     use crate::device::SurfaceSource;
-    use crate::draw_list::SubmeshMaterial;
     use crate::resources::BindlessFreeList;
     use crate::skinning::Skinning;
     use crate::upload::Uploader;
@@ -985,10 +868,9 @@ mod tests {
         };
 
         // No skinned work: wiring an empty gather arms nothing.
-        let mut static_list = SceneDrawList::default();
+        let mut static_list = FrameDeformation::default();
         instancing
             .wire_gathered_deformations(
-                &descriptors,
                 &mut skinning,
                 0,
                 DeformationGather::default(),
@@ -1013,9 +895,7 @@ mod tests {
             morph_weights: Vec::new(),
             model: Mat4::IDENTITY,
             displace: None,
-            material: crate::Material::default(),
-            submesh_materials: Vec::new(),
-            parameter_index: 0,
+            instance_slot: 0,
         };
         let mut gather = DeformationGather::default();
         let mut prev = palette.to_vec();
@@ -1026,19 +906,10 @@ mod tests {
             &palette,
             &mut prev,
             params,
-            0,
         );
-        let mut list = SceneDrawList::default();
+        let mut list = FrameDeformation::default();
         instancing
-            .wire_gathered_deformations(
-                &descriptors,
-                &mut skinning,
-                1,
-                gather,
-                &palette,
-                prev,
-                &mut list,
-            )
+            .wire_gathered_deformations(&mut skinning, 1, gather, &palette, prev, &mut list)
             .expect("wire skinned");
         assert_eq!(
             list.skin_dispatches.len(),
@@ -1066,67 +937,6 @@ mod tests {
         drop(list);
         drop(work);
         drop(mesh);
-        drop(instancing);
-        device.wait_idle().expect("idle before teardown");
-        drop(skinning);
-        drop(uploader);
-        drop(descriptors);
-        drop(device);
-    }
-
-    /// A new entity's first frame reads back prev == current (zero motion); a moved
-    /// entity's second frame reflects last frame's pose — the tess-seam instance rows
-    /// read and advance the cross-frame motion cache.
-    #[test]
-    fn cross_frame_motion_caches_track_the_entity() {
-        let Some((device, descriptors, mut instancing, mut skinning, uploader)) = fixture_or_skip()
-        else {
-            return;
-        };
-        let materials = vec![SubmeshMaterial::defaults()];
-        let mut list = SceneDrawList::default();
-
-        // Frame one: a new entity at the origin. Uncached → the cache now holds this
-        // pose (prev == current inside the row).
-        let first = Mat4::IDENTITY;
-        instancing
-            .upload_tess_instance_rows(
-                &descriptors,
-                &mut skinning,
-                0,
-                &[(7, first, materials.as_slice(), 0)],
-                crate::DEFAULT_WHITE_SLOT,
-                0,
-                &mut list,
-            )
-            .expect("frame one");
-        assert_eq!(
-            skinning.prev_model(7),
-            Some(first),
-            "the entity's pose is cached after its first frame"
-        );
-
-        // Frame two: the same entity moved. The row reads frame one's pose before the
-        // cache advances.
-        let second = Mat4::from_translation(Vec3::new(3.0, 0.0, 0.0));
-        instancing
-            .upload_tess_instance_rows(
-                &descriptors,
-                &mut skinning,
-                1,
-                &[(7, second, materials.as_slice(), 0)],
-                crate::DEFAULT_WHITE_SLOT,
-                0,
-                &mut list,
-            )
-            .expect("frame two");
-        assert_eq!(
-            skinning.prev_model(7),
-            Some(second),
-            "the cache advanced to frame two's pose"
-        );
-
-        drop(list);
         drop(instancing);
         device.wait_idle().expect("idle before teardown");
         drop(skinning);

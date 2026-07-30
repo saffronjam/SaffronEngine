@@ -1,6 +1,5 @@
 //! Workspace tooling, run via `cargo run -p xtask <task>`: the `slangc` shader fan-out and the
-//! protocol/codegen emitters. Not shipped; an explicit build step invoked by `just engine` and
-//! the gate.
+//! protocol codegen emitters.
 
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -81,9 +80,8 @@ fn run_gen_protocol() -> Result<()> {
     Ok(())
 }
 
-/// The repository root (`engine/`'s parent): the protocol artifacts live under `editor/` and
-/// `schemas/`, outside the Cargo tree, so the emitter writes against the repo root, not the
-/// workspace.
+/// The repository root: the protocol artifacts live under `editor/` and `schemas/`, outside the
+/// Cargo tree.
 fn workspace_root_repo() -> Result<PathBuf> {
     workspace_root()
         .parent()
@@ -111,7 +109,7 @@ fn run_shaders(args: Vec<String>) -> Result<()> {
     println!("xtask shaders: using slangc {}", config.slangc.display());
     let report = shaders::run(&config)?;
     println!(
-        "xtask shaders: {} compiled, {} up to date, lighting module {} -> {}/shaders",
+        "xtask shaders: {} compiled, {} up to date, shared modules {} -> {}/shaders",
         report.spv_compiled,
         report.spv_skipped,
         if report.module_compiled {
@@ -124,8 +122,7 @@ fn run_shaders(args: Vec<String>) -> Result<()> {
     Ok(())
 }
 
-/// The Cargo workspace root (`engine/`): `xtask`'s manifest dir is `engine/xtask`, so the parent
-/// is the workspace. Independent of the process cwd.
+/// The Cargo workspace root (`engine/`), independent of the process cwd.
 fn workspace_root() -> PathBuf {
     let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     manifest_dir

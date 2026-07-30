@@ -122,13 +122,24 @@ and platform hashes. Its directory records plant tags and exact cell-to-cell con
 Store validation cross-checks the graph outputs, manifest rows, compiled plant headers, tag tables,
 cell headers, section tables, and dependency targets before root publication.
 
-The compiled plant table contains all sixteen required facets: source normalization, part table,
+The compiled plant table contains all seventeen required facets: source normalization, part table,
 geometry, materials and coverage, skeleton and weights, phenotypes, collision, navigation,
 provenance, triangle hierarchy, voxel hierarchy, deformation, page directory, ray-tracing metadata,
-validation, and the distance field. The triangle and voxel sections form one portable hierarchy
-with parent-first page dependencies and a guaranteed drawable root. See
+validation, the distance field, and the texture container. The triangle and voxel sections form one
+portable hierarchy with parent-first page dependencies and a guaranteed drawable root. See
 [virtual geometry](../virtual-geometry/) for its cluster, aggregate, residency, and global GPU
 contracts.
+
+The texture-container section carries the family atlas's texels as a KTX2 container: the declared
+`VkFormat`, the base extent, and a level index over the complete mip chain. Being a standard
+container is the point — the payload states its own format and extent, so the loader uploads what
+the bytes declare instead of what the calling code assumes, and the section can be lifted out and
+opened by any texture tool.
+
+It stores no supercompression of its own, because the section codec already frames the payload at
+the artifact's one pinned zstd profile. Where each slot landed stays in the materials-and-coverage
+section, so the layout and the texels are one atlas published as two sections; a family carrying
+only one half fails the cook.
 
 The distance-field section is what lets a placed plant occlude
 [global illumination](../../global-illumination-and-raytracing/distance-field-reflection-occlusion/):
@@ -168,6 +179,19 @@ selectors, provenance, conflicts, diagnostics, normalized counts, source updates
 dependencies. `plant-recook` runs the same preparation and publishes the validated `.splantc`, with
 an optional platform profile.
 
+## Where the outputs live
+
+Derived artifacts sit in a content-addressed store at `<project>/cache/vegetation/`, beside `assets/`
+rather than inside it, so a catalog scan never reaches them and a copy of the authored assets never
+carries them. Everything under that root is reproducible: delete it and the next cook rebuilds
+byte-identical artifacts, because canonical inputs determine every output identity.
+
+Persistent state is not reproducible, so it has its own root at `<project>/state/vegetation/`. A
+published baseline is a snapshot of runtime mutations that no authored source regenerates, and keeping
+it among disposable artifacts would mean clearing a cache destroys authored work. Those two roots are
+the durability boundary: anything that copies vegetation — an export, a packager — copies both, and
+the export closure lists them separately because they land in different places.
+
 ## Verifying what is on disk
 
 An artifact's file name *is* the hash of its bytes, so verifying the store is a rehash rather than a
@@ -199,7 +223,9 @@ current persistent state as that generation's baseline, behind the same promoted
 takes, and the runtime imports it when it binds the generation — so a shipped world boots into what the
 author saw rather than into an untouched one. The baseline is keyed by the manifest it belongs to,
 because a generation has exactly one starting state, and one that does not decode against that
-generation is a hard error rather than a silent skip.
+generation is a hard error rather than a silent skip. It travels from the durable state root into the
+package's own state root, so a player that clears its artifact cache still boots into the authored
+starting state.
 
 Every packaged plant source whose provenance requires attribution gets a line in the package's
 `ATTRIBUTION.txt`. A licence obligation that lives only in the editor is one the shipped product
@@ -230,6 +256,8 @@ store rather than through the catalog.
 | Staging, journal recovery, and commit | `assets/src/vegetation_cooker.rs` | `stage_vegetation_cook`, `StagedVegetationCook`, `commit_staged_vegetation_cook` |
 | Work plan, claims, and completions | `vegetation/src/cook_work.rs`, `assets/src/vegetation_cooker.rs`, `assets/src/vegetation_store.rs` | `CookWorkManifest`, `CookWorkPayload`, `CookWorkCompletion`, `cook_work_own_input_key`, `run_work_items`, `cook_one_cell`, `claim_work_item`, `sweep_stale_work_claims` |
 | Content-addressed publication | `assets/src/vegetation_store.rs` | `VegetationArtifactStore`, `publish_generation_locked` |
+| Durable persistent-state root | `assets/src/vegetation_state.rs` | `VegetationStateStore`, `publish_baseline`, `read_baseline_if_present` |
+| Export closure over both roots | `assets/src/vegetation_export.rs` | `vegetation_export_closure`, `VegetationExportClosure` |
 | Asynchronous jobs and commands | `control/src/vegetation_cook_jobs.rs`, `control/src/commands_vegetation.rs` | `VegetationCookJobs`, `register_vegetation_commands` |
 
 ## Related

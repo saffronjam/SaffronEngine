@@ -134,8 +134,8 @@ void computeMain(uint3 tid : SV_DispatchThreadID)
     float hysteresis = probeReset(phys) ? 0.0 : pc.params.x;
     // Adaptive convergence (Majercik/RTXGI): when the freshly-integrated irradiance differs strongly
     // from history — a newly-relevant probe as the camera moves — lower the hysteresis so the probe
-    // snaps in over a few frames instead of the flat ~20-frame tail (the "occlusion appears late,
-    // then settles" lag). A luminance-relative delta drives the ramp.
+    // snaps in over a few frames rather than trailing a flat ~20-frame tail. A luminance-relative
+    // delta drives the ramp.
     float lumPrev = dot(prev, float3(0.2126, 0.7152, 0.0722));
     float lumNew = dot(irradiance, float3(0.2126, 0.7152, 0.0722));
     float rel = abs(lumNew - lumPrev) / max(max(lumPrev, lumNew), 1e-4);

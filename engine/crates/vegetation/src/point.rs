@@ -24,7 +24,6 @@ pub struct PointColumnId(pub u32);
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u8)]
 pub enum PointColumnType {
-    /// Opaque 128-bit identifier.
     Id128 = 1,
     /// Hierarchical cell key.
     WorldCell = 2,
@@ -36,17 +35,13 @@ pub enum PointColumnType {
     WorldBounds = 6,
     /// Stable 64-bit asset identity.
     AssetUuid = 7,
-    /// Unsigned 32-bit scalar.
     U32 = 8,
-    /// Unsigned 64-bit scalar.
     U64 = 9,
-    /// Optional opaque 128-bit identifier.
     OptionalId128 = 10,
     /// Closed normalized unsigned scalar.
     Unit = 11,
     /// Three Q15.16 projection coordinates.
     SurfaceProjection = 12,
-    /// Optional stable surface attachment.
     OptionalSurfaceAttachment = 13,
     /// Exact level-zero cell plus three unsigned cell-local ticks.
     WorldPosition = 14,
@@ -57,9 +52,7 @@ pub enum PointColumnType {
 pub struct PointColumnDescriptor {
     /// Stable numeric column identity.
     pub id: PointColumnId,
-    /// Canonical semantic name.
     pub name: &'static str,
-    /// Packed element shape.
     pub element_type: PointColumnType,
 }
 
@@ -135,7 +128,6 @@ pub struct PlantFlags(u32);
 impl PlantFlags {
     /// Explicit authored point rather than cooked procedural acceptance.
     pub const AUTHORED: Self = Self(1 << 0);
-    /// Runtime-created point.
     pub const RUNTIME: Self = Self(1 << 1);
     /// A pin protects the point across graph recooks.
     pub const PINNED: Self = Self(1 << 2);
@@ -143,8 +135,6 @@ impl PlantFlags {
     pub const TRANSFORM_OVERRIDE: Self = Self(1 << 3);
     /// A persistent lifecycle/state override is active.
     pub const STATE_OVERRIDE: Self = Self(1 << 4);
-    /// The plant is alight. Vegetation owns the bit and the fuel it burns; a fire system owns heat
-    /// propagation and smoke.
     pub const IGNITED: Self = Self(1 << 5);
 
     /// Constructs the exact packed bitset, rejecting unknown bits.
@@ -161,13 +151,11 @@ impl PlantFlags {
         Ok(Self(bits))
     }
 
-    /// Packed flag bits.
     #[must_use]
     pub const fn bits(self) -> u32 {
         self.0
     }
 
-    /// Returns the union of two flag sets.
     #[must_use]
     pub const fn union(self, other: Self) -> Self {
         Self(self.0 | other.0)
@@ -232,9 +220,7 @@ pub struct PlantPoint {
     pub bounds: WorldBounds,
     /// Plant-family asset.
     pub family: Uuid,
-    /// Family variation.
     pub variation: u32,
-    /// Typed lifecycle state.
     pub lifecycle: PlantLifecycle,
     /// Species-declared phenotype/life-state variant.
     pub phenotype: u32,
@@ -244,23 +230,17 @@ pub struct PlantPoint {
     pub deterministic_key: u128,
     /// Candidate ordinal in the sampler namespace.
     pub candidate: u64,
-    /// Optional parent plant.
     pub parent: Option<PlantId>,
-    /// Optional colony/root plant.
+    /// Colony or root plant this one belongs to.
     pub colony: Option<PlantId>,
     /// Monotonic biological age tick.
     pub ecology_tick: u64,
-    /// Persistent health.
     pub health: UnitInterval,
-    /// Persistent moisture.
     pub moisture: UnitInterval,
-    /// Persistent fuel.
     pub fuel: UnitInterval,
     /// Current phenotype/calendar phase.
     pub phenology: UnitInterval,
-    /// Authored/runtime flags.
     pub flags: PlantFlags,
-    /// Gameplay interaction policy.
     pub interaction_policy: InteractionPolicy,
     /// Compact provenance-table handle.
     pub provenance: u32,
@@ -297,22 +277,17 @@ impl PlantPoint {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[repr(u32)]
 pub enum PlantLifecycle {
-    /// Dormant seed.
     #[default]
     Seed = 0,
-    /// Emerged sprout.
     Sprout = 1,
-    /// Growing juvenile.
     Juvenile = 2,
-    /// Mature plant.
     Mature = 3,
-    /// Senescent plant.
     Senescent = 4,
-    /// Dead standing/fallen plant.
+    /// Dead but still standing or fallen.
     Dead = 5,
     /// Remaining stump/root structure.
     Stump = 6,
-    /// Persistently removed/tombstoned.
+    /// Persistently removed and tombstoned.
     Removed = 7,
 }
 
@@ -337,9 +312,7 @@ impl TryFrom<u32> for PlantLifecycle {
 /// One registered extension column. IDs below `0x8000_0000` are reserved by the fixed schema.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ExtensionColumn {
-    /// Registered extension ID.
     pub id: PointColumnId,
-    /// Packed element type.
     pub element_type: PointColumnType,
     /// Packed bytes per row.
     pub stride: u32,
@@ -350,9 +323,7 @@ pub struct ExtensionColumn {
 /// One extension-column value projected for a single macro-point row.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PlantPointExtensionValue<'a> {
-    /// Registered extension identity.
     pub id: PointColumnId,
-    /// Packed element type.
     pub element_type: PointColumnType,
     /// Exact canonical bytes for this row.
     pub bytes: &'a [u8],
@@ -361,7 +332,6 @@ pub struct PlantPointExtensionValue<'a> {
 /// One complete macro-point row with its registered extension values.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PlantPointRow<'a> {
-    /// Fixed-schema point value.
     pub point: PlantPoint,
     /// Extension values in canonical column-ID order.
     pub extensions: Vec<PlantPointExtensionValue<'a>>,
@@ -370,57 +340,33 @@ pub struct PlantPointRow<'a> {
 /// Structure-of-arrays canonical CPU point table.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct PlantPointColumns {
-    /// Stable identities.
     pub ids: Vec<PlantId>,
-    /// Canonical owner cells.
     pub owner_cells: Vec<WorldCellKey>,
     /// Exact quantized world positions, independent of logical hierarchy ownership.
     pub positions: Vec<WorldPosition>,
-    /// Quantized orientations.
     pub orientations: Vec<QuantizedOrientation>,
-    /// Fixed scales.
     pub scales: Vec<[DecisionScalar; 3]>,
-    /// Conservative world bounds.
     pub bounds: Vec<WorldBounds>,
-    /// Family assets.
     pub families: Vec<Uuid>,
-    /// Family variations.
     pub variations: Vec<u32>,
-    /// Lifecycle states.
     pub lifecycles: Vec<PlantLifecycle>,
-    /// Phenotypes.
     pub phenotypes: Vec<u32>,
-    /// Representation classes.
     pub representation_classes: Vec<u32>,
-    /// Stable candidate keys.
     pub deterministic_keys: Vec<u128>,
-    /// Candidate ordinals.
     pub candidates: Vec<u64>,
-    /// Parent identities.
     pub parents: Vec<Option<PlantId>>,
-    /// Colony identities.
     pub colonies: Vec<Option<PlantId>>,
-    /// Biological ticks.
     pub ecology_ticks: Vec<u64>,
-    /// Health values.
     pub health: Vec<UnitInterval>,
-    /// Moisture values.
     pub moisture: Vec<UnitInterval>,
-    /// Fuel values.
     pub fuel: Vec<UnitInterval>,
-    /// Phenology values.
     pub phenology: Vec<UnitInterval>,
-    /// Flag sets.
     pub flags: Vec<PlantFlags>,
-    /// Interaction policies.
     pub interaction_policies: Vec<InteractionPolicy>,
-    /// Provenance handles.
     pub provenance: Vec<u32>,
-    /// Surface attachments.
     pub attachments: Vec<Option<SurfaceAttachment>>,
-    /// Surface projection coordinates.
     pub surface_projections: Vec<[DecisionScalar; 3]>,
-    /// Registered packed extension columns.
+    /// Registered packed extension columns, in column-ID order.
     pub extensions: Vec<ExtensionColumn>,
 }
 
@@ -500,7 +446,11 @@ impl PlantPointColumns {
             })?;
         for _ in 0..extension_count {
             let id = PointColumnId(reader.u32()?);
-            let element_type = point_column_type(reader.u8()?)?;
+            let element_type =
+                point_column_type_from_id(reader.u8()?).ok_or_else(|| Error::ArtifactFormat {
+                    format: "vegetation macro points",
+                    field: "extension.elementType".to_owned(),
+                })?;
             let stride = reader.u32()?;
             let byte_length = reader.length()?;
             columns.extensions.push(ExtensionColumn {
@@ -942,26 +892,23 @@ fn read_attachment(reader: &mut BinaryReader<'_>) -> Result<Option<SurfaceAttach
     }
 }
 
-fn point_column_type(value: u8) -> Result<PointColumnType> {
-    match value {
-        1 => Ok(PointColumnType::Id128),
-        2 => Ok(PointColumnType::WorldCell),
-        4 => Ok(PointColumnType::Orientation),
-        5 => Ok(PointColumnType::FixedVec3),
-        6 => Ok(PointColumnType::WorldBounds),
-        7 => Ok(PointColumnType::AssetUuid),
-        8 => Ok(PointColumnType::U32),
-        9 => Ok(PointColumnType::U64),
-        10 => Ok(PointColumnType::OptionalId128),
-        11 => Ok(PointColumnType::Unit),
-        12 => Ok(PointColumnType::SurfaceProjection),
-        13 => Ok(PointColumnType::OptionalSurfaceAttachment),
-        14 => Ok(PointColumnType::WorldPosition),
-        _ => Err(Error::ArtifactFormat {
-            format: "vegetation macro points",
-            field: "extension.elementType".to_owned(),
-        }),
-    }
+pub(crate) fn point_column_type_from_id(value: u8) -> Option<PointColumnType> {
+    Some(match value {
+        1 => PointColumnType::Id128,
+        2 => PointColumnType::WorldCell,
+        4 => PointColumnType::Orientation,
+        5 => PointColumnType::FixedVec3,
+        6 => PointColumnType::WorldBounds,
+        7 => PointColumnType::AssetUuid,
+        8 => PointColumnType::U32,
+        9 => PointColumnType::U64,
+        10 => PointColumnType::OptionalId128,
+        11 => PointColumnType::Unit,
+        12 => PointColumnType::SurfaceProjection,
+        13 => PointColumnType::OptionalSurfaceAttachment,
+        14 => PointColumnType::WorldPosition,
+        _ => return None,
+    })
 }
 
 fn push_optional_id<S: CanonicalSink>(sink: &mut S, id: Option<PlantId>) -> Result<()> {
@@ -992,6 +939,48 @@ fn push_attachment<S: CanonicalSink>(
         None => sink.write_byte(0)?,
     }
     Ok(())
+}
+
+/// A representative sprout at the centre-plus-one tick of `cell`, for tests that need a valid row
+/// rather than a particular one.
+#[cfg(test)]
+pub(crate) fn sample_plant_point(id: PlantId, cell: WorldCellKey) -> PlantPoint {
+    let position = WorldPosition::from_global_ticks(
+        cell.coordinates()
+            .map(|coordinate| i128::from(coordinate) * 262_144 + 1),
+    )
+    .unwrap();
+    PlantPoint {
+        id,
+        owner: cell,
+        position,
+        orientation: QuantizedOrientation::identity(),
+        scale: [DecisionScalar::from_integer(1).unwrap(); 3],
+        bounds: saffron_spatial::WorldBounds::new(
+            position.global_ticks().map(|tick| tick - 1),
+            position.global_ticks().map(|tick| tick + 2),
+        )
+        .unwrap(),
+        family: Uuid(7),
+        variation: 0,
+        lifecycle: PlantLifecycle::Sprout,
+        phenotype: 0,
+        representation_class: 0,
+        deterministic_key: 8,
+        candidate: 9,
+        parent: None,
+        colony: None,
+        ecology_tick: 10,
+        health: UnitInterval::ONE,
+        moisture: UnitInterval::from_bits(20_000),
+        fuel: UnitInterval::from_bits(30_000),
+        phenology: UnitInterval::ZERO,
+        flags: PlantFlags::RUNTIME,
+        interaction_policy: InteractionPolicy::Interactive,
+        provenance: 0,
+        attachment: None,
+        surface_projection: [DecisionScalar::from_bits(0); 3],
+    }
 }
 
 #[cfg(test)]

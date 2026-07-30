@@ -57,6 +57,12 @@ These hold across the whole protocol:
 - **Failures are closed tagged unions.** Every failure carries `code` and `message`; code
   `diagnostic` also carries a tagged domain payload. Rust clients, the native shell, and the schema
   reject unknown fields, while every boundary rejects string-only errors.
+- **A tagged enum carries its discriminant as a field.** `#[serde(tag = "state")]` writes the
+  kebab-case variant name under `state`, beside that variant's camelCase fields; only an untagged
+  enum serializes as `{"Variant": {…}}`. The `ts-rs` derive needs the tag and both renames spelled
+  out again under `#[ts(…)]`, so `every_tagged_union_carries_its_tag_in_typescript` compares the
+  schema fragment against the emitted declaration and fails when the TypeScript describes a shape
+  no reply carries.
 
 Component bodies and the scene environment come from the Rust scene DTOs. `inspect.components` is
 validated as a registry-keyed map of component DTOs, and `set-component.json` is the generated
@@ -68,13 +74,13 @@ validated as a registry-keyed map of component DTOs, and `set-component.json` is
 |---|---|---|
 | DTO source of truth | `engine/crates/protocol/src/` | the params/result DTOs and `ControlFailureDto` |
 | Wire id newtype | `engine/crates/protocol/src/uuid.rs` | `Uuid` (decimal-string serde + `JsonSchema`) |
-| Static command table | `engine/crates/protocol/src/command.rs` | `COMMANDS`, `CommandSpec`, `COMMAND_FIXTURES`, `COMMAND_SKIPS` |
+| Static command table | `engine/crates/protocol/src/command/` | `COMMANDS`, `CommandSpec`, `COMMAND_FIXTURES`, `COMMAND_SKIPS` |
 | OpenRPC + positional order | `engine/crates/protocol/src/schema.rs` | `fragment_for`, `positional_field_order`, `standalone_schema_for` |
 | Codegen surface | `engine/crates/protocol/src/codegen.rs` | `ts_decls`, `schema_fragments` |
 | Typed command registration | `engine/crates/control/src/registry.rs` | `CommandRegistry::register`, `fold_positional_args` |
 | Generator (xtask) | `engine/xtask/src/protocol/mod.rs` | `emit`, `emit_envelope_schema`, `emit_openrpc`, `emit_manifest` |
 | Editor protocol types | `editor/src/protocol/sa-types.ts` | `WireUuid`, `CommandParamsMap`, `CommandResultMap` |
-| Contract / freshness tests | `engine/crates/protocol/tests/`, `engine/crates/e2e/tests/contract_u64.rs` | `inventory`, `wire`, `schema_fragments`, the byte-identity tests, `contract_u64` |
+| Contract / freshness tests | `engine/crates/protocol/tests/`, `engine/crates/protocol/src/codegen.rs`, `engine/crates/e2e/tests/contract_u64.rs` | `inventory`, `wire`, `schema_fragments`, `every_tagged_union_carries_its_tag_in_typescript`, the byte-identity tests, `contract_u64` |
 
 ## Related
 

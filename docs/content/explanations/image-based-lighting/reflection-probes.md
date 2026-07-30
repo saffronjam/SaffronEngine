@@ -91,12 +91,12 @@ The CPU bit-casts the active record count into `LightUbo.ambient_color.w`. `sa s
 | What | File | Symbols |
 |---|---|---|
 | Scene component | `engine/crates/scene/src/component.rs` | `ReflectionProbe` |
-| Save and load | `engine/crates/scene/src/serde.rs` | `SceneSerialize for ReflectionProbe`, `to_json`, `load_json` |
-| Scene gathering | `engine/crates/assets/src/render_scene.rs` | `gather_reflection_probes` |
-| Upload and metadata | `engine/crates/rendering/src/ibl.rs` | `ReflectionProbeUpload`, `ProbeMetaGpu`, `ReflectionProbes::submit`, `ReflectionProbes::prepare_frame` |
-| Descriptor slots | `engine/crates/rendering/src/ibl.rs` | `ReflectionProbes::seed`, `ReflectionProbes::refresh_fallbacks`, `ReflectionProbes::write_slot` |
+| Save and load | `engine/crates/scene/src/serde/` | `SceneSerialize for ReflectionProbe`, `to_json`, `load_json` |
+| Scene gathering | `engine/crates/assets/src/render_scene/` | `gather_reflection_probes` |
+| Upload and metadata | `engine/crates/rendering/src/ibl/` | `ReflectionProbeUpload`, `ProbeMetaGpu`, `ReflectionProbes::submit`, `ReflectionProbes::prepare_frame` |
+| Descriptor slots | `engine/crates/rendering/src/ibl/` | `ReflectionProbes::seed`, `ReflectionProbes::refresh_fallbacks`, `ReflectionProbes::write_slot` |
 | Shader selection | `engine/assets/shaders/lighting.slang` | `ProbeMeta`, `boxProject`, `probeCubes`, `probeIrradiance`, `probeMeta` |
-| Control commands | `engine/crates/control/src/commands_render.rs` | `set-probes`, `recapture-probes`, `list-probes` |
+| Control commands | `engine/crates/control/src/commands_render/` | `set-probes`, `recapture-probes`, `list-probes` |
 
 ## Related
 

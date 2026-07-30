@@ -11,8 +11,8 @@ The public surface of `saffron-rendering`. The `Renderer` owns the instance/devi
 | What | File | Symbols |
 |---|---|---|
 | The renderer | `renderer.rs` | `Renderer`, `Renderer::new`, `ViewId`, `ViewMode`, `RenderStatsFull` |
-| GPU-facing data types | `gpu_types.rs` | `Material`, `InstanceData`, `GpuLight`, `MaterialParamsData` |
-| Frame draw state | `draw_list.rs` | `SceneDrawList`, `SubmeshMaterial`, `TessSceneDraw`, `RenderStats` |
+| GPU-facing data types | `gpu_types.rs` | `Material`, `GpuLight`, `MaterialParamsData`, `SdfInstance` |
+| Frame deformation state | `draw_list.rs` | `FrameDeformation`, `SubmeshMaterial`, `RenderStats` |
 | Lighting inputs | `lighting.rs` | `SceneLighting`, `ClusterCamera` |
 | Upload | `upload.rs` | `Uploader`, `GpuQueue` |
 
@@ -57,7 +57,7 @@ The renderer keeps `VIEW_COUNT` views (`ViewId::Scene` and `ViewId::AssetPreview
 | `stats() -> RenderStats` / `render_stats() -> RenderStatsFull` | last frame's draw counters / counters + timing + flags |
 | `pipeline_count() -> u32` | distinct cached mesh PSOs |
 
-`pipelines()` returns `&mut Pipelines`; `Pipelines::request_mesh_pipeline(material, …)` is the PSO-cache front door (build-and-cache on first request).
+`pipelines()` returns `&mut Pipelines`; `Pipelines::request_executor_mesh_pipeline(material, …)` is the PSO-cache front door (build-and-cache on first request).
 
 ## Lighting
 
@@ -123,15 +123,14 @@ Mesh and texture upload go through `Uploader::upload_mesh(mesh, skin) -> Result<
 
 | Type | Fields (abridged) |
 |---|---|
-| `Material` | `shader: String` (default `"shaders/mesh.spv"`); `unlit: bool` |
-| `DeformationWork` | `mesh: Arc<GpuMesh>`; `model: Mat4`; `skinned: bool`; `joint_offset`, `joint_count: u32`; `morph_weights: Vec<f32>`; `displace: Option<DisplaceInfo>`; `submesh_materials: Vec<SubmeshMaterial>`; `parameter_index: u32`; `entity: u64` |
+| `Material` | `shader: String` (default `"shaders/mesh.spv"`); `unlit`, `blend`, `masked: bool` |
+| `DeformationWork` | `mesh: Arc<GpuMesh>`; `model: Mat4`; `skinned: bool`; `joint_offset`, `joint_count: u32`; `morph_weights: Vec<f32>`; `displace: Option<DisplaceInfo>`; `instance_slot: u32`; `entity: u64` |
 | `SubmeshMaterial` | the per-submesh textures (`Option<Arc<GpuTexture>>`) + `base_color`, `metallic`, `roughness`, `emissive`, UV / normal / alpha factors |
 | `RenderStats` | `draw_calls`, `batches`, `instances`, `triangles`, `descriptor_binds`, `command_buffers`, `queue_submits`, `pipelines_created: u32` |
-| `InstanceData` | std430: `model`, `normal_matrix`, `prev_model: Mat4`; `base_color: Vec4`; `texture: UVec4` (.x = bindless albedo); `pbr`, `emissive: Vec4` |
 | `GpuLight` | `position_range`, `color_intensity`, `direction_type` (.w: 0 = point, 1 = spot), `spot_cos: Vec4` |
 
 ## Related
 
 - [Render seams](../../explanations/app-lifecycle-and-window/the-submit-and-rendergraph-seams/) — how `submit` feeds the frame
-- [Material and PSO selection](../../explanations/materials-and-pipelines/material-and-pso-selection/) — what `request_mesh_pipeline` keys on
+- [Material and PSO selection](../../explanations/materials-and-pipelines/material-and-pso-selection/) — what `request_executor_mesh_pipeline` keys on
 - [Meta-layer resources](../../explanations/vulkan-foundation/meta-layer-resources/) — `Arc<GpuMesh>` / `GpuTexture` ownership

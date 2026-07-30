@@ -1,88 +1,56 @@
-// Triangle↔voxel parity: a plant drawn as aggregate voxels must look like the same plant drawn as
-// triangles, from the same camera.
+// Triangle-versus-voxel parity: a plant drawn as aggregate voxels must look like the same plant
+// drawn as triangles, from the same camera.
 //
-// THE OBVIOUS TEST IS THE WRONG ONE. The hierarchy cut is chosen by projected appearance error, so
-// the only way to reach the aggregate form in a normal frame is to fly the camera away — which
-// shrinks the subject at the same moment it coarsens it. Differencing those two frames measures
-// "the plant got smaller" and "the plant is drawn differently" together, and cannot separate them.
+// The hierarchy cut is chosen by projected appearance error, so the only way to reach the aggregate
+// form in a normal frame is to fly the camera away, which shrinks the subject at the same moment it
+// coarsens it. Differencing those frames measures "the plant got smaller" and "the plant is drawn
+// differently" together.
 //
-// So the cut is pinned instead. `SAFFRON_CUT_OVERRIDE` forces the traversal to stop refining
-// (`coarse`, where aggregate voxels live) or to refine fully (`fine`, triangle clusters), leaving
-// the camera, the scene, the lighting and the wind identical between the two runs. One thing
-// changes, which is the only arrangement under which the difference means anything.
+// So the cut is pinned: `SAFFRON_CUT_OVERRIDE` forces the traversal to stop refining (`coarse`,
+// where aggregate voxels live) or refine fully (`fine`, triangle clusters), leaving camera, scene,
+// lighting, and wind identical between runs.
 //
-// The bound is deliberately loose. An aggregate voxel is a *different representation*, not a
+// The bound is loose because an aggregate voxel is a different representation, not a
 // finer-quantized one: it replaces a stack of leaves with occupancy-weighted matter, so silhouettes
-// and high-frequency detail genuinely differ. What must NOT differ is gross energy — the plant
-// cannot become markedly brighter or darker when it crosses the transition, which is the artifact
-// the derived parity occupancy exists to prevent. The assertion is therefore on mean brightness,
-// not on per-pixel agreement, and the control below shows the frames really are two different
-// pictures rather than one.
+// and high-frequency detail genuinely differ. What must not differ is gross energy — the plant
+// cannot become markedly brighter or darker across the transition — so the assertion is on mean
+// brightness, with a control showing the frames really are two different pictures.
 
 import { afterAll, beforeAll, expect, test } from "bun:test";
-import { readFileSync } from "node:fs";
-import { dirname, join } from "node:path";
-import { fileURLToPath } from "node:url";
-import type {
-  EntityRef,
-  ImportVegetationAssetResult,
-  VegetationCookJobDto,
-  VegetationRuntimeQueryResult,
-} from "@saffron/protocol";
+import type { VegetationRuntimeQueryResult } from "@saffron/protocol";
 import { Engine } from "./harness.ts";
-import { Cleaner, captureViewport, prepareScene, trackEntity } from "./test-utils.ts";
-import { authoredAssets, awaitCook, installTrunkObj, type VegetationFixture } from "./vegetation-utils.ts";
+import { Cleaner, captureViewport, prepareScene } from "./test-utils.ts";
+import {
+  BOUNDS,
+  bindVegetationField,
+  cookCells,
+  importVegetationPackage,
+  loadFixture,
+} from "./vegetation-utils.ts";
 import { decodeRgb8Png, meanAbsoluteDifference, regionMean } from "./image.ts";
 
-const HERE = dirname(fileURLToPath(import.meta.url));
-const FIXTURE_PATH = join(HERE, "fixtures", "vegetation-phase3.json");
-const CELL = { coordinates: ["0", "0", "0"], level: 0 } as const;
-const BOUNDS = {
-  minTicks: ["0", "0", "0"],
-  maxTicksExclusive: ["262144", "262144", "262144"],
-} as const;
-
-/// The pose both runs render from, framing a cooked plant.
+// The pose both runs render from, framing a cooked plant.
 const CAMERA = { position: { x: 16, y: 4, z: 22 }, yaw: 0, pitch: 0 };
 
-/// Mean brightness (0-255) the two representations may differ by over the whole frame. Energy
-/// parity is the claim; silhouette and detail are expected to differ. Measured: 2.93, against a
-/// whole-frame difference of 8.97 between the same two captures — so the frames are visibly
-/// different pictures carrying the same amount of light, which is exactly the claim.
+// Mean brightness (0-255) the two representations may differ by over the whole frame. Energy
+// parity is the claim; silhouette and detail are expected to differ. Measured: 2.93, against a
+// whole-frame difference of 8.97 between the same two captures — so the frames are visibly
+// different pictures carrying the same amount of light, which is exactly the claim.
 const BRIGHTNESS_TOLERANCE = 6;
 
 const cleaner = new Cleaner();
 const frames: Record<string, Buffer> = {};
 
-/// Boots a host with the cut pinned, cooks the fixture cell, and captures one settled frame.
+// Boots a host with the cut pinned, cooks the fixture cell, and captures one settled frame.
 async function captureWithCut(cut: "coarse" | "fine"): Promise<Buffer> {
   const engine = await Engine.boot({ SAFFRON_SCRATCH_PROJECT: "1", SAFFRON_CUT_OVERRIDE: cut });
   cleaner.defer(() => engine.shutdown());
   await prepareScene(engine, { width: 480, height: 270 });
 
-  const fixture = JSON.parse(readFileSync(FIXTURE_PATH, "utf8")) as VegetationFixture;
-  const sources = authoredAssets(cleaner, fixture, `repr-${cut}`);
-  await installTrunkObj(engine, fixture);
-  for (const path of [sources.plant, sources.biome, sources.map]) {
-    await engine.call<ImportVegetationAssetResult>("import-vegetation-asset", { path });
-  }
-  const world = trackEntity(
-    cleaner,
-    engine,
-    await engine.call<EntityRef>("create-entity", { name: `Representation ${cut}` }),
-  );
-  await engine.call("add-component", { entity: world.id, component: "VegetationField" });
-  await engine.call("set-component", {
-    entity: world.id,
-    component: "VegetationField",
-    json: { map: fixture.map, enabled: true },
-  });
-  const cook = await engine.call<VegetationCookJobDto>("vegetation-cook", {
-    map: fixture.map,
-    scope: { kind: "cells", cells: [CELL] },
-    workers: 1,
-  });
-  await awaitCook(engine, cook.job);
+  const fixture = loadFixture("vegetation-phase3");
+  await importVegetationPackage(engine, cleaner, fixture, `repr-${cut}`);
+  const world = await bindVegetationField(engine, cleaner, fixture, `Representation ${cut}`);
+  await cookCells(engine, fixture.map);
 
   await engine.call("set-camera", CAMERA);
   await engine.call("set-wind", { speed: 0, gust: 0 });

@@ -29,8 +29,8 @@ exponential average — one multiply per stage, no history to walk.
 
 ```sh
 sa vegetation-telemetry
-#   last     residency=0.42ms  promotion=0.00ms  collision=0.11ms  nav=0.03ms  ecology=0.00ms  total=0.56ms
-#   average  residency=0.39ms  promotion=0.01ms  collision=0.09ms  nav=0.04ms  ecology=0.00ms  total=0.53ms
+#   last     residency=0.42ms  promotion=0.00ms  collision=0.11ms  nav=0.03ms  ecology=0.18ms  total=0.74ms
+#   average  residency=0.39ms  promotion=0.01ms  collision=0.09ms  nav=0.04ms  ecology=0.06ms  total=0.59ms
 #   syncs=1284  queries=17 (hits 402)  mutations=3 (612 bytes)  snapshots=1 (48210 bytes)  ecologyTicks=96
 #   bodies=142  navContributions=88  promoted=1
 #   cook live=0  submitted=9  completed=8  cancelled=1  superseded=0  failed=0
@@ -45,7 +45,8 @@ Each is incremented where the work happens, so the count cannot drift from the w
   expensive;
 - a mutation records the exact canonical bytes the reducer hashed, not the JSON the wire carried;
 - a snapshot records the bytes it produced;
-- an ecology tick records itself as it executes.
+- an ecology tick records itself as it executes, whether the world clock earned it or an explicit
+  step asked for it.
 
 Resident bytes by facet, collision bodies, navigation contributions, and promoted plants come from the
 authorities that already track them, so the telemetry command adds no bookkeeping of its own.

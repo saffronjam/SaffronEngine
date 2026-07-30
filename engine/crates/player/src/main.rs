@@ -1,10 +1,9 @@
 //! `saffron-player`: the standalone runtime that runs an exported Saffron app.
 //!
-//! It loads a project from the exported runtime data directory: beside its executable on Linux, or
-//! under `Contents/Resources` in a macOS application bundle. It opens a real window and runs the
-//! scene as a live simulation through the shared [`saffron_runtime::RuntimeSession`]. It links none
-//! of the editor stack. Material shaders are loaded pre-baked (`.spv`); the player never invokes
-//! `slangc`.
+//! It loads a project from the exported runtime data directory — beside its executable on Linux, or
+//! under `Contents/Resources` in a macOS application bundle — and runs the scene as a live simulation
+//! through the shared [`saffron_runtime::RuntimeSession`]. It links none of the editor stack, and
+//! loads material shaders pre-baked as `.spv`, so it never invokes `slangc`.
 
 #![deny(unsafe_code)]
 
@@ -44,8 +43,8 @@ fn main() -> ExitCode {
         manifest.height,
         project_dir.display()
     );
-    // The window backend presents FIFO and has no fullscreen path, so surface unsupported manifest
-    // settings instead of silently dropping them.
+    // The window backend presents FIFO and has no fullscreen path, so an unsupported manifest
+    // setting is surfaced rather than silently dropped.
     if manifest.fullscreen {
         tracing::warn!(
             "saffron-player: fullscreen requested but the window backend does not support it"
@@ -88,7 +87,7 @@ fn resolve_project_dir() -> PathBuf {
     )
 }
 
-/// The pure precedence logic behind [`resolve_project_dir`].
+/// The precedence logic behind [`resolve_project_dir`], without the environment reads.
 fn resolve_project_dir_from(
     arg: Option<String>,
     env: Option<String>,
@@ -124,8 +123,8 @@ fn platform_project_dir(executable_dir: &Path) -> PathBuf {
     executable_dir.to_path_buf()
 }
 
-/// Reads `app.json` from the project directory, falling back to defaults (field-by-field via
-/// `#[serde(default)]`) when it is absent or unparseable.
+/// Reads `app.json` from the project directory, falling back field-by-field to defaults when it is
+/// absent or unparseable.
 fn load_manifest(dir: &Path) -> AppManifest {
     let path = dir.join("app.json");
     match std::fs::read_to_string(&path) {
@@ -143,9 +142,8 @@ fn load_manifest(dir: &Path) -> AppManifest {
     }
 }
 
-/// The [`ProjectHost`] adapter over the renderer, for `AssetServer::load_project` (the GPU-idle +
-/// render-settings serde it needs). Wraps `&mut Renderer` directly — the player has no control
-/// plane to route through.
+/// The [`ProjectHost`] adapter `AssetServer::load_project` needs. It wraps `&mut Renderer` directly,
+/// because the player has no control plane to route through.
 struct PlayerProjectHost<'a> {
     renderer: &'a mut Renderer,
 }
@@ -166,9 +164,7 @@ impl ProjectHost for PlayerProjectHost<'_> {
     }
 }
 
-/// The player's single [`Layer`]: loads the project + starts the runtime on attach, advances the
-/// simulation each update, renders the scene through its primary camera each frame, and tears the
-/// runtime down before the renderer drops.
+/// The player's single [`Layer`].
 struct PlayerLayer {
     project_dir: PathBuf,
     manifest: AppManifest,
@@ -179,9 +175,8 @@ struct PlayerLayer {
     registry: ComponentRegistry,
     project: ProjectInfo,
     uploader: Option<Uploader>,
-    /// The journal-driven bridge feeding the renderer's persistent GPU scene.
     gpu_scene_mirror: GpuSceneMirror,
-    /// The gameplay input, shared with the window-signal closures that mutate it.
+    /// Shared with the window-signal closures that mutate it.
     input: Rc<RefCell<ScriptInputState>>,
     started: bool,
     warned_no_camera: bool,
@@ -207,13 +202,12 @@ impl PlayerLayer {
         }
     }
 
-    /// Writes the rendered frame to the path in `SAFFRON_CAPTURE_FRAME`, overwriting it each
-    /// frame so the file holds the last one rendered.
+    /// Writes the rendered frame to the path in `SAFFRON_CAPTURE_FRAME`, overwriting it each frame
+    /// so the file holds the last one rendered.
     ///
-    /// The test seam that lets the player's output be compared against the host's — the player
-    /// has no control plane to ask for a screenshot, and pairs with `SAFFRON_EXIT_AFTER_FRAMES`
-    /// to make a bounded run produce one deterministic image. Unset (every real run) it is a
-    /// single env read.
+    /// The player has no control plane to ask for a screenshot, so this is the seam that lets its
+    /// output be compared against the host's. Paired with `SAFFRON_EXIT_AFTER_FRAMES` it makes a
+    /// bounded run produce one deterministic image.
     fn capture_frame(&mut self, renderer: &mut Renderer) {
         let Some(path) = std::env::var_os("SAFFRON_CAPTURE_FRAME") else {
             return;
@@ -228,7 +222,7 @@ impl PlayerLayer {
         }
     }
 
-    /// Lazily builds the one-off uploader from the renderer's device + queue (asset GPU uploads).
+    /// Lazily builds the one-off uploader for asset GPU uploads.
     fn ensure_uploader(&mut self, renderer: &Renderer) {
         if self.uploader.is_some() {
             return;
@@ -240,7 +234,7 @@ impl PlayerLayer {
         }
     }
 
-    /// Routes the runtime's buffered script logs/errors to the console.
+    /// Routes the runtime's buffered script logs and errors to the console.
     fn drain_logs(&mut self) {
         for line in self.runtime.take_logs() {
             tracing::info!("[script] {}", line.message);
@@ -302,7 +296,7 @@ impl PlayerLayer {
     }
 
     /// Subscribes the window input signals into the shared [`ScriptInputState`]: held keys via the
-    /// typed key signals, mouse position/buttons/scroll via the raw-event signal.
+    /// typed key signals, mouse state via the raw-event signal.
     fn wire_input(&self, window: &Window) {
         let input = Rc::clone(&self.input);
         window.on_key_pressed.subscribe(move |(key, _repeat)| {
@@ -362,7 +356,6 @@ impl Layer for PlayerLayer {
             }
         }
 
-        // Start the live simulation (build the Jolt world + script VM from the loaded scene).
         let project_dir = self.project_dir.clone();
         self.runtime
             .start(&mut self.scene, &mut self.assets, &project_dir);
@@ -402,7 +395,7 @@ impl Layer for PlayerLayer {
         let Some(renderer) = app.frame_host.renderer_mut() else {
             return;
         };
-        // Track the window size so the offscreen the present blits from is native-resolution.
+        // Track the window size so the offscreen the present blits from stays native-resolution.
         if let Some(window) = app.window.as_ref() {
             let view = renderer.active_view_id();
             let _ = renderer.set_viewport_desired_size(view, window.width(), window.height());
@@ -463,7 +456,7 @@ impl Layer for PlayerLayer {
                 &mut driver,
                 &mut self.scene,
                 &mut self.assets,
-                &self.gpu_scene_mirror,
+                &mut self.gpu_scene_mirror,
                 &cam,
                 options,
             );
@@ -479,24 +472,23 @@ impl Layer for PlayerLayer {
     }
 
     fn on_detach(&mut self, _app: &mut App) {
-        // Teardown order mirrors the host's, before the renderer drops (the loop already idled the
-        // GPU): stop scripts → drop the world → shut down the Jolt globals → release GPU caches so
-        // the last `Arc<GpuMesh>`/`Arc<GpuTexture>` drops under a live-but-idle device.
+        // Teardown order mirrors the host's: stop scripts, drop the world, shut down the Jolt
+        // globals, then release the GPU caches, so the last `Arc<GpuMesh>`/`Arc<GpuTexture>` drops
+        // under a live-but-idle device. The loop already idled the GPU.
         self.runtime.stop_scripts();
         self.runtime.drop_physics_world();
         self.runtime.shutdown_physics_globals();
         self.uploader = None;
         self.assets.clear_asset_caches();
-        // The mirror retains `Arc<GpuMesh>`/`Arc<GpuTexture>` clones for its mirrored prototypes
-        // and interned textures; they must release with the rest, or the device outlives its own
-        // destruction and the driver faults inside `vkDestroyInstance`.
+        // The mirror retains `Arc<GpuMesh>`/`Arc<GpuTexture>` clones for its prototypes and
+        // interned textures. They must release with the rest, or the driver faults inside
+        // `vkDestroyInstance`.
         self.gpu_scene_mirror = GpuSceneMirror::new();
     }
 }
 
-/// Maps a winit physical key to the lowercase name scripts read from `sa.input` (matching the
-/// control plane's `to_ascii_lowercase` convention): letters → `"a"`..`"z"`, digits → `"0"`..`"9"`,
-/// plus the common named/movement/modifier keys. Unmapped keys are ignored.
+/// Maps a winit physical key to the lowercase name scripts read from `sa.input`, matching the control
+/// plane's `to_ascii_lowercase` convention. Unmapped keys are ignored.
 fn key_name(key: PhysicalKey) -> Option<String> {
     let PhysicalKey::Code(code) = key else {
         return None;
@@ -528,9 +520,8 @@ fn key_name(key: PhysicalKey) -> Option<String> {
     Some(name.to_string())
 }
 
-/// Folds a raw mouse [`WindowEvent`] into the gameplay input: cursor position, button held-set,
-/// and accumulated scroll. Keyboard events are handled by the typed signals, so they are ignored
-/// here.
+/// Folds a raw mouse [`WindowEvent`] into the gameplay input. Keyboard events arrive through the
+/// typed signals, so they are ignored here.
 fn apply_mouse_event(input: &mut ScriptInputState, event: &WindowEvent) {
     match event {
         WindowEvent::CursorMoved { position, .. } => {
@@ -559,7 +550,7 @@ fn apply_mouse_event(input: &mut ScriptInputState, event: &WindowEvent) {
     }
 }
 
-/// The lowercase name for a mouse button (`"left"`/`"right"`/`"middle"`); others are ignored.
+/// The lowercase name for a mouse button; others are ignored.
 fn mouse_button_name(button: MouseButton) -> Option<String> {
     Some(
         match button {
@@ -585,7 +576,7 @@ mod tests {
 
     #[test]
     fn key_name_maps_letters_lowercased() {
-        // Pins the `Key<Letter>` Debug contract: winit's `KeyA`..`KeyZ` decode to `"a"`..`"z"`.
+        // Pins the `Key<Letter>` Debug contract that the mapping parses.
         assert_eq!(key_name(code(KeyCode::KeyA)).as_deref(), Some("a"));
         assert_eq!(key_name(code(KeyCode::KeyW)).as_deref(), Some("w"));
         assert_eq!(key_name(code(KeyCode::KeyZ)).as_deref(), Some("z"));
@@ -593,7 +584,7 @@ mod tests {
 
     #[test]
     fn key_name_maps_digits() {
-        // Pins the `Digit<N>` Debug contract: winit's `Digit0`..`Digit9` decode to `"0"`..`"9"`.
+        // Pins the `Digit<N>` Debug contract that the mapping parses.
         assert_eq!(key_name(code(KeyCode::Digit0)).as_deref(), Some("0"));
         assert_eq!(key_name(code(KeyCode::Digit5)).as_deref(), Some("5"));
         assert_eq!(key_name(code(KeyCode::Digit9)).as_deref(), Some("9"));
@@ -616,7 +607,7 @@ mod tests {
             key_name(code(KeyCode::ArrowRight)).as_deref(),
             Some("right")
         );
-        // Both physical sides collapse to a single modifier name.
+
         assert_eq!(key_name(code(KeyCode::ShiftLeft)).as_deref(), Some("shift"));
         assert_eq!(
             key_name(code(KeyCode::ShiftRight)).as_deref(),
@@ -636,9 +627,8 @@ mod tests {
 
     #[test]
     fn key_name_ignores_unmapped_and_non_code_keys() {
-        // A physical key whose Debug is neither `Key*` nor `Digit*` and has no explicit arm.
         assert_eq!(key_name(code(KeyCode::F1)), None);
-        // A non-`Code` physical key (no scancode-to-name mapping) is dropped.
+
         assert_eq!(
             key_name(PhysicalKey::Unidentified(NativeKeyCode::Unidentified)),
             None
@@ -698,7 +688,6 @@ mod tests {
         );
         assert!(!input.mouse_buttons.contains("left"));
 
-        // An unmapped button never enters the held-set.
         apply_mouse_event(
             &mut input,
             &WindowEvent::MouseInput {
@@ -729,7 +718,7 @@ mod tests {
                 phase: TouchPhase::Moved,
             },
         );
-        // Both notch and pixel deltas fold into the same running total.
+
         assert_eq!(input.scroll, 1.0);
     }
 
@@ -797,7 +786,7 @@ mod tests {
         let manifest = load_manifest(&dir);
         assert_eq!(manifest.title, "My Game");
         assert_eq!(manifest.width, 800);
-        // Absent fields fall back field-by-field to `AppManifest::default`.
+
         assert_eq!(manifest.height, AppManifest::default().height);
         assert_eq!(manifest.vsync, AppManifest::default().vsync);
 
@@ -812,10 +801,8 @@ mod tests {
         ));
         std::fs::create_dir_all(&dir).expect("create temp dir");
 
-        // Missing file → defaults.
         assert_eq!(load_manifest(&dir), AppManifest::default());
 
-        // Present but unparseable → defaults.
         std::fs::write(dir.join("app.json"), "not json").expect("write app.json");
         assert_eq!(load_manifest(&dir), AppManifest::default());
 

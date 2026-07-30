@@ -26,12 +26,12 @@ async function vsm() {
   return stats.vsm;
 }
 
-/// Renders until the atlas has rasterized at least one page, returning the PEAK of each counter
-/// across the wait rather than one frame's sample.
-///
-/// Every counter describes a single frame, and they do not peak together: a page is allocated on
-/// the frame that first demands it and rasterized on a later one. The peak is what lets an
-/// assertion talk about the window instead of whichever frame the poll landed on.
+// Renders until the atlas has rasterized at least one page, returning the PEAK of each counter
+// across the wait rather than one frame's sample.
+//
+// Every counter describes a single frame, and they do not peak together: a page is allocated on
+// the frame that first demands it and rasterized on a later one. The peak is what lets an
+// assertion talk about the window instead of whichever frame the poll landed on.
 async function awaitRenderedPages(timeoutMs = 20_000) {
   const deadline = Date.now() + timeoutMs;
   const peak = { requested: 0, hits: 0, allocated: 0, rendered: 0, dirtied: 0, overflow: 0 };

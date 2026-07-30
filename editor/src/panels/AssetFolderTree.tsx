@@ -1,9 +1,6 @@
-/// The folder sidebar of the Assets panel: a pinned Root row plus the virtual-folder
-/// forest built client-side from the flat `assetFolders` path list. Rows navigate on
-/// click, expand via the twisty, accept asset drops (`move-asset`), and carry the
-/// same New Folder / Rename / Delete commands as the grid tiles. Expand state is
-/// local, with an ancestor-reveal effect so tile, breadcrumb, and history navigation
-/// never lands inside a collapsed branch.
+/// The Assets panel's folder sidebar: a pinned Root row plus the virtual-folder forest built from
+/// the flat `assetFolders` path list. Expand state is local, with an ancestor-reveal effect so tile,
+/// breadcrumb, and history navigation never lands inside a collapsed branch.
 import { useEffect, useMemo, useRef, useState } from "react";
 import { ChevronRight, Folder, FolderPlus, Pen, Trash } from "lucide-react";
 import {

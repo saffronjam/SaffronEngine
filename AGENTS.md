@@ -324,9 +324,10 @@ a feature — follow and update a matching plan rather than starting cold.
 ## Status
 
 - **Built** (per-concept reference is `docs/`): the full forward+ PBR pipeline — clustered lighting, IBL,
-  shadows (directional/spot/point/contact/ray-traced), DDGI + voxel GI + SSGI + ReSTIR, GTAO, TAA, motion
+  shadows through one physical-atlas virtual shadow map (directional/spot/point page-allocated in the
+  `vsm-pages` pass, plus contact and ray-traced), DDGI + voxel GI + SSGI + ReSTIR, GTAO, TAA, motion
   vectors, tonemap, MSAA/FXAA; bindless + instanced rendering with an übershader/PSO cache; the render
-  graph; hecs scene + registry-driven JSON project format with scene-graph parenting (a `Relationship`
+  graph with async-compute pass scheduling; hecs scene + registry-driven JSON project format with scene-graph parenting (a `Relationship`
   component, parent-composed world transforms, and a `set-parent` reparent command); glTF/OBJ import +
   asset catalog; a native
   material system (`.smat` PBR assets + params buffer, importer, asset-level instances/overrides,
@@ -349,7 +350,10 @@ a feature — follow and update a matching plan rather than starting cold.
   the persistent GPU scene with GPU-driven rendering (a journal-driven mirror + device tables,
   byte-locked page residency with a streaming worker, per-view HZB occlusion + hierarchy traversal +
   GPU binning, counted-indirect executor draws with BDA vertex pulling for every raster pass, a GPU
-  radix-sorted transparent pass, and a tessellation-seam path for displaced instances);
+  radix-sorted transparent pass, and a displacement amplification arena displaced instances draw
+  from through the same binned cut); a second
+  `VK_EXT_mesh_shader` executor over the same binned cut, selected by `SAFFRON_MESH_EXECUTOR=1` on a
+  device that offers a mesh stage and held to image parity by `tests/e2e/mesh-executor-parity.test.ts`;
   and vegetation as a deterministic world system (below).
 - **Vegetation** is the largest single subsystem and spans nine directories, each with its own
   `AGENTS.md`. Three authored asset types — `.splant` plant families, `.sbiome` placement/ecology
@@ -361,8 +365,9 @@ a feature — follow and update a matching plan rather than starting cold.
   Placement is integer-exact end to end (Q15.16 scalars, counter-based Philox, an integer trig
   table) so a plant grows identically on every target. Also built: the native botanical graph with a
   nondestructive manual-edit layer, a fixed-tick ecology clock with dependency-region catch-up,
-  Houdini/USD/glTF point interchange, batched collision proxies and navigation contributions, and
-  the editor's five vegetation panels. Per-concept reference lives across the
-  `geometry-and-assets`, `scene-and-ecs`, and `physics` docs hubs.
-- **Not yet:** transient render-graph resources (graph-created images + aliasing) + async compute;
-  the optional `VK_EXT_mesh_shader` executor; hardware GPU in the toolbox.
+  Houdini/USD/glTF point interchange, batched collision proxies and navigation contributions, and the
+  editor's eleven vegetation/plant/biome panels (`panelRegistry.tsx` is the registered set). Per-concept
+  reference lives across the `geometry-and-assets`, `scene-and-ecs`, and `physics` docs hubs.
+- **Not yet:** transient render-graph resources — the graph declares resources and `transient.rs` pools
+  their allocations, but the graph creates no images of its own and nothing aliases memory between
+  disjoint lifetimes.

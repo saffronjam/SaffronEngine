@@ -1,8 +1,6 @@
 //! The serde_json gateway: the parse/dump entry points, the lenient typed readers
 //! the control-command handlers depend on, and the decimal-string-`u64` wire encoding
 //! the engine and the editor share byte-for-byte.
-//!
-//! Depends on `saffron-core`.
 
 #![deny(unsafe_code)]
 
@@ -17,8 +15,7 @@ pub use serde_json::{Map, Value, json};
 /// Errors raised by the JSON gateway and the typed readers.
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
-    /// Text could not be parsed as JSON. The payload is the parser's message —
-    /// genuinely unstructured, so a `String` is the right shape.
+    /// Text could not be parsed as JSON; the payload is the parser's message.
     #[error("invalid JSON: {0}")]
     Parse(String),
     /// A required object field was absent.
@@ -67,21 +64,19 @@ pub fn dump_json(value: &Value, indent: i32) -> String {
     }
 }
 
-/// Serializes a JSON value with every object's keys in **lexicographically sorted** order,
-/// recursively — the byte-frozen asset formats (`.smat`, the `.smodel` META chunk) depend
-/// on this for a stable source hash.
+/// Serializes a JSON value with every object's keys in lexicographically sorted order,
+/// recursively, giving the byte-frozen asset formats a stable source hash.
 ///
-/// `serde_json` is built workspace-wide with `preserve_order` (the control wire needs
-/// insertion order = field order), so object keys do not sort implicitly; the asset
-/// encoders call this instead of [`dump_json`] to keep their sorted byte shape. `indent`
-/// follows [`dump_json`]: `< 0` is compact, `>= 0` pretty-prints with that many spaces.
+/// `serde_json` is built workspace-wide with `preserve_order` because the control wire
+/// needs insertion order, so object keys do not sort implicitly. `indent` follows
+/// [`dump_json`].
 #[must_use]
 pub fn dump_json_sorted(value: &Value, indent: i32) -> String {
     dump_json(&sort_keys(value), indent)
 }
 
-/// A deep copy of `value` with every object's keys re-inserted in sorted order (arrays keep
-/// their element order; scalars pass through). Used by [`dump_json_sorted`].
+/// A deep copy of `value` with every object's keys re-inserted in sorted order; arrays keep
+/// their element order and scalars pass through.
 fn sort_keys(value: &Value) -> Value {
     match value {
         Value::Object(map) => {
@@ -100,21 +95,17 @@ fn sort_keys(value: &Value) -> Value {
 
 /// Emits a `u64` id as a decimal JSON *string*.
 ///
-/// Ids span the full `u64` range, past JavaScript's `2^53` safe integer, so a JSON
-/// number would silently lose precision on a JS client. The matching read
-/// ([`json_u64`]) accepts a string *or* a number; this is the emit side of the frozen
-/// wire contract and the protocol crate's `serde_with` derive must match it byte-for-byte.
+/// Ids span the full `u64` range, past JavaScript's `2^53` safe integer, so a JSON number
+/// would silently lose precision on a JS client. The matching read [`json_u64`] accepts a
+/// string *or* a number.
 #[must_use]
 pub fn uuid_to_json(value: u64) -> Value {
     Value::String(value.to_string())
 }
 
-/// The `serde_with` adapter for the frozen decimal-string-`u64` wire encoding.
-///
-/// `#[serde_as(as = "WireUuid")]` on a [`Uuid`] field emits a decimal string and accepts
-/// a string *or* a number on read — the exact lenient union [`uuid_to_json`] / [`json_u64`]
-/// implement imperatively. This is the single source of the derive-driven encoding the
-/// protocol crate reuses, so there is one wire encoding and it is defined once here.
+/// The `serde_with` adapter for the decimal-string-`u64` wire encoding: `#[serde_as(as =
+/// "WireUuid")]` on a [`Uuid`] field emits a decimal string and accepts a string *or* a
+/// number on read, the same lenient union [`uuid_to_json`] / [`json_u64`] implement.
 pub struct WireUuid;
 
 impl SerializeAs<Uuid> for WireUuid {
@@ -156,10 +147,6 @@ fn find_field<'a>(object: &'a Value, key: &str) -> Option<&'a Value> {
 }
 
 /// Reads a `u64` field, accepting a number *or* a decimal string.
-///
-/// The lenient union mirrors the frozen wire contract: an unsigned number, a
-/// non-negative integer, or a string whose entire content parses as a `u64`. A
-/// trailing-garbage string (`"42x"`) or a negative number is rejected.
 ///
 /// # Errors
 ///
@@ -227,10 +214,8 @@ pub fn json_string_or(object: &Value, key: &str, fallback: String) -> String {
     json_string(object, key).unwrap_or(fallback)
 }
 
-/// Reads a number field as `f32`, narrowing the `f64` wire value.
-///
-/// Returns `fallback` when absent or mistyped; otherwise reads the value as an `f64`
-/// (the wire numeric type) and narrows it to `f32`.
+/// Reads a number field as `f32`, narrowing the `f64` wire value; returns `fallback`
+/// when absent or mistyped.
 #[must_use]
 pub fn json_f32_or(object: &Value, key: &str, fallback: f32) -> f32 {
     json_f64(object, key).map_or(fallback, |value| value as f32)
@@ -253,7 +238,6 @@ mod tests {
         assert_eq!(dump_json(&value, -1), r#"{"a":1,"b":[2,3]}"#);
         let pretty = dump_json(&value, 2);
         assert!(pretty.contains('\n'));
-        // A pretty dump re-parses to the same value.
         assert_eq!(parse_json(&pretty).unwrap(), value);
     }
 
@@ -264,8 +248,6 @@ mod tests {
 
     #[test]
     fn uuid_emits_decimal_string_not_number() {
-        // The silent-failure guard: a full-range id must serialize as a *string*,
-        // never a number — the serialized bytes must carry quotes.
         let value = uuid_to_json(u64::MAX);
         assert_eq!(value, Value::String("18446744073709551615".to_owned()));
         let serialized = dump_json(&value, -1);
@@ -275,7 +257,6 @@ mod tests {
 
     #[test]
     fn uuid_round_trips_through_json_u64() {
-        // uuid_to_json then json_u64 recovers the full u64 range exactly.
         for raw in [0u64, 1023, 1024, 42, u64::MAX] {
             let object = serde_json::json!({ "id": uuid_to_json(raw) });
             assert_eq!(json_u64(&object, "id").unwrap(), raw);
@@ -295,17 +276,14 @@ mod tests {
 
     #[test]
     fn json_u64_rejects_trailing_garbage_negative_and_missing() {
-        // A string with trailing garbage is rejected (whole-string parse).
         assert!(matches!(
             json_u64(&serde_json::json!({ "k": "42x" }), "k"),
             Err(Error::WrongType { .. })
         ));
-        // A negative number is not an unsigned integer.
         assert!(matches!(
             json_u64(&serde_json::json!({ "k": -1 }), "k"),
             Err(Error::WrongType { .. })
         ));
-        // A missing key is a distinct, typed error.
         assert!(matches!(
             json_u64(&serde_json::json!({ "other": 1 }), "k"),
             Err(Error::MissingKey(_))
@@ -357,19 +335,16 @@ mod tests {
             "bad_u": "x", "bad_f": "x", "bad_b": "x",
         });
 
-        // Present and well-typed → the value.
         assert_eq!(json_u64_or(&object, "u", 99), 7);
         assert_eq!(json_string_or(&object, "s", "def".to_owned()), "set");
         assert!((json_f32_or(&object, "f", 0.0) - 2.5).abs() < f32::EPSILON);
         assert!(json_bool_or(&object, "b", false));
 
-        // Missing → the fallback.
         assert_eq!(json_u64_or(&object, "missing", 99), 99);
         assert_eq!(json_string_or(&object, "missing", "def".to_owned()), "def");
         assert!((json_f32_or(&object, "missing", 1.25) - 1.25).abs() < f32::EPSILON);
         assert!(json_bool_or(&object, "missing", true));
 
-        // Mistyped → the fallback.
         assert_eq!(json_u64_or(&object, "bad_u", 99), 99);
         assert!((json_f32_or(&object, "bad_f", 1.25) - 1.25).abs() < f32::EPSILON);
         assert!(json_bool_or(&object, "bad_b", true));
@@ -377,7 +352,6 @@ mod tests {
 
     #[test]
     fn f32_or_narrows_f64_wire_value() {
-        // A wire f64 with no exact f32 representation narrows to the nearest f32.
         let object = serde_json::json!({ "f": 0.1f64 });
         assert!((json_f32_or(&object, "f", 0.0) - 0.1f32).abs() < f32::EPSILON);
     }
@@ -393,14 +367,10 @@ mod tests {
 
         let holder = Holder { id: Uuid(u64::MAX) };
         let json = serde_json::to_string(&holder).unwrap();
-        // The derive-driven encoding emits a decimal string, byte-identical to
-        // uuid_to_json — the contract the protocol crate relies on.
         assert_eq!(json, r#"{"id":"18446744073709551615"}"#);
 
-        // Read accepts a string …
         let from_string: Holder = serde_json::from_str(r#"{"id":"18446744073709551615"}"#).unwrap();
         assert_eq!(from_string, holder);
-        // … or a number.
         let from_number: Holder = serde_json::from_str(r#"{"id":42}"#).unwrap();
         assert_eq!(from_number, Holder { id: Uuid(42) });
     }

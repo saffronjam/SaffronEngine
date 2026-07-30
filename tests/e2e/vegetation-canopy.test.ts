@@ -1,48 +1,36 @@
 // A multi-object plant family renders every part, and a phenotype flip changes the parts.
 //
-// The canopy fixture is the one family whose cooked hierarchy is a REAL assembly: two
-// per-part prototypes (trunk and crown, split from one source by the family's submesh
-// semantic targets), each placed by its own use, two material slots. Every other fixture
-// is a trivial single-use family that draws as a plain mesh, so this suite is the only
-// end-to-end coverage of the GPU assembly-use path — the fork, per-use records, per-use
-// representation crossfades, and the combination masks.
+// The canopy fixture is the one family whose cooked hierarchy is a real assembly: two per-part
+// prototypes (trunk and crown, split from one source by the family's submesh semantic targets), each
+// placed by its own use, two material slots. Every other fixture is a trivial single-use family that
+// draws as a plain mesh, so this is the only end-to-end coverage of the GPU assembly-use path — the
+// fork, per-use records, per-use representation crossfades, and the combination masks.
 //
-// The phenotype assertion is the sharp one: the senescent phenotype's mask keeps only the
-// trunk part active, so a flip removes the crown use's draw records AND its pixels, and a
-// flip back restores both. That proves combination masks gate uses over real per-part
-// geometry and that a confirmed mutation re-mirrors its cell (the revision bump adapters
-// re-derive on).
+// The phenotype assertion is the sharp one: the senescent phenotype's mask keeps only the trunk part
+// active, so a flip removes the crown use's draw records and its pixels, and a flip back restores
+// both. That proves combination masks gate uses over real per-part geometry and that a confirmed
+// mutation re-mirrors its cell.
 
 import { afterAll, beforeAll, expect, test } from "bun:test";
-import { readFileSync } from "node:fs";
-import { dirname, join } from "node:path";
-import { fileURLToPath } from "node:url";
-import type {
-  EntityRef,
-  ImportVegetationAssetResult,
-  VegetationCookJobDto,
-  VegetationRuntimeQueryResult,
-} from "@saffron/protocol";
+import type { VegetationRuntimeQueryResult } from "@saffron/protocol";
 import type { Engine } from "./harness.ts";
 import { decodeRgb8Png, meanAbsoluteDifference } from "./image.ts";
-import { Cleaner, bootEngine, captureViewport, prepareScene, trackEntity } from "./test-utils.ts";
-import { authoredAssets, awaitCook, installTrunkObj, type VegetationFixture } from "./vegetation-utils.ts";
+import { Cleaner, bootEngine, captureViewport, prepareScene } from "./test-utils.ts";
+import {
+  WIDE_BOUNDS,
+  bindVegetationField,
+  cookCells,
+  importVegetationPackage,
+  loadFixture,
+} from "./vegetation-utils.ts";
 
-const HERE = dirname(fileURLToPath(import.meta.url));
-const FIXTURE_PATH = join(HERE, "fixtures", "vegetation-canopy.json");
-const CELL = { coordinates: ["0", "0", "0"], level: 0 } as const;
-const BOUNDS = {
-  minTicks: ["0", "0", "0"],
-  maxTicksExclusive: ["4194304", "4194304", "4194304"],
-} as const;
-/// Faces the cooked cell's tallest plant from the far side (this map spans 64 m cells).
+// Faces the cooked cell's tallest plant from the far side (this map spans 64 m cells).
 const CAMERA = { position: { x: 53, y: 7, z: -11 }, yaw: 180, pitch: -10 } as const;
-/// The senescent flip must move the frame at least this much (crowns really leave the
-/// picture; measured ~0.28) and the flip back must return it below the run-to-run noise
-/// floor (measured ~0.007).
+// The senescent flip must move the frame at least this much (crowns really leave the
+// picture; measured ~0.28) and the flip back must return it below the run-to-run noise
+// floor (measured ~0.007).
 const SHED_FLOOR = 0.1;
 const RESTORE_TOLERANCE = 0.05;
-
 
 const cleaner = new Cleaner();
 let engine: Engine;
@@ -52,34 +40,15 @@ beforeAll(async () => {
   engine = await bootEngine(cleaner, { SAFFRON_SCRATCH_PROJECT: "1" });
   await prepareScene(engine, { width: 480, height: 270 });
 
-  const fixture = JSON.parse(readFileSync(FIXTURE_PATH, "utf8")) as VegetationFixture;
-  const sources = authoredAssets(cleaner, fixture, "canopy");
-  await installTrunkObj(engine, fixture);
-  for (const path of [sources.plant, sources.biome, sources.map]) {
-    await engine.call<ImportVegetationAssetResult>("import-vegetation-asset", { path });
-  }
-  const world = trackEntity(
-    cleaner,
-    engine,
-    await engine.call<EntityRef>("create-entity", { name: "Canopy vegetation" }),
-  );
-  await engine.call("add-component", { entity: world.id, component: "VegetationField" });
-  await engine.call("set-component", {
-    entity: world.id,
-    component: "VegetationField",
-    json: { map: fixture.map, enabled: true },
-  });
-  const cook = await engine.call<VegetationCookJobDto>("vegetation-cook", {
-    map: fixture.map,
-    scope: { kind: "cells", cells: [CELL] },
-    workers: 1,
-  });
-  await awaitCook(engine, cook.job);
+  const fixture = loadFixture("vegetation-canopy");
+  await importVegetationPackage(engine, cleaner, fixture, "canopy");
+  const world = await bindVegetationField(engine, cleaner, fixture, "Canopy vegetation");
+  await cookCells(engine, fixture.map);
   await engine.call("set-camera", CAMERA);
   const deadline = Date.now() + 40_000;
   for (;;) {
     const hits = await engine.call<VegetationRuntimeQueryResult>("vegetation-runtime-query", {
-      query: { kind: "bounds", bounds: BOUNDS },
+      query: { kind: "bounds", bounds: WIDE_BOUNDS },
     });
     if (hits.hits.length > 0) {
       subjects = hits.hits.map((hit) => ({ plant: hit.plant.plant, cell: hit.plant.cell }));

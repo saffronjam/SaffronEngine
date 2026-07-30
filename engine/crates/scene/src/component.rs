@@ -1,18 +1,8 @@
 //! The component structs the world holds.
 //!
-//! The serialized components plus the runtime-only caches. Vectors use the matching
-//! `glam` type, with `Vec3` pinned at 12 bytes (the geometry-area pin) so the downstream
-//! std430/byte layouts stay correct.
-//!
-//! The data-carrying enums (`Wrap`, `Transition`, `Motion`, `Shape`, `Joint`) are plain
-//! Rust enums; their wire spelling lives in the serde phase, not on the enum repr. The
-//! in-struct member initializers are the `Default` impls — a wrong default silently
-//! changes loaded data, so the values here are load-bearing.
-//!
-//! The runtime-only components (the [`Relationship`] caches, [`WorldTransform`],
-//! [`PoseOverride`], [`SkinnedMesh::bone_handles`]) are a distinct set: they never
-//! serialize and never copy, encoded by simply not registering them in the registry
-//! phase.
+//! `Vec3` is pinned at 12 bytes (never `Vec3A`) so the downstream std430/file byte layouts stay
+//! correct. Every `Default` here is load-bearing: a wrong default silently changes loaded data.
+//! A runtime-only component is encoded by simply not registering it in the registry phase.
 
 use glam::{BVec3, Mat4, Quat, Vec3};
 use serde_json::Value;
@@ -32,8 +22,7 @@ pub struct Name {
 ///
 /// ECS handles are not stable across a load and can alias between worlds, so every
 /// cross-entity reference resolves through this id, never through a raw handle. Left
-/// unregistered (like [`ComponentOrder`]): the id is written by the document assembler,
-/// not by a registered component serializer.
+/// unregistered: the id is written by the document assembler, not by a component serializer.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, Default)]
 pub struct IdComponent {
     /// The entity's stable identity.
@@ -85,10 +74,7 @@ pub struct Relationship {
     pub children: Vec<Entity>,
 }
 
-/// The cached world matrix, overwritten each frame by the world-transform update.
-///
-/// Runtime-only — stays unregistered (like [`IdComponent`]), so entity serialization
-/// skips it.
+/// The cached world matrix, overwritten each frame by the world-transform update. Runtime-only.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct WorldTransform {
     /// The composed world matrix.
@@ -122,9 +108,8 @@ pub struct Bone {
 }
 
 /// Tags an entity (and every node of an instantiated model's subtree) as a not-yet-committed
-/// asset-placement preview. Left unregistered: a ghost is never serialized, never listed in the
-/// outliner, and never hit by the placement pick — it only renders, so the user sees where the
-/// drop will land. Committing the placement removes the tag; the entity becomes ordinary.
+/// asset-placement preview. A ghost only renders: it is never serialized, listed in the outliner,
+/// or hit by the placement pick. Committing the placement removes the tag.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct PreviewGhost {
     /// A single byte of storage so the generic component access can bind a non-empty type
@@ -134,10 +119,8 @@ pub struct PreviewGhost {
 
 /// Binds a promoted entity to the authoritative macro plant it is a transient view of.
 ///
-/// Runtime-only and immutable: the promotion authority adds it when it spawns the entity,
-/// and the scene rejects replacing, mutably borrowing, or removing it — an entity can never
-/// be re-pointed at another plant. The macro SoA stays the authority; this entity is a view,
-/// not a second plant record, so the component is never serialized.
+/// Runtime-only and immutable: the scene rejects replacing, mutably borrowing, or removing it, so
+/// an entity can never be re-pointed at another plant. The macro SoA stays the authority.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct PlantOrigin {
     /// The plant this entity represents.
@@ -150,9 +133,9 @@ pub struct PlantOrigin {
 /// A promoted plant's live biological state, carried on its entity view so gameplay reads and
 /// writes it like any other component.
 ///
-/// Runtime-only and never serialized: the macro SoA remains the authority, and a demotion returns
-/// whatever the view settled at through the reducer. Unlike [`PlantOrigin`] this is mutable — that
-/// is the point, since damage and growth happen to the view.
+/// Runtime-only: the macro SoA remains the authority, and a demotion returns whatever the view
+/// settled at through the reducer. Unlike [`PlantOrigin`] this is mutable, because damage and
+/// growth happen to the view.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct PlantVitals {
     /// Biological lifecycle stage, as the vegetation lifecycle discriminant.
@@ -168,9 +151,8 @@ pub struct PlantVitals {
 }
 
 /// Selects which authored `(variation, phenotype)` combination of a multi-prototype
-/// assembly mesh (a compiled plant family) this entity renders. Left unregistered —
-/// preview tooling sets it; an entity without it renders the first authored
-/// combination.
+/// assembly mesh (a compiled plant family) this entity renders. Unregistered; an entity without
+/// it renders the first authored combination.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct PlantVariant {
     /// Authored variation index.
@@ -251,11 +233,9 @@ pub enum Transition {
 
 /// Drives a skinned rig from an animation clip.
 ///
-/// Dumb data — the evaluator and serde live elsewhere. `autoplay` is the only authored
-/// playback intent that persists; `time`, `playing`, `preview_in_edit`, `ping_forward` and
-/// the transition trio (`prev_clip`/`transition`/`transition_duration`) are pure runtime
-/// state (not serialized). Entering Play resets every player to `time = 0`,
-/// `playing = autoplay`.
+/// `autoplay` is the only authored playback intent that persists; `time`, `playing`,
+/// `preview_in_edit`, `ping_forward` and the transition trio are runtime state. Entering Play
+/// resets every player to `time = 0`, `playing = autoplay`.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct AnimationPlayer {
     /// The animation catalog entry to play.
@@ -310,10 +290,9 @@ impl Default for AnimationPlayer {
 
 /// The animated local TRS the evaluator writes onto a driven bone each frame.
 ///
-/// Runtime-only (never serialized). World-transform composition prefers it over the
-/// bone's [`Transform`], so the authored rest pose stays untouched and Edit preview is
-/// non-destructive. Uses a [`Quat`] directly (no Euler round-trip). Removed from a bone
-/// when its rig stops animating (reverts to rest).
+/// Runtime-only. World-transform composition prefers it over the bone's [`Transform`], so the
+/// authored rest pose stays untouched and Edit preview is non-destructive. Removed from a bone
+/// when its rig stops animating.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct PoseOverride {
     /// Overriding local translation.
@@ -336,11 +315,10 @@ impl Default for PoseOverride {
 
 /// The per-entity morph (blend-shape) weight vector and the target names that label it.
 ///
-/// Durable and import-managed: seeded at spawn from the mesh's authored rest weights, it
-/// round-trips through the registry as `"Morph"`. The weight-vector length must equal the
-/// mesh's morph-target count, so the editor treats it as non-addable / non-removable.
-/// `weights` are canonical `0..1`. The animation evaluator does not write here — it writes
-/// the runtime-only [`MorphWeightOverride`], so a stopped morph reverts to these weights.
+/// Seeded at spawn from the mesh's authored rest weights. The weight-vector length must equal the
+/// mesh's morph-target count, so the editor treats it as non-addable / non-removable. The
+/// animation evaluator writes the runtime-only [`MorphWeightOverride`] instead, so a stopped morph
+/// reverts to these weights. Weights are canonical `0..1`.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct MorphComponent {
     /// One weight per morph target (canonical `0..1`).
@@ -351,9 +329,8 @@ pub struct MorphComponent {
 
 /// The animated morph weights the evaluator writes each frame.
 ///
-/// Runtime-only (never serialized, never registered — the twin of [`PoseOverride`]); the
-/// GPU morph deform reads it, and it is removed when the rig stops animating so the mesh
-/// reverts to the durable [`MorphComponent::weights`]. Weights are canonical `0..1`.
+/// Runtime-only. The GPU morph deform reads it, and it is removed when the rig stops animating so
+/// the mesh reverts to the durable [`MorphComponent::weights`]. Weights are canonical `0..1`.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct MorphWeightOverride {
     /// One animated weight per morph target (canonical `0..1`).
@@ -389,14 +366,13 @@ impl Default for FootChain {
 
 /// Foot-IK config on the rig entity (beside [`SkinnedMesh`]).
 ///
-/// When enabled, the animation evaluator runs a two-bone IK solve per chain and feeds
-/// the result through the pose blend layer, never the bones' [`Transform`]s. v1 ground
-/// is a horizontal plane at `ground_height`.
+/// When enabled, the animation evaluator runs a two-bone IK solve per chain and feeds the result
+/// through the pose blend layer, never the bones' [`Transform`]s.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct FootIk {
     /// Whether foot IK is active.
     pub enabled: bool,
-    /// The ground plane height (v1: a horizontal plane).
+    /// The height of the horizontal ground plane the feet plant onto.
     pub ground_height: f32,
     /// The IK chains to solve.
     pub chains: Vec<FootChain>,
@@ -416,10 +392,7 @@ pub enum Joint {
     Free,
 }
 
-/// Reserved per-bone metadata for the eventual Jolt powered-ragdoll.
-///
-/// No runtime use yet — purely the schema the physics phase reads to build collider
-/// bodies and constraints. Authored once, mapped 1:1 later.
+/// Per-bone collider and constraint metadata the ragdoll builds its parts and joints from.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct BonePhysics {
     /// Capsule/box collider half-size.
@@ -452,8 +425,8 @@ impl Default for BonePhysics {
     }
 }
 
-/// A sidecar on the rig entity: a parallel array to [`SkinnedMesh::bones`] of the
-/// reserved per-bone physics metadata. Serialized through the component path; inert.
+/// A sidecar on the rig entity: a parallel array to [`SkinnedMesh::bones`] of per-bone physics
+/// metadata.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct BonePhysicsComponent {
     /// Per-bone physics metadata (parallel to the rig's `bones`).
@@ -672,11 +645,8 @@ impl Default for VegetationField {
 /// One material binding for a submesh: a reference to a `.smat` material asset plus a
 /// sparse per-object override map applied over the referenced material's resolved params.
 ///
-/// `material == 0` resolves to the built-in default material. `overrides` is opaque,
-/// editor-shaped JSON `{ paramName: value }` (empty in the common case); the engine applies
-/// only the recognized exposed parameters at resolve time (see the assets crate's material
-/// schema). This is the single per-object material shape — a single-material mesh is a
-/// [`MaterialSet`] with one slot.
+/// `material == 0` resolves to the built-in default material. `overrides` is opaque editor-shaped
+/// JSON `{ paramName: value }`; only recognized exposed parameters apply at resolve time.
 #[derive(Clone, Debug, PartialEq)]
 pub struct MaterialSlot {
     /// The referenced `.smat` material asset id (`0` = the built-in default material).
@@ -697,9 +667,8 @@ impl Default for MaterialSlot {
 
 /// An entity's material bindings, one slot per submesh.
 ///
-/// Each submesh's `material_slot` indexes `slots` (clamped to the slot count); a slot
-/// references a `.smat` material asset and layers sparse per-object overrides on top. This
-/// is the single per-entity material component — a single-material mesh is one slot.
+/// Each submesh's `material_slot` indexes `slots`, clamped to the slot count. A single-material
+/// mesh is one slot.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct MaterialSet {
     /// The ordered material slots, indexed by submesh `material_slot`.
@@ -718,8 +687,7 @@ pub struct ModelInstance {
 /// One script attached to an entity: a `.lua` path relative to the project `src/` plus
 /// per-instance field overrides (filled by the editor; empty until then).
 ///
-/// `overrides` is opaque JSON passed through verbatim — the editor fills it; the engine
-/// never interprets it. Defaulted to an empty object `{}`.
+/// `overrides` is opaque JSON the editor fills and the engine never interprets.
 #[derive(Clone, Debug, PartialEq)]
 pub struct ScriptSlot {
     /// The `.lua` path relative to the project `src/`.
@@ -737,10 +705,8 @@ impl Default for ScriptSlot {
     }
 }
 
-/// An entity's scripts, run top-to-bottom each play tick.
-///
-/// Multiple scripts per entity is this vector, never two components. Data only — the
-/// Lua runtime lives in the script crate.
+/// An entity's scripts, run top-to-bottom each play tick. Multiple scripts per entity is this
+/// vector, never two components.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Script {
     /// The ordered scripts.
@@ -931,9 +897,8 @@ impl Default for ReflectionProbe {
     }
 }
 
-/// The bounds primitive a [`FogVolume`] injects density within. Deliberately just the two closed
-/// primitives the froxel injection can evaluate — a box (oriented half-extents) or a sphere — so the
-/// Inspector picker and the injection loop stay exhaustive with no unsupported case.
+/// The bounds primitive a [`FogVolume`] injects density within: the two closed primitives the
+/// froxel injection can evaluate.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum FogShape {
     /// Oriented box, bounded by `extents` (local-space half-extents).
@@ -944,11 +909,9 @@ pub enum FogShape {
 }
 
 /// A placeable box/sphere of local participating media, injected into the froxel fog grid during
-/// density evaluation. Positioned by the entity's [`Transform`]; `extents` are box half-extents in
-/// local space, `radius` is the sphere radius. It contributes to the *same* `sigma_t`/`sigma_s` the
-/// analytic height base and global density write, so a local volume is lit, shadowed, temporally
-/// reprojected, and integrated by the identical stages — there is no special-case local-fog path.
-/// All optical fields default to a light, drifting-off (`noise_intensity: 0`) static haze.
+/// density evaluation. Positioned by the entity's [`Transform`]. It contributes to the *same*
+/// `sigma_t`/`sigma_s` the analytic height base and global density write, so a local volume is lit,
+/// shadowed, temporally reprojected, and integrated by the identical stages.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct FogVolume {
     /// Box or sphere bounds.
@@ -1049,7 +1012,7 @@ mod tests {
     }
 
     #[test]
-    fn enum_defaults_match_cpp() {
+    fn enum_defaults() {
         assert_eq!(Wrap::default(), Wrap::Loop);
         assert_eq!(Transition::default(), Transition::Inertialize);
         assert_eq!(Motion::default(), Motion::Dynamic);
@@ -1194,8 +1157,6 @@ mod tests {
 
     #[test]
     fn bone_carries_one_byte_of_storage() {
-        // The ECS elides zero-sized types from generic access; the byte tag keeps the
-        // type bindable. Its default is `tag = 0`.
         assert_eq!(Bone::default().tag, 0);
         assert_eq!(std::mem::size_of::<Bone>(), 1);
     }
@@ -1210,8 +1171,6 @@ mod tests {
 
     #[test]
     fn vec3_is_twelve_bytes() {
-        // The geometry-area pin: `Vec3` is 12 bytes (never `Vec3A`), so downstream
-        // std430/file byte layouts stay correct.
         assert_eq!(std::mem::size_of::<Vec3>(), 12);
     }
 }

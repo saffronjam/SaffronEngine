@@ -1,35 +1,33 @@
-// Phase-13 acceptance through the real host: biological time advances, dependency regions catch up
-// under a budget, and the route taken to a tick does not change the state it reaches. One cooked
-// cell streams resident, then the test drives the ecology clock over the control plane and compares
-// checkpoint identities — the same comparison the in-crate byte-for-byte test makes, but through
-// the wire, against a live runtime.
+// Ecology through the real host: the world simulation clock ages biology while play runs, an
+// explicit step drives the same ticks under the same rules, dependency regions catch up under a
+// budget, a region behind world time publishes nothing for a facet to read, and the route taken to a
+// tick does not change the state it reaches. One cooked cell streams resident, then the test drives
+// the clock over the control plane and compares checkpoint identities — the same comparison the
+// in-crate byte-for-byte test makes, but through the wire, against a live runtime.
 
 import { afterAll, beforeAll, expect, test } from "bun:test";
-import { readFileSync } from "node:fs";
-import { dirname, join } from "node:path";
-import { fileURLToPath } from "node:url";
 import type {
-  EntityRef,
-  ImportVegetationAssetResult,
   VegetationCombustionDto,
-  VegetationCookJobDto,
+  VegetationEcologyClockDto,
   VegetationEcologyReportDto,
   VegetationEcologyStatusDto,
+  VegetationNavigationResult,
   VegetationRuntimeQueryResult,
   VegetationRuntimeStatusDto,
+  VegetationTelemetryResult,
 } from "@saffron/protocol";
 import type { Engine } from "./harness.ts";
-import { Cleaner, bootEngine, trackEntity } from "./test-utils.ts";
-import { authoredAssets, awaitCook, installTrunkObj, type VegetationFixture } from "./vegetation-utils.ts";
+import { Cleaner, bootEngine } from "./test-utils.ts";
+import {
+  BOUNDS,
+  CELL,
+  bindVegetationField,
+  cookCells,
+  importVegetationPackage,
+  loadFixture,
+} from "./vegetation-utils.ts";
 
-const HERE = dirname(fileURLToPath(import.meta.url));
-const FIXTURE_PATH = join(HERE, "fixtures", "vegetation-phase3.json");
-const CELL = { coordinates: ["0", "0", "0"], level: 0 } as const;
-const BOUNDS = {
-  minTicks: ["0", "0", "0"],
-  maxTicksExclusive: ["262144", "262144", "262144"],
-} as const;
-/// Growing weather: enough water and warmth that a tick is not dormant.
+// Growing weather: enough water and warmth that a tick is not dormant.
 const WEATHER = { water: 40_000, warmth: 45_000 } as const;
 
 const cleaner = new Cleaner();
@@ -47,7 +45,6 @@ async function advance(targetTick: number, maxTicks: number) {
   return engine.call<VegetationEcologyReportDto>("vegetation-advance-ecology", {
     targetTick: String(targetTick),
     maxTicks,
-    ...WEATHER,
   });
 }
 
@@ -55,32 +52,21 @@ async function status() {
   return engine.call<VegetationEcologyStatusDto>("vegetation-ecology-status");
 }
 
+async function clock(params: Record<string, unknown> = {}) {
+  return engine.call<VegetationEcologyClockDto>("vegetation-ecology-clock", params);
+}
+
+async function navigation() {
+  return engine.call<VegetationNavigationResult>("vegetation-nav-contributions", {});
+}
+
 test("biological time advances, regions catch up under a budget, and the route does not matter", async () => {
-  const fixture = JSON.parse(readFileSync(FIXTURE_PATH, "utf8")) as VegetationFixture;
-  const sources = authoredAssets(cleaner, fixture, "ecology");
-  await installTrunkObj(engine, fixture);
-  for (const path of [sources.plant, sources.biome, sources.map]) {
-    await engine.call<ImportVegetationAssetResult>("import-vegetation-asset", { path });
-  }
+  const fixture = loadFixture("vegetation-phase3");
+  await importVegetationPackage(engine, cleaner, fixture, "ecology");
 
-  const world = trackEntity(
-    cleaner,
-    engine,
-    await engine.call<EntityRef>("create-entity", { name: "Ecology vegetation" }),
-  );
-  await engine.call("add-component", { entity: world.id, component: "VegetationField" });
-  await engine.call("set-component", {
-    entity: world.id,
-    component: "VegetationField",
-    json: { map: fixture.map, enabled: true },
-  });
+  await bindVegetationField(engine, cleaner, fixture, "Ecology vegetation");
 
-  const cook = await engine.call<VegetationCookJobDto>("vegetation-cook", {
-    map: fixture.map,
-    scope: { kind: "cells", cells: [CELL] },
-    workers: 1,
-  });
-  await awaitCook(engine, cook.job);
+  await cookCells(engine, fixture.map);
 
   await engine.call("set-camera", { position: { x: 32, y: 8, z: 44 }, yaw: 0, pitch: -10 });
   await engine.settle(200);
@@ -103,11 +89,21 @@ test("biological time advances, regions catch up under a budget, and the route d
     }
   }
 
+  // Stop the world clock so the explicit steps below are the only thing moving biology. A running
+  // clock works off what a budget leaves owed, which is the point of it — and would finish these
+  // ticks between two commands.
+  const stopped = await clock({ running: false, ...WEATHER });
+  expect(stopped.running).toBe(false);
+  expect(stopped.water).toBe(WEATHER.water);
+  expect(stopped.warmth).toBe(WEATHER.warmth);
+
   const before = await status();
   expect(before.worldTick).toBe("0");
   expect(before.simulationVersion).toBeGreaterThan(0);
   expect(before.regions.length).toBeGreaterThan(0);
   expect(before.regionRadiusCells).toBeGreaterThan(0);
+  expect(before.clock.running).toBe(false);
+  expect(before.regions.every((region) => region.caughtUp)).toBe(true);
 
   // A budget bounds the call: world time reaches the target, the region does not, and what is left
   // is owed rather than dropped.
@@ -121,6 +117,7 @@ test("biological time advances, regions catch up under a budget, and the route d
   expect(midway.regions.every((region) => region.caughtUp)).toBe(false);
   expect(midway.cells.length).toBeGreaterThan(0);
   expect(midway.cells.every((cell) => Number(cell.tick) === 3)).toBe(true);
+  expect(midway.clock.ticksOwed).toBe("5");
 
   // The remaining ticks run on the following calls, in the same order they would have.
   const second = await advance(8, 3);
@@ -142,6 +139,89 @@ test("biological time advances, regions catch up under a budget, and the route d
   expect(engine.validationErrors()).toEqual([]);
 });
 
+test("the world simulation clock ages biology while play runs, and the telemetry counts its ticks", async () => {
+  // One tick per 16 ms of simulated play, so a short play window earns several.
+  const configured = await clock({
+    running: true,
+    tickMilliseconds: 16,
+    maxTicksPerSync: 8,
+    ...WEATHER,
+  });
+  expect(configured.running).toBe(true);
+  expect(configured.tickMilliseconds).toBe(16);
+  expect(configured.maxTicksPerSync).toBe(8);
+  expect(configured.workers).toBeGreaterThan(0);
+
+  const before = await status();
+  const ticksBefore = Number(
+    (await engine.call<VegetationTelemetryResult>("vegetation-telemetry")).work.ecologyTicks,
+  );
+
+  await engine.call("play");
+  await engine.settle(600);
+  await engine.call("stop");
+
+  const after = await status();
+  expect(Number(after.worldTick)).toBeGreaterThan(Number(before.worldTick));
+  expect(after.checkpoint).not.toBe(before.checkpoint);
+  // Nothing asked for these ticks: the world advanced and biology advanced with it.
+  const telemetry = await engine.call<VegetationTelemetryResult>("vegetation-telemetry");
+  expect(Number(telemetry.work.ecologyTicks)).toBeGreaterThan(ticksBefore);
+
+  // Stopping the clock stops biology: no further tick, and no payment of what a budget left owed.
+  const halted = await clock({ running: false });
+  expect(halted.running).toBe(false);
+  const held = await status();
+  await engine.call("play");
+  await engine.settle(300);
+  await engine.call("stop");
+  const stillHeld = await status();
+  expect(stillHeld.worldTick).toBe(held.worldTick);
+  expect(stillHeld.checkpoint).toBe(held.checkpoint);
+
+  expect(engine.validationErrors()).toEqual([]);
+});
+
+test("a cell mid-catch-up publishes for no facet", async () => {
+  // The physics and navigation facets are claimed only in play, so the seam has to be live before
+  // the gate is observable at all.
+  await clock({ running: false });
+  await engine.call("play");
+  const deadline = Date.now() + 30_000;
+  for (;;) {
+    if (Number((await navigation()).contributions) > 0) {
+      break;
+    }
+    if (Date.now() >= deadline) {
+      await engine.call("stop");
+      throw new Error("timeout waiting for the navigation seam to publish a contribution");
+    }
+    await engine.settle(100);
+  }
+
+  // Leave the resident region behind world time. Mid-catch-up its lifecycle state changes every
+  // tick, so the seam retires what it published rather than republishing biology from a moment nobody
+  // was meant to observe — and a consumer is spared a tile rebuild per executed tick.
+  const target = Number((await status()).worldTick) + 4;
+  const behindReport = await advance(target, 1);
+  expect(behindReport.ticksOwed).toBe("3");
+  // The one cell is resident, so the arrears are work the next call runs, not ground waiting to load.
+  expect(behindReport.ticksAwaitingResidency).toBe("0");
+  expect(behindReport.regionsAwaitingResidency).toBe(0);
+  expect(behindReport.workers).toBeGreaterThan(0);
+  await engine.settle(150);
+  expect(Number((await navigation()).contributions)).toBe(0);
+
+  // Reaching world time settles the cell again, and the seam republishes it.
+  const caughtUp = await advance(target, 8);
+  expect(caughtUp.ticksOwed).toBe("0");
+  await engine.settle(150);
+  expect(Number((await navigation()).contributions)).toBeGreaterThan(0);
+
+  await engine.call("stop");
+  expect(engine.validationErrors()).toEqual([]);
+});
+
 test("a volume reports what would burn, and ignition is persistent typed state", async () => {
   const sample = await engine.call<VegetationCombustionDto>("vegetation-combustion", {
     bounds: BOUNDS,
@@ -149,7 +229,7 @@ test("a volume reports what would burn, and ignition is persistent typed state",
   expect(sample.plants).toBeGreaterThan(0);
   expect(sample.ignited).toBe(0);
   expect(sample.occupancy).toBeGreaterThanOrEqual(0);
-  // Eight growing ticks settled moisture toward the supply, so the sample is not the cooked zero.
+  // Growing ticks settled moisture toward the supply, so the sample is not the cooked zero.
   expect(sample.moisture).toBeGreaterThan(0);
 
   const hits = await engine.call<VegetationRuntimeQueryResult>("vegetation-runtime-query", {
@@ -172,9 +252,7 @@ test("a volume reports what would burn, and ignition is persistent typed state",
   expect(alight.ignited).toBe(1);
 
   await engine.call("vegetation-mutate", {
-    records: [
-      { header: header("7002", "8002"), mutation: { kind: "extinguish", plant } },
-    ],
+    records: [{ header: header("7002", "8002"), mutation: { kind: "extinguish", plant } }],
   });
   const out = await engine.call<VegetationCombustionDto>("vegetation-combustion", {
     bounds: BOUNDS,

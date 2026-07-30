@@ -1,22 +1,20 @@
 //! The partitioned top-level acceleration structure.
 //!
-//! A `VK_KHR_acceleration_structure` TLAS is rebuilt whole every frame: the instance table
-//! is repacked and the driver re-derives the entire hierarchy even when one plant moved.
-//! `VK_NV_partitioned_acceleration_structure` replaces that with a structure whose instances
-//! live in partitions, built from an op stream that names only what changed — so a frame
-//! costs the instances it touched rather than the instances that exist.
+//! `VK_NV_partitioned_acceleration_structure` builds a top-level structure whose instances live in
+//! partitions, driven by an op stream that names only what changed, so a frame costs the instances
+//! it touched rather than the instances that exist.
 //!
-//! Partitions are the world's own base cells ([`saffron_spatial::BASE_CELL_EDGE_METERS`]),
-//! hashed into the partition table, because that is the granularity content actually changes
-//! at: a cook republishes a cell, a plant is felled in a cell, a camera moves across cells.
-//! An instance with no fixed home — a deforming one, whose structure is refit every frame
-//! anyway — goes in the global partition.
+//! Partitions are the world's own base cells ([`saffron_spatial::BASE_CELL_EDGE_METERS`]), hashed
+//! into the partition table, because that is the granularity content changes at. An instance with
+//! no fixed home — a deforming one, refit every frame anyway — goes in the global partition.
 //!
-//! Instance indices are stable across frames, which is what makes the diff expressible:
-//! each placed instance owns a slot keyed by its scene identity, so a frame emits a write
-//! only for instances that appeared or moved, and a cheaper update for one whose structure
-//! address changed under an unmoved transform. This module and `device.rs` / `descriptors.rs`
-//! are the only importers of the transcribed [`crate::vk_nv_ptlas`] bindings.
+//! Instance indices are stable across frames, which is what makes the diff expressible: each placed
+//! instance owns a slot keyed by its scene identity, so a frame emits a write only for instances
+//! that appeared or moved, and a cheaper update for one whose structure address changed under an
+//! unmoved transform.
+//!
+//! Only this module, `device.rs`, and `descriptors.rs` may import the transcribed
+//! [`crate::vk_nv_ptlas`] bindings.
 
 use std::collections::BTreeMap;
 

@@ -3,23 +3,18 @@
 // package alone — no project directory, no authored sources, no editor.
 
 import { afterAll, beforeAll, expect, test } from "bun:test";
-import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, readdirSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { dirname, join } from "node:path";
-import { fileURLToPath } from "node:url";
-import type {
-  EntityRef,
-  ExportAppResult,
-  ImportVegetationAssetResult,
-  VegetationCookJobDto,
-} from "@saffron/protocol";
+import { join } from "node:path";
+import type { ExportAppResult } from "@saffron/protocol";
 import { IS_MACOS, type Engine } from "./harness.ts";
-import { Cleaner, bootEngine, trackEntity } from "./test-utils.ts";
-import { authoredAssets, awaitCook, installTrunkObj, type VegetationFixture } from "./vegetation-utils.ts";
-
-const HERE = dirname(fileURLToPath(import.meta.url));
-const FIXTURE_PATH = join(HERE, "fixtures", "vegetation-phase3.json");
-const CELL = { coordinates: ["0", "0", "0"], level: 0 } as const;
+import { Cleaner, bootEngine } from "./test-utils.ts";
+import {
+  bindVegetationField,
+  cookCells,
+  importVegetationPackage,
+  loadFixture,
+} from "./vegetation-utils.ts";
 
 const cleaner = new Cleaner();
 let engine: Engine;
@@ -32,7 +27,7 @@ afterAll(async () => {
   await cleaner.cleanup();
 });
 
-/// Every file under `dir`, relative, so an assertion can talk about the package's shape.
+// Every file under `dir`, relative, so an assertion can talk about the package's shape.
 function tree(dir: string, prefix = ""): string[] {
   if (!existsSync(dir)) {
     return [];
@@ -50,29 +45,10 @@ function tree(dir: string, prefix = ""): string[] {
 }
 
 test("an exported package carries its cooked vegetation and no authored sources", async () => {
-  const fixture = JSON.parse(readFileSync(FIXTURE_PATH, "utf8")) as VegetationFixture;
-  const sources = authoredAssets(cleaner, fixture, "export");
-  await installTrunkObj(engine, fixture);
-  for (const path of [sources.plant, sources.biome, sources.map]) {
-    await engine.call<ImportVegetationAssetResult>("import-vegetation-asset", { path });
-  }
-  const world = trackEntity(
-    cleaner,
-    engine,
-    await engine.call<EntityRef>("create-entity", { name: "Exported vegetation" }),
-  );
-  await engine.call("add-component", { entity: world.id, component: "VegetationField" });
-  await engine.call("set-component", {
-    entity: world.id,
-    component: "VegetationField",
-    json: { map: fixture.map, enabled: true },
-  });
-  const cook = await engine.call<VegetationCookJobDto>("vegetation-cook", {
-    map: fixture.map,
-    scope: { kind: "cells", cells: [CELL] },
-    workers: 1,
-  });
-  await awaitCook(engine, cook.job);
+  const fixture = loadFixture("vegetation-phase3");
+  const sources = await importVegetationPackage(engine, cleaner, fixture, "export");
+  const world = await bindVegetationField(engine, cleaner, fixture, "Exported vegetation");
+  await cookCells(engine, fixture.map);
   await engine.call("save-project", {});
 
   // Park the camera over the cell, start play so state exists, then publish the generation's

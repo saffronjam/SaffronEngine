@@ -1,29 +1,11 @@
-//! The mlua/Luau VM, the typed `sa.*` bindings, and the generated Luau type defs.
+//! The mlua/Luau VM, the typed `sa.*` bindings, and the generated Luau type defs. `mlua` confines
+//! every `lua_State` unsafety internally, so this crate is `#![deny(unsafe_code)]`.
 //!
-//! Depends on `saffron-core`, `saffron-scene` only. `mlua` confines every `lua_State`
-//! unsafety internally, so this crate is `#![deny(unsafe_code)]`.
-//!
-//! The VM primitive is a sandboxed [`ScriptVm`] with an instruction/memory budget and a
-//! typed [`Error`] carrying the Luau traceback. The [`SaVec3`] value type and the
-//! declarative [`BINDINGS`] table are the single source that both registers the no-scene
-//! `sa.*` surface and feeds the Luau type emitter. The scoped [session guard](session)
-//! holds the live-scene invariant, and the [`EntityHandle`] scene-only surface
-//! (transforms, name/uuid, valid) is built on it. The [`ScriptHost`] lifecycle
-//! (`start_scripts`/`tick_scripts`/`stop_scripts`) drives the class cache, the instance
-//! build with field injection + overrides, pause-on-error, and the deferred destroy +
-//! relink. The coroutine [scheduler](scheduler), the inter-script [`ScriptMessage`]
-//! queue (`entity:send`/`sa.broadcast`, drained after the loop), the input reads (held +
-//! derived edges + mouse, lent through the session guard), and the hierarchy/query
-//! bindings (`parent`/`children`/`set_parent`/`spawn`/`get_entity_by_name`/
-//! `find_all_by_name`/`find_by_uuid`/`primary_camera`) round out the runtime surface.
-//! The [`ScriptHostBridge`] is the POD seam the host implements for the physics reach
-//! (`sa.raycast`/`apply_impulse`/ragdoll control + the `sa.log` sink); `move_character`
-//! is a pure-Scene write; [`ScriptHost::dispatch_contact`] routes the contact-event ring
-//! to `on_trigger_enter`/`on_trigger_exit`/`on_contact` handlers. [`read_script_schema`]
-//! is the Inspector field contract: a throwaway sandboxed VM reads a script's declared
-//! `properties` and infers each [`ScriptField`]'s [`ScriptFieldType`] from its default —
-//! the shape the host's `get-script-schema` command maps to the `GetScriptSchemaResult`
-//! DTO.
+//! [`ScriptVm`] is sandboxed with an instruction and memory budget, raising a typed [`Error`] that
+//! carries the Luau traceback. [`BINDINGS`] is the single source that both registers the `sa.*`
+//! surface and feeds the Luau type emitter. The scoped [session guard](session) holds the live-scene
+//! invariant that [`EntityHandle`] is built on, and [`ScriptHostBridge`] is the POD seam the host
+//! implements for the physics reach, so this crate needs no physics edge.
 
 #![deny(unsafe_code)]
 

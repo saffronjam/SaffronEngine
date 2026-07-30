@@ -74,11 +74,9 @@ pub fn resolve_entity(
     Err(Error::command(format!("entity not found: {selector}")))
 }
 
-/// Re-fits an entity's `Collider` to its mesh AABB through the asset reader: a thin
-/// wrapper that binds the [`MeshCook`](saffron_physics::MeshCook) seam to
-/// [`AssetServer::load_mesh_cpu_asset`] and forwards to the shared
-/// [`saffron_physics::fit_collider_to_mesh`]. Returns `false` when there is no
-/// collider, no resolvable mesh, or a degenerate shape.
+/// Re-fits an entity's `Collider` to its mesh AABB, binding the
+/// [`MeshCook`](saffron_physics::MeshCook) seam to [`AssetServer::load_mesh_cpu_asset`]. `false`
+/// when there is no collider, no resolvable mesh, or a degenerate shape.
 ///
 /// [`AssetServer`]: saffron_assets::AssetServer
 /// [`AssetServer::load_mesh_cpu_asset`]: saffron_assets::AssetServer::load_mesh_cpu_asset

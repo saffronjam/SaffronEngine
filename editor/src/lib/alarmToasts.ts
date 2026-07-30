@@ -1,9 +1,7 @@
-/// Severity-routed, fatigue-aware alarm toasts. The reconcile poll hands every freshly
-/// drained alarm event here: info stays in the log only, a warning raises a throttled
-/// toast, a critical raises a persistent one, and a RESOLVED event dismisses the toast its
-/// fingerprint raised. The warning throttle is keyed per fingerprint and **survives a
-/// resolve**, so an alarm that flaps (fire → resolve → fire) can't bypass it by cycling —
-/// at most one warning toast per fingerprint per throttle window.
+/// Severity-routed, fatigue-aware alarm toasts: info stays in the log, a warning raises a throttled
+/// toast, a critical a persistent one, and a RESOLVED event dismisses the toast its fingerprint
+/// raised. The warning throttle is keyed per fingerprint and SURVIVES a resolve, so an alarm that
+/// flaps cannot bypass it by cycling.
 import { toast } from "sonner";
 import type { AlarmEventDto } from "../protocol";
 

@@ -7,6 +7,7 @@ control plane — the same wire the editor and `sa` CLI use. The driver is plain
 
 ```sh
 just e2e                       # from anywhere — auto-enters the toolbox
+just e2e-typecheck             # tsc --noEmit alone, no engine needed
 cd tests/e2e && bun test       # inside the toolbox (host bun on PATH)
 ```
 
@@ -33,8 +34,17 @@ cd tests/e2e && bun test       # inside the toolbox (host bun on PATH)
   Pixel tests drive the `screenshot` command (`target: "viewport"`, a path), wait for the PNG, read it
   back, and compare buffers directly (`Buffer.equals`, no image-diff dep) — see the `*_render.test.ts`
   files. Golden-image baselines are not wired up yet.
+- **The suite is typechecked, and `bun test` is not the thing that does it.** `bun test` strips
+  types without checking them, so `tsc --noEmit` (`bun run typecheck`, `just e2e-typecheck`) runs in
+  the gate's e2e step. A type error there fails the gate; keep it at zero.
 - Type results via `@saffron/protocol` (`engine.call<RenderStats>("render-stats")`) so a schema
-  change that breaks an assertion shows up at typecheck.
+  change that breaks an assertion shows up at typecheck. `call` takes only a `CommandName` — a key
+  of the generated `CommandParamsMap` — so a renamed or retired command fails the typecheck instead
+  of a live host, and `params` takes a generated params DTO or the positional `{ args: […] }` form.
+- **Assert against the generated DTO, not a hand-written shape.** A local `as { … }` cast or an
+  inline structural result type states what the test wishes the wire were; the DTO states what it
+  is. When the two disagree the DTO is the one to fix (`engine/crates/protocol`) — an internally
+  tagged enum whose tag `ts-rs` dropped reads as a test bug and is not one.
 
 ## Vegetation
 
@@ -48,5 +58,6 @@ store, the runtime cell store, and the ecology clock.
   documents in Rust with stable UUIDs. Regenerate whenever a `.splant` (or other vegetation) schema
   identity changes — a hand-patched fixture passes locally and diverges from what the engine writes.
 - The suites also write a generated trunk OBJ before cooking; the fixture generator owns that too.
-- Cooked artifacts land in the content-addressed store beside `assets/`, not inside it. A test that
-  asserts on packaged output must account for `<project>/cache/vegetation/`.
+- Cooked artifacts land in the content-addressed store beside `assets/`, not inside it, and a
+  published state baseline lands in a second root beside both. A test that asserts on packaged output
+  must account for `<project>/cache/vegetation/` **and** `<project>/state/vegetation/`.

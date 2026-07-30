@@ -86,8 +86,8 @@ The shader contains gates for [GTAO](../../screen-space-and-post/gtao/) and [SSG
 | Ambient composition | `engine/assets/shaders/lighting.slang` | `evalLighting`, `ambient`, `reflectionSpec` |
 | Specular IBL | `engine/assets/shaders/lighting.slang` | `prefilterLod`, `prefilteredMap`, `brdfLut`, `fresnelSchlickRoughness` |
 | Opaque diffuse resolve | `engine/assets/shaders/gi_resolve.slang` | `GiParams`, `computeMain`, `indirectOut` |
-| Light UBO upload | `engine/crates/rendering/src/lighting.rs` | `LightUbo`, `Lighting::set_scene_lighting`, `Lighting::set_frame_ibl`, `Lighting::set_frame_ddgi` |
-| Ambient source selection | `engine/crates/assets/src/render_scene.rs` | `render_scene` |
+| Light UBO upload | `engine/crates/rendering/src/lighting/` | `LightUbo`, `Lighting::set_scene_lighting`, `Lighting::set_frame_ibl`, `Lighting::set_frame_ddgi` |
+| Ambient source selection | `engine/crates/assets/src/render_scene/` | `render_scene` |
 | Environment defaults | `engine/crates/scene/src/environment.rs` | `SceneEnvironment`, `SceneEnvironment::default` |
 
 ## Related

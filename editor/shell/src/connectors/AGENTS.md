@@ -95,9 +95,3 @@ cache or a per-feature directory.
 
 Each blob carries a `{key}.meta.json` sidecar (source url, ext, content type, fetched-at). A
 bounded `Semaphore` caps upstream concurrency; only cache misses take a permit.
-
-## Trap
-
-Some module/phase doc-comments still describe **unbuilt** or since-changed work (e.g. "Phase 1
-enables Poly Haven by default"). Trust the code, not the phase markers — the registry already wires
-all four providers and enablement is per-project.

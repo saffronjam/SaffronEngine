@@ -1,8 +1,5 @@
-//! Nested profiler scopes for pass bodies: a typed, lifetime-safe handle a render-graph
-//! pass body can use to bracket sub-phases of its own work in child GPU + CPU timestamp
-//! scopes. The graph opens one top-level scope per pass; a body that wants finer detail
-//! (e.g. the scene pass splitting opaque draws from app submissions) opens child scopes
-//! through this handle, which nest under the pass scope in the recorded tree.
+//! Nested profiler scopes for pass bodies: a lifetime-safe handle that brackets sub-phases of a
+//! pass's work in child GPU + CPU timestamp scopes, nested under the graph's per-pass scope.
 
 use ash::vk;
 

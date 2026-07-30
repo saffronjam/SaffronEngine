@@ -148,7 +148,7 @@ describe("fog debug view mode", () => {
   });
 });
 
-// Phase 4 — temporal reprojection, quality tiers, and per-light volumetric controls. The grid
+// Temporal reprojection, quality tiers, and per-light volumetric controls. The grid
 // quality tier reallocates the ping-pong history + integration volumes and rebinds the composite
 // sample; the temporal knobs ride the same `set-fog` merge; and the per-light fields round-trip
 // through the generic `set-component-field` / `inspect` with no per-command code.
@@ -226,8 +226,8 @@ describe("per-light volumetric controls", () => {
   });
 });
 
-// Phase 5 — local FogVolume components. A `fog-volume` preset spawns a box/sphere of local
-// participating media injected into the *same* froxel grid during Phase-3 density evaluation; its
+// Local FogVolume components. A `fog-volume` preset spawns a box/sphere of local
+// participating media injected into the *same* froxel grid during density evaluation; its
 // fields round-trip through the generic `set-component-field` / `inspect` with no per-command code,
 // and the injection loop (soft edge + height slab + tiling-noise erosion) stays validation-clean.
 describe("local fog volumes", () => {
@@ -292,7 +292,7 @@ describe("local fog volumes", () => {
   });
 });
 
-// Phase 6 — aerial perspective. `aerialPerspective` + `aerialIntensity` ride the same `set-fog`
+// Aerial perspective. `aerialPerspective` + `aerialIntensity` ride the same `set-fog`
 // merge (no new command). With an active atmosphere they arm the 32³ AP fill (the atmosphere LUT
 // march) + the shared-ledger composite fold; `set-atmosphere enabled:false` collapses AP to fog-only.
 // The two fields round-trip through `EnvironmentDto`, `aerialIntensity` validates `>= 0`, and the

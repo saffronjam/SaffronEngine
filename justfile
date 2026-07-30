@@ -17,8 +17,8 @@ engine_bin := engine / "target/debug/saffron-host"
 e2e_test_args := "--timeout 30000 --max-concurrency 4"
 
 # Put the toolchain on PATH: on Linux re-exec the recipe inside the toolbox (unless already in it
-# or SAFFRON_NO_TOOLBOX) then add bun; on macOS there is no toolbox, so use the host's rustup
-# toolchain (which honors rust-toolchain.toml — ahead of any Homebrew cargo) plus the host's bun.
+# or SAFFRON_NO_TOOLBOX) then add bun; on macOS use the host's rustup toolchain, which honors
+# rust-toolchain.toml, ahead of any Homebrew cargo.
 reenter := '''
     if [ "$(uname)" = "Darwin" ]; then
       export PATH="$HOME/.cargo/bin:$HOME/.bun/bin:$PATH"
@@ -31,40 +31,15 @@ reenter := '''
     fi
 '''
 
-# Point the Vulkan loader at the host GPU driver: on Linux add the host's NVIDIA ICD (Mesa/llvmpipe
-# stays the fallback); on macOS name MoltenVK's ICD plus Homebrew's validation-layer manifest and
-# dynamic-library directory.
-gpu_driver := '''
-    if [ "$(uname)" = "Darwin" ]; then
-      for icd in /opt/homebrew/etc/vulkan/icd.d/MoltenVK_icd.json /usr/local/etc/vulkan/icd.d/MoltenVK_icd.json; do
-        [ -f "$icd" ] && export VK_ICD_FILENAMES="$icd" && break
-      done
-      if [ -z "${VK_LAYER_PATH:-}" ]; then
-        for prefix in /opt/homebrew /usr/local; do
-          layer_manifest="$prefix/opt/vulkan-validationlayers/share/vulkan/explicit_layer.d"
-          layer_library="$prefix/opt/vulkan-validationlayers/lib"
-          if [ -d "$layer_manifest" ] && [ -d "$layer_library" ]; then
-            export VK_LAYER_PATH="$layer_manifest"
-            export DYLD_FALLBACK_LIBRARY_PATH="$layer_library${DYLD_FALLBACK_LIBRARY_PATH:+:$DYLD_FALLBACK_LIBRARY_PATH}"
-            break
-          fi
-        done
-      fi
-    else
-      NVIDIA_ICD="$(ls /run/host/usr/share/vulkan/icd.d/nvidia_icd.x86_64.json /usr/share/vulkan/icd.d/nvidia_icd.x86_64.json 2>/dev/null | head -n1 || true)"
-      [ -n "$NVIDIA_ICD" ] && export VK_ADD_DRIVER_FILES="$NVIDIA_ICD"
-    fi
-'''
+# Point the Vulkan loader at this platform's driver. `tools/gpu-driver.sh` is the one resolution;
+# `tools/ci/check.sh` sources the same file so the gate selects the device the recipes do.
+gpu_driver_script := repo / "tools/gpu-driver.sh"
+gpu_driver := '. "' + gpu_driver_script + '"'
 
 # Build the CEF shell and verify its staged runtime, leaving $shell_bin at the binary to exec.
-# Linux: cef-dll-sys stages the runtime next to the binary; an interrupted extraction leaves 0-byte
-# icudtl.dat/*.pak, which cef-dll-sys never repairs on its own (it only downloads when the dir is
-# absent) and CEF then aborts at startup with "Couldn't mmap icu data file" — on a truncated
-# resource, purge cef-dll-sys and rebuild once, failing loudly if it recurs. macOS: CEF loads from
-# the framework inside the `.app` bundle; the shell builds against a pre-provisioned CEF
-# distribution at $CEF_PATH (version pinned to the `cef` crate in editor/shell/Cargo.toml — without
-# it, cef-dll-sys downloads a full distribution per target dir), the bundle is assembled once, and
-# later builds refresh only the binaries inside it (the framework re-copy is the slow path).
+# Linux: cef-dll-sys only stages the runtime when the directory is absent, so a truncated resource
+# needs an explicit purge and rebuild or CEF aborts at startup. macOS: CEF loads from the framework
+# inside the `.app` bundle, built against the pre-provisioned distribution at $CEF_PATH.
 # Requires cwd = editor/shell and $cef_profile (debug|release; the macOS bundle path is debug-only).
 cef_gate := '''
     if [ "$(uname)" = "Darwin" ]; then
@@ -101,7 +76,7 @@ cef_gate := '''
         [ "$(stat -Lc%s "$cef_dir/icudtl.dat")" -ge 1000000 ]
       }
       if ! _cef_intact; then
-        echo "cef: runtime resources in $cef_dir are truncated (interrupted extraction) — re-provisioning cef-dll-sys" >&2
+        echo "cef: runtime resources in $cef_dir are truncated — re-provisioning" >&2
         rm -f "$cef_dir"/icudtl.dat "$cef_dir"/*.pak "$cef_dir"/v8_context_snapshot.bin
         cargo clean -p cef-dll-sys
         if [ "${cef_profile:-debug}" = release ]; then cargo build --release; else cargo build; fi
@@ -114,8 +89,7 @@ cef_gate := '''
 '''
 
 # The per-platform Chromium switch set the shell forwards via SAFFRON_CEF_SWITCHES (comma-separated
-# `k=v` / bare flags). Linux brings CEF's GPU process up over Ozone/X11; macOS runs the default
-# GPU-composited OSR and mocks the Chromium keychain so a dev run never prompts for keychain access.
+# `k=v` / bare flags). Mocking the keychain on macOS keeps a dev run from prompting for access.
 cef_switches := '''
     if [ "$(uname)" = "Darwin" ]; then
       export SAFFRON_CEF_SWITCHES="use-mock-keychain"
@@ -218,16 +192,20 @@ schema: engine
     {{gpu_driver}}
     cd "{{repo}}/tools/check-control-schema" && bun run check.ts
 
+# typecheck the e2e suite against the generated @saffron/protocol types
+e2e-typecheck:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    RECIPE=e2e-typecheck; {{reenter}}
+    cd "{{repo}}/tests/e2e" && bun install --frozen-lockfile && bun run typecheck
+
 # end-to-end tests driving a headless engine over the control plane (bun test)
-e2e: engine
+e2e: engine e2e-typecheck
     #!/usr/bin/env bash
     set -euo pipefail
     RECIPE=e2e; {{reenter}}
     {{gpu_driver}}
     rm -f /tmp/saffron-e2e-*.sock 2>/dev/null || true
-    # A generous per-test/hook timeout: boots wait for the non-blocking project load to reach
-    # `ready`, and on the llvmpipe fallback the first content renders are slow, so the 5s default is
-    # too tight for the heavier setup hooks (boot + multiple loads + import).
     cd "{{repo}}/tests/e2e" && bun test {{e2e_test_args}}
 
 # run one e2e file by name (`.test.ts` appended if omitted): `just e2e-file rendering`
@@ -268,7 +246,7 @@ test:
     {{gpu_driver}}
     cd "{{engine}}" && cargo test --workspace
 
-# execute the Phase-1/Phase-3 Rust/Slang corpus on one physical GPU and emit bound JSON evidence
+# run the Rust/Slang conformance corpus on one physical GPU and emit bound JSON evidence
 compute-conformance:
     #!/usr/bin/env bash
     set -euo pipefail
@@ -296,13 +274,11 @@ run mode="":
     cd "{{editor}}/shell"
     cef_profile=debug; {{cef_gate}}
     {{cef_switches}}
-    # `just run inspect` also exposes Chrome DevTools over remote debugging. `remote-allow-origins`
-    # is mandatory on Chromium 149 or the DevTools websocket is refused.
+    # `remote-allow-origins` is required or the DevTools websocket is refused.
     if [ "{{mode}}" = "inspect" ]; then
       export SAFFRON_CEF_SWITCHES="${SAFFRON_CEF_SWITCHES},remote-debugging-port=9222,remote-allow-origins=*"
       echo "[run] remote debugging: Chrome -> chrome://inspect -> Configure -> add localhost:9222 -> inspect the editor page."
     fi
-    # Start Vite in the background, wait for it, run the shell; Vite dies with the recipe.
     cd "{{editor}}"
     bun run dev >/tmp/saffron-vite.log 2>&1 &
     trap 'kill %1 2>/dev/null || true' EXIT
@@ -331,9 +307,8 @@ run-debug:
     export SAFFRON_DEV_URL="http://127.0.0.1:1420"
     exec "$shell_bin"
 
-# run the editor with CEF's GPU process on software (`disable-gpu`) and, on Linux, the engine on the
-# llvmpipe software GPU (no NVIDIA ICD). macOS has no software Vulkan ICD, so the engine stays on
-# MoltenVK there and only the CEF half goes software.
+# run the editor with CEF's GPU process on software (`disable-gpu`) and, on Linux, the engine on
+# llvmpipe. macOS has no software Vulkan ICD, so only the CEF half goes software there.
 run-software:
     #!/usr/bin/env bash
     set -euo pipefail
@@ -414,8 +389,8 @@ capture out="engine/target/capture.png":
     [ -S "$sock" ] || { echo "capture: host never opened $sock"; tail -20 "$log"; exit 1; }
     SA="{{engine}}/target/debug/sa"
     "$SA" screenshot --target viewport --path "$out" >/dev/null
-    # per-pass GPU timings: arm timestamps, then nudge the camera so the reactive loop renders a
-    # fresh burst in timestamps mode (a static scene idles and would otherwise report nothing).
+    # Nudge the camera after arming timestamps: the reactive loop idles on a static scene and
+    # would report no timings.
     "$SA" profiler.set-mode --mode timestamps >/dev/null
     "$SA" set-camera --fov 44 >/dev/null; "$SA" set-camera --fov 45 >/dev/null
     sleep 1

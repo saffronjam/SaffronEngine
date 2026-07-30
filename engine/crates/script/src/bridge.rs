@@ -2,16 +2,12 @@
 //! POD structs ([`ScriptRayHit`], [`ScriptRagdollState`]) the physics-reaching bindings
 //! exchange with the host.
 //!
-//! Keeping `saffron-script` off a physics/sceneedit dependency edge means routing every
-//! physics reach through one [`ScriptHostBridge`] trait with one method per bridge over
-//! POD args (`glam::Vec3`, [`Uuid`], the two POD structs), so this crate stays
-//! `saffron-core` + `saffron-scene` only — the host (which *does* depend on physics +
-//! sceneedit) implements it.
+//! Routing every physics reach through one trait over POD args is what keeps this crate off a
+//! physics or sceneedit dependency edge; the host, which does depend on both, implements it.
 //!
-//! Unset = a safe no-op: [`ScriptHost`](crate::ScriptHost) defaults its bridge to
-//! [`NoopBridge`], so a session without a host-installed bridge (every unit test, an
-//! Edit-mode read) sees `raycast` miss, `get_velocity` return zero, and the ragdoll/log
-//! calls no-op — never a panic.
+//! [`ScriptHost`](crate::ScriptHost) defaults its bridge to [`NoopBridge`], so a session with no
+//! host-installed bridge sees `raycast` miss, `get_velocity` return zero, and the ragdoll and log
+//! calls no-op rather than panic.
 
 use glam::Vec3;
 

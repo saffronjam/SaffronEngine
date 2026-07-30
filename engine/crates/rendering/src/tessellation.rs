@@ -1,10 +1,8 @@
-//! GPU **adaptive tessellation** subsystem — the amplifying displacement path. Compute passes *amplify*
-//! each base triangle of a displacement-enabled mesh into a watertight grid of displaced micro-geometry
-//! written to a per-frame transient VB/IB, read by both the raster passes (indirect draw) and the RT
-//! BLAS. This module owns the descriptor infrastructure + push layouts for the Phase-3 preparation
-//! passes; the Phase-4 dice/emit kernel joins the same subsystem.
+//! GPU adaptive tessellation — the amplifying displacement path. Compute passes amplify each base
+//! triangle of a displacement-enabled mesh into a watertight grid of displaced micro-geometry written
+//! to a per-frame transient VB/IB, read by both the raster passes (indirect draw) and the RT BLAS.
 //!
-//! Phase-3 passes, per displaced instance unless noted:
+//! The passes, per displaced instance unless noted:
 //! - **factor** (`tess_factor.slang`): one fractional tessellation factor per unique base edge, from
 //!   the welded endpoints only — shared edges index one slot, so they cannot crack.
 //! - **scan** (`tess_scan.slang`): predict each triangle's exact dice output counts, atomic-carry
@@ -12,21 +10,20 @@
 //! - **finalize** (`tess_finalize.slang`): write the instance's indirect `VkDrawIndexedIndirectCommand`
 //!   seed + its RT primitive count.
 //! - **args** (`tess_args.slang`, once): the global `VkDispatchIndirectCommand` sizing the emit dispatch.
+//! - **emit** (`tessellate.slang`): one workgroup per base triangle dices it into the barycentric
+//!   micro-grid at level `L`, Phong-smooths + displaces + welds each micro-vertex, and writes the
+//!   amplified micro-vertices + generated index stream into the transient VB/IB. It also writes each
+//!   micro-vertex's previous-frame position (the double-buffered per-edge factors on the same grid)
+//!   into a parallel prev-VB, so the motion prepass reprojects the geomorph slide for TAA.
 //!
-//! - **emit** (`tessellate.slang`, Phase 4): one workgroup per base triangle dices it into the
-//!   barycentric micro-grid at level `L`, Phong-smooths + displaces + welds each micro-vertex, and
-//!   writes the amplified micro-vertices + generated index stream into the transient VB/IB. It also
-//!   writes each micro-vertex's previous-frame position (the Phase-5 double-buffered per-edge factors on
-//!   the same grid) into a parallel prev-VB, so the motion prepass reprojects the geomorph slide for TAA.
-//!
-//! The dice contract (Phase 3 defines, Phase 4 emits): the driving factor `m = max(f0,f1,f2)` (capped) is
-//! resolved by the **split pass** ([`dice_plan`]) into `4^levels` barycentric subpatches, each diced at
+//! The dice contract: the driving factor `m = max(f0,f1,f2)` (capped) is resolved by the split pass
+//! ([`dice_plan`]) into `4^levels` barycentric subpatches, each diced at
 //! `leaf_level = ceil(m / 2^levels)` clamped to `[1, TESS_MAX_DICE_FACTOR]`, giving `4^levels·(L+1)(L+2)/2`
 //! vertices and `4^levels·L²` triangles. A triangle within the dice cap needs no split (`levels = 0`, one
 //! leaf at `L = ceil(m)`). Sibling subpatches share their interior split edges bit-identically (parent-
-//! relative dyadic midpoints); the parent's OUTER edges still weld with the neighbouring base triangle
-//! because each boundary micro-vertex is snapped onto the SHARED per-edge factor's floor→ceil segment grid
-//! (Phase-5 geomorph), a pure function of that edge's two endpoints regardless of either side's split depth.
+//! relative dyadic midpoints); the parent's outer edges still weld with the neighbouring base triangle
+//! because each boundary micro-vertex is snapped onto the shared per-edge factor's floor→ceil segment
+//! grid, a pure function of that edge's two endpoints regardless of either side's split depth.
 
 use std::sync::Arc;
 
@@ -39,16 +36,14 @@ use crate::frame::MAX_FRAMES_IN_FLIGHT;
 use crate::resources::{Buffer, DeviceResources, GpuMesh};
 
 /// Per-frame cap on tessellated instances (matching the displacement/skinning budgets). The global
-/// micro-triangle ceiling (Phase-3 budget) bounds emitted geometry within this instance count.
+/// micro-triangle ceiling bounds emitted geometry within this instance count.
 pub const TESS_MAX_INSTANCES: u32 = 64;
 
-/// Default hard per-edge dice cap until a control command tunes it. Generous by design: the split pass
-/// expresses factors far beyond the CLAS leaf (`dice_plan` resolves 256 → 1024 subpatches × leaf 8), the
-/// screen-space factor only *reaches* the cap where detail warrants it, and the hard budget
-/// ([`budget_scaled_caps`]) coarsens instances whenever the summed worst case would exceed
-/// [`TESS_MICRO_VERTEX_BUDGET`] — the budget, not this constant, is the real bound (the
-/// vk_tessellated_clusters / Nanite pattern: a dice cap + unbounded-ish split + a pool clamp). A low cap
-/// here was the "8-peak plane" defect: it strangled the split before the budget ever mattered.
+/// Default hard per-edge dice cap until a control command tunes it. Deliberately generous: the split
+/// pass expresses factors far beyond the CLAS leaf (`dice_plan` resolves 256 → 1024 subpatches × leaf 8),
+/// the screen-space factor only *reaches* the cap where detail warrants it, and
+/// [`budget_scaled_caps`] coarsens instances whenever the summed worst case would exceed
+/// [`TESS_MICRO_VERTEX_BUDGET`] — the budget, not this constant, is the real bound.
 pub const TESS_DEFAULT_FACTOR_CAP: f32 = 256.0;
 /// Default lower factor clamp — never coarser than the base triangle.
 pub const TESS_DEFAULT_MIN_FACTOR: f32 = 1.0;
@@ -57,7 +52,7 @@ pub const TESS_DEFAULT_MIN_FACTOR: f32 = 1.0;
 /// quad-occupancy collapse. Tunable live via `set-tessellation-quality`.
 pub const TESS_DEFAULT_EDGE_LENGTH_TARGET: f32 = 4.0;
 
-/// RT secondary-ray tessellation **coarsening** factor (Phase 10, Q2). Shadow / GI / reflection rays do
+/// RT secondary-ray tessellation coarsening factor. Shadow / GI / reflection rays do
 /// not need the primary view's ~1-triangle-per-pixel density, so the per-frame RT BLAS is built from a
 /// **separate, coarser** run of the factor→scan→emit chain: the per-edge LOD target is multiplied by this
 /// factor (fewer micro-edges) and the dice cap divided by it (a smaller worst-case reservation → far fewer
@@ -68,7 +63,7 @@ pub const TESS_DEFAULT_EDGE_LENGTH_TARGET: f32 = 4.0;
 /// build at coarser relief. Applied per instance in [`rt_coarsen_target`] / [`rt_coarsen_cap`].
 pub const TESS_RT_COARSEN: f32 = 2.0;
 
-/// The frame-global ceiling on emitted micro-vertices across all instances (the Phase-3 budget). The
+/// The frame-global ceiling on emitted micro-vertices across all instances. The
 /// transient VB/IB are reserved to this size regardless of per-instance worst cases summing higher; the
 /// scan's global totals are read back to detect (and log) an overflow.
 /// ~one micro-vertex per 1080p pixel. VRAM anchor: the budget bounds the transient VB (48 B/vert) + the
@@ -79,9 +74,8 @@ pub const TESS_MICRO_VERTEX_BUDGET: u64 = 2 * 1024 * 1024;
 /// Initial per-edge factor-buffer capacity (in `f32` edges), doubling grow-only from here.
 const INITIAL_FACTOR_CAPACITY: u32 = 4096;
 
-/// Max triangles per cluster for the NVIDIA CLAS fast path (`VK_NV_cluster_acceleration_structure`,
-/// Phase 8). Aligning the dice/split leaf size to this hardware cap now lets the CLAS backend bolt on
-/// later with no re-clustering; the portable BLAS floor is unaffected by it.
+/// Max triangles per cluster for the NVIDIA CLAS fast path (`VK_NV_cluster_acceleration_structure`).
+/// The dice/split leaf size aligns to this hardware cap; the portable BLAS floor is unaffected by it.
 pub const TESS_CLAS_MAX_TRIS: u32 = 128;
 /// Max vertices per cluster for the CLAS fast path (the paired hardware cap).
 pub const TESS_CLAS_MAX_VERTS: u32 = 256;
@@ -152,21 +146,18 @@ pub fn smoothstep01(t: f32) -> f32 {
     t * t * (3.0 - 2.0 * t)
 }
 
-/// Geomorph blend weight (Phase 5) for a diced micro-vertex, from the Phase-3 fractional factor. The
+/// Geomorph blend weight for a diced micro-vertex, from the fractional factor. The
 /// continuous tessellation factor is `f = level + remainder` (`remainder ∈ [0,1)`); `levels_since_birth`
 /// is `current_level − birth_level`, the number of integer subdivision levels a vertex has existed.
 ///
-/// A vertex born at the current top level (`levels_since_birth == 0`) is an "odd" vertex still morphing
-/// in: it blends from its **coarse-parent** position (`w = 0` — the linear midpoint of its two even
-/// neighbours, which lies on the lower-level surface, so a newborn appears with no pop) to its **fine**
-/// diced + displaced position (`w = 1`) as `remainder` sweeps `0 → 1`. A vertex present at a lower level
-/// (`levels_since_birth ≥ 1`) is fully resolved (`w = 1`).
+/// A vertex born at the current top level (`levels_since_birth == 0`) blends from its coarse-parent
+/// position (`w = 0`, the linear midpoint of its two even neighbours, which lies on the lower-level
+/// surface) to its fine diced + displaced position (`w = 1`) as `remainder` sweeps `0 → 1`. A vertex
+/// present at a lower level is fully resolved (`w = 1`).
 ///
-/// C0 across an integer boundary: a just-born vertex at `remainder → 1⁻` reads `w → 1`, and the same
-/// sample one level up (`levels_since_birth == 1`) reads `w = 1` — no discontinuity, so a factor
-/// transition is a smooth motion, not a topology pop. The smoothstep ramp additionally matches velocity
-/// (C1) at the boundary, keeping the motion vector continuous for TAA. The emit kernel evaluates this
-/// same weight on both the current and the previous streams so a geomorph is a small cur/prev delta.
+/// The weight is C0 across an integer boundary — `remainder → 1⁻` reads `w → 1`, and the same sample
+/// one level up reads `w = 1` — so a factor transition is a smooth motion, not a topology pop; the
+/// smoothstep ramp also matches velocity (C1) there, keeping the motion vector continuous for TAA.
 pub fn geomorph_weight(remainder: f32, levels_since_birth: u32) -> f32 {
     if levels_since_birth >= 1 {
         1.0
@@ -175,26 +166,20 @@ pub fn geomorph_weight(remainder: f32, levels_since_birth: u32) -> f32 {
     }
 }
 
-/// The **interior-geomorph coarse-parent lookup** (Phase 10) — CPU mirror of the emit kernel's
-/// `coarseParentPosition`. A triangle dices at `L = ceil(maxFactor)`; an interior micro-vertex morphs from
-/// the coarser `L-1` approximation toward the fine `L` surface as the fractional factor sweeps `0 → 1`
-/// (weighted by [`smoothstep01`]), so a diced row appearing as the camera dollies in is a smooth morph,
-/// not a facet pop. The coarse-parent position is the linear interpolation across the `L-1` micro-triangle
-/// that contains the vertex's barycentric point: this function locates that micro-triangle and returns its
-/// three corner grid vertices (as integer `(i, j)` coords on the `level = L-1` grid) each paired with the
-/// point's local barycentric weight there. The kernel evaluates the displaced surface at the three corners
-/// and blends by these weights.
+/// The interior-geomorph coarse-parent lookup — CPU mirror of the emit kernel's
+/// `coarseParentPosition`. Locates the `L-1` micro-triangle containing a vertex's barycentric point and
+/// returns its three corner grid vertices (integer `(i, j)` on the `level = L-1` grid), each paired with
+/// the point's local barycentric weight; the kernel evaluates the displaced surface at those corners and
+/// blends by these weights.
 ///
 /// `a`, `b` are the corner-1 / corner-2 barycentric weights of the point over the base triangle
 /// (`w = (1-a-b, a, b)`), with `a, b ≥ 0` and `a + b ≤ 1`; `level ≥ 1`. The returned weights sum to 1 and
 /// reconstruct the point in coarse-grid coords (`Σ wᵢ·(iᵢ, jᵢ) = (a·level, b·level)`). Interior samples
-/// have `a + b < 1`, so `I + J < level` and every returned corner (including the down-triangle apex) is a
-/// valid grid vertex. Pure + testable: the barycentric location the shader and this test must agree on.
+/// have `a + b < 1`, so `I + J < level` and every returned corner is a valid grid vertex.
 ///
-/// Exactness note: successive integer dice levels are *distinct* barycentric grids, not nested
-/// refinements, so the morph is continuous only up to the sub-facet error of a fine micro-triangle
-/// straddling a coarse facet crease (bounded by per-facet curvature, vanishing as `L` grows) — visually
-/// continuous, not bit-exact. This is inherent to integer-`L` dicing, not a defect of the lookup.
+/// Successive integer dice levels are distinct barycentric grids, not nested refinements, so the morph
+/// is continuous only up to the sub-facet error of a fine micro-triangle straddling a coarse facet
+/// crease (bounded by per-facet curvature, vanishing as `L` grows) — visually continuous, not bit-exact.
 pub fn coarse_parent_bary(a: f32, b: f32, level: u32) -> [(u32, u32, f32); 3] {
     let level_f = level.max(1) as f32;
     let bi = a * level_f; // corner-1 axis, coarse-grid coords
@@ -233,7 +218,7 @@ pub fn project_world_to_pixels(
     (world_len / dist) / tan * viewport_h * 0.5
 }
 
-/// The **displacement-aware** per-edge tessellation factor (Phase 10). The base metric measures the flat
+/// The displacement-aware per-edge tessellation factor. The base metric measures the flat
 /// base edge only, so a flat surface under a tall/high-frequency height field undersamples the *displaced*
 /// surface (the "spiky plane"). The displaced patch spans the base edge **plus** the local displacement
 /// range along the normal, so the tessellation must resolve whichever is larger: the factor is driven by
@@ -253,7 +238,7 @@ pub fn displacement_aware_factor(
     (driving_px / target).clamp(min_factor, factor_cap)
 }
 
-/// The **hard triangle budget** (Phase 10): scale each instance's factor cap down so the *summed*
+/// The hard triangle budget: scale each instance's factor cap down so the *summed*
 /// worst-case micro-vertex reservation fits `vert_budget`, coarsening under pressure. Worst-case vertices
 /// grow ~quadratically in the cap (`≈ tri·L²/2`), so a proportional fit scales every cap by
 /// `√(budget/total)`; a couple of iterations tighten the +L linear terms. Each cap is floored at its
@@ -287,14 +272,14 @@ pub fn budget_scaled_caps(instances: &[(u32, f32, f32)], vert_budget: u64) -> Ve
     caps
 }
 
-/// The RT-coarsened per-edge LOD target (Phase 10, Q2): the raster `edge_length_target` scaled up by
+/// The RT-coarsened per-edge LOD target: the raster `edge_length_target` scaled up by
 /// [`TESS_RT_COARSEN`], so each RT micro-edge is allowed to span more pixels and the factor kernel emits a
 /// coarser dice for the secondary-ray BLAS. Pure; the shared CPU/GPU contract fed into the RT factor push.
 pub fn rt_coarsen_target(edge_length_target: f32) -> f32 {
     edge_length_target * TESS_RT_COARSEN.max(1.0)
 }
 
-/// The RT-coarsened dice cap (Phase 10, Q2): the (budget-scaled) raster `factor_cap` divided by
+/// The RT-coarsened dice cap: the (budget-scaled) raster `factor_cap` divided by
 /// [`TESS_RT_COARSEN`] and rounded up, floored at `min_factor` (never coarser than requested) and at `1`
 /// (always at least the base triangle — displaced, never flat). Because the coarse factors are already
 /// ~`1/COARSEN` of the raster ones, this cap only re-clips what the raster cap would, scaled; it bounds the
@@ -306,23 +291,23 @@ pub fn rt_coarsen_cap(factor_cap: f32, min_factor: f32) -> f32 {
         .max(min_factor.max(1.0))
 }
 
-/// One displaced instance to tessellate: its base mesh (carrying the Phase-2 conditioning buffers), its
+/// One displaced instance to tessellate: its base mesh (carrying the conditioning buffers), its
 /// world transform, the material displacement params, and the per-instance budget. Gathered from each
 /// displacement-enabled draw item; the amplified transient geometry it emits is what every raster + RT
 /// consumer reads for that mesh.
 pub struct TessBucket {
     /// The base mesh; [`GpuMesh::conditioning`] supplies the welded/edges/tri-edges buffers.
     pub mesh: Arc<GpuMesh>,
-    /// The base offset into the frame's instance buffer for this instance's submesh-major block —
-    /// the `firstInstance` the tessellated indirect draw must seed, and the key that links this
-    /// bucket to its [`crate::TessSceneDraw`] when `record_tess_prep` resolves the draw handles.
-    pub base_instance: u32,
+    /// The instance's slot in the persistent GPU scene's instance table, or
+    /// [`crate::RT_UNMIRRORED_INSTANCE`] when the instance is not mirrored. The traversal
+    /// looks the arena row up by this slot, so an unmirrored instance amplifies nothing.
+    pub instance_slot: u32,
     /// The entity id, keying this bucket to its [`crate::DeformedRtInstance`] so `record_tess_prep`
     /// can fill the RT tessellated slice (and the per-entity `TessellatedBlas`). `0` when RT is unarmed.
     pub entity: u64,
     /// This instance's world transform.
     pub model: Mat4,
-    /// Bindless index of the height map (Phase-4 dice samples it).
+    /// Bindless index of the height map (the dice pass samples it).
     pub height_index: u32,
     /// Local-space displacement amplitude.
     pub height_scale: f32,
@@ -336,6 +321,49 @@ pub struct TessBucket {
     pub min_factor: f32,
     /// Desired pixels per micro-edge (the LOD target).
     pub edge_length_target: f32,
+}
+
+/// One (instance slot, arena row) pair in the frame's displaced-row table, sorted by slot so
+/// the traversal's lookup is a binary search.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, bytemuck::Pod, bytemuck::Zeroable)]
+#[repr(C)]
+pub struct DisplacedRow {
+    /// The instance's slot in the persistent GPU scene's instance table.
+    pub slot: u32,
+    /// The instance's row in the frame's displacement arena.
+    pub row: u32,
+}
+
+/// Buffer device addresses of the frame's displacement arena, published in the GPU-scene
+/// address block. All zero on a frame where nothing displaces.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct DisplacedFrameAddresses {
+    /// The amplified micro-vertex arena (48-byte vertices).
+    pub vertices: u64,
+    /// The parallel previous-frame micro-vertex arena.
+    pub prev_vertices: u64,
+    /// The amplified index stream.
+    pub indices: u64,
+    /// The per-row draw seeds the binner reads.
+    pub draws: u64,
+    /// The slot-sorted row table.
+    pub rows: u64,
+    /// Entries in the row table.
+    pub row_count: u32,
+}
+
+/// The frame's displacement arena as pass inputs: the buffers the executor's displaced
+/// buckets bind and read. Absent on a frame where nothing displaces.
+#[derive(Clone, Copy, Debug)]
+pub struct DisplacedFrameBuffers {
+    /// The amplified micro-vertex arena.
+    pub vertices: vk::Buffer,
+    /// The parallel previous-frame micro-vertex arena.
+    pub prev_vertices: vk::Buffer,
+    /// The amplified index stream — the index buffer a displaced draw bucket binds.
+    pub indices: vk::Buffer,
+    /// The per-row draw seeds.
+    pub draws: vk::Buffer,
 }
 
 /// The CPU-computed placement of one instance inside the shared transient buffers + descriptor rows.
@@ -372,8 +400,8 @@ struct FrameTess {
     pool: vk::DescriptorPool,
 }
 
-/// The tessellation subsystem: the five compute set layouts (factor/scan/finalize/args prep + the
-/// Phase-4 emit) + a per-frame descriptor pool. The transient VB/IB/args/count buffers are owned by
+/// The tessellation subsystem: the five compute set layouts (factor/scan/finalize/args prep + emit)
+/// plus a per-frame descriptor pool. The transient VB/IB/args/count buffers are owned by
 /// [`crate::transient::RenderGraphResources`]; this wires the dispatches that write them.
 pub struct Tessellation {
     resources: Arc<DeviceResources>,
@@ -383,7 +411,7 @@ pub struct Tessellation {
     args_layout: vk::DescriptorSetLayout,
     emit_layout: vk::DescriptorSetLayout,
     frames: Vec<FrameTess>,
-    /// The persistent double-buffered per-edge factor store (Phase-5 temporal): two grow-only slots,
+    /// The persistent double-buffered per-edge factor store: two grow-only slots,
     /// **not** the rewound transient pool, so last frame's factors survive to drive the prev geomorph.
     /// Frame `f` writes cur factors into `slot[f % 2]` and reads prev from `slot[(f + 1) % 2]` — the
     /// same 2-slot parity the TAA history ping-pong uses (in lockstep with the frame-in-flight index).
@@ -397,6 +425,10 @@ pub struct Tessellation {
     /// Factor slots superseded by a grow, held for [`MAX_FRAMES_IN_FLIGHT`] `begin_frame`s before free so
     /// an in-flight frame reading the old slot as its prev stream never sees a use-after-free.
     retired_factors: Vec<(Buffer, usize)>,
+    /// One host-visible slot-sorted row table per frame in flight. The traversal reads it
+    /// through its device address, so it is written before the frame's address block is
+    /// published and not touched again.
+    row_tables: Vec<Buffer>,
 }
 
 impl Tessellation {
@@ -437,7 +469,7 @@ impl Tessellation {
             }
         };
         // The emit set: base VB + base IB + perTri + triEdges + factors + out VB + out IB + prev factors +
-        // prev out VB (the Phase-5 temporal prev-stream — same slice layout, previous frame's factors).
+        // prev out VB (the prev-stream — same slice layout, previous frame's factors).
         let emit_layout = match storage_set_layout(raw, 9) {
             Ok(l) => l,
             Err(err) => {
@@ -482,6 +514,7 @@ impl Tessellation {
             factor_capacity: [0, 0],
             factor_layout_sig: [Vec::new(), Vec::new()],
             retired_factors: Vec::new(),
+            row_tables: Vec::new(),
         })
     }
 
@@ -537,7 +570,7 @@ impl Tessellation {
         if let Some(old) = self.factor_slots[slot].take() {
             // Held past the fences of every frame that could still read the old slot as its prev stream.
             self.retired_factors.push((old, MAX_FRAMES_IN_FLIGHT));
-            // The old contents are gone, so the stored layout no longer describes this slot's buffer.
+            // The reallocated slot holds no contents the stored layout describes.
             self.factor_layout_sig[slot].clear();
         }
         let handle = buffer.handle();
@@ -553,6 +586,47 @@ impl Tessellation {
     /// The buffer handle of factor `slot`, or `None` before its first grow.
     pub fn factor_slot(&self, slot: usize) -> Option<vk::Buffer> {
         self.factor_slots[slot].as_ref().map(Buffer::handle)
+    }
+
+    /// Publishes `rows` into `frame`'s row table and returns its device address.
+    ///
+    /// The table is sorted by instance slot here rather than at the call site: the
+    /// traversal binary-searches it, and an unsorted table silently loses instances.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`crate::Error::Vk`] when the table cannot be created.
+    pub fn publish_rows(
+        &mut self,
+        device: &Device,
+        frame: usize,
+        rows: &mut [DisplacedRow],
+    ) -> crate::Result<u64> {
+        rows.sort_unstable_by_key(|entry| entry.slot);
+        while self.row_tables.len() <= frame {
+            self.row_tables.push(Buffer::new(
+                &self.resources,
+                TESS_MAX_INSTANCES as u64 * size_of::<DisplacedRow>() as u64,
+                vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS,
+                &vk_mem::AllocationCreateInfo {
+                    usage: vk_mem::MemoryUsage::Auto,
+                    flags: vk_mem::AllocationCreateFlags::HOST_ACCESS_SEQUENTIAL_WRITE
+                        | vk_mem::AllocationCreateFlags::MAPPED,
+                    ..Default::default()
+                },
+            )?);
+        }
+        let table = &self.row_tables[frame];
+        // SAFETY: HOST_VISIBLE + MAPPED; the frame slot's fence completed before reuse, and
+        // the caller clamps `rows` to `TESS_MAX_INSTANCES`.
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                rows.as_ptr().cast::<u8>(),
+                table.mapped_ptr(),
+                std::mem::size_of_val(rows),
+            );
+        }
+        Ok(device.buffer_device_address(table.handle()))
     }
 
     /// Whether factor `slot`'s last-written per-instance edge-count sequence equals `sig` — i.e. the
@@ -638,7 +712,7 @@ pub struct TessFactorPush {
     pub factor_base: u32,
     /// LOCAL-space displacement amplitude (`height_scale`, the material's object-space amplitude) — the
     /// extent along the normal for a *full* `[0,1]` height range. The kernel scales it by the per-edge
-    /// local height range sampled from the min/max pyramid (Phase 10 per-region adaptivity), so a flat
+    /// local height range sampled from the min/max pyramid, so a flat
     /// base under a busy — not merely tall — height field still refines.
     pub disp_amp_local: f32,
     /// Bindless slot of the height map, addressing its min/max pyramid (binding 4) so the kernel samples
@@ -678,9 +752,7 @@ pub struct TessFinalizePush {
     pub index_base: u32,
     /// Prim-count slot index (the tess instance row).
     pub instance_row: u32,
-    /// The draw's `firstInstance` — the batch's `base_instance` (submesh-major instance row).
-    pub first_instance: u32,
-    pub _pad: [u32; 2],
+    pub _pad: [u32; 3],
 }
 
 /// The `tessellate` emit push (64 B) — matches `tessellate.slang`'s `Push`.
@@ -699,7 +771,7 @@ pub struct TessEmitPush {
     /// other vertex, so gizmo-scaling an object scales its relief proportionally (the Blender / Arnold /
     /// RenderMan / Nanite object-space convention).
     pub height_scale: f32,
-    /// Hard clamp on the driving factor (matches Phase 3); the split pass resolves it into subpatches +
+    /// Hard clamp on the driving factor; the split pass resolves it into subpatches +
     /// leaf level. Also the cap `snapEdgeParam` clamps the shared per-edge factor to for the outer-edge
     /// weld, so a split triangle's boundary is diced at the full shared factor (not the leaf cap).
     pub factor_cap: f32,
@@ -783,8 +855,8 @@ fn storage_set_layout(raw: &ash::Device, count: u32) -> crate::Result<vk::Descri
 }
 
 /// A per-frame tessellation pool: per instance the raster factor (3) + scan (5) + finalize (3) + emit (9)
-/// sets **plus** the RT-coarsening factor (3) + scan (5) + emit (9) sets (Phase 10, Q2 — the coarse
-/// secondary-ray chain reuses the same layouts, minus finalize/args), plus one global args (2) set, across
+/// sets **plus** the RT-coarsening factor (3) + scan (5) + emit (9) sets (the coarse secondary-ray chain
+/// reuses the same layouts, minus finalize/args), plus one global args (2) set, across
 /// [`TESS_MAX_INSTANCES`].
 fn create_tess_pool(raw: &ash::Device) -> crate::Result<vk::DescriptorPool> {
     // Raster: factor + scan + finalize + emit (4). RT: factor + scan + emit (3). = 7 sets per instance.
@@ -1140,10 +1212,10 @@ mod tests {
         );
     }
 
-    /// RT secondary-ray coarsening (Phase 10, Q2): the target scales up by `TESS_RT_COARSEN` (a coarser
+    /// RT secondary-ray coarsening: the target scales up by `TESS_RT_COARSEN` (a coarser
     /// dice), the cap scales down (a smaller reservation), the cap never drops below the min factor or 1
     /// (still displaced, never flat), and the worst-case reservation shrinks ~quadratically vs. the raster
-    /// arena — the whole point of coarsening the RT BLAS build.
+    /// arena.
     #[test]
     fn rt_coarsening_scales_target_up_and_cap_and_reservation_down() {
         // Target scales up by the coarsening factor.

@@ -1,7 +1,7 @@
 // Node-TRS animation end to end: import BoxAnimated (a >1-node forest with a translate/rotate
 // clip on a non-skin node), and prove the importer keeps a LIVE node forest — the child node's
 // transform is not baked into vertices, so playing the clip moves the entity — and that
-// `list-clip-bindings` resolves the node channel to the spawned entity. Closes Phase 1/3/6.
+// `list-clip-bindings` resolves the node channel to the spawned entity.
 
 import { afterAll, beforeAll, expect, test } from "bun:test";
 import { join } from "node:path";

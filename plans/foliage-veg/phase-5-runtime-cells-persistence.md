@@ -75,14 +75,22 @@ macro generation remains authoritative.
 - [x] CPU memory and query work scale with resident cell facets/macro plants, never micro blade count.
 - [x] `sa` query/state commands and protocol DTOs use opaque string `PlantId`s and generated TS.
 - [x] Standard gate and runtime vegetation/persistence docs are green.
-  (GREEN, verified together on 2026-07-26: `just engine` and
-  `just prepare-for-commit` EXIT=0; `cargo test --workspace` green; `just schema` EXIT=0 with all 249
-  manifest-driven control checks passing; `just e2e` at **328/328 across 51 files**, the first fully
-  clean full-suite run — the `alpha_blend` device-loss that held this box is fixed and its 4 cases pass;
-  and the docs three-check sweep at hugo EXIT=0, links none broken, style 0 errors / 0 warnings.)
-  `vegetation-state.md`, `plant-promotion.md`, `ecology-catchup.md`, and `vegetation-telemetry.md`
-  carry the runtime and persistence concepts, and the run exercises residency, the reducer, snapshot
-  export/import, and the state baseline.
+  (`tools/ci/check.sh` is the gate; the docs pages carrying these concepts are `vegetation-state.md`,
+  `plant-promotion.md`, `ecology-catchup.md`, and `vegetation-telemetry.md`, checked by the docs-page
+  skill's `hugo --gc` + `check_links.py` + `check_style.py`.
+  What proves each mechanism, by name: residency —
+  `load_query_unload_and_reload_preserve_persistent_tombstones`,
+  `source_budget_limits_admission_without_losing_demand`, and
+  `residency_revision_discards_late_staged_work` in `vegetation/src/runtime_world/tests.rs`, plus
+  `tests/e2e/vegetation-churn.test.ts` driving camera-driven residency over the control plane; the
+  reducer — `snapshot_compaction_and_duplicate_tail_replay_are_equivalent` and
+  `complete_reduced_snapshot_round_trips_every_delta_family` in `vegetation/src/state_codec/tests.rs`
+  with `snapshot_tail_compaction_matches_full_reduction` in `mutation/tests.rs`; the snapshot
+  round-trip — `export_state_snapshot` → `import_state_snapshot` inside
+  `load_query_unload_and_reload_preserve_persistent_tombstones` and
+  `prediction_overlay_is_transient_until_authority_confirmation`, which is world-level coverage: the
+  `vegetation-state-export`/`vegetation-state-import` commands over it carry a manifest `skip` because
+  they need an exact bound runtime generation, so no harness dispatches them.)
 
 ## NO-LEGACY gate
 

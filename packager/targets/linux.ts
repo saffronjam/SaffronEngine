@@ -12,7 +12,6 @@ const OUT = join(distDir, "Saffron_Anima-x86_64.AppImage");
 const APPIMAGETOOL_URL =
   "https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-x86_64.AppImage";
 
-// The CEF runtime files that must sit beside the shell binary (the executables are copied separately).
 const CEF_RUNTIME = /\.(so|so\.\d+|pak|bin|dat|json)$/;
 
 export async function packageLinux(): Promise<void> {
@@ -48,8 +47,8 @@ async function stageAppDir(): Promise<void> {
   await installExe(join(shellDir, "target/release/saffron-editor-shell"), join(bin, "saffron-editor-shell"));
   await bundleCxxRuntime(join(bin, "saffron-host"), bin);
 
-  // cef-dll-sys stages the CEF runtime beside the shell binary; copy it next to the packaged shell,
-  // where CEF resolves libcef.so + its resource packs. Dereference so legacy symlinks become real files.
+  // CEF resolves libcef.so and its resource packs beside the shell binary, so the runtime staged by
+  // cef-dll-sys is copied there; dereference turns its symlinks into real files.
   const release = join(shellDir, "target/release");
   for (const entry of await readdir(release)) {
     if (CEF_RUNTIME.test(entry)) {
@@ -69,14 +68,12 @@ async function stageAppDir(): Promise<void> {
     if (size === 0) throw new Error(`${file} is empty after copy — CEF staging in ${release} is corrupt`);
   }
 
-  // Engine data (models/fonts/icons + compiled SPIR-V) and the built React UI.
   for (const dir of ["models", "fonts", "icons"]) {
     await cp(join(engineDir, "assets", dir), join(data, "assets", dir), { recursive: true, dereference: true });
   }
   await cp(join(engineDir, "target/release/shaders"), join(data, "assets/shaders"), { recursive: true, dereference: true });
   await cp(join(editorDir, "dist"), join(data, "ui"), { recursive: true, dereference: true });
 
-  // Entrypoint + desktop integration + icon.
   await installExe(join(assetsDir, "linux/AppRun"), join(APPDIR, "AppRun"));
   for (const dest of [join(APPDIR, "saffron-anima.desktop"), join(applications, "saffron-anima.desktop")]) {
     await cp(join(assetsDir, "linux/saffron-anima.desktop"), dest);
@@ -93,9 +90,9 @@ async function installExe(src: string, dest: string): Promise<void> {
   await chmod(dest, 0o755);
 }
 
-// The host links the toolbox's LLVM C++ runtime (Jolt via cxx). A stock system ships libstdc++, not
-// libc++, so copy libc++/libc++abi beside the host binary (AppRun's LD_LIBRARY_PATH covers usr/bin).
-// Nothing else on a target host depends on libc++, so bundling it cannot shadow a system library.
+// The host links the toolbox's LLVM C++ runtime (Jolt via cxx) and a stock system ships libstdc++,
+// not libc++, so libc++/libc++abi ride along beside the host binary (AppRun's LD_LIBRARY_PATH
+// covers usr/bin).
 async function bundleCxxRuntime(hostBin: string, destDir: string): Promise<void> {
   const { stdout } = await $`ldd ${hostBin}`.nothrow().quiet();
   for (const line of stdout.toString().split("\n")) {
@@ -109,11 +106,10 @@ async function bundleCxxRuntime(hostBin: string, destDir: string): Promise<void>
 async function packImage(): Promise<void> {
   await mkdir(toolsDir, { recursive: true });
   const onPath = Bun.which("appimagetool");
-  // appimagetool via --appimage-extract-and-run needs no FUSE, so it runs inside the toolbox.
+  // --appimage-extract-and-run needs no FUSE, so the downloaded tool runs inside the toolbox.
   const tool = onPath ? [onPath] : [await ensureAppimagetool(), "--appimage-extract-and-run"];
-  // Pack to a temp file, then atomically rename over OUT: a running AppImage keeps the old file
-  // mmap'd (a direct overwrite hits ETXTBSY / "Text file busy"), and a rename swaps the directory
-  // entry without touching the live inode, so re-packaging while the old build runs just works.
+  // A running AppImage keeps the old file mmap'd, so overwriting it in place hits ETXTBSY; pack to a
+  // temp file and rename, which swaps the directory entry without touching the live inode.
   const tmp = `${OUT}.new`;
   await rm(tmp, { force: true });
   await $`${tool} ${APPDIR} ${tmp}`.env({ ...process.env, ARCH: "x86_64" }).quiet();

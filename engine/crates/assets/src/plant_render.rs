@@ -1,10 +1,7 @@
 //! The cooked-plant render loader: one validated `.splantc` becomes the family's
-//! renderable [`GpuMesh`] — the prototypes' vertex/index streams flattened in
-//! prototype-id order (the assembly's per-prototype vertex bases), the decoded
-//! portable hierarchy (pages + prototype uses), and the family's material slots.
-//!
-//! The family registers under its own id in the shared mesh + page-payload caches, so
-//! the GPU-scene mirror renders it through the same prototype path as every mesh.
+//! renderable [`GpuMesh`], registered under the family id in the shared mesh +
+//! page-payload caches so the GPU-scene mirror renders it through the same prototype
+//! path as every mesh.
 
 use std::sync::Arc;
 
@@ -23,8 +20,8 @@ use crate::error::{Error, Result};
 use crate::gpu::GpuUploader;
 use crate::page_stream::PagePayloadSource;
 use crate::plant_cook::{
-    PlantGeometryMesh, PlantPhenotypeRow, decode_material_section, decode_mesh_section,
-    decode_phenotype_section,
+    PlantGeometryMesh, PlantPhenotypeRow, decode_family_atlas, decode_material_section,
+    decode_mesh_section, decode_phenotype_section,
 };
 
 /// One loaded plant family's renderable identity: the flattened family mesh and the
@@ -47,9 +44,7 @@ pub struct PlantFamilyRender {
     ///
     /// Present exactly when the cook packed one, and then the family's UVs address it — so a
     /// present atlas is not an optimization the renderer may decline, it is the image those UVs
-    /// index. Held here rather than under a synthesized asset id because ids are minted uniformly
-    /// from the whole non-reserved range, leaving no id a family could derive without risking a
-    /// collision with a real asset.
+    /// index.
     pub atlas: Option<Arc<saffron_rendering::GpuTexture>>,
 }
 
@@ -89,10 +84,6 @@ impl crate::AssetServer {
 
     /// One plant family's authored wind and bend response, registered when its render
     /// form loaded. Absent for anything that is not a plant family.
-    ///
-    /// The GPU-scene mirror reaches prototypes through the generic mesh path, which knows
-    /// nothing about plants; this is where that path asks whether the mesh it is about to
-    /// publish is one, so a family's response reaches its prototype record.
     #[must_use]
     pub fn plant_family_mechanics(
         &self,
@@ -102,10 +93,7 @@ impl crate::AssetServer {
     }
 
     /// Loads one plant family's renderable form from its validated `.splantc`, cached by
-    /// exact artifact identity. The load registers the family mesh + its cooked page
-    /// payload source under the family id, so the mirror's prototype path resolves it
-    /// like any mesh; the family's pinned `.smat` documents register under their
-    /// material ids for interning.
+    /// exact artifact identity.
     pub fn load_plant_family(
         &mut self,
         gpu: &dyn GpuUploader,
@@ -146,7 +134,7 @@ impl crate::AssetServer {
             .map_err(|err| Error::Io(format!("plant family mesh upload: {err}")))?;
         for row in &decoded.material_documents {
             // An empty pinned document means the cook resolved the material by identity
-            // only — the id resolves through the project catalog like any material.
+            // only, so the id resolves through the project catalog like any material.
             if row.1.is_empty() || self.material_by_uuid.contains_key(&row.0.value()) {
                 continue;
             }
@@ -166,8 +154,8 @@ impl crate::AssetServer {
             .map(|assembly| assembly.combinations.clone())
             .unwrap_or_default()
             .into();
-        // One upload per family, from the artifact's own bytes. sRGB matches how the slot
-        // textures it replaces were uploaded, so packing does not shift colour.
+        // The container declares the encoding its texels carry, and the upload honours it: an sRGB
+        // chain uploaded as linear (or the reverse) shifts every packed slot's colour.
         let atlas = decoded
             .atlas
             .as_ref()
@@ -181,7 +169,7 @@ impl crate::AssetServer {
                         height: level.height,
                     })
                     .collect();
-                gpu.upload_texture_mips(&mips, true)
+                gpu.upload_texture_mips(&mips, atlas.format.is_srgb())
                     .map_err(|err| Error::Io(format!("plant family atlas upload: {err}")))
             })
             .transpose()?;
@@ -212,10 +200,9 @@ pub(crate) struct DecodedPlantRender {
     pub(crate) hierarchy: PortableVirtualHierarchy,
     pub(crate) material_slots: Vec<Uuid>,
     pub(crate) material_documents: Vec<(Uuid, Vec<u8>)>,
-    /// The packed family atlas, when the cook produced one.
-    ///
-    /// The family's UVs already address it, so a family carrying an atlas must sample it rather
-    /// than its slots' own textures — the two are not interchangeable at this point.
+    /// The packed family atlas, when the cook produced one. The family's UVs already
+    /// address it, so a family carrying an atlas must sample it rather than its slots'
+    /// own textures.
     pub(crate) atlas: Option<crate::FamilyAtlas>,
     pub(crate) phenotypes: Vec<PlantPhenotypeRow>,
     pub(crate) mechanics: saffron_vegetation::MechanicalResponse,
@@ -242,7 +229,7 @@ pub struct PlantAtlasImage {
 }
 
 /// One level of the packed coverage atlas a cooked family carries, or `None` when the cook
-/// produced none (a family whose slots resolve to catalog materials rather than packed coverage).
+/// produced none.
 ///
 /// Reads the published artifact rather than re-deriving: the atlas the family's UVs address is the
 /// one in the bytes, and a second packing would produce a different layout for the same family.
@@ -323,12 +310,15 @@ pub(crate) fn decode_plant_render_sections(artifact: &[u8]) -> Result<DecodedPla
     let rows = decode_mesh_section(read(PlantCompiledSectionKind::Geometry)?.as_ref())?;
     let phenotypes =
         decode_phenotype_section(read(PlantCompiledSectionKind::Phenotypes)?.as_ref())?;
-    let (materials, atlas) =
+    let (materials, layout) =
         decode_material_section(read(PlantCompiledSectionKind::MaterialsCoverage)?.as_ref())?;
+    let atlas = decode_family_atlas(
+        layout,
+        read(PlantCompiledSectionKind::TextureContainer)?.as_ref(),
+    )?;
     let mesh = flatten_prototype_rows(&hierarchy, &rows)?;
-    // The family-space distance field, cooked from the aggregate occupancy. A family
-    // that cooked no voxel brick writes no section — nothing aggregate to occlude with —
-    // so absence is a valid state, not a missing facet.
+    // A family that cooked no voxel brick writes no distance-field section, so absence is
+    // a valid state rather than a missing facet.
     let distance_fields = match index.section(artifact, PlantCompiledSectionKind::DistanceField)? {
         Some(bytes) if !bytes.is_empty() => saffron_geometry::sdf_set_from_bytes(bytes.as_ref())
             .map_err(|err| Error::Io(format!("compiled plant distance field: {err}")))?,

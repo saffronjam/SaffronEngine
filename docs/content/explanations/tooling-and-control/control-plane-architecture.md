@@ -142,7 +142,7 @@ Command handlers must keep synchronous work bounded. Operations such as project 
 | Per-frame assembly and polling | `engine/crates/control/src/context.rs` | `ControlContext::poll`, `ControlContext::advance_project_load` |
 | Failure conversion | `engine/crates/control/src/error.rs` | `Error`, `Error::into_failure` |
 | Wire failure DTOs | `engine/crates/protocol/src/control_dto.rs` | `ControlFailureDto`, `ControlDiagnosticDto`, `VegetationGraphDiagnosticDto` |
-| Host loop integration | `engine/crates/host/src/layer.rs` | `poll_control`, `advance_project_load` |
+| Host loop integration | `engine/crates/host/src/layer/` | `poll_control`, `advance_project_load` |
 | Editor version reconciliation | `editor/src/state/store.ts` | `startReconcile` |
 
 ## Related

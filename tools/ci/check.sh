@@ -25,48 +25,35 @@
 #   5. present-only smoke        SAFFRON_EXIT_AFTER_FRAMES=5 + validation-clean log grep
 #   6. control-schema contract   check-control-schema/check.ts against the live host
 #   7. project startup smoke     check-projects/check.sh against the live host
-#   8. e2e                       the tests/e2e bun suite against the host
+#   8. e2e                       tsc --noEmit over tests/e2e, then the bun suite against the host
 #   9. frontend                  editor/ bun run build + bun test
 #  10. lint                      cargo fmt --check + cargo clippy --workspace -- -D warnings
 #
-# The four standing gates are IN the sequence: validation-clean (step 5), the control-schema
-# contract (step 6), golden/snapshot + the cross-arch determinism gate (inside step 3's cargo
-# test), and the e2e validation-clean assertions (step 8).
-#
-# Hardware/display-gated steps that this x86 software-GPU toolbox cannot fully run DEFER (without
-# failing the gate) and say why: the frontend build defers if bun/editor deps are absent, and the
-# determinism gate's aarch64 leg is owned by `physics/tests/determinism.rs` and DEFERRED-NEEDS-
-# HARDWARE there (the x86 half runs in step 3; the ARM half needs the self-hosted aarch64 runner).
+# A step whose prerequisite this environment lacks DEFERS with a reason instead of failing.
 set -uo pipefail
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 ENGINE="$REPO/engine"
 cd "$REPO"
+. "$REPO/tools/gpu-driver.sh"
 fail=0
 declare -a results=()
 deferred=()
 
 step() { echo; echo "=== $* ==="; }
 
-# A required step failed: record it so the final verdict is SOME GATES FAILED.
 fail() { echo "FAILED: $*" >&2; fail=1; }
 
-# A step's prerequisite (a host tool / display this hardware lacks) is missing: note it and move
-# on without failing the gate, with the reason.
 defer() { echo "DEFERRED: $*"; deferred+=("$*"); }
 
-# Record a per-step verdict for the final summary.
 pass_step() { results+=("PASS  $1"); }
 fail_step() { results+=("FAIL  $1"); fail "$2"; }
 defer_step() { results+=("DEFER $1"); defer "$2"; }
 
-# The present-only host + control CLI built by `cargo build --workspace`.
 RUST_HOST="${SAFFRON_ANIMA_BIN:-$ENGINE/target/debug/saffron-host}"
 RUST_SA="${SAFFRON_SA_BIN:-$ENGINE/target/debug/sa}"
 
-# Does the host boot far enough to answer a control `ping`? A per-run socket must appear and
-# `sa ping` must round-trip. Probed once and cached (steps 5–8 gate on it). A FALSE here is a
-# regression (NOT a defer): the build step produced the binary, so a host that does not answer
-# ping is a failure to surface, not a missing prerequisite.
+# Probed once and cached; steps 5-8 gate on it. A false answer is a failure, never a defer:
+# the build step produced the binary, so a host that will not answer ping is a regression.
 host_ready_cache=""
 host_ready() {
   if [ -n "$host_ready_cache" ]; then return "$host_ready_cache"; fi
@@ -104,9 +91,8 @@ else
   fail_step "1. workspace build" "cargo build --workspace"
 fi
 
-# The CEF editor shell is a standalone crate (its own Cargo.toml/lock, outside the engine workspace).
-# Its build.rs downloads/links the version-locked libcef; defer if that provisioning
-# is absent rather than failing the gate (the "hardware/tooling this environment lacks" spirit).
+# The CEF editor shell is a standalone crate outside the engine workspace; its build.rs links the
+# version-locked libcef, so an absent provisioning defers.
 step "1b. editor shell build (cargo build in editor/shell, links libcef)"
 if ( cd "$REPO/editor/shell" && cargo build ); then
   pass_step "1b. editor shell build"
@@ -133,10 +119,7 @@ else
 fi
 
 step "4. self-test-removal assertion (no runtime run*SelfTest / SAFFRON_SELFTEST / fn *self_test)"
-# No in-engine self-test mechanism survives. Any of the three patterns appearing OUTSIDE a
-# `#[cfg(test)]` module is a runtime self-test and fails the gate. The `#[cfg(test)] mod tests`
-# test functions (e.g. `scene_hierarchy_self_test`) are the legitimate place for these and are
-# not flagged.
+# Any of the three patterns outside a `#[cfg(test)]` module is a runtime self-test and fails.
 selftest_hits="$(
   find "$ENGINE" -name '*.rs' -not -path '*/target/*' -print0 | xargs -0 awk '
     /^#\[cfg\(test\)\]/ { intest = 1 }
@@ -154,13 +137,20 @@ else
   fail_step "4. self-test-removal assertion" "a runtime self-test survives outside #[cfg(test)] (see above)"
 fi
 
-step "4b. draw-path tripwire (no CPU gather/batcher/meshlet symbol survives)"
-# The persistent GPU scene's visibility traversal is the ONE production draw path.
-# Any of these identifiers reappearing in engine source is a resurrected CPU draw
-# list, batcher, or the retired mesh-shader raster toggle.
+step "4b. draw-path tripwire (one production draw path, no retired symbol survives)"
+# The persistent GPU scene's visibility traversal binned into counted-indirect executor draws is
+# the ONE production draw path. Every identifier below named a path that path replaced: the CPU
+# gather/batcher types and their recorders, the per-instance meshlet loop, the retired raster
+# env toggle (`SAFFRON_MESH_EXECUTOR` selects the mesh executor now), and the second executor
+# depth PSO + shader pair that once shadowed the übershader's depth pre-pass. A hit in engine
+# source or in the shader tree means one of them is back.
 tripwire_hits="$(
-  grep -rnE 'DrawItem|DrawBatch|submit_draw_list|gather_static_draw_list|record_scene_draw_list|record_transparent_draw_list|SAFFRON_MESH_SHADER|MeshletRaster|record_meshlet_draws' \
+  grep -rnE 'DrawItem|DrawBatch|SceneDrawList|scene_draw_list|submit_draw_list|gather_static_draw_list|record_scene_draw_list|record_transparent_draw_list|SAFFRON_MESH_SHADER|MeshletRaster|record_meshlet_draws|scene_executor_depth' \
     "$ENGINE/crates" --include='*.rs' 2>/dev/null || true
+  # The retired shader pair, by filename as well as by reference: a resurrected entry point is a
+  # new source file, and its name is the only thing a content grep would miss.
+  find "$ENGINE/assets/shaders" -name 'scene_executor_depth*' -print 2>/dev/null || true
+  grep -rnE 'scene_executor_depth' "$ENGINE/assets/shaders" 2>/dev/null || true
 )"
 if [ -z "$tripwire_hits" ]; then
   pass_step "4b. draw-path tripwire"
@@ -179,11 +169,8 @@ if host_ready; then
     SAFFRON_EXIT_AFTER_FRAMES=5 SAFFRON_CONTROL_SOCK="/tmp/sa-ci-$$.sock" "$RUST_HOST" >"$smoke_log" 2>&1
   ) || smoke_ok=1
   cat "$smoke_log"
-  # The validation-clean gate (13:phase-5): the boot+render smoke must produce zero
-  # `ERROR  vulkan  [validation] …` lines. The grep IS the gate — a dirty log is a
-  # render-subsystem bug (a wrong barrier, a layout mismatch) that never throws or corrupts a
-  # wire byte, so this is its only automated detector. The regression probe lives in the e2e
-  # suite (boots with `SAFFRON_VK_PLANT_VALIDATION_ERROR` and asserts the grep WOULD catch it).
+  # The grep IS the validation-clean gate: a wrong barrier or layout mismatch corrupts no wire
+  # byte and throws nothing, so a dirty log is its only automated detector.
   if grep -qE "ERROR[[:space:]]+vulkan[[:space:]]+\[validation\]" "$smoke_log"; then
     smoke_ok=1
     echo "present-only smoke produced Vulkan validation errors (see log above)" >&2
@@ -216,11 +203,18 @@ else
   fail_step "7. project smoke" "the Rust host did not boot + answer ping (see probe log)"
 fi
 
-step "8. e2e (the tests/e2e bun suite against the Rust host)"
+step "8. e2e (tsc --noEmit over the suite, then the tests/e2e bun suite against the Rust host)"
 if ! command -v bun >/dev/null; then
   defer_step "8. e2e" "e2e — bun not on PATH (add /var/home/saffronjam/.bun/bin)"
 elif host_ready; then
-  if ( cd "$REPO/tests/e2e" && SAFFRON_ANIMA_BIN="$RUST_HOST" bun test ); then
+  rm -f /tmp/saffron-e2e-*.sock 2>/dev/null || true
+  # `bun test` strips types without checking them, so the suite's assertions only stay bound to the
+  # generated @saffron/protocol types while `tsc` runs over them here.
+  if ! ( cd "$REPO/tests/e2e" && bun install --frozen-lockfile ); then
+    fail_step "8. e2e" "tests/e2e dependency install (bun install --frozen-lockfile)"
+  elif ! ( cd "$REPO/tests/e2e" && bun run typecheck ); then
+    fail_step "8. e2e" "tests/e2e typecheck"
+  elif ( cd "$REPO/tests/e2e" && SAFFRON_ANIMA_BIN="$RUST_HOST" bun test --timeout 30000 --max-concurrency 4 ); then
     pass_step "8. e2e"
   else
     fail_step "8. e2e" "e2e suite"

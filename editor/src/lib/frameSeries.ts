@@ -1,9 +1,7 @@
-/// A long client-side history of per-frame timing, accumulated across metrics polls and
-/// deduplicated by the engine's absolute frame index (consecutive polls return overlapping
-/// windows of the engine's 1024-frame ring). Module scope, fixed typed-array ring — NOT
-/// React state — because it is high-frequency, high-volume data. The graph reads it and
-/// downsamples a chosen window into per-bucket averages, so the rendered line stays smooth
-/// and readable however fast the engine renders.
+/// A long client-side history of per-frame timing, accumulated across metrics polls and deduplicated
+/// by the engine's absolute frame index (consecutive polls return overlapping windows of the
+/// engine's ring). Module scope and a fixed typed-array ring rather than React state, because it is
+/// high-frequency, high-volume data.
 import type { FrameSampleDto } from "../protocol";
 
 /// Retained frames (~5 min even at 240 fps; ~20 min at 60 fps). The graph never plots these

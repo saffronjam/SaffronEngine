@@ -4,6 +4,7 @@ use saffron_core::Uuid;
 use saffron_spatial::{DecisionScalar, UnitInterval, WorldBounds, WorldCellKey};
 
 use crate::binary::{BinaryReader, BinaryWriter};
+use crate::point::point_column_type_from_id;
 use crate::{
     ArtifactSectionCodec, ContentHash, CookDependency, CookPlatformProfile, CookVersionSet,
     CookWorkActual, CookWorkEstimate, Error, POINT_SCHEMA_COLUMNS, PlantTagId, PointColumnType,
@@ -28,18 +29,14 @@ pub fn vegetation_base_manifest_schema_hash() -> ContentHash {
 pub struct ManifestPointColumn {
     /// Stable numeric column identity.
     pub id: u32,
-    /// Canonical semantic name.
     pub name: String,
-    /// Packed element shape.
     pub element_type: PointColumnType,
 }
 
 /// One stable, named seed domain used by world generation.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct VegetationSeedNamespace {
-    /// Canonical namespace name.
     pub name: String,
-    /// Stable namespace identity.
     pub namespace: u128,
 }
 
@@ -58,9 +55,7 @@ pub struct VegetationManifestPlant {
     pub local_bounds_min: [DecisionScalar; 3],
     /// Canonical local-space maximum bounds in Q15.16 metres.
     pub local_bounds_max: [DecisionScalar; 3],
-    /// Compiled variation count.
     pub variation_count: u32,
-    /// Compiled phenotype count.
     pub phenotype_count: u32,
     /// Species ecology rules and relations, baked by the cook so a tick never needs the asset
     /// catalog.
@@ -99,7 +94,6 @@ impl ManifestCellDependencyRole {
 /// One exact inter-cell dependency in the immutable directory.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ManifestCellDependency {
-    /// Referenced cell key.
     pub cell: WorldCellKey,
     /// Exact referenced artifact identity.
     pub content_hash: ContentHash,
@@ -112,7 +106,6 @@ pub struct ManifestCellDependency {
 /// Per-family population statistics for one cell.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ManifestSpeciesCount {
-    /// Plant-family identity.
     pub family: Uuid,
     /// Accepted macro-point count.
     pub macro_count: u64,
@@ -125,9 +118,7 @@ pub struct ManifestSpeciesCount {
 pub struct ManifestCellSection {
     /// Exact owned facet.
     pub kind: VegetationCellSectionKind,
-    /// Section semantic version.
     pub version: u32,
-    /// Storage codec.
     pub codec: ArtifactSectionCodec,
     /// Required payload alignment.
     pub alignment: u32,
@@ -173,11 +164,9 @@ pub struct VegetationManifestCell {
 /// Complete immutable identity binding authored sources, contracts, and cooked base cells.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct VegetationBaseManifest {
-    /// Manifest format version.
     pub version: u32,
     /// Owning world identity.
     pub world: Uuid,
-    /// Vegetation-map identity.
     pub map: Uuid,
     /// Exact authored map-manifest identity.
     pub map_hash: ContentHash,
@@ -729,25 +718,10 @@ pub(crate) fn decode_cell(reader: &mut BinaryReader<'_>) -> Result<VegetationMan
 }
 
 fn decode_point_column_type(id: u8) -> Result<PointColumnType> {
-    match id {
-        1 => Ok(PointColumnType::Id128),
-        2 => Ok(PointColumnType::WorldCell),
-        4 => Ok(PointColumnType::Orientation),
-        5 => Ok(PointColumnType::FixedVec3),
-        6 => Ok(PointColumnType::WorldBounds),
-        7 => Ok(PointColumnType::AssetUuid),
-        8 => Ok(PointColumnType::U32),
-        9 => Ok(PointColumnType::U64),
-        10 => Ok(PointColumnType::OptionalId128),
-        11 => Ok(PointColumnType::Unit),
-        12 => Ok(PointColumnType::SurfaceProjection),
-        13 => Ok(PointColumnType::OptionalSurfaceAttachment),
-        14 => Ok(PointColumnType::WorldPosition),
-        _ => Err(Error::ArtifactFormat {
-            format: "vegetation base manifest",
-            field: "pointColumns.type".to_owned(),
-        }),
-    }
+    point_column_type_from_id(id).ok_or_else(|| Error::ArtifactFormat {
+        format: "vegetation base manifest",
+        field: "pointColumns.type".to_owned(),
+    })
 }
 
 fn reject_duplicate_keys<T>(entries: &[(Vec<u8>, T)], field: &str) -> Result<()> {

@@ -9,16 +9,16 @@
 // emits — 8-bit RGB, colour type 2, non-interlaced. Anything else is rejected rather than guessed
 // at, so a format change surfaces as a decode error instead of silently wrong pixels.
 
-import { inflateSync } from "node:zlib";
+import { deflateSync, inflateSync } from "node:zlib";
 
-/// A decoded 8-bit RGB image. `pixels` is tightly packed, three bytes per pixel, row-major.
+// A decoded 8-bit RGB image. `pixels` is tightly packed, three bytes per pixel, row-major.
 export interface Rgb8Image {
   width: number;
   height: number;
   pixels: Buffer;
 }
 
-/// A rectangle in pixels, clamped to the image when sampled.
+// A rectangle in pixels, clamped to the image when sampled.
 export interface Region {
   x: number;
   y: number;
@@ -26,7 +26,7 @@ export interface Region {
   height: number;
 }
 
-/// Decodes an 8-bit RGB, non-interlaced PNG.
+// Decodes an 8-bit RGB, non-interlaced PNG.
 export function decodeRgb8Png(png: Buffer): Rgb8Image {
   const signature = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
   if (!png.subarray(0, 8).equals(signature)) {
@@ -65,7 +65,7 @@ export function decodeRgb8Png(png: Buffer): Rgb8Image {
   return { width, height, pixels: unfilter(inflateSync(Buffer.concat(idat)), width, height) };
 }
 
-/// Reverses the per-scanline PNG filters into tightly-packed RGB rows.
+// Reverses the per-scanline PNG filters into tightly-packed RGB rows.
 function unfilter(raw: Buffer, width: number, height: number): Buffer {
   const bpp = 3;
   const stride = width * bpp;
@@ -119,8 +119,8 @@ function paeth(a: number, b: number, c: number): number {
   return pb <= pc ? b : c;
 }
 
-/// The mean channel value over `region`, in `[0, 255]` — the region's brightness. A shadow falling
-/// on a surface lowers it; the surface being lit raises it.
+// The mean channel value over `region`, in `[0, 255]` — the region's brightness. A shadow falling
+// on a surface lowers it; the surface being lit raises it.
 export function regionMean(image: Rgb8Image, region: Region): number {
   const x0 = Math.max(0, region.x);
   const y0 = Math.max(0, region.y);
@@ -141,14 +141,61 @@ export function regionMean(image: Rgb8Image, region: Region): number {
   return total / count;
 }
 
-/// Mean absolute per-channel difference between two same-sized images, in `[0, 255]`. The metric a
-/// cross-platform comparison scores: identical renders are 0, and a tolerance admits the
-/// quantization and rounding two implementations are allowed to disagree on.
+// Writes an 8-bit RGBA PNG the engine's importer accepts, `pixel(x, y)` supplying each texel.
+//
+// Authored textures are generated rather than checked in so the property a fixture depends on — a
+// cutout that straddles the alpha cutoff, a height field with real gradient — is visible as intent
+// instead of opaque bytes.
+export function encodeRgba8Png(
+  width: number,
+  height: number,
+  pixel: (x: number, y: number) => [number, number, number, number],
+): Buffer {
+  const raw: number[] = [];
+  for (let y = 0; y < height; y += 1) {
+    raw.push(0); // PNG filter byte: none
+    for (let x = 0; x < width; x += 1) {
+      raw.push(...pixel(x, y));
+    }
+  }
+  const crcTable = Array.from({ length: 256 }, (_, n) => {
+    let c = n;
+    for (let k = 0; k < 8; k += 1) c = c & 1 ? 0xedb88320 ^ (c >>> 1) : c >>> 1;
+    return c >>> 0;
+  });
+  const crc = (buf: Buffer) => {
+    let c = 0xffffffff;
+    for (const byte of buf) c = crcTable[(c ^ byte) & 0xff]! ^ (c >>> 8);
+    return (c ^ 0xffffffff) >>> 0;
+  };
+  const chunk = (type: string, data: Buffer) => {
+    const head = Buffer.alloc(4);
+    head.writeUInt32BE(data.length);
+    const body = Buffer.concat([Buffer.from(type, "ascii"), data]);
+    const tail = Buffer.alloc(4);
+    tail.writeUInt32BE(crc(body));
+    return Buffer.concat([head, body, tail]);
+  };
+  const ihdr = Buffer.alloc(13);
+  ihdr.writeUInt32BE(width, 0);
+  ihdr.writeUInt32BE(height, 4);
+  ihdr[8] = 8; // bit depth
+  ihdr[9] = 6; // colour type: RGBA
+  return Buffer.concat([
+    Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]),
+    chunk("IHDR", ihdr),
+    // PNG IDAT carries a zlib stream, not raw deflate — `node:zlib` wraps it, Bun's does not.
+    chunk("IDAT", deflateSync(Buffer.from(raw))),
+    chunk("IEND", Buffer.alloc(0)),
+  ]);
+}
+
+// Mean absolute per-channel difference between two same-sized images, in `[0, 255]`. The metric a
+// cross-platform comparison scores: identical renders are 0, and a tolerance admits the
+// quantization and rounding two implementations are allowed to disagree on.
 export function meanAbsoluteDifference(a: Rgb8Image, b: Rgb8Image): number {
   if (a.width !== b.width || a.height !== b.height) {
-    throw new Error(
-      `image sizes differ: ${a.width}x${a.height} vs ${b.width}x${b.height}`,
-    );
+    throw new Error(`image sizes differ: ${a.width}x${a.height} vs ${b.width}x${b.height}`);
   }
   let total = 0;
   for (let i = 0; i < a.pixels.length; i += 1) {

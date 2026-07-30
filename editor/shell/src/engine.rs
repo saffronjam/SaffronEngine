@@ -28,7 +28,7 @@ fn engine_binary() -> String {
 }
 
 /// Spawn the present-only host: it publishes each view's frames into its own shm segment for the
-/// subsurface presenter (Phase 6) instead of presenting to a swapchain.
+/// presenter instead of presenting to a swapchain.
 pub fn spawn_engine(socket_path: &str) -> Result<Child, ShellError> {
     let _ = fs::remove_file(socket_path);
     ensure_app_dirs()?;

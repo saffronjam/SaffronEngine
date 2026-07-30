@@ -90,16 +90,14 @@ public SdfSample sdfSample(float3 wp, uint count, float footprint)
     return s;
 }
 
-// One trilinear tap of the Global Distance Field at a world sample: selects the finest cascade
-// whose bounds contain `wp` (minus a wrap-seam margin), converts world → that cascade's toroidal
-// `[0,1]³` UVW (`wp / worldExtent`, the repeat sampler wraps), and denormalizes the `R16_SNORM`
-// by the cascade's max-encode distance. Near the cascade's outer edge it blends into the next
-// coarser cascade over an overlap band so the cascade boundary shows no shell. `valid` is false
-// (and the return undefined) when `wp` lies beyond the coarsest cascade — the caller then falls
-// back to the per-mesh near field / treats it as open sky.
-// One cascade walk serving every consumer: distance from the finest containing cascade
-// (band-blended into the next coarser near its edge) plus the porous-occupancy density
-// from the same cascade — the marches pay a single cascade select for both.
+// One cascade walk serving every consumer: a trilinear Global Distance Field tap plus the
+// porous-occupancy density from the same cascade, so a march pays one cascade select for both.
+// Selects the finest cascade whose bounds contain `wp` (minus a wrap-seam margin), converts world
+// → that cascade's toroidal `[0,1]³` UVW (`wp / worldExtent`, the repeat sampler wraps), and
+// denormalizes the `R16_SNORM` by the cascade's max-encode distance. Near the cascade's outer edge
+// it blends into the next coarser cascade over an overlap band, so the boundary shows no shell.
+// `valid` is false (and the return undefined) when `wp` lies beyond the coarsest cascade — the
+// caller then falls back to the per-mesh near field, or treats it as open sky.
 public float gdfDistanceOccupancy(float3 wp, out bool valid, out float occupancy)
 {
     valid = false;
@@ -153,12 +151,6 @@ public float gdfFinestWorldExtent()
     return gdfParams.cascades[0].voxelEncode.z;
 }
 
-// The unified near/far field sample for the cone march: the per-mesh MDF for the near field
-// (full resolution where leaks matter — the README's leak mitigation) and a single Global-SDF
-// tap beyond the handoff radius, so far-field cost decouples from instance count. Falls back to
-// the per-mesh field when the GDF is off or the sample lies beyond the coarsest cascade. Public so
-// the DDGI ray trace (`ddgi_trace.slang`) sphere-marches the same near/far handoff the per-pixel
-// cone trace does.
 // The porous-occupancy density at `wp` alone (the fused walk's occupancy output).
 public float gdfOccupancyAt(float3 wp)
 {
@@ -176,6 +168,10 @@ public float sdfExtinctionStep(float occupancy, float stepLength)
     return exp(-3.0 * max(occupancy, 0.0) * max(stepLength, 0.0));
 }
 
+// The unified near/far field sample for a march: the full-resolution per-mesh MDF for the near
+// field, where leaks matter, and a single Global-SDF tap beyond the handoff radius, so far-field
+// cost decouples from instance count. Falls back to the per-mesh field when the GDF is off or the
+// sample lies beyond the coarsest cascade.
 public SdfSample sampleField(float3 wp, uint count, float footprint, float t)
 {
     bool useGdf = (uint(gdfParams.control.x) != 0u) && (t >= gdfParams.control.z);

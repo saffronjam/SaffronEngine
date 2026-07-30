@@ -4,8 +4,7 @@
 import { afterAll, beforeAll, expect, test } from "bun:test";
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { dirname, join } from "node:path";
-import { fileURLToPath } from "node:url";
+import { join } from "node:path";
 import type {
   ImportVegetationAssetResult,
   VegetationExportPointsResult,
@@ -13,10 +12,11 @@ import type {
 } from "@saffron/protocol";
 import type { Engine } from "./harness.ts";
 import { Cleaner, bootEngine } from "./test-utils.ts";
-import { authoredAssets, installTrunkObj, type VegetationFixture } from "./vegetation-utils.ts";
-
-const HERE = dirname(fileURLToPath(import.meta.url));
-const FIXTURE_PATH = join(HERE, "fixtures", "vegetation-phase3.json");
+import {
+  authoredAssets,
+  installTrunkObj,
+  loadFixture,
+} from "./vegetation-utils.ts";
 
 const cleaner = new Cleaner();
 let engine: Engine;
@@ -29,7 +29,7 @@ afterAll(async () => {
   await cleaner.cleanup();
 });
 
-/// A Houdini JSON `.geo` point cloud: two oaks and one colour attribute nothing can express.
+// A Houdini JSON `.geo` point cloud: two oaks and one colour attribute nothing can express.
 function scatter(name: string) {
   const numeric = (attribute: string, size: number, tuples: number[][]) => [
     ["scope", "public", "type", "numeric", "name", attribute],
@@ -89,8 +89,8 @@ function scatter(name: string) {
   ];
 }
 
-/// A minimal glTF with one instanced node: two placements under a node offset in x, plus an
-/// attribute the canonical vocabulary cannot express.
+// A minimal glTF with one instanced node: two placements under a node offset in x, plus an
+// attribute the canonical vocabulary cannot express.
 function instancedGltf(name: string) {
   const floats = (values: number[]) => {
     const buffer = new ArrayBuffer(values.length * 4);
@@ -149,7 +149,7 @@ function instancedGltf(name: string) {
 }
 
 test("instanced points import as anchors and export back addressing the same plants", async () => {
-  const fixture = JSON.parse(readFileSync(FIXTURE_PATH, "utf8")) as VegetationFixture;
+  const fixture = loadFixture("vegetation-phase3");
   const sources = authoredAssets(cleaner, fixture, "interchange");
   await installTrunkObj(engine, fixture);
   for (const path of [sources.plant, sources.biome, sources.map]) {

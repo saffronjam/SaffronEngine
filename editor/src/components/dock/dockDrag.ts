@@ -1,12 +1,11 @@
-/// The cross-strip drag channel, module-scope like `layoutBus`. While a dock tab is torn
-/// out, the drag state, the cursor ghost, and the hovered drop target live here — a foreign
-/// strip's `useTabStripDrag` instance is idle and cannot render a parting preview for a tab
-/// it does not own, so every `TabStrip` and the drop overlay subscribe to this single source.
+/// The cross-strip drag channel, module-scope like `layoutBus`. While a dock tab is torn out, the
+/// drag state, the cursor ghost, and the hovered drop target live here: a foreign strip's
+/// `useTabStripDrag` instance is idle and cannot render a parting preview for a tab it does not own,
+/// so every `TabStrip` and the drop overlay subscribe to this single source.
 ///
-/// Hit-testing is manual: `setPointerCapture` retargets every pointer event to the source
-/// tab, so candidate leaves never see `pointerover` (w3c/pointerevents#566). On each move we
-/// re-snapshot the mounted `[data-dock-leaf]` rects (cheap; also catches the reveal bands that
-/// mount mid-drag) and point-test against them. The geometry exists only while a drag is torn.
+/// Hit-testing is manual because `setPointerCapture` retargets every pointer event to the source
+/// tab, so candidate leaves never see `pointerover`. Each move re-snapshots the mounted
+/// `[data-dock-leaf]` rects — cheap, and it also catches the reveal bands that mount mid-drag.
 import { useSyncExternalStore } from "react";
 import type { DockEdge, DockNodeId, DockPanelId, DropTarget } from "../../state/dockLayout";
 

@@ -1,11 +1,7 @@
 //! Asynchronous hierarchy-page payload loading.
 //!
-//! [`PageStreamWorker`] owns one named worker thread that turns page-load requests into
-//! locked device payloads: an artifact-backed source re-reads its `.smesh`/`.smodel`
-//! slice from disk and decodes the embedded hierarchy envelope (cached per mesh while
-//! its pages stream), a cooked source builds straight from the retained hierarchy. The
-//! mirror drains completed payloads once per frame, patches the child-handle tables, and
-//! hands the bytes to the renderer's page-residency authority.
+//! The mirror drains completed payloads once per frame, patches the child-handle tables,
+//! and hands the bytes to the renderer's page-residency authority.
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Condvar, Mutex};

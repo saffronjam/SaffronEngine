@@ -1,13 +1,8 @@
-/// The Plant workspace's materials and atlas view: the packed coverage the family actually samples.
-///
-/// A family's UVs address exactly one layout, so this shows the atlas out of the PUBLISHED artifact
-/// rather than re-packing the slots. A re-pack of the same images produces a different arrangement,
-/// and a view that did that would be showing an image the plant is not sampling — which is worse
-/// than showing nothing, because it looks authoritative.
-///
-/// The mip level is scrubbable because the chain is coverage-preserving and that is a claim worth
-/// being able to check: a level that lost alpha area is exactly where distant foliage goes thin, and
-/// it is invisible at level zero.
+/// The packed coverage atlas the family actually samples, read out of the PUBLISHED artifact rather
+/// than re-packed: a re-pack of the same images produces a different arrangement, which would look
+/// authoritative while showing an image the plant never samples. The mip level is scrubbable because
+/// the chain is coverage-preserving, and a level that lost alpha area is exactly where distant
+/// foliage goes thin.
 import { useCallback, useEffect, useState } from "react";
 import { client } from "../control/client";
 import { errorText } from "../lib/flash";

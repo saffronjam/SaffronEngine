@@ -1,13 +1,7 @@
-/// The Plant workspace's lifecycle and season timeline.
-///
-/// Scrubbing the year asks the engine which appearance the family would render at that point, then
-/// binds it to the live preview — so this is the plant through the year rather than a picker over a
-/// list of phenotype ids. The resolution is the ENGINE's (`resolve_rendered_phenotype`), never a
-/// second reading of the same rules in TypeScript: a preview that resolved the season differently
-/// from the renderer would be showing an appearance the scene never picks.
-///
-/// Lifecycle wins over season, which is why it is a control here and not an afterthought. A dead
-/// plant does not turn autumnal, and seeing that hold is the point of being able to set both.
+/// The Plant workspace's lifecycle and season timeline. Scrubbing the year asks the ENGINE which
+/// appearance the family resolves to and binds it to the live preview — never a second reading of
+/// the same rules in TypeScript, which would show an appearance the scene never picks. Lifecycle
+/// wins over season: a dead plant does not turn autumnal.
 import { useCallback, useEffect, useState } from "react";
 import { client } from "../control/client";
 import { errorText, notifyError } from "../lib/flash";

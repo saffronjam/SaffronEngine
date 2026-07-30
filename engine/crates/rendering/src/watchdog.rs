@@ -1,16 +1,10 @@
 //! GPU hang watchdog: names the submission that is still in flight, while it is still in flight.
 //!
-//! A timing report printed after a submission completes can never name a submission that never
-//! completes. A GPU hang is exactly that case, so the elapsed-time reports around a submit are
-//! silent for the one failure they matter most for. This watchdog inverts the reporting: each
-//! submission registers itself before it waits and unregisters after, and a plain background
-//! thread reports whatever has been registered too long. It sleeps, so it keeps reporting even
-//! when every other thread is blocked on a fence that will never signal.
-//!
-//! It runs in every build, shipped games included: a hang in the field is precisely where no one
-//! can attach a debugger, and the log line is the whole diagnosis. That only holds if the cost is
-//! nil, so registration allocates nothing and touches no growable container — a `&'static str`
-//! label plus a serial into a fixed slot table, under a mutex no other thread contends for.
+//! Each submission registers itself before it waits and unregisters after, and a background thread
+//! reports whatever has been registered too long. The thread sleeps rather than waiting on GPU
+//! work, so it keeps reporting even when every other thread is blocked on a fence that will never
+//! signal. Registration allocates nothing and touches no growable container — a `&'static str`
+//! label plus a serial into a fixed slot table — so it is always on, shipped builds included.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};

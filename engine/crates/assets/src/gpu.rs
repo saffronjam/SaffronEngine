@@ -1,14 +1,10 @@
 //! The GPU-upload seam the resolve/load paths reach through.
 //!
-//! Rendering owns the upload calls (README §1); this crate reaches them through the
-//! [`GpuUploader`] trait so the loaders are one code path over either the live renderer
-//! or a test stub — the upload is genuinely performed by rendering's ash seam, not
-//! stubbed in the engine.
+//! Rendering owns the upload calls; this crate reaches them through the [`GpuUploader`] trait so
+//! the loaders are one code path over either the live renderer or a test stub.
 //!
-//! The trait carries exactly the three upload entry points the loaders need plus the
-//! `skinning_enabled` gate `render_scene` reads (the skinned draw path is byte-identical
-//! to a build without it when off). Errors surface as [`saffron_rendering::Error`]; the
-//! loaders turn a failure into a logged warn plus a negative-cache `None`, never an `Err`.
+//! Errors surface as [`saffron_rendering::Error`]; the loaders turn a failure into a logged warn
+//! plus a negative-cache `None`, never an `Err`.
 
 use std::sync::Arc;
 
@@ -107,7 +103,8 @@ pub trait GpuUploader {
     }
 
     /// Uploads a creative look-up table — `size³` red-fastest `[r, g, b]` triples — as an
-    /// `R16G16B16A16_SFLOAT` `TYPE_3D` sampled image, returning the [`GpuLut`] the tonemap pass binds.
+    /// `R16G16B16A16_SFLOAT` `TYPE_3D` sampled image, returning the
+    /// [`GpuLut`](saffron_rendering::GpuLut) the tonemap pass binds.
     ///
     /// The default errors ([`saffron_rendering::Error::ZeroSizedImage`]) — a non-GPU test stub never
     /// imports a LUT. The live uploaders override it with the real 3D upload.

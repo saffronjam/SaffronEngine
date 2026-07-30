@@ -1,9 +1,6 @@
-/// The Physics diagnostics panel (a "diagnostics" dock panel beside Stats/Profiler). While
-/// Playing it shows the live Jolt world: body/dynamic counts, a per-body table, and a contact /
-/// trigger event feed (from the open-AND-playing poll in store.ts). In Edit it shows an empty
-/// state and the poll adds zero round-trips. It also hosts the per-selection ragdoll test controls
-/// (a designer affordance, like UE's PhAT simulate). It is an INSPECT/TEST surface — gameplay
-/// movement (driving a CharacterController) is Lua's job, not an editor button.
+/// The Physics diagnostics panel: the live Jolt world while playing (body counts, a per-body table,
+/// and the contact/trigger feed), an empty state in Edit, plus the per-selection ragdoll test
+/// controls. An inspect-and-test surface — gameplay movement is Lua's job, not an editor button.
 import { useEffect, useMemo, useState } from "react";
 import { client } from "../control/client";
 import { useEditorStore } from "../state/store";
@@ -16,6 +13,7 @@ import { Button } from "@/components/ui/button";
 import { Switch } from "@/components/ui/switch";
 import { Separator } from "@/components/ui/separator";
 import { ScrollArea } from "@/components/ui/scroll-area";
+import { SectionLabel } from "../components/PanelRows";
 
 function Stat({ label, value }: { label: string; value: React.ReactNode }) {
   return (
@@ -23,14 +21,6 @@ function Stat({ label, value }: { label: string; value: React.ReactNode }) {
       <span className="text-[11px] text-muted-foreground">{label}</span>
       <span className="font-mono text-[11px] tabular-nums text-foreground">{value}</span>
     </div>
-  );
-}
-
-function SectionLabel({ children }: { children: React.ReactNode }) {
-  return (
-    <Label className="text-[10px] font-medium tracking-wide text-muted-foreground uppercase">
-      {children}
-    </Label>
   );
 }
 

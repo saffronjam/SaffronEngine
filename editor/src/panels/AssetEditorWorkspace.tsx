@@ -1,19 +1,12 @@
-/// The asset editor: a full work-area main tab (see App.tsx / openAssetEditorTab) that previews ANY
-/// model — rigged or static — outside the authored scene. The engine spawns the model into an isolated
-/// preview scene and publishes it through the one viewport subsurface (glued into the center pane here).
-/// The side panels appear by capability: the skeleton tree (left) only for a rigged model, the clip list
-/// + details (right) and the bottom timeline only when the model has clips. A static model is just the
-/// framed viewport (orbit, materials, floor) — no rig chrome.
+/// The asset editor: a full work-area main tab that previews any model, rigged or static, in an
+/// isolated preview scene published through the viewport subsurface. Side panels appear by
+/// capability — the skeleton tree for a rigged model, the clip list and timeline only when the model
+/// has clips.
 ///
-/// Orbit is eased: input moves a target, a rAF loop drains current→target with the engine's tau (refs
-/// only, no React re-render), so a slight lag reads as smooth motion. Loading is masked: the panels +
-/// subsurface mount only once the model's capabilities are known (so the first frame already has the
-/// right panels at the final width), behind a "Preparing…" spinner that lifts after the viewport settles.
-///
-/// Lifecycle is keyed to the mount: App renders this with key={assetId}, so switching to a different
-/// model remounts (cleanup exits model A, mount enters model B) — an activeKind-only effect would keep
-/// previewing A under B's panels. enter-asset-preview / exit-asset-preview stash + restore the camera
-/// engine-side, so orbiting never dirties the saved editorCamera.
+/// Orbit is eased through refs and a rAF loop rather than React state, so a slight lag reads as
+/// smooth motion. The lifecycle is keyed to the mount (App renders this with `key={assetId}`), so
+/// switching models remounts and the cleanup exits model A before mount enters model B; an
+/// activeKind-only effect would keep previewing A under B's panels.
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Axis3d, Bone, Box, Grid2x2, Wrench } from "lucide-react";
 import { client } from "../control/client";

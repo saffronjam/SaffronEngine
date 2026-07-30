@@ -16,8 +16,8 @@ pub enum ProjectPhase {
     Failed,
 }
 
-/// The ordered boot stages within [`ProjectPhase::Loading`]. Reported through
-/// [`ProjectLoadProgress`]; Phase 3 mirrors it to a wire `BootStageDto`.
+/// The ordered boot stages within [`ProjectPhase::Loading`], reported through
+/// [`ProjectLoadProgress`] and mirrored to the wire `BootStageDto`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum BootStage {
     /// Reading + parsing `project.json` (off-thread, indeterminate).

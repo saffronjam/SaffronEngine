@@ -1,7 +1,7 @@
 // Standalone golden-fixture generator (13-testing-and-verification phase 2).
 //
 // Emits the byte-exact reference artifacts the Rust snapshot harness diffs against:
-// `cube.smesh`, `cube.sanim`, `material.smat`, `cube.smodel`, the three std430 offset
+// `cube.smesh`, `cube.sanim`, `material.smat`, `cube.smodel`, the two std430 offset
 // maps, and the shm header layout. Disk-format writers reproduce the C++ reference owners; current
 // GPU ABI structs mirror their Rust/Slang owners directly. The generator needs no Vulkan/Jolt/SDL.
 //
@@ -10,7 +10,7 @@
 //   .sanim   geometry.cppm saveAnimationToBuffer / SANimHeader / SANimTrackRecord (:406,:1619)
 //   .smodel  geometry.cppm writeContainer / SModelHeader / TocEntry (:296,:386)
 //   .smat    assets.cppm materialAssetToJson + dump(2) (:1488,:2137)
-//   std430   renderer_types.cppm InstanceData/GpuLight (:1868,:2018) and the current
+//   std430   renderer_types.cppm GpuLight (:2018) and the current
 //            gpu_types.rs/material_params.slang MaterialParamsData ABI
 //   shm      renderer_capture.cpp recreateShmSegment header (:129)
 //
@@ -360,19 +360,7 @@ auto materialAssetToJson(const MaterialAsset& m) -> nlohmann::json {
 
 // ---- std430 GPU structs (canonical Rust/Slang ABI, plus C++ reference structs) ----
 
-struct Mat4 { f32 m[16]; };
 struct UVec4 { u32 x, y, z, w; };
-
-struct InstanceData {
-    Mat4 model;
-    Mat4 normalMatrix;
-    Mat4 prevModel;
-    Vec4 baseColor;
-    UVec4 texture;
-    Vec4 pbr;
-    Vec4 emissive;
-};
-static_assert(sizeof(InstanceData) == 256);
 
 struct MaterialParamsData {
     Vec4 baseColor;
@@ -495,19 +483,6 @@ auto hexdump(const T& value) -> std::string {
     return hexdumpBytes(std::span<const u8>(reinterpret_cast<const u8*>(&value), sizeof(T)));
 }
 
-auto knownInstanceData() -> InstanceData {
-    InstanceData d{};
-    // model = a recognizable affine matrix (column-major, glm/std430)
-    d.model = Mat4{{1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 2, 3, 4, 1}};
-    d.normalMatrix = Mat4{{1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1}};
-    d.prevModel = Mat4{{1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 1, 1, 1, 1}};
-    d.baseColor = Vec4{0.8f, 0.4f, 0.2f, 1.0f};
-    d.texture = UVec4{3, 7, 11, 13};
-    d.pbr = Vec4{0.25f, 0.7f, 0.0f, 0.0f};
-    d.emissive = Vec4{0.1f, 0.0f, 0.0f, 0.0f};
-    return d;
-}
-
 auto knownMaterialParams() -> MaterialParamsData {
     MaterialParamsData d{};
     d.baseColor = Vec4{0.8f, 0.4f, 0.2f, 1.0f};
@@ -593,14 +568,6 @@ int main(int argc, char** argv) {
     writeFile(dir + "/cube.smodel", writeContainerBytes(std::span<const ContainerChunk>(chunks, 2)));
 
     // std430 offset maps: a header line per field offset, then a full known-valued hexdump.
-    {
-        const InstanceData d = knownInstanceData();
-        std::string s = "struct InstanceData size=256 align=16\n";
-        s += "offset model 0\noffset normalMatrix 64\noffset prevModel 128\n";
-        s += "offset baseColor 192\noffset texture 208\noffset pbr 224\noffset emissive 240\n";
-        s += "hexdump:\n" + hexdump(d);
-        writeText(dir + "/instance_data.offsets", s);
-    }
     {
         const MaterialParamsData d = knownMaterialParams();
         std::string s = "struct MaterialParamsData size=256 align=16\n";

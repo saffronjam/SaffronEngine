@@ -1,15 +1,11 @@
-/// A reusable per-tab undo/redo hook for an editable main tab whose canonical state is
-/// a local JS model flushed to the engine through one apply command — the material
-/// graph today, any future asset editor next. It records a `{ before, after }` snapshot
-/// at each apply boundary and pushes it onto the active tab's history; undo/redo replay
-/// the editor's own apply command with the prior/next snapshot, so the engine stays
-/// unaware of undo. A consumer supplies three model-specific functions: `read` (current
-/// snapshot), `write` (show + persist a model), `equals` (stable, normalized compare).
+/// Per-tab undo/redo for an editable main tab whose canonical state is a local JS model flushed to
+/// the engine through one apply command. It records a `{ before, after }` snapshot at each apply
+/// boundary; undo/redo replay the editor's own apply command with the prior/next snapshot, so the
+/// engine stays unaware of undo. A consumer supplies `read`, `write`, and a stable `equals`.
 ///
-/// The hook owns the snapshot baseline and a replay guard that outlives the store's
-/// `historyReplaying` flag — a debounced editor re-applies its model AFTER the replay's
-/// await resolves, so the consumer calls `consumeReplay()` at its apply boundary to skip
-/// that settle's persist + record.
+/// The hook owns a replay guard that outlives the store's `historyReplaying` flag: a debounced
+/// editor re-applies its model AFTER the replay's await resolves, so the consumer calls
+/// `consumeReplay()` at its apply boundary to skip that settle's persist and record.
 import { useRef } from "react";
 import { useEditorStore } from "../state/store";
 import type { UndoableEdit } from "./undo";

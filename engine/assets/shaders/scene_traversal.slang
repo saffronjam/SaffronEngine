@@ -54,9 +54,11 @@ struct Push
     uint recordCapacity;
     uint listCapacity;
     uint survivor;
-    // Nonzero: skip records whose material displaces (the tessellation seam draws
-    // the amplified transient geometry instead).
-    uint tessSeam;
+    // Nonzero: an instance holding a row in the frame's displacement arena emits one
+    // record for its amplified micro-geometry instead of walking its base hierarchy.
+    // Zero: every instance walks its base pages, which is what a view that reads the
+    // undisplaced surface (shadow pages, the reach walk) wants.
+    uint displacedRecords;
     // Crossfade length in frames for this view; zero disables transitions (the view
     // draws settled cuts only and never touches the state table).
     uint transitionFrames;
@@ -221,8 +223,8 @@ bool nodeCulled(
 // marks an empty table entry. An assembly visits one node once per use and each use's
 // cut decision is its own: sharing one entry would let two uses read each other's mode
 // as a flip and restart the crossfade forever, which draws the aggregate over the fine
-// geometry every frame. `GPU_ASSEMBLY_NO_USE + 1u` is zero, so a plain mesh's key is
-// exactly the old (slot, page) hash.
+// geometry every frame. `GPU_ASSEMBLY_NO_USE + 1u` is zero, so a plain mesh's key reduces
+// to the (slot, page) hash.
 uint transitionKey(uint slot, uint page, uint use)
 {
     uint hash = slot * 0x9e3779b9u ^ page * 0x85ebca6bu ^ ((use + 1u) * 0xc2b2ae35u);
@@ -302,11 +304,6 @@ void emitNodeRecords(
         let materialReference =
             gpuSceneLoadMaterialReference(addresses, sceneMaterial.index);
         let material = gpuSceneResidentMaterial(addresses, materialReference.target);
-        if (pc.tessSeam != 0u
-            && (material.flags & GPU_MATERIAL_TABLE_FLAG_TESSELLATED) != 0u)
-        {
-            return;
-        }
         record.material = sceneMaterial;
         record.part = 0u;
         record.psoBin = composeGpuPsoBin(
@@ -330,11 +327,6 @@ void emitNodeRecords(
             let materialReference =
                 gpuSceneLoadMaterialReference(addresses, sceneMaterial.index);
             let material = gpuSceneResidentMaterial(addresses, materialReference.target);
-            if (pc.tessSeam != 0u
-                && (material.flags & GPU_MATERIAL_TABLE_FLAG_TESSELLATED) != 0u)
-            {
-                continue;
-            }
             record.material = sceneMaterial;
             record.part = cluster;
             record.psoBin = composeGpuPsoBin(
@@ -354,6 +346,42 @@ void emitNodeRecords(
 }
 
 
+// Emits the one record a displaced instance draws through: its whole amplified
+// micro-geometry, addressed by the row it owns in the frame's displacement arena. The
+// amplification covers the base mesh in one packed slice, so there is no cut to walk and
+// no cluster to partition — the row IS the instance's geometry for this view. Slot-0
+// material, matching the arena the emit kernel displaced through. The triangle count
+// lives in the arena's draw seed, so the binner adds it once it resolves the command.
+void emitDisplacedRecord(
+    GpuSceneAddressBlock addresses,
+    GpuSceneInstanceGpuRecord instance,
+    GpuScenePrototypeGpuRecord prototype,
+    uint slot,
+    uint row)
+{
+    let sceneMaterial = resolveMaterial(addresses, instance, prototype, 0u);
+    let materialReference = gpuSceneLoadMaterialReference(addresses, sceneMaterial.index);
+    let material = gpuSceneResidentMaterial(addresses, materialReference.target);
+    GpuDrawRecord record;
+    record.geometry = prototype.geometry;
+    record.material = sceneMaterial;
+    record.instance = GpuHandle(slot, instance.sourceGeneration);
+    record.deformation = instance.deformation;
+    record.contentIndex = row;
+    record.part = 0u;
+    record.representation = GPU_REPRESENTATION_DISPLACED_MICRO;
+    record.sourceGeneration = instance.sourceGeneration;
+    record.psoBin = composeGpuPsoBin(
+        GPU_REPRESENTATION_DISPLACED_MICRO,
+        material.materialClass,
+        GPU_DEFORMATION_RIGID,
+        0u);
+    record.transition = 0u;
+    record.clusterState = GPU_ASSEMBLY_NO_USE;
+    record.reserved = material.shaderIndex;
+    emitRecord(record, 0u);
+}
+
 [shader("compute")]
 [numthreads(64, 1, 1)]
 void computeMain(uint3 tid : SV_DispatchThreadID)
@@ -371,6 +399,14 @@ void computeMain(uint3 tid : SV_DispatchThreadID)
     uint slot = visibleList[index];
     let instance = gpuSceneLoadInstance(addresses, slot);
     let prototype = gpuSceneLoadPrototype(addresses, instance.prototype.index);
+
+    uint displacedRow;
+    if (pc.displacedRecords != 0u && pc.demandOnly == 0u
+        && gpuSceneDisplacedRow(addresses, slot, displacedRow))
+    {
+        emitDisplacedRecord(addresses, instance, prototype, slot, displacedRow);
+        return;
+    }
 
     // The prototype's root is a scene-page handle; children in payloads are resident
     // page-table handles already.

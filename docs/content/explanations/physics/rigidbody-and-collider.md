@@ -103,10 +103,10 @@ In Edit, the same command returns `physics=inactive  bodies=0  dynamic=0`.
 | What | File | Symbols |
 |---|---|---|
 | Scene components and serialization | `engine/crates/scene/src/component.rs`, `serde.rs` | `Collider`, `Rigidbody`, `Motion`, `PhysicsMaterial`, `SceneSerialize for Rigidbody` |
-| Body creation and stepping | `engine/crates/physics/src/world.rs` | `World::populate`, `body_create`, `allowed_dofs`, `World::step`, `BodyEntry` |
+| Body creation and stepping | `engine/crates/physics/src/world/` | `World::populate`, `body_create`, `allowed_dofs`, `World::step`, `BodyEntry` |
 | Physics vocabulary | `engine/crates/physics/src/types.rs` | `MotionType`, `MotionType::from_scene`, `ObjectLayer`, `FIXED_STEP` |
-| Runtime lifecycle and tick order | `engine/crates/runtime/src/session.rs`, `engine/crates/host/src/layer.rs` | `RuntimeSession::start`, `RuntimeSession::step`, `HostLayer::reconcile_play_edge` |
-| Shape fitting | `engine/crates/physics/src/world.rs` | `fit_collider_to_mesh` |
+| Runtime lifecycle and tick order | `engine/crates/runtime/src/session.rs`, `engine/crates/host/src/layer/` | `RuntimeSession::start`, `RuntimeSession::step`, `HostLayer::reconcile_play_edge` |
+| Shape fitting | `engine/crates/physics/src/world/` | `fit_collider_to_mesh` |
 | World inspection | `engine/crates/control/src/commands_physics.rs` | `register_physics_commands`, `PhysicsStateResult`, `PhysicsBodiesResult` |
 
 ## Related

@@ -44,7 +44,7 @@ fn parse_cell(value: &saffron_protocol::WorldCellDto) -> Result<WorldCellKey> {
             .map_err(|_| Error::command("cell coordinate is not an i64"))?;
     }
     WorldCellKey::new(coordinates[0], coordinates[1], coordinates[2], value.level)
-        .map_err(|error| Error::command(error.to_string()))
+        .map_err(Error::command)
 }
 
 fn parse_plant(value: &saffron_protocol::PlantId) -> Result<PlantId> {
@@ -60,7 +60,7 @@ fn scalars(bits: [i32; 3]) -> [DecisionScalar; 3] {
 }
 
 fn orientation(bits: [i16; 4]) -> Result<QuantizedOrientation> {
-    QuantizedOrientation::new(bits).map_err(|error| Error::command(error.to_string()))
+    QuantizedOrientation::new(bits).map_err(Error::command)
 }
 
 fn bounds(value: &saffron_protocol::WorldBoundsDto) -> Result<WorldBounds> {
@@ -70,7 +70,7 @@ fn bounds(value: &saffron_protocol::WorldBoundsDto) -> Result<WorldBounds> {
         *low = parse_i128(&value.min_ticks[axis], "bounds.minTicks")?;
         *high = parse_i128(&value.max_ticks_exclusive[axis], "bounds.maxTicksExclusive")?;
     }
-    WorldBounds::new(minimum, maximum).map_err(|error| Error::command(error.to_string()))
+    WorldBounds::new(minimum, maximum).map_err(Error::command)
 }
 
 fn position(transform: &PlantTransformDto) -> Result<WorldPosition> {
@@ -78,7 +78,7 @@ fn position(transform: &PlantTransformDto) -> Result<WorldPosition> {
     for (tick, value) in ticks.iter_mut().zip(&transform.global_ticks) {
         *tick = parse_i128(value, "transform.globalTicks")?;
     }
-    WorldPosition::from_global_ticks(ticks).map_err(|error| Error::command(error.to_string()))
+    WorldPosition::from_global_ticks(ticks).map_err(Error::command)
 }
 
 fn attachment(value: &SurfaceAttachmentDto) -> Result<SurfaceAttachment> {
@@ -88,7 +88,7 @@ fn attachment(value: &SurfaceAttachmentDto) -> Result<SurfaceAttachment> {
         value.barycentric.map(UnitInterval::from_bits),
         SurfaceRevision(parse_u64(&value.revision, "attachment.revision")?),
     )
-    .map_err(|error| Error::command(error.to_string()))
+    .map_err(Error::command)
 }
 
 fn channel(value: &FieldChannelDto) -> Result<FieldChannel> {
@@ -124,10 +124,9 @@ pub(crate) fn point_from_dto(value: &PlantPointDto) -> Result<PlantPoint> {
         owner,
         position: WorldPosition::new(
             owner,
-            QuantizedLocalPosition::new(value.local_position)
-                .map_err(|error| Error::command(error.to_string()))?,
+            QuantizedLocalPosition::new(value.local_position).map_err(Error::command)?,
         )
-        .map_err(|error| Error::command(error.to_string()))?,
+        .map_err(Error::command)?,
         orientation: orientation(value.orientation)?,
         scale: scalars(value.scale_bits),
         bounds: bounds(&value.bounds)?,

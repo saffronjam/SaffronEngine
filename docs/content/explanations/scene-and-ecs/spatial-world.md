@@ -116,7 +116,7 @@ JSON useful in tests and diagnostic diffs.
 | Residency and publication | `engine/crates/spatial/src/residency.rs` | `SpatialSource`, `ResidencyManager`, `GenerationSlot` |
 | Static mesh provider and scene queries | `engine/crates/assets/src/mesh_surface.rs`, `render_scene.rs` | `StaticMeshSurfaceProvider`, `query_scene_surface_ray` |
 | GPU numeric goldens | `engine/assets/shaders/spatial_numeric.slang`, `spatial_numeric_test.slang` | `spatialRandomSample`, `computeMain` |
-| Control diagnostics | `engine/crates/control/src/commands_scene.rs` | `register_scene_commands`, `spatial-cell`, `spatial-sample` |
+| Control diagnostics | `engine/crates/control/src/commands_scene/` | `register_scene_commands`, `spatial-cell`, `spatial-sample` |
 
 ## Related
 

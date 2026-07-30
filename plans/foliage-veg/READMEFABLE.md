@@ -4940,9 +4940,10 @@ all 4 boxes of its first section are [x] with evidence.
 - NEW vegetation/src/ecology.rs: ECOLOGY_SIMULATION_VERSION (a
   rule-set + numeric contract identity; decoding state produced
   under a different version is a HARD ERROR, never a silent
-  re-simulation against new rules); EcologyClock (ticks_to
-  refuses a target behind the clock, complete accepts only the
-  exact successor — a skipped tick cannot drop a generation, a
+  re-simulation against new rules); EcologyClock
+  (`advance_to` refuses a target behind the clock, and
+  `EcologyState::publish_region_tick` accepts only the exact
+  successor — a skipped tick cannot drop a generation, a
   repeat cannot double-apply one); EcologyCellSummary (the
   per-tick boundary facts a neighbour reads without touching its
   plants: plants, canopy, health, moisture, fuel);
@@ -6771,8 +6772,8 @@ export VK_ICD_FILENAMES=/opt/homebrew/etc/vulkan/icd.d/MoltenVK_icd.json
 export VK_LAYER_PATH=/opt/homebrew/opt/vulkan-validationlayers/share/vulkan/explicit_layer.d
 export DYLD_FALLBACK_LIBRARY_PATH=/opt/homebrew/opt/vulkan-validationlayers/lib${DYLD_FALLBACK_LIBRARY_PATH:+:$DYLD_FALLBACK_LIBRARY_PATH}
 
-cargo +1.96.0 test -p saffron-rendering \
-  'portable_executor::moltenvk_renders_every_cooked_representation_through_indexed_draws' \
+cargo test -p saffron-rendering \
+  'visibility::tests::executor::the_depth_prepass_rasterizes_every_cooked_representation' \
   --lib -- --exact --nocapture
 ```
 

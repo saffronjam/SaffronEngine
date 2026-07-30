@@ -87,7 +87,7 @@ This division keeps camera projection parameters in one place while each consume
 | TRS and Euler conversion | `engine/crates/scene/src/hierarchy.rs` | `transform_matrix`, `quat_from_euler_xyz`, `quat_to_euler_zyx` |
 | Hierarchy composition and reparenting | `engine/crates/scene/src/hierarchy.rs` | `Scene::update_world_transforms`, `Scene::set_parent`, `Scene::set_local_from_matrix` |
 | Camera view and projection | `engine/crates/scene/src/hierarchy.rs` | `Scene::primary_camera`, `CameraView`, `camera_projection` |
-| Vulkan Y flip | `engine/crates/assets/src/render_scene.rs` | `render_scene`, `viewport_ray` |
+| Vulkan Y flip | `engine/crates/assets/src/render_scene/` | `render_scene`, `viewport_ray` |
 | Degree/radian editor conversion | `editor/src/components/fieldRenderer.tsx` | `Transform.rotation`, `RAD_TO_DEG`, `DEG_TO_RAD` |
 
 ## Related

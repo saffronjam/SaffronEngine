@@ -1,9 +1,9 @@
 // The shader mirror of the shared deterministic wind field (`saffron-wind`): the
-// same mean-advection + gust-front + fixed-phase multiscale turbulence math. The
-// module is parameter-fed — the wind deformation prepass passes its push-constant
-// words and lighting-side consumers pass the light UBO's wind words — so one
-// implementation serves every sampler, and equal (position, time) inputs sample
-// equal velocities everywhere.
+// same mean-advection + gust-front + fixed-phase multiscale turbulence math, plus
+// the world interaction field the same consumers read. The module is parameter-fed —
+// the wind deformation prepass passes its push-constant words and lighting-side
+// consumers pass the light UBO's wind words — so one implementation serves every
+// sampler, and equal (position, time) inputs sample equal velocities everywhere.
 module wind;
 
 static const float WIND_TAU = 6.28318530718;
@@ -214,4 +214,146 @@ public float3 windSwayOffset(
         offset *= 1.5 / magnitude;
     }
     return offset;
+}
+
+// The world interaction field: camera-centered cascades of damped-oscillator texels the
+// interaction pass integrates each frame. Every texel stores its ABSOLUTE world texel coordinate;
+// a texel whose stored coordinate mismatches the one its slot derives is at rest, so recentring
+// never copies state.
+public static const uint GPU_INTERACTION_CASCADES = 2u;
+// Texels per cascade side.
+public static const uint GPU_INTERACTION_TEXELS = 256u;
+public static const uint GPU_INTERACTION_TEXEL_SIZE = 32u;
+public static const uint GPU_INTERACTION_HEADER_SIZE = 32u;
+
+// Metres per texel of cascade `cascade` (0.25 m, then ×4 per cascade).
+public float gpuInteractionTexelMeters(uint cascade)
+{
+    return 0.25 * float(1u << (2u * cascade));
+}
+
+// Scalar reserved words, not a `uint3`: this block starts at offset 20, and std430 requires a
+// three-component vector to start on a 16-byte boundary.
+public struct GpuInteractionHeader
+{
+    // Per-cascade centre texel in absolute world texel coordinates.
+    public int2 centerTexel[GPU_INTERACTION_CASCADES];
+    public uint generation;
+    public uint reserved0;
+    public uint reserved1;
+    public uint reserved2;
+};
+
+public struct GpuInteractionTexel
+{
+    public float2 displacement;
+    public float2 velocity;
+    public float depress;
+    public float depressVelocity;
+    public int2 worldCoord;
+};
+
+public uint64_t gpuInteractionTexelOffset(uint cascade, uint2 texel)
+{
+    return uint64_t(GPU_INTERACTION_HEADER_SIZE)
+        + (uint64_t(cascade) * GPU_INTERACTION_TEXELS * GPU_INTERACTION_TEXELS
+           + uint64_t(texel.y) * GPU_INTERACTION_TEXELS + texel.x)
+            * GPU_INTERACTION_TEXEL_SIZE;
+}
+
+// One texel's live displacement, or rest when the slot is stale or out of range.
+float3 gpuInteractionTexelValue(uint64_t field, uint cascade, int2 worldCoord, int2 center)
+{
+    int2 slot = worldCoord - center + int(GPU_INTERACTION_TEXELS / 2u);
+    if (slot.x < 0 || slot.y < 0 || slot.x >= int(GPU_INTERACTION_TEXELS)
+        || slot.y >= int(GPU_INTERACTION_TEXELS))
+    {
+        return float3(0.0, 0.0, 0.0);
+    }
+    GpuInteractionTexel* texel = (GpuInteractionTexel*)(
+        field + gpuInteractionTexelOffset(cascade, uint2(uint(slot.x), uint(slot.y))));
+    GpuInteractionTexel value = *texel;
+    if (value.worldCoord.x != worldCoord.x || value.worldCoord.y != worldCoord.y)
+    {
+        return float3(0.0, 0.0, 0.0);
+    }
+    return float3(value.displacement.x, -value.depress, value.displacement.y);
+}
+
+// Whether `positionXZ` falls inside `cascade`'s bilinear-safe window around `center`,
+// and the base texel coordinate + fraction of its footprint.
+bool gpuInteractionFootprint(
+    uint cascade, float2 positionXZ, int2 center, out int2 baseCoord, out float2 fraction)
+{
+    float texelMeters = gpuInteractionTexelMeters(cascade);
+    float2 grid = positionXZ / texelMeters - 0.5;
+    float2 base = floor(grid);
+    fraction = grid - base;
+    baseCoord = int2(int(base.x), int(base.y));
+    int2 offset = baseCoord - center;
+    int half = int(GPU_INTERACTION_TEXELS / 2u);
+    return offset.x >= -half + 1 && offset.y >= -half + 1 && offset.x < half - 2
+        && offset.y < half - 2;
+}
+
+// The finest cascade covering `positionXZ` for the given cascade centres, or
+// `GPU_INTERACTION_CASCADES` when the position falls outside every cascade. The centres are
+// arguments so a caller can ask the same question of the previous frame's field placement.
+public uint gpuSceneInteractionCascade(float2 positionXZ, int2 center0, int2 center1)
+{
+    for (uint cascade = 0u; cascade < GPU_INTERACTION_CASCADES; ++cascade)
+    {
+        int2 baseCoord;
+        float2 fraction;
+        int2 center = cascade == 0u ? center0 : center1;
+        if (gpuInteractionFootprint(cascade, positionXZ, center, baseCoord, fraction))
+        {
+            return cascade;
+        }
+    }
+    return GPU_INTERACTION_CASCADES;
+}
+
+// The field's live cascade centres, as the interaction step wrote them this frame.
+public void gpuSceneInteractionCenters(uint64_t field, out int2 center0, out int2 center1)
+{
+    center0 = int2(0, 0);
+    center1 = int2(0, 0);
+    if (field == 0)
+    {
+        return;
+    }
+    GpuInteractionHeader head = *(GpuInteractionHeader*)field;
+    center0 = head.centerTexel[0];
+    center1 = head.centerTexel[1];
+}
+
+// Bilinear world-space sample of the interaction field's displacement at a ground
+// position: horizontal push in xz, ground depression as negative y. The finest
+// cascade containing the position wins.
+public float3 gpuSceneInteractionSample(uint64_t field, float2 positionXZ)
+{
+    if (field == 0)
+    {
+        return float3(0.0, 0.0, 0.0);
+    }
+    GpuInteractionHeader* header = (GpuInteractionHeader*)field;
+    GpuInteractionHeader head = *header;
+    for (uint cascade = 0u; cascade < GPU_INTERACTION_CASCADES; ++cascade)
+    {
+        int2 baseCoord;
+        float2 fraction;
+        int2 center = head.centerTexel[cascade];
+        if (!gpuInteractionFootprint(cascade, positionXZ, center, baseCoord, fraction))
+        {
+            continue;
+        }
+        float3 v00 = gpuInteractionTexelValue(field, cascade, baseCoord, center);
+        float3 v10 = gpuInteractionTexelValue(field, cascade, baseCoord + int2(1, 0), center);
+        float3 v01 = gpuInteractionTexelValue(field, cascade, baseCoord + int2(0, 1), center);
+        float3 v11 = gpuInteractionTexelValue(field, cascade, baseCoord + int2(1, 1), center);
+        return lerp(
+            lerp(v00, v10, fraction.x), lerp(v01, v11, fraction.x), fraction.y);
+    }
+    return float3(0.0, 0.0, 0.0);
 }

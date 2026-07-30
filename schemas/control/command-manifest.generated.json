@@ -1171,6 +1171,13 @@
       "skip": "requires an exact bound vegetation runtime generation"
     },
     {
+      "name": "vegetation-ecology-clock",
+      "params": "VegetationEcologyClockParams",
+      "result": "VegetationEcologyClockDto",
+      "status": "typed",
+      "skip": "requires an exact bound vegetation runtime generation"
+    },
+    {
       "name": "vegetation-combustion",
       "params": "VegetationCombustionParams",
       "result": "VegetationCombustionDto",

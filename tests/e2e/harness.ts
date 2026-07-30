@@ -12,7 +12,15 @@ import { existsSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-import type { ControlFailureDto } from "@saffron/protocol";
+import type { CommandParamsMap, ControlFailureDto } from "@saffron/protocol";
+
+// Every command the control plane serves. `call` takes only these, so a renamed or retired command
+// fails to typecheck instead of failing at runtime against a live host.
+export type CommandName = keyof CommandParamsMap;
+
+// One command's request payload: its named params, or the positional `args` form the engine folds
+// into those names.
+export type CommandParams = CommandParamsMap[CommandName] | { args: unknown[] };
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 export const REPO = join(HERE, "..", "..");
@@ -23,7 +31,7 @@ const delay = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve,
 
 export const IS_MACOS = process.platform === "darwin";
 
-/// A rejected engine command carrying the exact shared control failure.
+// A rejected engine command carrying the exact shared control failure.
 export class EngineCallError extends Error {
   constructor(
     readonly command: string,
@@ -34,9 +42,9 @@ export class EngineCallError extends Error {
   }
 }
 
-/// macOS has no Wayland compositor; the offscreen host needs none. It needs MoltenVK's ICD plus
-/// Homebrew's validation-layer manifest and dynamic-library directory. Applied only when Vulkan
-/// discovery is not already configured, so an explicit override still wins.
+// macOS has no Wayland compositor; the offscreen host needs none. It needs MoltenVK's ICD plus
+// Homebrew's validation-layer manifest and dynamic-library directory. Applied only when Vulkan
+// discovery is not already configured, so an explicit override still wins.
 export function macosVulkanEnv(): Record<string, string> {
   const candidates = [
     "/opt/homebrew/etc/vulkan/icd.d/MoltenVK_icd.json",
@@ -77,12 +85,12 @@ async function waitFor(ready: () => boolean, timeoutMs: number, what: string): P
   }
 }
 
-/// A booted engine plus a typed control client. Always call shutdown() (afterAll/finally).
+// A booted engine plus a typed control client. Always call shutdown() (afterAll/finally).
 export class Engine {
   readonly socketPath: string;
-  /// The per-boot app-data root the host writes its `userdata/` (and any scratch project) into.
-  /// The harness owns a fresh temp dir per boot and removes it on shutdown, so runs are isolated
-  /// and never pollute the source tree. A caller that passes its own `SAFFRON_APPDATA_DIR` owns it.
+  // The per-boot app-data root the host writes its `userdata/` (and any scratch project) into.
+  // The harness owns a fresh temp dir per boot and removes it on shutdown, so runs are isolated
+  // and never pollute the source tree. A caller that passes its own `SAFFRON_APPDATA_DIR` owns it.
   readonly appdata: string;
   private proc: ChildProcess;
   private exited = false;
@@ -102,13 +110,13 @@ export class Engine {
     this.ownsAppdata = ownsAppdata;
   }
 
-  /// Everything the engine has written to stdout+stderr so far.
+  // Everything the engine has written to stdout+stderr so far.
   get log(): string {
     return this.buf;
   }
 
-  /// Lines the validation layers flagged as errors (empty = clean). The engine's debug
-  /// messenger prints them as `<ts>  ERROR  vulkan  [validation] …` (ANSI off when piped).
+  // Lines the validation layers flagged as errors (empty = clean). The engine's debug
+  // messenger prints them as `<ts>  ERROR  vulkan  [validation] …` (ANSI off when piped).
   validationErrors(): string[] {
     return this.buf.split("\n").filter((line) => /ERROR\s+vulkan\s+\[validation\]/.test(line));
   }
@@ -174,8 +182,8 @@ export class Engine {
     }
   }
 
-  /// Send one control command; resolves its `result`, rejects on `ok:false` or transport error.
-  call<T = unknown>(cmd: string, params: Record<string, unknown> = {}): Promise<T> {
+  // Send one control command; resolves its `result`, rejects on `ok:false` or transport error.
+  call<T = unknown>(cmd: CommandName, params: CommandParams = {}): Promise<T> {
     return new Promise<T>((resolve, reject) => {
       const socket = net.connect({ path: this.socketPath });
       const id = this.nextId++;
@@ -222,9 +230,9 @@ export class Engine {
     });
   }
 
-  /// Fetch a thumbnail, transparently retrying the `pending` reply the engine sends while its
-  /// worker thread generates a cold-cache entry (mirrors the editor's backoff). Resolves the final
-  /// PNG reply; rejects on an engine error or after `timeoutMs`.
+  // Fetch a thumbnail, transparently retrying the `pending` reply the engine sends while its
+  // worker thread generates a cold-cache entry (mirrors the editor's backoff). Resolves the final
+  // PNG reply; rejects on an engine error or after `timeoutMs`.
   async getThumbnail<T = { base64: string; width: number; height: number; format: string }>(
     cmd: "get-thumbnail" | "view-asset",
     params: Record<string, unknown>,
@@ -245,15 +253,15 @@ export class Engine {
     }
   }
 
-  /// Let the engine run a few render frames so deferred GPU work + validation surface.
+  // Let the engine run a few render frames so deferred GPU work + validation surface.
   async settle(ms = 300): Promise<void> {
     await delay(ms);
   }
 
-  /// Poll `project-status` until the non-blocking loader (Phase 2) reaches `ready`; reject on
-  /// `failed` or timeout. Every project bring-up is async now — the env/scratch bootstrap and each
-  /// lifecycle command kick the load, then it runs across frames — so a test must await this before
-  /// touching the loaded scene/catalog. `project-status` is allow-listed during `Loading`.
+  // Polls `project-status` until the non-blocking loader reaches `ready`; rejects on `failed` or
+  // timeout. Every project bring-up is async — the bootstrap and each lifecycle command kick the
+  // load, which then runs across frames — so a test must await this before touching the loaded
+  // scene or catalog. `project-status` is allow-listed during `Loading`.
   async awaitProjectReady(timeoutMs = 30_000): Promise<void> {
     const start = Date.now();
     for (;;) {
@@ -293,43 +301,42 @@ export class Engine {
     }
   }
 
-  /// Kick a project open + await the load — the async-contract replacement for a raw
-  /// `call("load-project")` that assumed the load finished synchronously.
+  // Kick a project open + await the load.
   async loadProject(path: string): Promise<void> {
     await this.call("load-project", { path });
     await this.awaitProjectReady();
   }
 
-  /// Kick a project open by folder/path + await the load.
+  // Kick a project open by folder/path + await the load.
   async openProject(path: string): Promise<void> {
     await this.call("open-project", { path });
     await this.awaitProjectReady();
   }
 
-  /// Kick a fresh-project create + await the load.
+  // Kick a fresh-project create + await the load.
   async newProject(params: Record<string, unknown>): Promise<void> {
     await this.call("new-project", params);
     await this.awaitProjectReady();
   }
 
-  /// Kick a reload of the active project + await the load.
+  // Kick a reload of the active project + await the load.
   async reloadProject(): Promise<void> {
     await this.call("reload-project", {});
     await this.awaitProjectReady();
   }
 
-  /// Import a glTF/OBJ as a .smodel asset, then instantiate it into the scene, returning the placed
-  /// root entity. The standard "get a model into the scene" path: import bakes the asset, instantiate
-  /// places it.
+  // Import a glTF/OBJ as a .smodel asset, then instantiate it into the scene, returning the placed
+  // root entity. The standard "get a model into the scene" path: import bakes the asset, instantiate
+  // places it.
   async importEntity(path: string, name?: string): Promise<{ id: string; name: string }> {
     const model = await this.call<{ id: string }>("import-model", { path });
     const params = name === undefined ? { asset: model.id } : { asset: model.id, name };
     return this.call<{ id: string; name: string }>("instantiate-model", params);
   }
 
-  /// The rig descendant of an instantiated model: a skinned model wraps its node forest under a
-  /// container root, so the SkinnedMesh (and the auto-fit BonePhysics) live on a child. Returns the
-  /// first entity carrying a SkinnedMesh, falling back to `root` for a non-skinned model.
+  // The rig descendant of an instantiated model: a skinned model wraps its node forest under a
+  // container root, so the SkinnedMesh (and the auto-fit BonePhysics) live on a child. Returns the
+  // first entity carrying a SkinnedMesh, falling back to `root` for a non-skinned model.
   async rig(root: string): Promise<string> {
     const { entities } = await this.call<{ entities: { id: string }[] }>("list-entities");
     for (const e of entities) {

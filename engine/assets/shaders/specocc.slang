@@ -4,8 +4,8 @@
 // with roughness, reconstructing world position + normal from the thin G-buffer. The output feeds
 // a bilateral upsample + temporal accumulation (the specocc-blur → specocc-accum chain, reusing
 // the SSGI denoise kernels); the mesh then samples the resolved occlusion (set 4 binding 6) to
-// occlude the reflected skybox. This is why the reflection cone-march no longer runs per full-res
-// fragment — it runs once per half-res pixel here and is denoised across frames.
+// occlude the reflected skybox. The cone-march is too expensive per full-res fragment, so it runs
+// once per half-res pixel here and is denoised across frames.
 //
 // Sets: 0 = the bindless brick arrays (the `sdf` import; unused on this path — only the GDF
 // clipmap is tapped), 1 = the light set (GDF cascade clipmap + params at bindings 9/10),

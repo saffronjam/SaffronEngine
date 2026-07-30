@@ -24,8 +24,7 @@ serde_json.workspace = true
 criterion.workspace = true
 serde = { workspace = true }
 
-# The ECS speed go/no-go gate (03-ecs-and-scene phase 2). Disable the libtest harness so
-# criterion's own `main` drives the per-frame iteration + structural-churn measurements.
+# `harness = false` so criterion's own `main` drives the measurements.
 [[bench]]
 name = "ecs"
 harness = false

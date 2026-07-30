@@ -1,10 +1,6 @@
-//! Coverage of the [`ScriptHostBridge`] POD seam, the physics-reaching `sa.*` bindings +
-//! `sa.log` sink routed through it, the pure-Scene `move_character`, and
-//! [`ScriptHost::dispatch_contact`] (the contact-event ring → script handlers).
-//!
-//! Drives real `.luau` fixtures through a real VM against a real [`Scene`] + a stub
-//! [`ScriptHostBridge`] that records the calls, so the test can assert each binding routed
-//! to the bridge with the entity's uuid and shaped the POD result correctly.
+//! The `ScriptHostBridge` POD seam and the bindings routed through it, driven as real `.luau`
+//! fixtures against a real `Scene` and a recording stub bridge, so each case asserts the binding
+//! reached the bridge with the entity's uuid and shaped the POD result.
 
 use std::cell::RefCell;
 use std::path::PathBuf;

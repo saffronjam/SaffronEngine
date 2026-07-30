@@ -1,52 +1,43 @@
 // A plant family's authored wind response reaches the GPU and changes how it moves.
 //
-// `MechanicalResponse` — stiffness, damping, drag, flutter, bend limit — was authored on
-// `.splant`, written into the cooked part table, and read by nothing. The wind prepass
-// derived its whole response from the plant's height, so a stiff sapling and a supple reed
-// of the same height swayed identically no matter what the author wrote.
+// `MechanicalResponse` — stiffness, damping, drag, flutter, bend limit — is authored on `.splant`,
+// written into the cooked part table, and read by the wind prepass. Without it the prepass would
+// derive its whole response from the plant's height, so a stiff sapling and a supple reed of the
+// same height would sway identically.
 //
-// The chain being proven is four links long and every one of them could drop the value
-// silently: the part-table decoder, the family render load, the mirror's prototype record,
-// and the prepass that reads it. A unit test covers the first link and a mirror test the
-// third; only a running host covers all four, because only there does the record the GPU
-// actually wrote come back.
+// The chain is four links long and every one can drop the value silently: the part-table decoder,
+// the family render load, the mirror's prototype record, and the prepass that reads it. A unit test
+// covers the first and a mirror test the third; only a running host covers all four, because only
+// there does the record the GPU actually wrote come back.
 //
-// `vegetation-wind-record` is that readback. It is an explicit one-shot capture — the
-// record buffer is device-local and reading it idles the queue, which is fine when a person
-// asks a question and ruinous every frame.
+// `vegetation-wind-record` is that readback, and it is an explicit one-shot capture — the record
+// buffer is device-local and reading it idles the queue.
 
 import { afterAll, beforeAll, expect, test } from "bun:test";
-import { readFileSync } from "node:fs";
-import { dirname, join } from "node:path";
-import { fileURLToPath } from "node:url";
 import type {
   EntityRef,
-  ImportVegetationAssetResult,
-  VegetationCookJobDto,
   VegetationRuntimeQueryResult,
   VegetationWindRecordResult,
 } from "@saffron/protocol";
-import type { ActiveAlarmsDto, DrainAlarmsResult, GpuSceneStatsDto } from "@saffron/protocol";
+import type { ActiveAlarmsDto, DrainAlarmsResult, GpuSceneMirrorStatsDto } from "@saffron/protocol";
 import type { Engine } from "./harness.ts";
 import { Cleaner, bootEngine, prepareScene } from "./test-utils.ts";
-import { authoredAssets, awaitCook, installTrunkObj, type VegetationFixture } from "./vegetation-utils.ts";
-
-const HERE = dirname(fileURLToPath(import.meta.url));
-const FIXTURE_PATH = join(HERE, "fixtures", "vegetation-phase3.json");
-const CELL = { coordinates: ["0", "0", "0"], level: 0 } as const;
-const BOUNDS = {
-  minTicks: ["0", "0", "0"],
-  maxTicksExclusive: ["262144", "262144", "262144"],
-} as const;
+import {
+  BOUNDS,
+  CELL,
+  cookCells,
+  importVegetationPackage,
+  loadFixture,
+} from "./vegetation-utils.ts";
 
 const cleaner = new Cleaner();
 let engine: Engine;
-/// The first resident plant, and its captured record under a steady wind.
+// The first resident plant, and its captured record under a steady wind.
 let plant: { plant: string; cell: typeof CELL } | undefined;
 let record: VegetationWindRecordResult;
 let stillRecord: VegetationWindRecordResult;
-/// GPU-scene counters with the plant resident and the wind blowing.
-let stats: GpuSceneStatsDto;
+// GPU-scene counters with the plant resident and the wind blowing.
+let stats: GpuSceneMirrorStatsDto;
 
 beforeAll(async () => {
   engine = await bootEngine(cleaner, { SAFFRON_SCRATCH_PROJECT: "1" });
@@ -56,12 +47,8 @@ beforeAll(async () => {
     camera: { position: { x: 2, y: 1, z: 4 }, yaw: 0, pitch: 0 },
   });
 
-  const fixture = JSON.parse(readFileSync(FIXTURE_PATH, "utf8")) as VegetationFixture;
-  const sources = authoredAssets(cleaner, fixture, "mechanics");
-  await installTrunkObj(engine, fixture);
-  for (const path of [sources.plant, sources.biome, sources.map]) {
-    await engine.call<ImportVegetationAssetResult>("import-vegetation-asset", { path });
-  }
+  const fixture = loadFixture("vegetation-phase3");
+  await importVegetationPackage(engine, cleaner, fixture, "mechanics");
   const world = await engine.call<EntityRef>("create-entity", { name: "Mechanics vegetation" });
   await engine.call("add-component", { entity: world.id, component: "VegetationField" });
   await engine.call("set-component", {
@@ -69,12 +56,7 @@ beforeAll(async () => {
     component: "VegetationField",
     json: { map: fixture.map, enabled: true },
   });
-  const cook = await engine.call<VegetationCookJobDto>("vegetation-cook", {
-    map: fixture.map,
-    scope: { kind: "cells", cells: [CELL] },
-    workers: 1,
-  });
-  await awaitCook(engine, cook.job);
+  await cookCells(engine, fixture.map);
 
   const deadline = Date.now() + 30_000;
   for (;;) {
@@ -96,7 +78,7 @@ beforeAll(async () => {
   await engine.call("set-wind", { speed: 12, gust: 0.6 });
   await engine.settle(600);
   record = await engine.call<VegetationWindRecordResult>("vegetation-wind-record", plant);
-  stats = await engine.call<GpuSceneStatsDto>("gpu-scene-stats");
+  stats = await engine.call<GpuSceneMirrorStatsDto>("gpu-scene-stats");
 
   await engine.call("set-wind", { speed: 0, gust: 0 });
   await engine.settle(600);
@@ -114,8 +96,8 @@ test("the capture reaches a real mirrored plant", () => {
 });
 
 test("the family's authored response reaches the GPU", () => {
-  // The whole point: nothing read these numbers before, so an all-zero prototype record
-  // (the "not a plant family" value) would mean the chain still drops them.
+  // An all-zero prototype record is the "not a plant family" value, so it would mean the chain
+  // dropped the authored numbers.
   expect(record.mechanics).not.toBeNull();
   const mechanics = record.mechanics!;
   expect(mechanics.stiffness).toBeGreaterThan(0);
@@ -188,7 +170,7 @@ test("a camera jump across a cascade edge marks the plants reactive; standing st
   // The counter is a running total on purpose. A reset is an event lasting one frame, and no
   // caller can time a stats query to the frame the camera crossed an edge.
   const resets = async () =>
-    (await engine.call<GpuSceneStatsDto>("gpu-scene-stats")).visibility.interactionResets;
+    (await engine.call<GpuSceneMirrorStatsDto>("gpu-scene-stats")).visibility.interactionResets;
 
   const idle = await resets();
   await engine.settle(500);

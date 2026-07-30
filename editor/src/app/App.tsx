@@ -1,13 +1,10 @@
-/// Top-level editor shell. Wires the shell lifecycle events to the store, starts
-/// the reconcile poll + the global W/E/R gizmo shortcuts, and composes the chrome
-/// above the Scene dock `Layout` and a status bar below.
-/// Each main tab that owns a dockspace is its own island: the Scene tree (Hierarchy,
-/// the tabbed Inspector/Environment/Render group, Assets, the locked Viewport, plus the
-/// right/bottom docks) lives in `Layout`; the asset editor is the second island
-/// (`AssetEditorWorkspace`). The embedded viewport's LoadingOverlay is a sibling inside
-/// ViewportPanel, never a panel the native window paints over. Both islands stay mounted
-/// while the other main tab is active (display:none), so layouts, scroll positions, and the
-/// viewport survive tab navigation; each remounts on the per-project key.
+/// Top-level editor shell: wires the shell lifecycle events to the store, starts the reconcile poll
+/// and the global shortcuts, and composes the chrome around the dockspaces.
+///
+/// Each main tab that owns a dockspace is its own island — the Scene tree in `Layout`, the asset
+/// editor in `AssetEditorWorkspace`. Both stay mounted while the other is active (`display:none`),
+/// so layouts, scroll positions, and the viewport survive tab navigation; each remounts on the
+/// per-project key.
 import { useEffect, useRef, useState } from "react";
 import { X } from "lucide-react";
 import { getCurrentWindow, listen, type UnlistenFn } from "../shell";

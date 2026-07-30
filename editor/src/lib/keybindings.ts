@@ -1,19 +1,13 @@
-/// The keybinding registry: every rebindable editor command, its default key, and
-/// the parse/match/format helpers the handlers and the settings modal share. The
-/// resolved overrides live in the editor store (`keyBindings`, deltas only —
-/// settings.json stores just the changed commands, VS Code-style); handlers call
-/// `matchesBinding(event, id, overrides)` instead of comparing key literals.
+/// The keybinding registry: every rebindable editor command, its default key, and the
+/// parse/match/format helpers the handlers and the settings modal share. Overrides live in the store
+/// as deltas only; handlers call `matchesBinding(event, id, overrides)` rather than comparing key
+/// literals.
 ///
-/// Three command kinds:
-/// - "press": one-shot commands matched on a normalized key-string built from
-///   `event.key` plus modifier prefixes in fixed order ("w", "shift+f", "escape").
-///   Matching is exact-modifier: a binding of "f" does not fire on Ctrl+F, so
-///   menu/OS chords pass through untouched unless explicitly bound.
-/// - "hold": held-state fly-camera keys matched on the physical `event.code`
-///   ("KeyW", "Space", "ShiftLeft"), no modifier combos.
-/// - "mouse": a mouse-button command, bound to a `mouse:<name>` token (the side buttons
-///   and middle button). Rebindable only to another mouse button, never a key, so its
-///   capture and matching never overlap the key value-space.
+/// Three command kinds: "press" one-shots matched on a normalized key-string with exact modifiers,
+/// so a binding of "f" does not fire on Ctrl+F and OS chords pass through untouched; "hold"
+/// fly-camera keys matched on the physical `event.code`; and "mouse" buttons bound to a
+/// `mouse:<name>` token, rebindable only to another mouse button so their value-space never overlaps
+/// the keys.
 export type CommandKind = "press" | "hold" | "mouse";
 
 /// Conflict scope: bindings only collide within one scope. Global press commands

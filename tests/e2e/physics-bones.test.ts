@@ -1,4 +1,4 @@
-// Phase 5 of the physics plan: the Kinematic motion type + per-bone kinematic bodies that follow the
+// The Kinematic motion type + per-bone kinematic bodies that follow the
 // animated pose (binding mode b, animation -> physics). A Kinematic body is not pushed by the
 // simulation (it ignores gravity); a rig that opts in via KinematicBonesComponent gets one kinematic
 // body per joint, driven each step by MoveKinematic so a moving character shoves the world.

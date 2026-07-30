@@ -1,9 +1,7 @@
-/// Global undo/redo keyboard shortcuts: Ctrl+Z undoes and Ctrl+Shift+Z (plus the
-/// fixed Ctrl+Y alias) redoes, dispatched to the ACTIVE main tab's history. Gated like
-/// the gizmo shortcuts — off while a text field is focused (the browser keeps its own
-/// text undo there), while the settings modal is open, and until the engine is ready.
-/// The mouse Back/Forward path shares these store actions but is deliberately not
-/// text-gated, since a side-button click is not typing.
+/// Global undo/redo shortcuts dispatched to the ACTIVE main tab's history. Gated like the gizmo
+/// shortcuts: off while a text field is focused (the browser keeps its own text undo there), while
+/// the settings modal is open, and until the engine is ready. The mouse Back/Forward path shares
+/// these store actions but is deliberately not text-gated.
 import { useEffect } from "react";
 import { useEditorStore } from "../state/store";
 import { matchesBinding } from "../lib/keybindings";

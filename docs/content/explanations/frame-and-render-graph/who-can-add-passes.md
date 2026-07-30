@@ -56,7 +56,7 @@ compute-skinning gate shows the shape:
 
 ```rust
 let do_skin = pipelines.skin.is_some()
-    && !self.scene_draw_list.skin_dispatches.is_empty()
+    && !self.frame_deformation.skin_dispatches.is_empty()
     && self.skinning.deformed_buffer(frame).is_some()
     && self.skinning.prev_deformed_buffer(frame).is_some();
 ```

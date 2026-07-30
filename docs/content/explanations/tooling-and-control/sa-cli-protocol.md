@@ -138,7 +138,7 @@ Detached mode discards host standard streams and polls the socket for five secon
 | Start and export routes | `engine/crates/sa/src/main.rs` | `start`, `export`, `engine_binary_path` |
 | Shared wire implementation | `engine/crates/control-client/src/lib.rs` | `Client`, `request_envelope`, `socket_path` |
 | Position-to-DTO folding | `engine/crates/control/src/registry.rs` | `fold_positional_args` |
-| Static command metadata | `engine/crates/protocol/src/command.rs` | `COMMANDS`, `CommandSpec` |
+| Static command metadata | `engine/crates/protocol/src/command/` | `COMMANDS`, `CommandSpec` |
 
 ## Related
 

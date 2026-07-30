@@ -1,23 +1,21 @@
 // The mesh-shader executor renders what the indexed executor renders.
 //
-// `VK_EXT_mesh_shader` gives a second way to execute the same binned records. It is a second
-// path by design, not a replacement — MoltenVK has no mesh stage and runs the indexed executor
-// at full quality — so the claim to prove is equivalence, not improvement.
+// `VK_EXT_mesh_shader` is a second way to execute the same binned records, not a replacement —
+// MoltenVK has no mesh stage and runs the indexed executor at full quality — so the claim is
+// equivalence.
 //
-// WHAT MAKES THE CUT SHARED RATHER THAN COMPARED: both executors consume the same command
-// stream from `scene_bin_scatter`. The indexed path takes those words as draw arguments; the
-// mesh path reads the identical words as data, recovering its draw from `SV_DrawIndex` and its
-// triangle block from the group id. So "identical semantic cluster cuts" is structural — a
-// divergence would mean one executor ignored records the binner emitted, which is a different
-// bug from the two disagreeing about geometry.
+// Both executors consume the same command stream from `scene_bin_scatter`: the indexed path takes
+// those words as draw arguments, the mesh path reads the identical words as data and recovers its
+// draw from `SV_DrawIndex` and its triangle block from the group id. Identical cluster cuts are
+// therefore structural, and a divergence would mean one executor ignored records the binner emitted.
 //
-// That leaves the image as the thing worth measuring, and it is measured by booting two hosts
-// that differ in exactly one environment variable. Everything else — scene, camera, lighting,
-// wind — is identical by construction.
-//
-// The frames should be bit-identical: the mesh entry calls the *same* `executorVertexOutput`
-// helper the vertex entry does, so the arithmetic is not merely equivalent but literally the
-// same code. The tolerance below exists for rasterization order, not for a shading difference.
+// That leaves the image, measured by booting two hosts differing in one environment variable. The
+// frames are compared for bit-identity, not closeness: the mesh entry calls the same
+// `executorVertexOutput` helper the vertex entry does, over the same records, behind the same
+// indexed depth pre-pass — so every shaded fragment resolves from identical inputs. The capture
+// turns anti-aliasing off, because a temporally accumulated frame's value depends on how many
+// frames it settled for, which is wall-clock and would put boot-to-boot noise in front of the
+// property being measured.
 
 import { afterAll, beforeAll, expect, test } from "bun:test";
 import type { RenderStatsDto } from "@saffron/protocol";
@@ -25,20 +23,16 @@ import { Engine } from "./harness.ts";
 import { Cleaner, captureViewport, prepareScene } from "./test-utils.ts";
 import { decodeRgb8Png, meanAbsoluteDifference } from "./image.ts";
 
-/// The pose both hosts render from.
+// The pose both hosts render from.
 const CAMERA = { position: { x: 0, y: 5, z: 9 }, yaw: 0, pitch: -25 };
-
-/// Mean absolute per-channel difference (0-255) the two executors may differ by. Both run the
-/// same vertex arithmetic over the same records, so this covers rasterization order alone.
-const PARITY_TOLERANCE = 1.0;
 
 const cleaner = new Cleaner();
 const frames: Record<string, Buffer> = {};
-/// Which executor each run actually used, read back from the engine rather than assumed.
+// Which executor each run actually used, read back from the engine rather than assumed.
 const active: Record<string, boolean> = {};
 let meshShaderSupported = false;
 
-/// Boots a host with the executor selected, builds the scene, and captures one settled frame.
+// Boots a host with the executor selected, builds the scene, and captures one settled frame.
 async function captureWithExecutor(meshExecutor: boolean): Promise<Buffer> {
   const engine = await Engine.boot({
     SAFFRON_SCRATCH_PROJECT: "1",
@@ -58,6 +52,9 @@ async function captureWithExecutor(meshExecutor: boolean): Promise<Buffer> {
     },
   });
   await engine.call("set-wind", { speed: 0, gust: 0 });
+  // No temporal accumulation in the capture: the comparison below is exact.
+  const aa = await engine.call<{ aa: string }>("set-aa", { mode: "off" });
+  expect(aa.aa).toBe("off");
   await engine.settle(1200);
   const frame = await captureViewport(engine, cleaner, `mesh-exec-${meshExecutor}`);
   active[meshExecutor ? "mesh" : "indexed"] = (
@@ -100,7 +97,9 @@ test("the mesh executor renders the indexed executor's image", () => {
   }
   const indexed = decodeRgb8Png(frames.indexed!);
   const mesh = decodeRgb8Png(frames.mesh!);
-  expect(meanAbsoluteDifference(indexed, mesh)).toBeLessThan(PARITY_TOLERANCE);
+  // Exactly equal, not merely close: a single differing channel would mean one executor
+  // shaded a fragment from inputs the other did not.
+  expect(meanAbsoluteDifference(indexed, mesh)).toBe(0);
 });
 
 test("both executors drew something", () => {

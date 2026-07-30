@@ -1,15 +1,11 @@
 // The cross-platform-deterministic Jolt build flag set, as pure data, one variant per target CPU
 // architecture.
 //
-// This is the single source of truth for the flags, `include!`d into `build.rs` (where
-// [`JoltBuildFlags::for_arch`] picks the variant from `CARGO_CFG_TARGET_ARCH` and feeds it to
-// `cc`) and declared as a `mod` in the crate's test build (where the flag set is asserted).
-// Sharing the data this way keeps the determinism contract testable under `cargo test` without
-// coupling the test to `cc` or to compiling Jolt.
+// `include!`d into `build.rs`, which picks the variant from `CARGO_CFG_TARGET_ARCH` and feeds it
+// to `cc`, and declared as a `mod` in the test build, which asserts the set.
 //
-// The determinism contract is architecture-independent — `JPH_CROSS_PLATFORM_DETERMINISTIC` is
-// what makes the SSE and NEON code paths produce bit-identical results — and holds in every
-// variant:
+// `JPH_CROSS_PLATFORM_DETERMINISTIC` is what makes the SSE and NEON code paths produce
+// bit-identical results, so the contract is architecture-independent and holds in every variant:
 //
 //   - CROSS_PLATFORM_DETERMINISTIC ON  → `JPH_CROSS_PLATFORM_DETERMINISTIC`
 //   - DOUBLE_PRECISION OFF             → single precision = the *absence* of `JPH_DOUBLE_PRECISION`
@@ -28,8 +24,7 @@
 //     `__aarch64__` — no arch define or `-m` flag is emitted here (defining `JPH_USE_NEON`
 //     ourselves would redefine Jolt's, and the x86 `-m*` flags are invalid on ARM).
 //
-// A plain `//` header (not `//!`) is deliberate: an inner doc comment is illegal when this file
-// is `include!`d mid-`build.rs` rather than parsed as a module root.
+// The header must be `//`, not `//!`: an inner doc comment is illegal in an `include!`d file.
 
 /// The frozen Saffron determinism flag set for vendored Jolt's translation units, for one target
 /// CPU architecture.
@@ -42,9 +37,8 @@ pub(crate) struct JoltBuildFlags {
     /// architecture; the `-m*` arch flags are the x86 instruction-set selection, applied here
     /// only and empty on architectures where the SIMD path is baseline (aarch64/NEON).
     pub(crate) arch_fp_flags: &'static [&'static str],
-    /// Jolt builds itself with `-Werror`; clang 21 flags the FP-model/FP-contract pairing
-    /// under `-Woverriding-option`, failing Jolt's own build. Drop `-Werror` and silence the
-    /// expected `-Woverriding-option` (the pairing is exactly what we want).
+    /// Jolt builds itself with `-Werror`, and clang flags the FP-model/FP-contract pairing under
+    /// `-Woverriding-option`. Drop `-Werror` and silence that warning; the pairing is intended.
     pub(crate) warning_flags: &'static [&'static str],
     /// Native threads linked at link time — `-pthread`, dropped from the per-TU *compile*
     /// options (it only matters at link) and re-emitted as a link flag.
@@ -52,18 +46,13 @@ pub(crate) struct JoltBuildFlags {
 }
 
 impl JoltBuildFlags {
-    /// The x86-64 determinism flag set. `const` so it is a single immutable definition with no
-    /// runtime construction.
+    /// The x86-64 determinism flag set.
     pub(crate) const DETERMINISTIC_X86_64: Self = Self {
         defines: &[
-            // The master determinism switch and the single-precision contract (the latter by
-            // omission — `JPH_DOUBLE_PRECISION` is deliberately never listed).
+            // Single precision is the absence of `JPH_DOUBLE_PRECISION`; never list it.
             ("JPH_CROSS_PLATFORM_DETERMINISTIC", None),
-            // ObjectStream + RTTI attributes are ON in Jolt's defaults, and the engine builds
-            // the full library, so the shim must agree.
             ("JPH_OBJECT_STREAM", None),
-            // x86 instruction-set defines, paired with the `-m*` flags below. AVX512 OFF and
-            // FMADD suppressed-by-determinism are the *absence* of `JPH_USE_AVX512`/`JPH_USE_FMADD`.
+            // Paired with the `-m*` flags below; AVX512 and FMADD are off by omission.
             ("JPH_USE_AVX2", None),
             ("JPH_USE_AVX", None),
             ("JPH_USE_SSE4_1", None),
@@ -71,16 +60,14 @@ impl JoltBuildFlags {
             ("JPH_USE_LZCNT", None),
             ("JPH_USE_TZCNT", None),
             ("JPH_USE_F16C", None),
-            // Distribution-style config: no asserts, profiler, or FP exceptions. This keeps the
-            // `-sys` archive identical whether the consuming Rust crate is built dev or release,
-            // and is the standard Jolt shipping ABI.
+            // No asserts, profiler, or FP exceptions, so the archive is identical whether the
+            // consuming Rust crate builds dev or release.
             ("NDEBUG", None),
         ],
         arch_fp_flags: &[
             "-ffp-model=precise",
             "-ffp-contract=off",
-            // The x86 instruction-set flags Jolt emits for USE_AVX2 ON + determinism; FMADD's
-            // `-mfma` is omitted under determinism.
+            // `-mfma` is omitted: contracted FMAs diverge across micro-architectures.
             "-mavx2",
             "-mbmi",
             "-mpopcnt",
@@ -107,10 +94,9 @@ impl JoltBuildFlags {
         link_threads: true,
     };
 
-    /// The determinism flag set for the given `CARGO_CFG_TARGET_ARCH` value. Every supported
-    /// architecture carries the same determinism contract; only the instruction-set selection
-    /// differs. An unsupported architecture is a hard error — a new target must add its variant
-    /// deliberately rather than silently inherit x86 `-m*` flags it cannot honor.
+    /// The flag set for a `CARGO_CFG_TARGET_ARCH` value. An unsupported architecture is a hard
+    /// error, so a new target adds its variant deliberately rather than inheriting x86 `-m*` flags
+    /// it cannot honor.
     pub(crate) fn for_arch(target_arch: &str) -> Self {
         match target_arch {
             "x86_64" => Self::DETERMINISTIC_X86_64,

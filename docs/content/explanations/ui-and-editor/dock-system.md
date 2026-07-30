@@ -75,7 +75,7 @@ Every `dockLayouts` identity change schedules a forced `emitLayoutSettled`. The 
 
 The Scene and asset-editor panel identifiers form disjoint sets, and store actions choose a tree with `panelKind`. Drag hit-testing measures leaves in the mounted island, so a drop target comes from the same surface as its source panel.
 
-The asset editor opens panels from the previewed asset's capabilities. `preview` is always present; a rig adds `skeleton`, clips add `clips` and `assetTimeline`, materials add `materialEdit`, and `assetStats` is available from the preview toolbar. Empty persistent leaves collapse until one of those panels opens.
+The asset editor opens panels from the previewed asset's capabilities. `preview` is always present; a rig adds `skeleton`, clips add `clips` and `assetTimeline`, materials add `materialEdit`, and `assetStats` is available from the preview toolbar. A plant, biome, or vegetation-map subject adds its [vegetation panels](../vegetation-asset-workspaces/). Empty persistent leaves collapse until one of those panels opens.
 
 ## Persistence
 

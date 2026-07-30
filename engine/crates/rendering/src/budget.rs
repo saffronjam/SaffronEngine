@@ -1,19 +1,14 @@
 //! The frame-budget controller: auto-steps the render-quality tier to hold the frame budget.
 //!
-//! The engine already measures per-frame GPU+CPU work time; this turns that measurement into a
-//! control signal. When auto-quality is on (`PerfConfig::auto_quality`), the controller watches the
-//! frame work time against the budget (`1000 / target_fps`) and, after a sustained run of
-//! over-budget frames, steps the [`QualityTier`] down (cheaper screen-space GI); after a sustained
-//! run with comfortable headroom it steps back up. Hysteresis (consecutive-frame thresholds + a
-//! cooldown after each switch) keeps it from oscillating, and it never auto-selects `Ultra` (a
-//! deliberate stills/screenshot tier) or drops below `Low`.
+//! When `PerfConfig::auto_quality` is on, the controller watches frame work time against the budget
+//! (`1000 / target_fps`) and steps the [`QualityTier`] down after a sustained over-budget run, back
+//! up after a sustained run with headroom. Hysteresis (consecutive-frame thresholds plus a cooldown
+//! after each switch) keeps it from oscillating; it never auto-selects `Ultra` (a stills tier) or
+//! drops below `Low`.
 //!
-//! It actuates two dials. The first is the Phase-3 quality tier — a step is just a
-//! `set_render_quality`. Below the tier floor (`Low`) it then steps **dynamic resolution**: the
-//! render targets shrink and the present blit upscales, so a frame that even `Low` GI can't hold
-//! drops resolution instead. The order is deliberate — going down it spends tier steps first
-//! (cheaper GI is less visible than fewer pixels), and coming back up it restores resolution before
-//! raising the tier.
+//! Below the `Low` floor it steps dynamic resolution instead: the render targets shrink and the
+//! present blit upscales. Going down it spends tier steps first, since cheaper GI is less visible
+//! than fewer pixels; coming back up it restores resolution before raising the tier.
 
 use crate::quality::QualityTier;
 

@@ -102,16 +102,16 @@ evaluator calls shared with the future editor, not a second debug interpreter.
 - [x] Cross-cell competition is identical whether neighbours cook serially, reversed, or in parallel.
 - [x] Every dual-domain node passes Rust/Slang equivalence on **NVIDIA and MoltenVK** before it can
   carry `EquivalentGpu`.
-  *(**AMD DESCOPED BY THE PROJECT OWNER (2026-07-26)**: no AMD adapter exists for this project and none can be obtained, so the three-vendor wording was an unmeetable requirement rather than a gap. The box is accepted on the platforms that exist. AMD was never verified and nothing here claims it was. VERIFIED ON BOTH: `just compute-conformance` on an
-  `NVIDIA GeForce RTX 3070 Ti` reports `rustReferenceSha256 == slangSha256` for the resident graph
-  corpus (`fb44dca4…`) with `newIssues: 0`, and that digest is byte-identical to the MoltenVK run —
-  the two platforms agree exactly rather than each merely matching its own reference. Evidence
-  `benchmarks/foliage-veg/compute-conformance-nvidia-rtx-3070-ti.json`.
-  What is verified on both: the dual-domain
-  qualification corpus covers every declared operator with resident programs, the ABI and corpus hashes
-  are pinned, branching and terminal masks preserve exact semantics, and only complete
-  program/profile/artifact evidence is admitted — `saffron-vegetation` `graph_gpu` 7/7. Recorded rather
-  than claimed: a box that says three vendors is not closed by one.)
+  *(`just compute-conformance` writes a bound record per adapter under `benchmarks/foliage-veg/`.
+  Both records — `compute-conformance-nvidia-rtx-3070-ti.json` (`NVIDIA GeForce RTX 3070 Ti`) and
+  `compute-conformance-apple-m4-moltenvk.json` (`Apple M4` through MoltenVK) — report
+  `rustReferenceSha256 == slangSha256` for the 32-word spatial corpus and the resident graph corpus
+  with `newIssues: 0`, and the two adapters' digests are byte-identical to each other rather than each
+  merely matching its own reference. The qualification corpus covers every declared operator with a
+  resident program, the ABI and corpus hashes are pinned, branching and terminal masks preserve exact
+  semantics, and only complete program/profile/artifact evidence is admitted. AMD is out of scope by
+  the project owner's decision (2026-07-26): no such adapter exists for this project, so nothing here
+  is verified or claimed on AMD.)*
 - [x] The compiler rejects cosmetic-to-authoritative dependencies, unbounded local influence, cycles,
   and NaN/overflow inputs with typed diagnostics.
 - [x] Concrete-job preflight exposes retained/generated inputs and admission/execution peaks, defines
@@ -141,17 +141,8 @@ point formats.
 
 ## Progress
 
-- 2026-07-21: All locally executable Phase-3 work and gates are green: `just engine`,
-  `just prepare-for-commit`, the 207-command live schema contract, `just test`, the 301-case live
-  E2E suite, the schema-harness unit tests, strict all-target rendering Clippy, and the docs
-  build/link/style checks.
-- The live schema gate exposed and verified two presentation defects. Presentation semaphores are
-  owned by a typed acquire-to-present transaction, internal offscreen renders cannot signal them,
-  and aliased slot/image fences are deduplicated and waited before reset. Seven consecutive
-  post-fix schema runs passed 207/207 without a timeout or Vulkan validation issue.
-- Physical NVIDIA and AMD CPU/Slang conformance records remain deferred verification work. They do
-  not block feature implementation. The next implementation step is Phase 4, followed by every
-  remaining phase in dependency order; the deferred platform records stay visible and unchecked
-  until the required hardware is available.
-- Work paused at the Codex weekly usage guard (90%). The reported reset is
-  `2026-07-27T22:26:57+02:00`.
+- The live schema gate exposed two presentation defects. `PresentSync` owns one
+  `AcquiredPresentFrame` acquire-to-present transaction, so an internal offscreen render cannot
+  signal a present semaphore, and a slot waits its prior present fence before the next acquire
+  reuses that slot's image-available semaphore. Repeated schema runs after the fix pass without a
+  timeout or a Vulkan validation issue.

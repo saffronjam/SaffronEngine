@@ -1,9 +1,7 @@
-/// Drag-local widget value with rAF-coalesced emit. The widget renders its own
-/// state the instant the pointer moves — never waiting on the store/wire round
-/// trip — while changes flow outward at most once per animation frame. Outside a
-/// gesture the local value mirrors the prop, so external edits (reconcile poll,
-/// other panels) still flow in. Every scrub widget (NumberDrag, SliderField,
-/// VectorEditor, ColorField) shares this one ownership model.
+/// Drag-local widget value with rAF-coalesced emit: the widget renders its own state the instant the
+/// pointer moves, never waiting on the store or wire round trip, while changes flow outward at most
+/// once per animation frame. Outside a gesture the local value mirrors the prop, so external edits
+/// still flow in. Every scrub widget shares this one ownership model.
 import { useEffect, useRef, useState } from "react";
 
 export interface ScrubValue<T> {

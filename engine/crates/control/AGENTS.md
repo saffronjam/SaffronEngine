@@ -15,10 +15,15 @@ commands, plus the job machinery behind them.
 | Area | Files |
 |---|---|
 | Transport + dispatch | `server.rs`, `registry.rs`, `context.rs`, `selector.rs`, `error.rs` |
-| Command registration | `commands_scene.rs`, `commands_asset.rs`, `commands_render.rs`, `commands_animation.rs`, `commands_physics.rs`, `commands_vegetation.rs`, `commands_vegetation_runtime.rs` |
-| Vegetation jobs | `vegetation_jobs.rs`, `vegetation_cook_jobs.rs`, `owned_worker.rs` |
+| Command registration | `commands_scene/`, `commands_asset/`, `commands_render/`, `commands_animation.rs`, `commands_physics.rs`, `commands_vegetation.rs`, `commands_vegetation_runtime/` |
+| Vegetation jobs | `vegetation_jobs/`, `vegetation_cook_jobs.rs`, `owned_worker.rs` |
 | Vegetation DTO conversion | `botanical_dto.rs`, `vegetation_cook_dto.rs`, `vegetation_layer_dto.rs`, `vegetation_mutation_dto.rs` |
 | Project + tests | `project_loader.rs`, `test_support.rs` |
+
+The four multi-file domains are directory modules: `mod.rs` declares the submodules, re-exports them
+crate-visibly, and owns the domain's `register_*_commands` entry, which calls the per-area registrars
+**in the frozen manifest order**. Adding a command means placing it in the right area file *and*
+keeping that call order intact.
 
 ## Where the vegetation commands live
 
@@ -27,10 +32,10 @@ Adding a command to the wrong one is easy and the split is by concern, not by na
 
 | File | Count | Concern |
 |---|---:|---|
-| `commands_asset.rs` | 14 | Authoring and catalog: `import-vegetation-asset`, all seven `plant-*`, `vegetation-asset-summary`, the two `*-points` interchange commands, the three `vegetation-map-*` commands |
+| `commands_asset/` | 14 | Authoring and catalog: `import-vegetation-asset` and the `vegetation-map-*` commands in `commands_map.rs`, all seven `plant-*` in `commands_plant.rs`, the two `*-points` interchange commands in `commands_interchange.rs` |
 | `commands_vegetation.rs` | 14 | Evaluation and cooking: `vegetation-cook`, `vegetation-start-evaluation`, `vegetation-compile-biome`, `vegetation-manifest`, `vegetation-explain-point`, the cancel/status pairs |
-| `commands_vegetation_runtime.rs` | 18 | Runtime and persistent state: `vegetation-mutate`, `vegetation-promote`/`-demote`/`-fell`, the ecology commands, the `vegetation-state-*` and `vegetation-runtime-*` families |
-| `commands_render.rs` | 1 | `vegetation-render-stats` — it reports renderer counters, so it registers with the render commands |
+| `commands_vegetation_runtime/` | 18 | Runtime and persistent state: `state.rs` (residency, query, telemetry), `plants.rs` (inspection, promotion), `convert.rs` (state export/import, mutation, ecology) |
+| `commands_render/` | 1 | `vegetation-render-stats` — it reports renderer counters, so it registers with the render commands (`stats.rs`) |
 
 ## Rules that are easy to break
 
@@ -47,10 +52,11 @@ Adding a command to the wrong one is easy and the split is by concern, not by na
 - **A cancelled or superseded job must not publish.** Publication is guarded by the generation
   token, so a job whose generation changed while it ran drops its result rather than overwriting
   newer state.
-- **Wire shapes that are silent when wrong.** Rust enums serialize as `{"Available": {...}}` with
-  capital variant keys, not camelCase. Mutation kinds are kebab-case. Optional fields are **omitted,
-  never null**. Guids cross as 32-hex strings, and `PlantId` is a lowercase 32-hex string — never a
-  number.
+- **Wire shapes that are silent when wrong.** A tagged enum carries its discriminant as a field —
+  `{"state": "available", …}`, `{"kind": "damaged", …}` — kebab-case, with camelCase fields beside
+  it; only an enum with no `#[serde(tag = …)]` serializes as `{"Variant": {…}}`. Optional fields are
+  **omitted, never null**. Guids cross as 32-hex strings, and `PlantId` is a lowercase 32-hex
+  string — never a number.
 - **`vegetation-runtime-inspect`'s `persistent` field is a list**, in canonical cell order. A plant
   that moved has entries in two cells, so reading only the first silently hides one of them.
 - **Every mutating command needs an inverse the editor can record.** Undo is reconstructed in the

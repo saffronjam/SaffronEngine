@@ -1,19 +1,18 @@
 // The exported game renders what the editor renders.
 //
-// `export-app` packages the scene, its cooked closure, and a copy of `saffron-player`. Nothing in
-// the suite had ever run that package — the export tests assert on the *files* it stages, which
-// says the packaging is right and nothing about whether the result draws the same picture. This
-// boots the packaged binary for real and compares its frame against the host's, pixel for pixel.
+// `export-app` packages the scene, its cooked closure, and a copy of `saffron-player`. The export
+// tests assert on the files it stages, which says the packaging is right and nothing about whether
+// the result draws the same picture. This boots the packaged binary and compares its frame against
+// the host's, pixel for pixel.
 //
-// THE COMPARISON MUST BE AGAINST PLAY MODE, and that is the whole subtlety. The player renders
-// through the scene's primary camera; the host in edit mode renders through the *editor* camera,
-// which is a different pose entirely. Comparing against an edit-mode frame measures the distance
-// between two cameras and says nothing about render semantics. The control assertion below scores
-// that edit-mode frame precisely so the mistake cannot be made silently later.
+// The comparison must be against play mode: the player renders through the scene's primary camera,
+// while the host in edit mode renders through the editor camera, a different pose entirely.
+// Comparing against an edit-mode frame measures the distance between two cameras, so the control
+// assertion scores that frame precisely and the mistake cannot be made silently.
 //
 // `SAFFRON_CAPTURE_FRAME` is the player's only output seam — it has no control plane to ask for a
-// screenshot — and pairs with `SAFFRON_EXIT_AFTER_FRAMES` to make a bounded run leave exactly one
-// deterministic image behind.
+// screenshot — and pairs with `SAFFRON_EXIT_AFTER_FRAMES` to leave exactly one deterministic image
+// behind.
 
 import { afterAll, beforeAll, expect, test } from "bun:test";
 import { spawnSync } from "node:child_process";
@@ -27,26 +26,26 @@ import { decodeRgb8Png, meanAbsoluteDifference } from "./image.ts";
 
 const IS_MACOS = process.platform === "darwin";
 
-/// The render size both sides use: the exported app's window size and the host's scene view.
+// The render size both sides use: the exported app's window size and the host's scene view.
 const WIDTH = 640;
 const HEIGHT = 360;
 
-/// Mean absolute per-channel difference (0-255) allowed between the player's frame and the host's.
-/// The two run the same passes over the same scene through the same camera, so the measured value
-/// is 0.0002 — 121 differing bytes in 691,200, all of them one-step rounding along the cube's
-/// silhouette. The budget covers that quantization, not a render difference; the edit-mode control
-/// below scores 11.7 for scale.
+// Mean absolute per-channel difference (0-255) allowed between the player's frame and the host's.
+// The two run the same passes over the same scene through the same camera, so the measured value
+// is 0.0002 — 121 differing bytes in 691,200, all of them one-step rounding along the cube's
+// silhouette. The budget covers that quantization, not a render difference; the edit-mode control
+// below scores 11.7 for scale.
 const PARITY_TOLERANCE = 1.0;
 
-/// The editor camera, deliberately away from the scene camera below so the control assertion has a
-/// real difference to score.
+// The editor camera, deliberately away from the scene camera below so the control assertion has a
+// real difference to score.
 const EDITOR_CAMERA = { position: { x: 0, y: 6, z: 12 }, yaw: 0, pitch: -22 };
 
 const cleaner = new Cleaner();
 let engine: Engine;
 let playerBinary = "";
 
-/// The packaged executable: nested inside the bundle on macOS, at the export root elsewhere.
+// The packaged executable: nested inside the bundle on macOS, at the export root elsewhere.
 function locatePlayer(root: string): string {
   if (!IS_MACOS) {
     return join(root, "saffron-player");

@@ -1,7 +1,4 @@
 //! [`SceneEditContext`] — the editor's mutable session state core.
-//!
-//! An owned struct constructed with [`SceneEditContext::new`] and torn down by its automatic
-//! `Drop`.
 
 use glam::Vec3;
 
@@ -22,9 +19,7 @@ use saffron_scene::ScriptInputState;
 /// The payload dragged from an asset tile onto a component picker field.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct AssetDragPayload {
-    /// The dragged asset id.
     pub id: u64,
-    /// The dragged asset's type.
     pub asset_type: AssetType,
 }
 
@@ -51,10 +46,7 @@ pub struct PlacementPreview {
     pub rest_bounds: Option<(Vec3, Vec3)>,
 }
 
-/// The editor's mutable state: the scene being edited, the component registry that drives
-/// every panel, the selection (broadcast as a signal), the version stamps the control
-/// plane diff-polls, the gizmo op/space source of truth, the overlay options, the
-/// smoothing queues, play state, and the asset-preview block.
+/// The editor's mutable session state.
 pub struct SceneEditContext {
     /// The authored scene.
     pub scene: Scene,
@@ -145,10 +137,10 @@ pub struct SceneEditContext {
     /// Raw gameplay input for scripts (held keys + mouse); edges derived per tick.
     pub script_input: ScriptInputState,
 
-    /// The isolated preview scene; `None` when not previewing.
-    /// Monotonic simulation seconds the host accumulates every frame (both modes).
-    /// Wind and other evolution sample it; the calendar never touches it.
+    /// Monotonic simulation seconds the host accumulates every frame, in both modes. Wind and
+    /// other evolution sample it; the calendar never touches it.
     pub simulation_time_s: f64,
+    /// The isolated preview scene; `None` when not previewing.
     pub preview_scene: Option<Scene>,
     /// The model container being previewed (`0` = none).
     pub preview_asset: Uuid,
@@ -271,14 +263,12 @@ impl SceneEditContext {
         self.play_scene.as_mut().expect("play scene present")
     }
 
-    /// The play scene and the gameplay [`ScriptInputState`], borrowed disjointly for the
-    /// runtime's simulation step.
+    /// The play scene and the gameplay [`ScriptInputState`], borrowed disjointly for the runtime's
+    /// simulation step. Only valid while playing.
     ///
-    /// Only valid while playing (the consumer calls it under a `Some(dt)` from
-    /// [`play_step_dt`](Self::play_step_dt), where the active scene is the play duplicate and
-    /// preview is impossible). [`active_scene`](Self::active_scene) borrows all of `self`, so the
-    /// host could not pass both the play scene and `&mut self.script_input` to the runtime in one
-    /// call; this splits the two field borrows (distinct fields) in one place.
+    /// [`active_scene`](Self::active_scene) borrows all of `self`, so the host cannot pass both the
+    /// play scene and `&mut self.script_input` to the runtime through it. This splits the two field
+    /// borrows in one place.
     pub fn play_scene_and_input(&mut self) -> (&mut Scene, &mut ScriptInputState) {
         (
             self.play_scene.as_mut().expect("play scene present"),
@@ -286,15 +276,12 @@ impl SceneEditContext {
         )
     }
 
-    /// The component registry paired with the active scene, borrowed disjointly.
+    /// The component registry paired with the active scene, borrowed disjointly. The scene routing
+    /// mirrors [`Self::active_scene`] exactly.
     ///
-    /// [`Self::active_scene`] borrows all of `self`, so a registry method that also takes the
-    /// active scene (`component_order`, `set_component_order`, `append_component_order`, …)
-    /// cannot be called as `self.registry.method(self.active_scene(), …)`. This splits the
-    /// two field borrows in one place: `registry` is a distinct field from the scene fields,
-    /// so the compiler accepts the disjoint pair. The scene routing mirrors
-    /// [`Self::active_scene`] exactly (preview view first, then play duplicate, then
-    /// authored).
+    /// [`Self::active_scene`] borrows all of `self`, so a registry method that also takes the active
+    /// scene cannot be called as `self.registry.method(self.active_scene(), …)`. This splits the two
+    /// field borrows in one place.
     pub fn registry_and_active_scene(&mut self) -> (&ComponentRegistry, &mut Scene) {
         let registry = &self.registry;
         if self.preview_active_view
@@ -310,25 +297,19 @@ impl SceneEditContext {
         (registry, scene)
     }
 
-    /// `true` while the asset preview is the ACTIVE view.
-    ///
-    /// Commands that mutate the authored scene or project must refuse while this holds —
-    /// [`Self::active_scene`] routes to the preview. With the scene view active this reads
-    /// `false` even if a preview scene is kept alive in the background.
+    /// `true` while the asset preview is the *active* view. Commands that mutate the authored scene
+    /// or project must refuse while this holds, because [`Self::active_scene`] routes to the
+    /// preview. A preview scene kept alive in the background reads `false`.
     #[must_use]
     pub fn previewing(&self) -> bool {
         self.preview_scene.is_some() && self.preview_active_view
     }
 
-    /// Whether the editor's in-viewport chrome — the gizmo, entity billboards, camera
-    /// frustums, and debug overlays — should render this frame.
+    /// Whether the editor's in-viewport chrome — gizmo, entity billboards, camera frustums, debug
+    /// overlays — should render this frame.
     ///
-    /// True only in Edit mode with the authored scene as the active view. It stays hidden in
-    /// Play and while the asset preview owns the viewport — including a *parked* preview whose
-    /// scene is still alive but not the active view (`preview_scene.is_some()` yet
-    /// `!preview_active_view`), where the authored scene renders again and the chrome must come
-    /// back. Keyed off [`previewing`](Self::previewing) so it can never drift from the grid
-    /// gate the way a bare `preview_scene.is_none()` check does.
+    /// True only in Edit with the authored scene as the active view. A *parked* preview whose scene
+    /// is alive but inactive renders the authored scene, so the chrome must return there.
     #[must_use]
     pub fn editor_chrome_visible(&self) -> bool {
         self.play_state == PlayState::Edit && !self.previewing()
@@ -353,10 +334,8 @@ mod tests {
     fn new_seeds_camera_and_sun_and_selects_camera() {
         let mut ctx = SceneEditContext::new();
 
-        // Exactly two entities: the Camera and the Sun.
         assert_eq!(ctx.scene.len(), 2);
 
-        // Resolve the seeded entities by component presence.
         let mut cameras = Vec::new();
         let mut suns = Vec::new();
         ctx.scene.for_each::<&Camera, _>(|e, _| cameras.push(e));
@@ -368,7 +347,6 @@ mod tests {
         let camera = cameras[0];
         let sun = suns[0];
 
-        // The camera is selected, and the selection bump fired.
         assert_eq!(ctx.selected, camera);
         assert_eq!(ctx.selection_version, 1);
 
@@ -384,7 +362,6 @@ mod tests {
             "camera forward {forward:?} should aim at the origin {to_origin:?}"
         );
 
-        // The sun carries a directional light and is a distinct entity.
         assert!(ctx.scene.has_component::<DirectionalLight>(sun));
         assert_ne!(camera, sun);
     }
@@ -393,7 +370,6 @@ mod tests {
     fn new_populates_the_component_registry() {
         let ctx = SceneEditContext::new();
 
-        // Every built-in serialized component resolves a row in the seeded registry.
         for &name in saffron_scene::BUILTIN_COMPONENT_NAMES {
             assert!(
                 ctx.registry.find_by_name(name).is_some(),
@@ -405,7 +381,6 @@ mod tests {
             saffron_scene::BUILTIN_COMPONENT_NAMES.len(),
             "the seeded registry holds exactly the built-in set"
         );
-        // A spot-check by name.
         assert_eq!(
             ctx.registry.find_by_name("Transform").map(|t| t.name),
             Some("Transform")
@@ -442,7 +417,7 @@ mod tests {
     fn active_scene_routes_edit_play_and_preview() {
         let mut ctx = SceneEditContext::new();
 
-        // Edit: the authored scene. Tag it so we can identify which scene is returned.
+        // Tag each scene so the assertions can identify which one was returned.
         let authored_tag = ctx.scene.create_entity("authored-tag");
         let authored_uuid = ctx.scene.component::<IdComponent>(authored_tag).unwrap().id;
         assert!(
@@ -453,7 +428,6 @@ mod tests {
         );
         assert!(!ctx.previewing());
 
-        // Playing with a play duplicate present: routes to the duplicate.
         let mut play = Scene::new();
         let play_tag = play.create_entity("play-tag");
         let play_uuid = play.component::<IdComponent>(play_tag).unwrap().id;
@@ -471,8 +445,7 @@ mod tests {
         );
         assert!(!ctx.previewing(), "playing is not previewing");
 
-        // A live preview scene that is NOT the active view does not route (the authored
-        // scene is fully editable while the scene view is active).
+        // A live preview scene that is not the active view does not route.
         let mut preview = Scene::new();
         let preview_tag = preview.create_entity("preview-tag");
         let preview_uuid = preview.component::<IdComponent>(preview_tag).unwrap().id;
@@ -487,7 +460,6 @@ mod tests {
             "still routes to the play duplicate while preview is inactive"
         );
 
-        // Preview as the active view takes precedence over everything.
         ctx.preview_active_view = true;
         assert!(ctx.previewing());
         assert!(
@@ -502,17 +474,14 @@ mod tests {
     fn editor_chrome_hidden_only_while_a_preview_owns_the_view() {
         let mut ctx = SceneEditContext::new();
 
-        // Edit, no preview: the authored scene is live, so the gizmo/billboards/frustums show.
         ctx.play_state = PlayState::Edit;
         assert!(ctx.editor_chrome_visible());
 
-        // Play hides the chrome regardless of the preview state.
         ctx.play_state = PlayState::Playing;
         assert!(!ctx.editor_chrome_visible());
 
-        // A preview scene kept alive but PARKED (not the active view) still renders the
-        // authored scene, so back in Edit the chrome must return — the regression: a bare
-        // `preview_scene.is_none()` gate wrongly hid the gizmo here while the grid stayed up.
+        // A preview scene kept alive but parked (not the active view) still renders the authored
+        // scene, so back in Edit the chrome must return.
         ctx.play_state = PlayState::Edit;
         ctx.preview_scene = Some(Scene::new());
         ctx.preview_active_view = false;
@@ -522,7 +491,6 @@ mod tests {
             "a parked preview must not hide the authored scene's chrome"
         );
 
-        // The preview as the active view (the orbit) hides the authored chrome.
         ctx.preview_active_view = true;
         assert!(ctx.previewing());
         assert!(!ctx.editor_chrome_visible());

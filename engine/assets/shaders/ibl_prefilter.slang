@@ -111,9 +111,9 @@ void computeMain(uint3 tid : SV_DispatchThreadID)
             float saTexel = 4.0 * PI / (6.0 * EnvSize * EnvSize);
             float saSample = 1.0 / (float(sampleCount) * pdf);
             float mip = push.roughness < 1e-3 ? 0.0 : max(0.5 * log2(saSample / saTexel), 0.0);
-            // No firefly clamp: the source mip chain (filtered importance sampling) is the variance
-            // control now — a bright emissive texel is pre-averaged into the coarse mip this sample
-            // reads, so it no longer scatters, and the reflection keeps its true (unclamped) energy.
+            // No firefly clamp: filtered importance sampling over the source mip chain is the
+            // variance control. A bright emissive texel is pre-averaged into the coarse mip this
+            // sample reads, so it cannot scatter and the reflection keeps its true energy.
             prefiltered += envCube.SampleLevel(l, mip).rgb * ndotl;
             totalWeight += ndotl;
         }

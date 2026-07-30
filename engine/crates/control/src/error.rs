@@ -44,8 +44,8 @@ pub enum Error {
 
 impl Error {
     /// Builds a [`Error::Command`] from anything that renders as a string.
-    pub fn command(message: impl Into<String>) -> Self {
-        Self::Command(message.into())
+    pub fn command(message: impl std::fmt::Display) -> Self {
+        Self::Command(message.to_string())
     }
 
     /// Converts this internal failure into the one shared wire representation.

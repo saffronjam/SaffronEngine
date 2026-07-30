@@ -1,18 +1,10 @@
 //! The live [`ControlRenderer`] the host hands the control plane each frame.
 //!
-//! The control crate defines the trait but cannot implement it for the bare
-//! [`Renderer`]: the GPU-upload seam ([`ControlRenderer::with_gpu_uploader`]) needs the
-//! host-owned one-off [`Uploader`] (the renderer owns none — the host constructs one
-//! alongside it, `layer.rs`). So the concrete impl lives here, on a wrapper that bundles
-//! `&mut Renderer` with `&Uploader` for one frame's control drain and is dropped at the
-//! end of it.
-//!
-//! The render-domain query/toggle methods delegate straight to [`Renderer`]; the
-//! view-select / screenshot / wait-idle methods route the matching `Renderer` entry
-//! points; and [`ControlRenderer::with_gpu_uploader`] builds a transient
-//! [`RendererUploader`] over the bundled uploader + the renderer's descriptors and hands
-//! it to the asset loaders (`import_texture`, `load_mesh_asset`, `resolve_material_asset`,
-//! `pick_entity`, …) for the call's duration.
+//! The control crate cannot implement the trait for a bare [`Renderer`], because
+//! [`ControlRenderer::with_gpu_uploader`] needs the host-owned [`Uploader`] the renderer does not
+//! carry. So the impl lives on a wrapper that bundles `&mut Renderer` with `&Uploader` for one
+//! frame's control drain and drops at the end of it, and `with_gpu_uploader` builds a transient
+//! [`RendererUploader`] over that pair for the asset loaders' duration.
 
 use std::path::Path;
 use std::sync::Arc;

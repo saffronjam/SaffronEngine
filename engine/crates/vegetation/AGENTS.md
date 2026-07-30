@@ -16,55 +16,61 @@ concepts: what breaks, and what must move together.
 
 ## Layout
 
-Thirty-two modules, all declared private in `lib.rs`. Clusters:
+Thirty-three modules, all declared private in `lib.rs`. Fifteen are directory modules whose
+`mod.rs` fixes the module's public surface; the other eighteen are single files.
 
 | Cluster | Modules |
 |---|---|
-| Authored documents | `asset` (the three documents as values), `codec` (their binary form + schema hashes), `point` (the 25-column macro-point schema), `layer` (map layer algebra + provenance) |
-| Biome graph | `graph` (typed IR, compilation, authority flow), `graph_gpu` (resident program ABI + Rust reference interpreter) |
-| Evaluation | `evaluator` (the largest module: reference + parallel evaluation, preflight, surface queries), `merge` (map-level composition in GUID order) |
-| Botanical graph | `botanical` (the IR, `BotanicalElementId`, integer trig), `botanical_edit` (manual edits + orphan diagnostics), `botanical_compile` (grown assembly → meshes/parts/spines) |
-| Plant normalization | `plant_compile` (format-erased imported families), `virtual_hierarchy` (adapters onto `saffron-geometry`) |
-| Derived artifacts | `artifact` (`.svegcell` / `.splantc` containers), `manifest` (the immutable world manifest), `cook` (`ContentHash`, `CookVersionSet`, the cook graph) |
-| Runtime + persistence | `runtime_world` (`VegetationWorld`, generations, residency, queries), `mutation` (typed persistent mutations), `state_codec` (state + save containers) |
-| Ecology | `ecology` (the clock and state), `ecology_region` (dependency-region closure), `ecology_tick` (`advance_cell`, the pure rules), `season` |
-| Interchange | `interchange` (Houdini/JSON points), `interchange_usd` (USDA `PointInstancer` text form) |
-| Identity | `identity` (`derive_procedural_plant_id`, collision table), `hash` (the one SHA-256) |
-| Internal only | `binary` (big-endian primitive codec), `canonical` (`CanonicalSink`), `memory` (checked allocation), `error` |
+| Authored documents | `asset/` (the three documents as values), `codec/` (their binary form + schema hashes), `point.rs` (the 25-column macro-point schema), `layer.rs` (map layer algebra + provenance) |
+| Biome graph | `graph/` (typed IR, compilation, authority flow), `graph_gpu/` (resident program ABI + Rust reference interpreter) |
+| Evaluation | `evaluator/` (the largest module, 34 files: reference + parallel evaluation, preflight, surface queries), `merge.rs` (map-level composition in GUID order) |
+| Botanical graph | `botanical/` (the IR, `BotanicalElementId`, integer trig in `shape.rs`), `botanical_edit/` (manual edits + orphan diagnostics), `botanical_compile/` (grown assembly → meshes/parts/spines) |
+| Plant normalization | `plant_compile/` (format-erased imported families), `virtual_hierarchy.rs` (adapters onto `saffron-geometry`) |
+| Derived artifacts | `artifact/` (`.svegcell` / `.splantc` containers plus the KTX2 texture payload in `texture.rs`), `cell_facet.rs` (the typed facet payloads inside a `.svegcell`), `manifest.rs` (the immutable world manifest), `cook/` (`ContentHash`, `CookVersionSet`, the cook graph), `cook_work.rs` (the distributed work-item manifest) |
+| Runtime + persistence | `runtime_world/` (`VegetationWorld`, generations, residency, queries), `mutation/` (typed persistent mutations), `state_codec/` (state + save containers) |
+| Ecology | `ecology.rs` (the clock and state), `ecology_region.rs` (dependency-region closure plus the `CellSpatialIndex` grid the closure and halo lookup query), `ecology_tick/` (`advance_cell`, the pure rules), `season.rs` |
+| Interchange | `interchange.rs` (Houdini/JSON points), `interchange_usd.rs` (USDA `PointInstancer` text form) |
+| Identity | `identity.rs` (`derive_procedural_plant_id`, collision table), `hash.rs` (the one SHA-256) |
+| Internal only | `binary.rs` (big-endian primitive codec), `canonical.rs` (`CanonicalSink`), `memory.rs` (checked allocation), `error.rs` |
 
-Tests are inline `#[cfg(test)] mod tests` at the bottom of each module, with golden values as inline
-literals. This crate does not use the repo's `fixtures/golden/` mechanism and has no on-disk
-fixtures. `tests/operator_coverage.rs` is the only integration test.
+Tests are `#[cfg(test)]` modules beside the code they cover — inline at the bottom of a single-file
+module, and a `tests.rs` or `tests/` submodule inside a directory module. Golden values are inline
+literals: this crate does not use the repo's `fixtures/golden/` mechanism and has no on-disk
+fixtures. `tests/operator_coverage/` is the only integration test — one `main.rs` binary over
+`contracts`, `evaluation`, `scheduling`, `surface`, and shared `fixtures` modules.
 
 ## Rules that are easy to break
 
 - **Value contracts only — no I/O, no device, no ECS.** There is no `std::fs`, no `ash`, no `hecs`,
   and no socket in this crate, and adding one moves truth to the wrong layer. The filesystem for
-  these formats is `saffron-assets` (`vegetation_store.rs` writes the content-addressed store;
-  `vegetation_cooker.rs` and `plant_cook.rs` drive cooking). The crate re-exports
+  these formats is `saffron-assets` (`vegetation_store/` writes the content-addressed store;
+  `vegetation_cooker/` and `plant_cook/` drive cooking). The crate re-exports
   `saffron_material::*` rather than restating surface, coverage, thin-sheet, or opacity-micromap
   vocabulary — `saffron-material` owns that, and a second definition here is a second truth.
-- **`lib.rs` glob-re-exports 26 of 32 modules, so `pub` publishes instantly and silently.** A new
+- **`lib.rs` glob-re-exports 27 of the 33 modules, so `pub` publishes instantly and silently.** A new
   helper marked `pub` becomes crate API the moment you save, with no `lib.rs` edit to review. New
-  internals are `pub(crate)`. `binary`, `canonical`, and `memory` are internal in full; `error`,
-  `hash`, and `season` re-export selected names only. (`saffron-spatial` uses explicit named
-  re-exports and is the better pattern — but this crate's shape is the one you have to work with.)
+  internals are `pub(crate)`. `binary`, `canonical`, `memory`, and `state_codec` are internal in
+  full (`state_codec` publishes only inherent impls on already-exported types); `error`, `hash`, and
+  `season` re-export selected names only. (`saffron-spatial` uses explicit named re-exports and is
+  the better pattern — but this crate's shape is the one you have to work with.)
 - **No float is hashed, cooked, persisted, or fed to a rule.** This is narrower and more useful than
-  "no floats": floats do exist, at four system boundaries. `evaluator.rs` takes them from surface
-  providers, `interchange.rs` / `interchange_usd.rs` from DCC files, `plant_compile.rs` from
-  imported meshes, and `runtime_world.rs` hands them out on the ephemeral ray/nearest query surface.
+  "no floats": floats do exist, at the system boundaries. `evaluator/` takes them from surface
+  providers, `interchange.rs` / `interchange_usd.rs` from DCC files, `plant_compile/mesh.rs` from
+  imported meshes, and `runtime_world/` hands them out on the ephemeral ray/nearest query surface.
   Every one of those quantizes at the boundary (`DecisionScalar::from_f64`, `snorm16`,
   `quantize_orientation`, `SignedUnit::from_f64`) and the quantized value is what travels inward.
-  The other twenty-five modules contain no float at all. **No lint enforces this** —
+  `season.rs` reads one `f32` latitude, for a hemisphere sign test only — it never reaches
+  arithmetic. No other module contains a float at all, and **no lint enforces this** —
   `clippy::float_arithmetic` is off — so it holds only if you keep it.
-- **Trigonometry is an integer table, never libm.** `turn_sin_cos` in `botanical.rs` is a 17-entry
-  quarter-turn table, and its doc comment is the reason: "A table rather than `f64`: an authored
-  plant must grow the same on every target, and a libm difference of one bit would move a branch."
-  `botanical_compile` and `botanical_edit` both call it. Nothing here calls `f64::sin`.
+- **Trigonometry is an integer table, never libm.** `turn_sin_cos` in `botanical/shape.rs` is a
+  17-entry quarter-turn table, and its doc comment is the reason: "A table rather than `f64`: an
+  authored plant must grow the same on every target, and a libm difference of one bit would move a
+  branch." `botanical/grow.rs`, `botanical_compile/`, and `botanical_edit/` all call it. Nothing
+  here calls `f64::sin`.
 - **Every map is a `BTreeMap`/`BTreeSet`.** `grep -rn "HashMap\|HashSet" engine/crates/vegetation/src`
   returns nothing, and must keep returning nothing — iteration order reaches published bytes. There
   is no `rand::` and no `SystemTime` either. `Instant::now()` appears only in deadline and
-  cancellation guards in `evaluator.rs`, where timing can abort a result but never alter one.
+  cancellation guards under `evaluator/`, where timing can abort a result but never alter one.
 - **Identity is derived from ancestry, never from a counter or a slot.** `BotanicalElementId::child`
   mixes the producing node with the parent and the ordinal, which is what lets a manual edit survive
   a parameter change — an edit addresses *that* element, not the seventh thing generated. Changing
@@ -77,13 +83,13 @@ fixtures. `tests/operator_coverage.rs` is the only integration test.
   cell bytes, family — appended in that order at those widths. Reordering, rewidening, or bumping a
   node's semantic revision when its meaning did not change re-keys plants that should have been
   stable. The golden digest is pinned in `identity.rs`; if it moves, you changed identity.
-- **Thirty-three domain-separated hash preimages exist**, each a `saffron-anima/…/vN` string next to
+- **Thirty-six domain-separated hash preimages exist**, each a `saffron-anima/…/vN` string next to
   the encoder it protects. A domain string, a field order, and a field width are all part of the
   contract. Version the string in the same change as the encoder.
 - **A format change moves four things together:** the writer, the reader, the version constant, and
   the schema-hash domain string. The codec tests corrupt the version byte and the first schema byte
   precisely to prove both are load-bearing. Magic strings do not carry the version (`SPLANT01` holds
-  `PLANT_ASSET_VERSION = 4`) — except `SVEGMAN4` and `SVCGPH04`, where the digit is part of the
+  `PLANT_ASSET_VERSION = 5`) — except `SVEGMAN4` and `SVCGPH04`, where the digit is part of the
   magic and both move at once.
 - **No migrations, ever.** A noncurrent graph, node, asset, artifact, or state version is rejected
   with a typed error. There is no best-effort reinterpretation of an unknown or corrupt section.
@@ -104,6 +110,22 @@ fixtures. `tests/operator_coverage.rs` is the only integration test.
   comment carries the trigger: bump it whenever a rule, a coefficient, an evaluation order, or a
   numeric convention changes. State simulated under old rules must not quietly advance under new
   ones.
+- **A catch-up round computes in parallel and commits in canonical region order.** `advance_ecology`
+  spreads the pure per-region rule evaluation across `EcologyCatchUpBudget::workers` and then commits
+  the results in the order the regions were given, so the worker count reaches how long a call takes
+  and nothing else. `catch_up_is_identical_across_worker_counts` compares `canonical_bytes()` at one
+  worker against three over an eight-region world: three shards of eight join out of index order, so
+  the result reordering is load-bearing at those numbers and a commit that followed completion order
+  fails outright. It also asserts `EcologyCatchUpReport::workers`, which `compute_region_ticks`
+  reports from the branch it actually took — otherwise a call that silently ran serial would pass a
+  bytes-only comparison. The budget is spent a round at a time, so one region cannot starve another
+  out of a call.
+- **The dependency-region partition is memoized on `ecology_ground_revision`, not rebuilt per read.**
+  Building it is a closure over every planted cell in the world, and both the per-frame catch-up poll
+  and the per-cell `simulation_facet_is_settled` reader need it. The revision moves when a generation
+  is published or unloaded and when a mutation changes which cells carry plants; `publish_staged`
+  takes `&mut self` for exactly that reason. Adding a publication path that skips the bump leaves the
+  partition — and the residency it records — stale.
 - **The point schema hash covers every column.** `point_schema_hash` folds each of the 25
   `POINT_SCHEMA_COLUMNS` by id, element type, and name. Adding, removing, renaming, retyping, or
   reordering a column invalidates every `.svegcell` macro-point section and every persisted point.
@@ -118,28 +140,33 @@ fixtures. `tests/operator_coverage.rs` is the only integration test.
 
 Authored documents live in the project and are versioned by the user. Derived artifacts live in the
 content-addressed store at `<project>/cache/vegetation/`, beside `assets/` rather than inside it,
-and are disposable: deleting the cache loses no authored and no persistent runtime state.
+and are disposable: deleting the cache loses no authored and no persistent runtime state. That holds
+because persistent state has a separate durable root, `<project>/state/vegetation/` — the `.svegstate`
+baseline a generation ships is the one derived-looking file no cook reproduces.
 
 | Extension | Magic | Version const | Owner |
 |---|---|---|---|
-| `.splant` | `SPLANT01` | `PLANT_ASSET_VERSION` | `codec.rs` |
-| `.sbiome` | `SBIOME01` | `BIOME_ASSET_VERSION` | `codec.rs` |
-| `.svegmap` | `SVEGMAP1` | `VEGETATION_MAP_VERSION` | `codec.rs` |
-| `.svegmap` chunk | `SVEGCH01` | `VEGETATION_MAP_CHUNK_VERSION` | `codec.rs` |
-| `.svegcell` | `SVEGCEL1` | `VEGETATION_CELL_ARTIFACT_VERSION` | `artifact.rs` |
-| `.splantc` | `SPLANTC2` | `PLANT_COMPILED_ARTIFACT_VERSION` | `artifact.rs` |
+| `.splant` | `SPLANT01` | `PLANT_ASSET_VERSION` | `codec/plant.rs` |
+| `.sbiome` | `SBIOME01` | `BIOME_ASSET_VERSION` | `codec/biome.rs` |
+| `.svegmap` | `SVEGMAP1` | `VEGETATION_MAP_VERSION` | `codec/map.rs` |
+| `.svegmap` chunk | `SVEGCH01` | `VEGETATION_MAP_CHUNK_VERSION` | `codec/map.rs` |
+| `.svegcell` | `SVEGCEL1` | `VEGETATION_CELL_ARTIFACT_VERSION` | `artifact/cell.rs` |
+| `.splantc` | `SPLANTC2` | `PLANT_COMPILED_ARTIFACT_VERSION` | `artifact/plant.rs` |
 | `.svegmanifest` | `SVEGMAN4` | `VEGETATION_BASE_MANIFEST_VERSION` | `manifest.rs` |
-| `.svegcook` | `SVCGPH04` | `CookVersionSet` | `cook.rs` |
-| `.svegstate` | `SVEGST01` / `SVEGSV01` | `STATE_VERSION` / `SAVE_VERSION` | `state_codec.rs` |
+| `.svegcook` | `SVCGPH04` | `CookVersionSet` | `cook/graph.rs` |
+| `.svegstate` | `SVEGST01` / `SVEGSV01` | `STATE_VERSION` / `SAVE_VERSION` | `state_codec/` |
+| cook work plan | `SVCWRK01` / `SVCWPL01` / `SVCWCP01` | — | `cook_work.rs` |
 
-`.svegmapc` is the compiled map, named and written by `saffron-assets` (`vegetation.rs`).
+`.svegmapc` is the compiled map, named and written by `saffron-assets`
+(`vegetation/map_package.rs`).
 `.svegcell` and `.splantc` are never catalog assets and cannot be imported or edited.
 
-Binary conventions: big-endian throughout, except the GPU program word stream in `graph_gpu.rs`.
-`bool` is a `u8` that rejects any byte other than 0 or 1. Every reader ends with `complete()`, so
-trailing bytes are an error. Lengths are `u64` in `binary.rs` but `u32` in `codec.rs::Writer` — do
-not mix the two writers. JSON embedded in binary goes through `dump_json_sorted`, never
-`dump_json`.
+Binary conventions: big-endian throughout, except the GPU program word stream in
+`graph_gpu/program.rs` and the KTX2 texture container in `artifact/texture.rs`, both of which are
+little-endian because the consumer reading them is. `bool` is a `u8` that rejects any byte other than 0 or 1. Every reader ends
+with `complete()`, so trailing bytes are an error. Lengths are `u64` in `binary.rs` but `u32` in
+`codec/stream.rs::Writer` — do not mix the two writers. JSON embedded in binary goes through
+`dump_json_sorted`, never `dump_json`.
 
 ## Vocabulary
 
@@ -163,11 +190,10 @@ not mix the two writers. JSON embedded in binary goes through `dump_json_sorted`
 
 ## What this system is not
 
-The planset fixes these as design decisions, not omissions: there is no terminal billboard or
-octahedral impostor, no artist-authored foliage LOD chain, no material-WPO wind path, no CPU foliage
-draw loop, no terrain-only grass system, and no one-hecs-entity-per-decorative-plant model. Micro
-grass is cosmetic — individual blades never reach saves, collision, navigation, ecology, or gameplay
-queries.
+These are design decisions, not omissions: there is no terminal billboard or octahedral impostor, no
+artist-authored foliage LOD chain, no material-WPO wind path, no CPU foliage draw loop, no
+terrain-only grass system, and no one-hecs-entity-per-decorative-plant model. Micro grass is
+cosmetic — individual blades never reach saves, collision, navigation, ecology, or gameplay queries.
 
 [vegetation-assets]: ../../../docs/content/explanations/geometry-and-assets/vegetation-assets.md
 [botanical-graph]: ../../../docs/content/explanations/geometry-and-assets/botanical-graph.md

@@ -85,7 +85,7 @@ Rename applies the name optimistically, sends `rename-entity`, and records the p
 | Tree, filters, and drag targets | `editor/src/panels/HierarchyTree.tsx` | `HierarchyTree`, `TreeRow`, `isInSubtree`, `subtreeIds`, `RenameRow` |
 | Tree and optimistic state | `editor/src/state/store.ts` | `buildTree`, `reanchorPastBones`, `setParent`, `expandedIds`, `recordEntityCreation` |
 | Creation menu | `editor/src/app/CreateMenu.tsx` | `CREATE_PRESETS`, `CreateMenu`, `NamedEmptyForm` |
-| Scene command registration | `engine/crates/control/src/commands_scene.rs` | `register_scene_commands`, `list-entities`, `set-parent`, `add-entity`, `copy-entity`, `destroy-entity`, `rename-entity` |
+| Scene command registration | `engine/crates/control/src/commands_scene/` | `register_scene_commands`, `list-entities`, `set-parent`, `add-entity`, `copy-entity`, `destroy-entity`, `rename-entity` |
 
 ## Related
 

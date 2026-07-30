@@ -1,27 +1,15 @@
 //! The asset catalog wrapper, the `.smat` material system, material codegen, the
 //! thumbnail worker, project I/O, the model import/bake pipeline, and `render_scene`.
 //!
-//! `saffron-assets` sits on top of geometry (the byte codecs), rendering
-//! (`GpuMesh`/`GpuTexture` + the bindless table) and scene (the `AssetCatalog`
-//! types + the ECS world). It owns the [`AssetServer`]: the live catalog wrapped in
-//! uuid-keyed GPU caches.
+//! [`AssetServer`] owns the live catalog wrapped in uuid-keyed GPU caches. Two invariants the
+//! type system cannot enforce:
 //!
-//! # The negative-cache (the rule that fails silently)
-//!
-//! The three GPU caches are [`AssetCache`]s — `HashMap<u64, Option<Arc<T>>>`. A
-//! present key with `None` is a *negative-cache marker* (a load that failed, not to
-//! be retried), distinct from an absent key (never attempted). [`resolve_cached`] is
-//! the single code path that honors this. See [`cache`].
-//!
-//! # GPU-resource lifetime: `Arc` + `Drop`, idle-before-clear
-//!
-//! The "clear caches only after `wait_gpu_idle`" rule is a *call-site discipline*, not
-//! a manual teardown loop. [`AssetServer::clear_asset_caches`] drops
-//! the three `HashMap`s; the last `Arc<GpuMesh>`/`Arc<GpuTexture>` drop runs the
-//! resource's `Drop`, freeing the VMA allocation and returning the bindless slot.
-//! Because an in-flight frame may still reference an `Arc<GpuTexture>`, the caller
-//! must idle the GPU *before* clearing — a runtime UAF that `Drop` ordering alone
-//! cannot catch.
+//! - The GPU caches are [`AssetCache`]s — `HashMap<u64, Option<Arc<T>>>` — where a present key
+//!   holding `None` means "this load failed, do not retry" and an absent key means "never
+//!   attempted". [`resolve_cached`] is the single path that honours the distinction.
+//! - The caller must `wait_gpu_idle` before [`AssetServer::clear_asset_caches`]: clearing drops
+//!   the last `Arc<GpuMesh>`/`Arc<GpuTexture>`, whose `Drop` frees the VMA allocation and returns
+//!   the bindless slot, and an in-flight frame may still reference it.
 
 mod atlas;
 mod cache;
@@ -52,16 +40,13 @@ mod project_load;
 mod render_material;
 mod render_scene;
 mod scan;
-// The UV-seam height-value reconciler: a foundation consumed by the Phase-4 dicer (which reads the
-// per-seam sampling mode) and the optional material-import dilation. Dead until then.
-#[allow(dead_code)]
-mod seam;
 mod spawn;
 mod thumbnail;
 mod time_of_day;
 mod vegetation;
 mod vegetation_cooker;
 mod vegetation_export;
+mod vegetation_state;
 mod vegetation_store;
 
 pub use atlas::{
@@ -178,6 +163,7 @@ pub use vegetation_export::{
     VegetationExportMap, VegetationFaultKind, VegetationVerifyReport, vegetation_export_closure,
     verify_vegetation_artifacts,
 };
+pub use vegetation_state::VegetationStateStore;
 pub use vegetation_store::{
     VegetationArtifactKind, VegetationArtifactPublication, VegetationArtifactStore,
     VegetationAuthoredLock, VegetationGenerationLock,
@@ -288,7 +274,7 @@ impl BuiltinMesh {
     }
 }
 
-/// Per-frame options the scene driver reads (phase 12).
+/// Per-frame options the scene driver reads.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct RenderSceneOptions {
     /// Keep a runtime gizmo-model ghost under each `show_model` camera.
@@ -305,17 +291,20 @@ fn project_vegetation_cache_root(asset_root: &Path) -> PathBuf {
         .join("vegetation")
 }
 
+fn project_vegetation_state_root(asset_root: &Path) -> PathBuf {
+    asset_root
+        .parent()
+        .unwrap_or(asset_root)
+        .join("state")
+        .join("vegetation")
+}
+
 /// Owns the project's asset catalog plus uuid-keyed GPU caches so entities sharing an
-/// id upload once.
+/// id upload once. It is the source of truth for the live catalog.
 ///
-/// The three caches are negative-caches (see [`cache`]): a cached `None` is a failed
-/// asset that is not retried each frame, not a miss. `AssetServer` is the source of
-/// truth for the live catalog; it shares an `Arc<AssetCatalog>` into `Scene.catalog`
-/// so the scene reads it without a lifetime tangle.
-///
-/// Touched only from the main thread — no `Arc<Mutex>` on its own state. The
-/// thumbnail worker (phase 11) is the sole cross-thread site, and its sharing is
-/// mediated by `saffron-rendering`'s queue/bindless mutexes.
+/// Touched only from the main thread — no `Arc<Mutex>` on its own state. The thumbnail worker is
+/// the sole cross-thread site, and its sharing is mediated by `saffron-rendering`'s
+/// queue/bindless mutexes.
 pub struct AssetServer {
     /// The asset root directory (the project's `assets/` dir).
     pub root: PathBuf,
@@ -358,14 +347,13 @@ pub struct AssetServer {
     model_by_uuid: AssetCache<ModelAsset>,
     /// Parent-resolved material assets (parent chain walked, instance overrides baked, *before*
     /// per-slot overrides), keyed by material id. The draw path resolves each entity's materials
-    /// every frame; without this it re-read + re-parsed each `.smat` (and, for a container-embedded
-    /// material, re-read the whole `.smodel`) from disk per entity per frame. `None` = negative
-    /// marker. Coarsely cleared on any material mutation.
+    /// every frame, so this keeps that off the disk. `None` = negative marker. Coarsely cleared on
+    /// any material mutation.
     material_by_uuid: AssetCache<MaterialAsset>,
     /// The codegen `_mesh.spv` shader path per material id (a non-foldable node-graph material's
     /// compiled übershader variant), or `None` (the common case: no graph shader). Memoizes
     /// [`render_material`](crate::render_material)'s `codegen_shader_for` so the per-frame resolve
-    /// stops probing the disk. Invalidated with [`Self::material_by_uuid`].
+    /// does not probe the disk. Invalidated with [`Self::material_by_uuid`].
     material_shader_by_uuid: AssetCache<String>,
     /// Monotonic invalidation epoch for render-derived asset content.
     ///
@@ -376,15 +364,19 @@ pub struct AssetServer {
     asset_journal_base: AssetRevision,
     asset_journal_capacity: usize,
     asset_journal: VecDeque<AssetMutation>,
-    /// The editor-camera gizmo's mesh visual.
     /// The app-level, content-addressed thumbnail cache dir, defaulted from
     /// [`app_data_root`] so it is shared across every project and survives a project switch
     /// (it is *not* repointed by [`Self::set_asset_root`]). Overridable so a test can isolate
     /// its cache to a temp dir.
     pub thumbnail_cache_root: PathBuf,
     /// Project-local derived vegetation CAS. It is a sibling of `assets/`, never catalogued or
-    /// serialized as authored project state.
+    /// serialized as authored project state, and disposable: everything under it is reproducible
+    /// from authored sources.
     pub vegetation_cache_root: PathBuf,
+    /// Project-local durable vegetation state. Also a sibling of `assets/` and not catalogued, but
+    /// **not** disposable: a published baseline is a snapshot of runtime mutations that no authored
+    /// source reproduces, so it must never share a root with the cache.
+    pub vegetation_state_root: PathBuf,
     /// Every thumbnail renders through the **main forward+ graph**, which lives only on the render
     /// thread: [`request_thumbnail`] classifies and enqueues each here, and the host drains them in
     /// `on_update` (build the preview scene → render on the offscreen thumbnail view → write the disk
@@ -402,6 +394,7 @@ impl AssetServer {
     pub fn new(root: impl Into<PathBuf>) -> Self {
         let root = root.into();
         let vegetation_cache_root = project_vegetation_cache_root(&root);
+        let vegetation_state_root = project_vegetation_state_root(&root);
         let assets = Self {
             root,
             catalog: AssetCatalog::default(),
@@ -425,6 +418,7 @@ impl AssetServer {
             asset_journal: VecDeque::new(),
             thumbnail_cache_root: Path::new(&app_data_root()).join("thumbnail-cache"),
             vegetation_cache_root,
+            vegetation_state_root,
             preview_render_queue: std::collections::VecDeque::new(),
             preview_render_in_flight: std::collections::HashSet::new(),
         };
@@ -753,6 +747,7 @@ impl AssetServer {
     pub fn set_asset_root(&mut self, root: impl Into<PathBuf>) {
         self.root = root.into();
         self.vegetation_cache_root = project_vegetation_cache_root(&self.root);
+        self.vegetation_state_root = project_vegetation_state_root(&self.root);
         self.ensure_asset_directories();
     }
 
@@ -762,12 +757,14 @@ impl AssetServer {
         VegetationArtifactStore::new(&self.vegetation_cache_root)
     }
 
-    /// Creates the standard asset subdirectories under the root, idempotently.
-    ///
-    /// Standard typed-asset directories live under the asset root. The thumbnail cache
-    /// is app-level (shared across projects) and created lazily on first write. Directory
-    /// creation errors are swallowed: a missing dir surfaces later as the real I/O failure
-    /// that needs it.
+    /// Returns the durable vegetation state store for the active project.
+    #[must_use]
+    pub fn vegetation_state_store(&self) -> VegetationStateStore {
+        VegetationStateStore::new(&self.vegetation_state_root)
+    }
+
+    /// Creates the standard asset subdirectories under the root, idempotently. Directory-creation
+    /// errors are swallowed: a missing dir surfaces later as the real I/O failure that needs it.
     pub fn ensure_asset_directories(&self) {
         for sub in [
             "models",
@@ -783,26 +780,22 @@ impl AssetServer {
         }
     }
 
-    /// The app-level thumbnail cache directory (`<appDataRoot>/thumbnail-cache/` by default).
-    ///
-    /// Content-addressed and shared across every project, so it survives a project switch
-    /// and dedups identical assets. Lives outside any project root, so the catalog scan and
-    /// project save/load never see it.
+    /// The app-level thumbnail cache directory (`<appDataRoot>/thumbnail-cache/` by default):
+    /// content-addressed and shared across projects, and outside any project root so the catalog
+    /// scan and project save/load never see it.
     #[must_use]
     pub fn thumbnail_cache_dir(&self) -> PathBuf {
         self.thumbnail_cache_root.clone()
     }
 
-    /// Drops the three GPU caches (and abandons stale worker jobs), freeing every
-    /// cached `GpuMesh`/`GpuTexture` whose last `Arc` lives here.
+    /// Drops the GPU caches (and abandons stale worker jobs), freeing every cached
+    /// `GpuMesh`/`GpuTexture` whose last `Arc` lives here.
     ///
     /// # GPU idle is the caller's responsibility
     ///
-    /// The caller (`load_project`/`create_project`) must have called
-    /// `wait_gpu_idle(renderer)` first: an in-flight frame may still reference a
-    /// cached `Arc<GpuTexture>`, and dropping it under the GPU is a use-after-free
-    /// that `Drop` ordering cannot catch. Clearing under an idle GPU is the entire
-    /// discipline.
+    /// The caller must have called `wait_gpu_idle(renderer)` first: an in-flight frame may still
+    /// reference a cached `Arc<GpuTexture>`, and dropping it under the GPU is a use-after-free that
+    /// `Drop` ordering cannot catch.
     pub fn clear_asset_caches(&mut self) {
         self.clear_loaded_asset_state();
         self.record_asset_mutation(
@@ -825,10 +818,6 @@ impl AssetServer {
         self.lut_by_uuid.clear();
         self.model_by_uuid.clear();
         self.clear_material_caches();
-        // The editor-camera gizmo visual is a cached GPU `Ref` too (its `Arc<GpuMesh>` +
-        // resolved submesh materials), so it must drop here with the other caches — before
-        // the renderer frees the device/allocator. Leaving it would `vmaDestroyBuffer` on a
-        // dead allocator when `AssetServer` finally drops (a teardown use-after-free).
     }
 
     fn clear_material_caches(&mut self) {
@@ -853,8 +842,6 @@ impl AssetServer {
 
     /// Abandons queued main-graph preview renders + their dedup set on a project switch, so tiles
     /// for the closed project never render into the new one.
-    ///
-    /// It stays a method on `AssetServer` so [`AssetServer::clear_asset_caches`] calls one stable seam.
     pub fn clear_thumbnail_queue(&mut self) {
         self.preview_render_queue.clear();
         self.preview_render_in_flight.clear();

@@ -1,26 +1,17 @@
 // Virtual shadow maps under churn: rapid wind and camera travel must leave no stale shadow behind.
 //
-// The invalidation half of that claim is already covered by `vsm.test.ts` through the page counters
-// — repeat demand answers from residency, a moving caster dirties far below the atlas page count,
-// nothing overflows. What counters cannot say is whether the *image* is right afterwards: a page
-// that was dirtied but never re-rasterized still reports clean counters while showing last
-// position's shadow.
+// `vsm.test.ts` covers invalidation through the page counters, but counters cannot say whether the
+// image is right afterwards — a page that was dirtied and never re-rasterized reports clean counters
+// while showing last position's shadow.
 //
-// So this compares pixels. A settled reference frame is captured, the scene is then driven hard —
-// wind swung between calm and gale, the camera flown away and back, repeatedly, without letting
-// anything settle — and the camera is returned to the reference pose. The frame must converge back
-// to the reference within a tolerance that admits temporal accumulation but not a stale shadow.
+// So this compares pixels. A settled reference frame is captured, the scene is driven hard — wind
+// swung between calm and gale, the camera flown away and back, repeatedly, without letting anything
+// settle — and the camera returns to the reference pose. The frame must converge back within a mean
+// absolute per-channel budget that admits temporal accumulation but not a stale shadow.
 //
-// The tolerance is a mean absolute per-channel difference over the whole frame. TAA and the wind
-// clock keep it from being exactly zero; a shadow left at a stale position moves far more than the
-// budget below.
-//
-// PAGE CHURN IS NOW COVERED, which it was not before: a 4096² atlas (32×32 tiles) never evicted
-// under a scene with seven casters and a twelve-pose sweep, and the earlier note here recorded the
-// case as untestable because the render budget was a compile-time constant. `vsm-page-budget` makes
-// it settable, so the throttle can be driven to one page a frame — the atlas then cannot keep up
-// with the dirty set, which is the pressure the reconvergence path exists to survive. The case
-// still asserts that the pressure REALLY happened rather than trusting the knob.
+// `vsm-page-budget` drives the render throttle to one page a frame so the atlas cannot keep up with
+// the dirty set, which is the pressure the reconvergence path exists to survive. The case asserts
+// the pressure really happened rather than trusting the knob.
 
 import { afterAll, beforeAll, expect, test } from "bun:test";
 import type { EntityRef, RenderStatsDto } from "@saffron/protocol";
@@ -28,9 +19,9 @@ import type { Engine } from "./harness.ts";
 import { Cleaner, bootEngine, captureViewport, prepareScene, trackEntity } from "./test-utils.ts";
 import { decodeRgb8Png, meanAbsoluteDifference } from "./image.ts";
 
-/// Mean absolute per-channel difference (0-255) allowed between the reference frame and the frame
-/// re-settled after churn. Temporal accumulation and the monotonic wind clock account for a small
-/// residue; a shadow rendered at a stale caster position does not fit inside it.
+// Mean absolute per-channel difference (0-255) allowed between the reference frame and the frame
+// re-settled after churn. Temporal accumulation and the monotonic wind clock account for a small
+// residue; a shadow rendered at a stale caster position does not fit inside it.
 const CONVERGENCE_TOLERANCE = 2.0;
 
 const CAMERA = { position: { x: 0, y: 6, z: 12 }, yaw: 0, pitch: -22 };
@@ -107,9 +98,9 @@ test("the atlas converges back to its settled image after wind and camera churn"
 
 
 test("a starved page budget still reconverges to the reference image", async () => {
-  // The arm the earlier note recorded as untestable. Throttling the atlas to ONE page a frame
-  // means the dirty set outruns the refresh — the backlog the reconvergence path exists to survive
-  // — where the default budget of 64 drains a churned frame almost immediately.
+  // Throttling the atlas to ONE page a frame means the dirty set outruns the refresh, which is the
+  // backlog the reconvergence path exists to survive. The default budget of 64 drains a churned
+  // frame almost immediately, so it never applies the pressure.
   await engine.call("set-camera", CAMERA);
   await engine.call("set-wind", { speed: 0, gust: 0 });
   await engine.settle(1400);

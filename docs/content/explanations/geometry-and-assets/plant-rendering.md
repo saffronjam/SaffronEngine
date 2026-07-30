@@ -201,6 +201,16 @@ transparent-black gutter filters into the slot's edge as a dark fringe. The mip 
 alpha-area-preserving for the same reason in the other direction: a naive box filter loses coverage
 with every level, and distant foliage thins out.
 
+The chain ships in the artifact's texture-container section as a KTX2 container, and the layout —
+extent, gutter, and each slot's rectangle — in the materials-and-coverage section. The container
+declares its own `VkFormat` and extent, so the load path uploads the encoding the bytes state rather
+than the one the calling code assumes: an sRGB chain uploaded as linear shifts every packed slot's
+colour.
+
+The two sections are one atlas. An artifact carrying a layout without texels, texels without a
+layout, disagreeing extents, or a chain that stops short of 1×1 is rejected at the cook and at the
+load.
+
 `plant-atlas` returns one level as a PNG with its placements, read out of the published artifact
 rather than re-packed — a second packing of the same slots produces a different arrangement, and that
 is not the one the plant is sampling. The Atlas panel in the Plant workspace shows it over a checker,
@@ -219,6 +229,7 @@ not a failure.
 |---|---|---|
 | Season → appearance | `vegetation/src/season.rs`, `control/src/commands_asset.rs` | `resolve_rendered_phenotype`, `plant-season-phenotype` |
 | Family atlas + coverage mips | `assets/src/atlas.rs`, `coverage.rs` | `generate_family_atlas`, `pack_atlas`, `FamilyAtlas`, `AtlasLayout`, `CoverageMip` |
+| Atlas texture container | `vegetation/src/artifact/texture.rs`, `assets/src/plant_cook/sections.rs` | `PlantTextureContainer`, `PlantTextureFormat`, `write_plant_texture_container`, `texture_container_section` |
 | Atlas inspection | `assets/src/plant_render.rs`, `control/src/commands_asset.rs` | `plant_family_atlas_image`, `PlantAtlasImage`, `plant-atlas` |
 | Family load, decode, and flatten | `assets/src/plant_render.rs` | `load_plant_family`, `PlantFamilyRender` |
 | Section decode mirrors | `assets/src/plant_cook.rs` | `decode_mesh_section`, `decode_plant_material_document` |

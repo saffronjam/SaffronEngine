@@ -1,12 +1,10 @@
 //! The stable sub-asset id hash.
 //!
-//! The asset catalog resolves baked sub-assets (a material, a mesh) by an id
-//! derived from the model key, the sub-asset kind, the source name, and a
-//! duplicate-disambiguation index. The id must be **stable across reimports** so a
-//! re-bake of the same source resolves to the same id — a drifting hash silently
-//! orphans every baked sub-asset. The hash is FNV-1a over the three string fields with
-//! an extra mix round between fields, then a four-byte little-endian mix of
-//! `dup_index`, then the `< 1024 -> + 1024` fold into the non-reserved id range.
+//! The asset catalog resolves baked sub-assets by an id derived from the model key, the
+//! sub-asset kind, the source name, and a duplicate-disambiguation index. The id must be
+//! stable across reimports, since a drifting hash silently orphans every baked sub-asset.
+//! The hash is FNV-1a over the three string fields with an extra mix round between them,
+//! then a four-byte little-endian mix of `dup_index`, then the fold into `[1024, u64::MAX]`.
 
 use saffron_core::Uuid;
 
@@ -22,13 +20,12 @@ const FNV_PRIME: u64 = 1099511628211;
 /// result is folded into `[1024, u64::MAX]`, never the reserved range below 1024.
 pub fn sub_id_for(model_key: &str, kind: &str, source_name: &str, dup_index: u32) -> Uuid {
     let mut hash = FNV_OFFSET;
-    // An extra mix round between fields keeps "ab|c" != "a|bc".
+    // The extra multiply between fields keeps "ab|c" != "a|bc".
     let mut mix = |part: &str| {
         for ch in part.bytes() {
             hash ^= u64::from(ch);
             hash = hash.wrapping_mul(FNV_PRIME);
         }
-        hash ^= 0;
         hash = hash.wrapping_mul(FNV_PRIME);
     };
     mix(model_key);

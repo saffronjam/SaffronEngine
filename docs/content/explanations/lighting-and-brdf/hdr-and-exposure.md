@@ -74,12 +74,12 @@ produces unbounded linear radiance and relies on that step to land it on screen.
 
 | What | File | Symbols |
 |---|---|---|
-| HDR offscreen format | `engine/crates/rendering/src/pipelines.rs` | `OFFSCREEN_COLOR_FORMAT` (`R16G16B16A16_SFLOAT`) |
+| HDR offscreen format | `engine/crates/rendering/src/pipelines/` | `OFFSCREEN_COLOR_FORMAT` (`R16G16B16A16_SFLOAT`) |
 | Linear radiance accumulation | `engine/assets/shaders/lighting.slang` | `evalLighting` — `lo + ambient + emissive` |
 | Exposure + tone curve | `engine/assets/shaders/tonemap.slang` | `computeMain`, `Push.exposure` |
 | EV → $2^{EV}$ | `engine/crates/rendering/src/overlay.rs` | `TonemapPush::from_ev` (`exposure_ev.exp2()`) |
-| Exposure setter + state | `engine/crates/rendering/src/renderer.rs` | `Renderer::set_exposure`, `Renderer::exposure_ev` |
-| `set-exposure` control command | `engine/crates/control/src/commands_render.rs` | the `set-exposure` registration |
+| Exposure setter + state | `engine/crates/rendering/src/renderer/` | `Renderer::set_exposure`, `Renderer::exposure_ev` |
+| `set-exposure` control command | `engine/crates/control/src/commands_render/` | the `set-exposure` registration |
 
 > [!TIP]
 > Exposure is a plain multiply applied before the Reinhard curve, so it shifts which part of

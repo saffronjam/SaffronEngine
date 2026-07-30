@@ -170,6 +170,16 @@ export interface FogVolume {
   speed: number;
 }
 
+export type WindSourceKindDto = "directional" | "point" | "vortex" | "wake" | "volume";
+
+export interface WindSource {
+  kind: WindSourceKindDto;
+  strength: number;
+  radius: number;
+  falloff: number;
+  enabled: boolean;
+}
+
 export interface Relationship {
   parent: WireUuid;
 }
@@ -281,6 +291,7 @@ export interface Components {
   SpotLight?: SpotLight;
   ReflectionProbe?: ReflectionProbe;
   FogVolume?: FogVolume;
+  WindSource?: WindSource;
   Relationship?: Relationship;
   SkinnedMesh?: SkinnedMesh;
   Morph?: Morph;
@@ -293,7 +304,7 @@ export interface Components {
   CharacterController?: CharacterController;
 }
 
-export type ComponentBody = Name | Transform | Mesh | VegetationField | Camera | MaterialSet | ModelInstance | Script | AnimationPlayer | DirectionalLight | PointLight | SpotLight | ReflectionProbe | FogVolume | Relationship | SkinnedMesh | Morph | Bone | FootIk | BonePhysics | Rigidbody | Collider | KinematicBones | CharacterController;
+export type ComponentBody = Name | Transform | Mesh | VegetationField | Camera | MaterialSet | ModelInstance | Script | AnimationPlayer | DirectionalLight | PointLight | SpotLight | ReflectionProbe | FogVolume | WindSource | Relationship | SkinnedMesh | Morph | Bone | FootIk | BonePhysics | Rigidbody | Collider | KinematicBones | CharacterController;
 
 export type SkyModeDto = "color" | "texture" | "procedural";
 
@@ -870,15 +881,15 @@ export type SourceUvOriginDto = "top-left" | "bottom-left";
 
 export type PlantTangentPolicyDto = "require" | "generate-missing" | "regenerate";
 
-export type PlantPivotDto = "SourceOrigin" | "BoundsBaseCenter" | { "Explicit": { 
+export type PlantPivotDto = { "kind": "source-origin" } | { "kind": "bounds-base-center" } | { "kind": "explicit", 
 /**
  * Position in source metres, as Q15.16 bits.
  */
-position_bits: [number, number, number], } } | { "SemanticPart": { 
+positionBits: [number, number, number], } | { "kind": "semantic-part", 
 /**
  * The part identity the origin follows.
  */
-part: VegetationGuid, } };
+part: VegetationGuid, };
 
 export interface PlantImportSettingsDto {
   units: SourceUnitsDto;
@@ -1248,7 +1259,7 @@ export interface VegetationRuntimeQueryFilterDto {
   interactionPolicies: InteractionPolicyDto[];
 }
 
-export type VegetationRuntimeQueryDto = { "Bounds": { bounds: WorldBoundsDto, } } | { "Radius": { center_ticks: [string, string, string], radius_m: number, } } | { "Ray": { origin_ticks: [string, string, string], direction: [number, number, number], max_distance_m: number, } } | { "Nearest": { position_ticks: [string, string, string], max_distance_m: number | null, } };
+export type VegetationRuntimeQueryDto = { "kind": "bounds", bounds: WorldBoundsDto, } | { "kind": "radius", centerTicks: [string, string, string], radiusM: number, } | { "kind": "ray", originTicks: [string, string, string], direction: [number, number, number], maxDistanceM: number, } | { "kind": "nearest", positionTicks: [string, string, string], maxDistanceM: number | null, };
 
 export interface VegetationRuntimeQueryParams {
   query: VegetationRuntimeQueryDto;
@@ -1335,7 +1346,7 @@ export interface VegetationRuntimeAvailableStatusDto {
   promotion?: VegetationPromotionReportDto;
 }
 
-export type VegetationRuntimeStatusDto = { "Unavailable": { reason: VegetationRuntimeUnavailableReasonDto, detail: string | null, } } | { "Available": VegetationRuntimeAvailableStatusDto };
+export type VegetationRuntimeStatusDto = { "state": "unavailable", reason: VegetationRuntimeUnavailableReasonDto, detail: string | null, } | { "state": "available" } & VegetationRuntimeAvailableStatusDto;
 
 export interface VegetationRuntimeCellParams {
   cell: WorldCellDto;
@@ -1355,7 +1366,7 @@ export interface VegetationRuntimePlantParams {
   plant: PlantId;
 }
 
-export type PlantPromotionStateDto = "Bulk" | "Promoting" | { "Promoted": { entity: WireUuid, } } | { "Demoting": { entity: WireUuid, } };
+export type PlantPromotionStateDto = { "state": "bulk" } | { "state": "promoting" } | { "state": "promoted", entity: WireUuid, } | { "state": "demoting", entity: WireUuid, };
 
 export interface VegetationPromotionResult {
   plant: PlantId;
@@ -1402,7 +1413,7 @@ export interface VegetationNavigationResult {
   drained: boolean;
 }
 
-export type VegetationTransitionKindDto = { "Damaged": { amount: number, health: number, } } | { "Harvested": { phenotype: number, } } | { "Burned": { phenotype: number, remaining_fuel: number, } } | "Removed" | "Planted" | { "Regrew": { lifecycle: PlantLifecycleDto, phenotype: number, } } | { "LifecycleChanged": { from: PlantLifecycleDto | null, to: PlantLifecycleDto, } } | "Ignited" | "Extinguished" | { "Wetted": { moisture: number, fuel: number, } } | "StateReplaced" | "Moved" | { "Disturbed": { categories: number, } };
+export type VegetationTransitionKindDto = { "kind": "damaged", amount: number, health: number, } | { "kind": "harvested", phenotype: number, } | { "kind": "burned", phenotype: number, remainingFuel: number, } | { "kind": "removed" } | { "kind": "planted" } | { "kind": "regrew", lifecycle: PlantLifecycleDto, phenotype: number, } | { "kind": "lifecycle-changed", from: PlantLifecycleDto | null, to: PlantLifecycleDto, } | { "kind": "ignited" } | { "kind": "extinguished" } | { "kind": "wetted", moisture: number, fuel: number, } | { "kind": "state-replaced" } | { "kind": "moved" } | { "kind": "disturbed", categories: number, };
 
 export interface VegetationEventDto {
   seq: string;
@@ -1475,11 +1486,11 @@ export interface BotanicalDrawnPointDto {
   radiusBits: number;
 }
 
-export type BotanicalEditActionDto = { "Transform": { 
+export type BotanicalEditActionDto = { "kind": "transform", 
 /**
  * Translation in family-local metres, as Q15.16 bits.
  */
-offset_bits: [number, number, number], 
+offsetBits: [number, number, number], 
 /**
  * Turn about the target's base, as `UnitInterval` bits.
  */
@@ -1487,11 +1498,11 @@ roll: number,
 /**
  * Uniform scale as Q15.16 bits, where 65536 is unchanged.
  */
-scale_bits: number, } } | { "Trim": { 
+scaleBits: number, } | { "kind": "trim", 
 /**
  * Where along the axis the cut falls, as `UnitInterval` bits.
  */
-at: number, } } | "Remove" | { "Graft": { 
+at: number, } | { "kind": "remove" } | { "kind": "graft", 
 /**
  * The family graft source supplying the geometry.
  */
@@ -1499,7 +1510,7 @@ source: VegetationGuid,
 /**
  * Which of that source's elements to take.
  */
-selector: PlantSourceSelectorDto, } };
+selector: PlantSourceSelectorDto, };
 
 export interface BotanicalManualEditDto {
   target: string;
@@ -1514,11 +1525,11 @@ export interface BotanicalEditOrphanDto {
   reason: BotanicalEditOrphanReasonDto;
 }
 
-export type BotanicalOperatorDto = { "Drawn": { element: BotanicalElementDto, points: Array<BotanicalDrawnPointDto>, } } | { "Trunk": { element: BotanicalElementDto, length_bits: number, base_radius_bits: number, taper: Array<BotanicalCurvePointDto>, segments: number, } } | { "Branch": { element: BotanicalElementDto, length_ratio: number, radius_ratio: number, declination: number, jitter: number, segments: number, } } | { "Phyllotaxis": { pattern: PhyllotaxisPatternDto, count: number, nodes: number, start: number, end: number, divergence: number, } } | { "Tropism": { kind_of: TropismKindDto, strength: number, } } | { "Prune": { rule: PruneRuleDto, threshold_bits: number, count: number, } } | { "Roots": { depth_ratio: number, spread_ratio: number, count: number, } } | { "Shell": { material_slot: number, sides: number, } } | { "Instance": { element: BotanicalElementDto, material_slot: number, size_bits: number, jitter: number, } } | { "ModuleCall": { 
+export type BotanicalOperatorDto = { "kind": "drawn", element: BotanicalElementDto, points: Array<BotanicalDrawnPointDto>, } | { "kind": "trunk", element: BotanicalElementDto, lengthBits: number, baseRadiusBits: number, taper: Array<BotanicalCurvePointDto>, segments: number, } | { "kind": "branch", element: BotanicalElementDto, lengthRatio: number, radiusRatio: number, declination: number, jitter: number, segments: number, } | { "kind": "phyllotaxis", pattern: PhyllotaxisPatternDto, count: number, nodes: number, start: number, end: number, divergence: number, } | { "kind": "tropism", kindOf: TropismKindDto, strength: number, } | { "kind": "prune", rule: PruneRuleDto, thresholdBits: number, count: number, } | { "kind": "roots", depthRatio: number, spreadRatio: number, count: number, } | { "kind": "shell", materialSlot: number, sides: number, } | { "kind": "instance", element: BotanicalElementDto, materialSlot: number, sizeBits: number, jitter: number, } | { "kind": "module-call", 
 /**
  * Call-site GUID as a canonical 32-hex-digit string.
  */
-call_guid: VegetationGuid, } } | "Family";
+callGuid: VegetationGuid, } | { "kind": "family" };
 
 export interface BotanicalNodeDto {
   guid: string;
@@ -1914,8 +1925,26 @@ export interface PlantElementsResult {
 export interface VegetationAdvanceEcologyParams {
   targetTick: string;
   maxTicks: number;
+}
+
+export interface VegetationEcologyClockParams {
+  running?: boolean;
+  tickMilliseconds?: number;
+  maxTicksPerSync?: number;
+  workers?: number;
+  water?: number;
+  warmth?: number;
+}
+
+export interface VegetationEcologyClockDto {
+  running: boolean;
+  tickMilliseconds: number;
+  pendingMilliseconds: string;
+  maxTicksPerSync: number;
+  workers: number;
   water: number;
   warmth: number;
+  ticksOwed: string;
 }
 
 export interface VegetationEcologyRegionDto {
@@ -1940,6 +1969,7 @@ export interface VegetationEcologyStatusDto {
   simulationVersion: number;
   checkpoint: string;
   regionRadiusCells: number;
+  clock: VegetationEcologyClockDto;
   regions: VegetationEcologyRegionDto[];
   cells: VegetationEcologyCellDto[];
 }
@@ -1951,6 +1981,8 @@ export interface VegetationEcologyReportDto {
   regionsAwaitingResidency: number;
   ticksRun: string;
   ticksOwed: string;
+  ticksAwaitingResidency: string;
+  workers: number;
   checkpoint: string;
 }
 
@@ -2099,6 +2131,7 @@ export interface RenderStatsDto {
   batches: number;
   instances: number;
   sceneGatherMs: number;
+  sceneGatherEntities: number;
   instanceUploadBytes: number;
   retainedMeshCpuBytes: number;
   shadowDrawCalls: number;
@@ -4591,6 +4624,7 @@ export interface CommandParamsMap {
   "vegetation-state-import": VegetationStateImportParams;
   "vegetation-advance-ecology": VegetationAdvanceEcologyParams;
   "vegetation-ecology-status": EmptyParams;
+  "vegetation-ecology-clock": VegetationEcologyClockParams;
   "vegetation-combustion": VegetationCombustionParams;
   "vegetation-usd-skeletons": UsdSkeletonsParams;
   "vegetation-wind-record": VegetationWindRecordParams;
@@ -4846,6 +4880,7 @@ export interface CommandResultMap {
   "vegetation-state-import": VegetationStateSnapshotDto;
   "vegetation-advance-ecology": VegetationEcologyReportDto;
   "vegetation-ecology-status": VegetationEcologyStatusDto;
+  "vegetation-ecology-clock": VegetationEcologyClockDto;
   "vegetation-combustion": VegetationCombustionDto;
   "vegetation-usd-skeletons": UsdSkeletonsResult;
   "vegetation-wind-record": VegetationWindRecordResult;

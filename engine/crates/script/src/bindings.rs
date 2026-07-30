@@ -1,18 +1,10 @@
-//! The declarative `sa.*` binding-descriptor table — the single source that both
-//! registers the API with the VM and feeds the Luau type emitter.
+//! The declarative `sa.*` binding-descriptor table — the single source that both registers the API
+//! with the VM and feeds the Luau type emitter. A binding's argument and return types are first-class
+//! Rust data, so there is no second hand-written copy to drift.
 //!
-//! A binding's argument and return types are first-class Rust data, so one ordered
-//! table drives both registration and typegen with no second hand-written copy to
-//! drift.
-//!
-//! [`BINDINGS`] is the table. [`register_value_types`] + [`register_no_scene_globals`]
-//! bind the no-scene surface (the value type, `sa.vec3`/`sa.lerp`/`sa.look_at`, and the
-//! base `sa.log`); [`register_scene_globals`] binds the scene-dependent free functions
-//! (input reads, hierarchy queries, `sa.broadcast`) onto the same `sa` table, and the
-//! `sa.Entity` methods live on the [`EntityHandle`] userdata. The xtask emitter reads
-//! [`BINDINGS`] to emit the `.luau` defs through the shared `map_type` mapper, so the
-//! type tokens here are spelled in that mapper's wire vocabulary (`"number"`, `"Vec3"`,
-//! `"string"`, …).
+//! The `sa.Entity` methods live on the [`EntityHandle`] userdata rather than in this table. The xtask
+//! emitter reads [`BINDINGS`] through the shared `map_type` mapper, so the type tokens here are
+//! spelled in that mapper's wire vocabulary (`"number"`, `"Vec3"`, `"string"`, …).
 
 use mlua::{Lua, Table, Value as LuaValue};
 

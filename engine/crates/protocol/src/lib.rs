@@ -1,12 +1,9 @@
-//! The control-plane DTO crate: the single source of truth for the wire types, shared by
-//! the engine, the `sa` CLI, and the protocol codegen (`serde`/`schemars`/`ts-rs` derives).
+//! The control-plane DTO crate: the single source of truth for the wire types, shared by the
+//! engine, the `sa` CLI, and the protocol codegen (`serde`/`schemars`/`ts-rs` derives).
 //!
-//! The crate defines the complete wire model, with field declaration order
-//! preserved — that order is the positional-CLI-argument order and the OpenRPC `required`
-//! order. There is no parser: the struct *is* the model and `derive` reads it at compile time,
-//! so the serde and schema codegen carry no hand-written serialization code.
-//!
-//! Depends only on `saffron-core` so the `sa` CLI links the DTOs without the engine.
+//! Field declaration order is load-bearing — it is the positional-CLI-argument order and the
+//! OpenRPC `required` order. Depends only on `saffron-core` so the `sa` CLI links the DTOs
+//! without the engine.
 
 #![deny(unsafe_code)]
 

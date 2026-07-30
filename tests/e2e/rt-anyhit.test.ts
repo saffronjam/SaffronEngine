@@ -1,22 +1,17 @@
 // The KHR any-hit path running over canonical coverage on real ray-tracing hardware.
 //
 // The blocker carries a thin-sheet-foliage surface with an `albedo-alpha` coverage source and a
-// `masked` classification, so its instance is packed FORCE_NO_OPAQUE and its triangles surface as
+// `masked` classification, so its instance packs FORCE_NO_OPAQUE and its triangles surface as
 // non-opaque ray candidates rather than auto-committing. `gpuSceneRayCandidateCovered` then
 // reconstructs the hit and runs `classifyCanonicalCoverage`; for an albedo-alpha source the verdict
 // is `sampled * baseColorAlpha` against the reference cutoff, and with no albedo texture bound
 // `sampled` is the default-white 1.0, so the base-colour alpha alone decides.
 //
-// WHAT THIS ESTABLISHES: the candidate-confirmation path executes over a masked thin-sheet blocker
-// with ray-query shadows armed, a TLAS built, and zero validation messages — the chain that had
-// never run on any device the project could reach.
-//
-// The assertion samples the RECEIVER patch the ray shadow falls on, not the whole frame. That
-// distinction is the whole test: the blocker's own shading also responds to its coverage, so a
-// frame-wide comparison cannot separate "the candidate was rejected" from "the blocker looks
-// different". The patch below was located by diffing a normal frame against a build that rejects
-// every candidate — the pixels that changed are exactly the candidate-driven ray shadow — and it
-// lies just below the blocker, well clear of the blocker's own pixels.
+// The assertion samples the receiver patch the ray shadow falls on, not the whole frame: the
+// blocker's own shading also responds to its coverage, so a frame-wide comparison cannot separate
+// "the candidate was rejected" from "the blocker looks different". The patch was located by diffing
+// a normal frame against a build that rejects every candidate, and it lies just below the blocker,
+// clear of the blocker's own pixels.
 
 import { afterAll, beforeAll, expect, test } from "bun:test";
 import type { EntityRef, RenderStatsDto } from "@saffron/protocol";
@@ -30,8 +25,8 @@ let rtSupported = false;
 let blocker = "";
 let material = "";
 
-/// A thin-sheet foliage surface whose coverage comes from albedo alpha and is `masked`, so the
-/// classifier — not the geometry — decides whether a ray candidate commits.
+// A thin-sheet foliage surface whose coverage comes from albedo alpha and is `masked`, so the
+// classifier — not the geometry — decides whether a ray candidate commits.
 const MASKED_THIN_SHEET = {
   model: "thin-sheet-foliage",
   parameters: {

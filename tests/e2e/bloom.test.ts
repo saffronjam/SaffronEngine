@@ -85,7 +85,7 @@ describe("bloom stays validation-clean across parameter changes", () => {
   });
 });
 
-// Phase 2 art direction: the lens-dirt mask (intensity + tint), the anamorphic streak (a
+// Bloom art direction: the lens-dirt mask (intensity + tint), the anamorphic streak (a
 // horizontally-squeezed blur added over the radial bloom), and the per-mip tint stack all ride the
 // one `set-bloom` command. Drive them together, assert the echo + `render-stats` read-back, and that
 // the extra streak ping-pong passes + dirt composite stay validation-clean.

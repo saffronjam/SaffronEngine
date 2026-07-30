@@ -3,10 +3,10 @@
 //! them.
 //!
 //! The pinned ash release carries no binding for this extension, so the structs below are
-//! transcribed from the toolbox SDK's `vulkan_core.h`. The same two belts as
-//! [`crate::vk_nv_cluster`] keep them honest: the pinned-ash-release test there fails on any
-//! ash bump naming both modules, and the device probe refuses to enable the extension on any
-//! spec revision other than the transcribed one.
+//! transcribed from the SDK's `vulkan_core.h`. The same two belts as [`crate::vk_nv_cluster`] keep
+//! them honest: the pinned-ash-release test there fails on any ash bump naming both modules, and
+//! the device probe refuses to enable the extension on any spec revision other than the transcribed
+//! one.
 
 use std::ffi::{CStr, c_void};
 

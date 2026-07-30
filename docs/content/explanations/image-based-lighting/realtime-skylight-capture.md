@@ -57,7 +57,7 @@ The atmosphere's `skyCaptureCadence` value controls specular cost and latency. A
 | What | File | Symbols |
 |---|---|---|
 | SH projection and reconstruction | `engine/assets/shaders/sh_project.slang`, `sky_sh.slang` | `computeMain`, `skyShRadiance`, `skyShIrradiance` |
-| Persistent resources and schedule | `engine/crates/rendering/src/ibl.rs` | `LiveCapture`, `Ibl::add_live_capture_passes`, `prefilter_slice` |
+| Persistent resources and schedule | `engine/crates/rendering/src/ibl/` | `LiveCapture`, `Ibl::add_live_capture_passes`, `prefilter_slice` |
 | Specular reconvergence | `engine/assets/shaders/ibl_prefilter.slang` | `Push`, `blendAlpha`, `rowOffset`, `rowCount` |
 | GI consumers | `engine/assets/shaders/gi_resolve.slang`, `ddgi_trace.slang` | `skyShCoefficients`, `skyShIrradiance`, `skyShRadiance` |
 | Authoring control | `engine/crates/scene/src/environment.rs` | `AtmosphereSettings::sky_capture_cadence` |

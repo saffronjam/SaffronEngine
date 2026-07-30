@@ -57,9 +57,9 @@ the light count is small enough that culling is not worth the compute dispatch.
 |---|---|---|
 | The two loops | `engine/assets/shaders/lighting.slang` | `evalLighting` — `clusterParams.screenSize.z` branch |
 | Shared per-light body | `engine/assets/shaders/lighting.slang` | `punctual`, `brdf` |
-| The flag | `engine/crates/rendering/src/renderer.rs` | `Renderer::set_clustered`, `Renderer::clustered_enabled` |
-| Skipping the cull pass | `engine/crates/rendering/src/lighting.rs` | `Lighting::use_clustered`, `take_cluster_dispatch_pending` |
-| `set-clustered` control command | `engine/crates/control/src/commands_render.rs` | the `set-clustered` registration |
+| The flag | `engine/crates/rendering/src/renderer/` | `Renderer::set_clustered`, `Renderer::clustered_enabled` |
+| Skipping the cull pass | `engine/crates/rendering/src/lighting/` | `Lighting::use_clustered`, `take_cluster_dispatch_pending` |
+| `set-clustered` control command | `engine/crates/control/src/commands_render/` | the `set-clustered` registration |
 
 > [!TIP]
 > The brute-force loop reads `globals.counts.x` (the full count); the clustered loop reads a

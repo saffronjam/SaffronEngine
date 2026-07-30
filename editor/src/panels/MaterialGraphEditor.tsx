@@ -1,12 +1,8 @@
-/// The node-graph material editor: a React Flow canvas + a LIVE 3D preview sphere, hosted as a main
-/// tab (see App.tsx / openMaterialGraphTab). Loads a material's stored graph (material-get), lets you
-/// add (right-click the canvas) / connect / edit nodes, and auto-applies changes (debounced) via
-/// material-set-graph. The preview pane is the modal `assetPreview` subsurface (the same view the
-/// asset editor drives) showing the edited `.smat` on a built-in sphere under real IBL — orbit it
-/// (pan-only, no dolly); it re-renders on its own each frame as the material cache is invalidated by
-/// the apply, so there is no readback round-trip. "Compile" forces codegen (material-compile-graph)
-/// for procedural graphs that don't fold to params. Node types mirror the engine emitter
-/// (materials/graph.ts).
+/// The node-graph material editor: a React Flow canvas plus a live 3D preview sphere, hosted as a
+/// main tab. Edits auto-apply (debounced) through `material-set-graph`; the preview is the
+/// `assetPreview` subsurface showing the edited `.smat` under real IBL, re-rendered each frame as
+/// the apply invalidates the material cache, so there is no readback round-trip. Compile forces
+/// codegen for procedural graphs that do not fold to params. Node types mirror `materials/graph.ts`.
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { type Edge, useEdgesState, useNodesState } from "@xyflow/react";
 import { Hammer } from "lucide-react";

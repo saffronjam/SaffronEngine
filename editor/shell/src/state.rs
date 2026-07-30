@@ -1,6 +1,5 @@
 //! The per-shell state container — an `Arc<ShellState>` shared with command handlers, plus the
-//! engine-facing socket/shm naming and the profiler-trace loopback server — all shell-agnostic and
-//! Command handlers receive an `Arc<ShellState>`.
+//! engine-facing socket/shm naming and the profiler-trace loopback server.
 
 use crate::geometry::WindowStateTracker;
 use serde_json::Value;
@@ -64,10 +63,8 @@ impl ResizeEdge {
     }
 }
 
-/// The per-shell state: engine slot + socket + trace server, plus the
-/// shared window-geometry tracker (read by `window_scale_factor`/`window_is_maximized`), the
-/// main-thread request inbox, and the exit flag `window_close` raises. `ConnectorRuntime` (Phase 7)
-/// is added when that module ports.
+/// The per-shell state: the engine slot, socket, and trace server, the shared window-geometry
+/// tracker, the main-thread request inbox, and the exit flag `window_close` raises.
 pub struct ShellState {
     /// Empty until `start_engine` spawns the host.
     pub engine: Mutex<Option<Child>>,

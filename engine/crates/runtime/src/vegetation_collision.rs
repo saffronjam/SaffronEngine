@@ -1,14 +1,21 @@
 //! Batched vegetation collision-facet residency.
 //!
-//! Physics-facet-resident vegetation cells materialize simplified Jolt proxies for their macro
-//! plants — one batched create per published cell generation, one batched remove when the
-//! generation is superseded or leaves residency — with every body registered under
-//! `WorldHitTarget::Vegetation(PlantId)`. The interaction policy selects the body class:
-//! `Decorative` never collides (micro/grass never reaches the collision rows at all),
-//! `Interactive` is a query-only sensor, `Structural` and `Harvestable` are solid near-field
-//! statics. Bodies are generation-tagged: a republished cell's old bodies are removed in the
-//! same synchronization pass that creates the new generation's, so exactly one collision owner
-//! exists per plant at every point the simulation can observe.
+//! A physics-facet-resident cell materializes simplified Jolt proxies for its macro plants: one
+//! batched create per published generation, one batched remove when that generation is superseded or
+//! leaves residency, every body registered under `WorldHitTarget::Vegetation(PlantId)`. The
+//! interaction policy picks the body class — `Decorative` never collides and micro/grass never
+//! reaches these rows at all, `Interactive` is a query-only sensor, `Structural` and `Harvestable`
+//! are solid near-field statics.
+//!
+//! Bodies are generation-tagged, and a republished cell's old bodies are removed in the same
+//! synchronization pass that creates the new generation's, so exactly one collision owner exists per
+//! plant at every point the simulation can observe.
+//!
+//! A cell mid-catch-up carries no bodies. Several ticks of lifecycle changes are still to run, and
+//! materializing a batch per intermediate tick would both publish state nobody should observe and
+//! rebuild the whole cell's proxies every frame of the catch-up. A cell whose region cannot run at
+//! all still carries bodies, from its last committed generation: it is not going to change until the
+//! ground it depends on loads.
 
 use std::collections::BTreeMap;
 
@@ -18,8 +25,8 @@ use saffron_physics::{INVALID_BODY_ID, StaticTargetBodyCreate, World, WorldHitTa
 use saffron_scene::Shape;
 use saffron_spatial::{ResidencyFacet, WorldCellKey};
 use saffron_vegetation::{
-    InteractionPolicy, PlantCollisionProxy, PlantCollisionShape, VegetationCollisionInput,
-    VegetationWorld,
+    EcologyInfluence, InteractionPolicy, PlantCollisionProxy, PlantCollisionShape,
+    VegetationCollisionInput, VegetationWorld,
 };
 
 use crate::vegetation_family::PlantFamilyCache;
@@ -61,19 +68,21 @@ pub(crate) struct VegetationCollisionResidency {
 
 impl VegetationCollisionResidency {
     /// The fixed synchronization point: removes every superseded generation's bodies, then
-    /// materializes bodies for newly resident generations, in one pass.
+    /// materializes bodies for newly resident generations whose biology is settled, in one pass.
     pub(crate) fn advance(
         &mut self,
         vegetation: &VegetationWorld,
         physics: &mut World,
         assets: &AssetServer,
         families: &mut PlantFamilyCache,
+        influence: EcologyInfluence,
     ) {
         let mut desired = BTreeMap::new();
         for (cell, generation) in vegetation.resident_cells() {
             if generation
                 .resident_facets()
                 .contains(ResidencyFacet::Physics)
+                && vegetation.simulation_facet_is_settled(cell, influence)
             {
                 desired.insert(cell, generation);
             }

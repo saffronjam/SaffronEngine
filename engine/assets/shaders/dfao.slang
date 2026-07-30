@@ -3,9 +3,9 @@
 // Field over the hemisphere of each pixel's normal, reconstructing world position + normal
 // from the thin G-buffer. The output feeds a bilateral upsample + temporal accumulation
 // (the dfao-blur → dfao-accum chain, reusing the SSGI denoise kernels); the mesh then samples
-// the resolved sky-visibility (set 4 binding 5) to occlude the analytic sky irradiance. This
-// is why the expensive 9-cone GDF march no longer runs per full-res fragment — it runs once
-// per half-res pixel here and is denoised across frames.
+// the resolved sky-visibility (set 4 binding 5) to occlude the analytic sky irradiance. The
+// 9-cone GDF march is too expensive per full-res fragment, so it runs once per half-res pixel
+// here and is denoised across frames.
 //
 // Sets: 0 = the bindless brick arrays (the `sdf` import; unused on this path — only the GDF
 // clipmap is tapped), 1 = the light set (GDF cascade clipmap + params at bindings 9/10),

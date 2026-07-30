@@ -107,10 +107,10 @@ handler error enters the runtime error sink and stops that tick's dispatch.
 
 | What | File | Symbols |
 |---|---|---|
-| Layer selection and Rust matrix | `engine/crates/physics/src/world.rs`, `src/types.rs` | `resolve_object_layer`, `ObjectLayer`, `layers_collide` |
+| Layer selection and Rust matrix | `engine/crates/physics/src/world/`, `src/types.rs` | `resolve_object_layer`, `ObjectLayer`, `layers_collide` |
 | Jolt layer filters and listener | `engine/crates/physics-sys/shim/jolt_bridge.h`, `jolt_bridge.cpp` | `BroadPhaseLayerImpl`, `ObjectVsBroadPhaseImpl`, `ObjectLayerPairImpl`, `ContactListenerImpl` |
-| Contact event ring | `engine/crates/physics/src/world.rs`, `src/types.rs` | `World::drain_into_ring`, `World::drain_contacts`, `ContactEvent`, `ContactDrain`, `CONTACT_RING_CAP` |
-| Control protocol | `engine/crates/control/src/commands_physics.rs`, `engine/crates/protocol/src/dto.rs` | `register_physics_commands`, `DrainContactsParams`, `DrainContactsResult`, `ContactEventDto` |
+| Contact event ring | `engine/crates/physics/src/world/`, `src/types.rs` | `World::drain_into_ring`, `World::drain_contacts`, `ContactEvent`, `ContactDrain`, `CONTACT_RING_CAP` |
+| Control protocol | `engine/crates/control/src/commands_physics.rs`, `engine/crates/protocol/src/dto/` | `register_physics_commands`, `DrainContactsParams`, `DrainContactsResult`, `ContactEventDto` |
 | Script consumption | `engine/crates/runtime/src/session.rs`, `engine/crates/script/src/runtime.rs` | `RuntimeSession::step`, `ScriptHost::dispatch_contact`, `ContactInfo` |
 
 ## Related

@@ -903,6 +903,7 @@ pub fn with_stub<T>(
         vegetation_collision: None,
         vegetation_promotion: None,
         vegetation_navigation: None,
+        vegetation_ecology: None,
         vegetation_telemetry: None,
         physics: None,
         vegetation_jobs: &mut vegetation_jobs,

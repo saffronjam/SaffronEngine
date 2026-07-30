@@ -71,7 +71,7 @@ The titlebar alarm badge opens Profiler when an active alarm names a render pass
 | Span-tree conversion | `editor/src/lib/captureTree.ts` | `spansToFlameTree`, `CaptureTree` |
 | Trace encoders | `editor/src/lib/chromeTrace.ts`, `editor/src/lib/perfettoExport.ts` | `captureToChromeTrace`, `toPerfettoTrace` |
 | Loopback trace delivery | `editor/shell/src/state.rs`, `editor/shell/src/commands.rs` | `ShellState::serve_trace`, `start_trace_server`, `serve_trace` |
-| Capture commands | `engine/crates/control/src/commands_render.rs` | `profiler.capture-start`, `profiler.capture-status`, `profiler.capture-stop` |
+| Capture commands | `engine/crates/control/src/commands_render/` | `profiler.capture-start`, `profiler.capture-status`, `profiler.capture-stop` |
 
 ## Related
 

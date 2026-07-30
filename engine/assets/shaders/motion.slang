@@ -4,31 +4,20 @@
 // previous camera viewProj.
 //
 // Two sources of motion are reprojected together:
-//   - object motion: inst.model vs inst.prevModel (the whole entity moved).
-//   - deformation motion (deforming meshes — skinned or morph): binding 0 = this frame's
-//     deformed position, binding 1 = the previous frame's deformed position. For a static
-//     mesh both bindings point at the same static stream, so prevPosition == position and
-//     only object motion contributes.
-// current clip = curViewProj  * model     * position
-// previous clip = prevViewProj * prevModel * prevPosition
+//   - object motion: the scene instance record's current and previous world columns.
+//   - deformation motion: the current and previous streams of whatever deforms the vertex —
+//     skin/morph output, a regenerated blade, or the displacement arena's geomorph slide. A
+//     static vertex reads one position for both, so only object motion contributes.
+// current clip = curViewProj  * curColumns  * position
+// previous clip = prevViewProj * prevColumns * prevPosition
 
 import coverage;
 import global_gpu_data;
 import material_params;
+import scene_micro_common;
 
 [[vk::binding(0, 0)]] Sampler2D albedoTextures[1024];
 
-struct Instance
-{
-    float4x4 model;
-    float4x4 normalMatrix;
-    float4x4 prevModel;  // last frame's world matrix (object-motion reprojection)
-    float4 baseColor;
-    uint4 texture;
-    float4 pbr;
-    float4 emissive;
-};
-[[vk::binding(0, 2)]] StructuredBuffer<Instance> instances;
 [[vk::binding(2, 2)]] StructuredBuffer<MaterialParams> materialParams;
 
 struct Push
@@ -37,14 +26,6 @@ struct Push
     float4x4 prevViewProj;
 };
 [[vk::push_constant]] Push pc;
-
-struct VertexInput
-{
-    [[vk::location(0)]] float3 position;      // binding 0: this frame's (deformed) position
-    [[vk::location(1)]] float3 normal;
-    [[vk::location(2)]] float2 uv0;
-    [[vk::location(3)]] float3 prevPosition;  // binding 1: previous frame's (deformed) position
-};
 
 struct VertexOutput
 {
@@ -59,24 +40,6 @@ struct VertexOutput
     nointerpolation uint transition : TEXCOORD5;
 };
 
-[shader("vertex")]
-VertexOutput vertexMain(VertexInput input, uint instanceIndex : SV_VulkanInstanceID)
-{
-    Instance inst = instances[instanceIndex];
-    VertexOutput output;
-    float4 curWorld = mul(inst.model, float4(input.position, 1.0));
-    float4 prevWorld = mul(inst.prevModel, float4(input.prevPosition, 1.0));
-    output.position = mul(pc.curViewProj, curWorld);
-    output.curClip = output.position;
-    output.prevClip = mul(pc.prevViewProj, prevWorld);
-    output.worldPos = curWorld.xyz;
-    output.uv0 = input.uv0;
-    output.materialIndex = inst.texture.w;
-    output.coverageAnchor = input.position;
-    output.transition = 0u;
-    return output;
-}
-
 // The frame's semantic record stream (layout parity with the mesh module's binding).
 [[vk::binding(4, 2)]] StructuredBuffer<GpuDrawRecord> executorRecords;
 
@@ -85,7 +48,8 @@ VertexOutput vertexMain(VertexInput input, uint instanceIndex : SV_VulkanInstanc
 // same static position), current/previous world transforms from the scene instance
 // record's two column sets.
 [shader("vertex")]
-VertexOutput vertexMainExecutor(uint vertexIndex : SV_VertexID, uint recordIndex : SV_VulkanInstanceID)
+VertexOutput vertexMainExecutor(
+    uint vertexIndex : SV_VulkanVertexID, uint recordIndex : SV_VulkanInstanceID)
 {
     let addresses = gpuSceneAddresses;
     let record = executorRecords[recordIndex];
@@ -127,6 +91,17 @@ VertexOutput vertexMainExecutor(uint vertexIndex : SV_VertexID, uint recordIndex
         local = vertex.position;
         prevLocal = local;
         uv = float2(0.0);
+    }
+    else if (record.representation == GPU_REPRESENTATION_DISPLACED_MICRO)
+    {
+        // The amplification arena carries a parallel previous-frame stream at the same
+        // slot: same local grid, last frame's per-edge factors, so the cur→prev delta is
+        // exactly the geomorph slide the micro-vertex made.
+        float3 microNormal;
+        float2 prevUv;
+        float3 prevNormal;
+        gpuSceneDisplacedVertex(addresses, vertexIndex, false, local, microNormal, uv);
+        gpuSceneDisplacedVertex(addresses, vertexIndex, true, prevLocal, prevNormal, prevUv);
     }
     else if (record.deformation.index != 0xFFFFFFFFu
         && instance.deformation.index == record.deformation.index)

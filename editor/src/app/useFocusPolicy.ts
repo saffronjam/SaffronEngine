@@ -1,12 +1,6 @@
-/// Native-app focus policy. The web platform makes every control Tab-focusable and walks
-/// a focus ring through the DOM on each Tab — behavior that does not belong in a game
-/// editor, where Enter/Space on a stray-focused control (a toolbar button) fires it by
-/// accident. This traps the Tab key so it never moves focus through the editor chrome.
-///
-/// Tab is left alone inside an open dialog (`[role="dialog"]`): Radix already focus-traps
-/// its modals, so field/button navigation there stays fully functional. Tree/list
-/// keyboard navigation (arrow keys on a click-focused row) is a deliberate future
-/// addition and needs no Tab traversal.
+/// Native-app focus policy: traps Tab so it never walks a focus ring through the editor chrome,
+/// where Enter/Space on a stray-focused toolbar button would fire it by accident. Tab is left alone
+/// inside an open dialog, which Radix already focus-traps.
 import { useEffect } from "react";
 
 /// True while focus sits inside an open modal, where native Tab navigation is expected.

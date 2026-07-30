@@ -1,17 +1,8 @@
 //! The resolution from a loaded [`MaterialAsset`] (or a scene material component) to a
 //! render-ready [`SubmeshMaterial`] with bindless GPU texture handles.
 //!
-//! Three entry points, narrowing in scope:
-//!
-//! - [`build_submesh_material`] maps one resolved [`MaterialAsset`] to a
-//!   [`SubmeshMaterial`], resolving each texture slot through a borrowed loader closure.
-//!   The main draw path passes [`AssetServer::load_texture_asset`]; the thumbnail worker
-//!   passes its own uploader — one mapping, one call site, with the upload role explicit.
-//! - [`AssetServer::resolve_material_asset`] instantiates a [`MaterialAsset`] on the main
-//!   thread, wiring [`build_submesh_material`]'s loader to [`AssetServer::load_texture_asset`].
-//! - [`AssetServer::resolve_entity_materials`] resolves a single renderable's whole
-//!   submesh-material table, applying the per-entity component precedence and producing
-//!   the [`ResolvedMaterials`] result the draw loop reads.
+//! Texture slots resolve through a borrowed loader closure, so the main draw path and the thumbnail
+//! worker share one mapping with their own uploader.
 //!
 //! # The packed ORM/ARM map feeds two slots
 //!
@@ -61,8 +52,8 @@ const DEFAULT_MESH_SHADER: &str = "shaders/mesh.spv";
 /// (which selects the PSO) and a proxy albedo for the DDGI voxel box.
 ///
 /// Built by [`AssetServer::resolve_entity_materials`] from the entity's
-/// [`MaterialAsset`]/[`MaterialSet`]/[`Material`] component (precedence in that order),
-/// else engine defaults.
+/// [`MaterialAsset`]/[`MaterialSet`](saffron_scene::MaterialSet) component (precedence in that
+/// order), else engine defaults.
 #[derive(Clone)]
 pub struct ResolvedMaterials {
     /// One [`SubmeshMaterial`] per mesh submesh; a single entry applies to every
@@ -131,7 +122,7 @@ impl Default for ResolvedMaterials {
 /// `blend_mode` parses the `.smat` `blend` string for standard surfaces and follows the
 /// canonical coverage classification for thin sheets.
 ///
-/// The loader receives a [`TextureLoadRole`] so height and coverage pyramids use their canonical
+/// The loader receives a `TextureLoadRole` so height and coverage pyramids use their canonical
 /// builders while one closure retains the single mutable server borrow.
 pub fn build_submesh_material(
     material: &MaterialAsset,
@@ -316,7 +307,6 @@ impl AssetServer {
             return out;
         }
 
-        // The whole-mesh flags + codegen shader follow slot 0.
         out.unlit = slots[0].1.unlit;
         out.proxy_albedo = slots[0].1.base_color.truncate();
         if let Some(shader) = self.codegen_shader_for(slots[0].0) {
@@ -444,10 +434,8 @@ fn load_material_asset(assets: &mut AssetServer, id: saffron_core::Uuid) -> Opti
     if id == crate::EDITOR_CAMERA_MATERIAL_ID {
         return Some(crate::load::editor_camera_material_asset());
     }
-    // Cached parent-resolved material (before the per-slot overrides the caller layers on the
-    // returned clone). A present key — including a negative-cached `None` — skips the disk read;
-    // only a true miss reads + parses the `.smat` (and, for a container material, slices the
-    // `.smodel` chunk). Cleared wholesale on any material mutation.
+    // A present key — including a negative-cached `None` — skips the disk read; only a true miss
+    // reads + parses the `.smat` (and, for a container material, slices the `.smodel` chunk).
     if let Some(cached) = assets.material_by_uuid.get(&id.value()) {
         return cached.as_ref().map(|material| (**material).clone());
     }
@@ -531,7 +519,6 @@ mod tests {
             };
         let sm = build_submesh_material(&material, &mut load);
 
-        // The factors copy across verbatim.
         assert_eq!(sm.base_color, Vec4::new(0.2, 0.4, 0.6, 1.0));
         assert_eq!(sm.metallic, 0.7);
         assert_eq!(sm.roughness, 0.3);
@@ -542,12 +529,9 @@ mod tests {
         assert_eq!(sm.uv_offset, Vec2::new(0.1, 0.2));
         assert_eq!(sm.height_scale, 0.1);
         assert_eq!(sm.alpha_cutoff, 0.25);
-        // `blend == "masked"` lowers to the masked blend mode.
         assert_eq!(sm.blend_mode, BlendMode::Masked);
 
-        // The packed ORM id is requested for *both* the metallic-roughness and the
-        // occlusion slot. `load`'s mutable borrow of `requests` ends at the call above
-        // (it is never used again), so the vector reads back here.
+        // The packed ORM id is requested for *both* the metallic-roughness and the occlusion slot.
         let orm_count = requests.iter().filter(|&&id| id == 200).count();
         assert_eq!(orm_count, 2, "the ORM id feeds both mr and occlusion");
         assert!(requests.contains(&100));
@@ -558,11 +542,8 @@ mod tests {
 
     #[test]
     fn build_submesh_material_populates_both_handles_from_one_orm_id() {
-        // A loader that hands a distinct (dummy) handle per id — but we cannot construct a
-        // real `GpuTexture` off-GPU, so this asserts the *handle presence* contract via the
-        // request count instead: an ORM id present yields two requests, mr + occlusion,
-        // and the slots are set from the same id (proved by the request-count test above).
-        // Here we assert the blend-mode derivation across the three glTF alpha modes.
+        // A real `GpuTexture` cannot be constructed off-GPU, so this asserts the blend-mode
+        // derivation across the three glTF alpha modes.
         for (blend, expect) in [
             ("opaque", BlendMode::Opaque),
             ("masked", BlendMode::Masked),
@@ -670,7 +651,6 @@ mod tests {
 
     #[test]
     fn build_submesh_material_leaves_zero_ids_unset() {
-        // The default material has every texture id at zero.
         let material = MaterialAsset::default();
         let mut asked = 0u32;
         let sm = build_submesh_material(&material, &mut |_, _| {
@@ -755,14 +735,12 @@ mod tests {
         let meshes = [submesh(0), submesh(0), submesh(0)];
         let resolved = assets.resolve_entity_materials(&NoGpu, &scene, entity, &meshes);
 
-        // The slot's `.smat`: its base color, its unlit flag, one entry per submesh.
         assert_eq!(resolved.submeshes.len(), 3);
         assert!(resolved.unlit);
         assert_eq!(resolved.proxy_albedo, Vec3::new(0.11, 0.22, 0.33));
         for sm in &resolved.submeshes {
             assert_eq!(sm.base_color, Vec4::new(0.11, 0.22, 0.33, 1.0));
         }
-        // A no-graph material keeps the shared übershader.
         assert_eq!(resolved.shader, DEFAULT_MESH_SHADER);
 
         let _ = std::fs::remove_dir_all(&tmp);
@@ -787,7 +765,6 @@ mod tests {
         let meshes = [submesh(0)];
         let resolved = assets.resolve_entity_materials(&NoGpu, &scene, entity, &meshes);
         assert_eq!(resolved.submeshes.len(), 1);
-        // Base color rides through from the `.smat`; metallic comes from the override.
         assert_eq!(
             resolved.submeshes[0].base_color,
             Vec4::new(0.4, 0.5, 0.6, 1.0)
@@ -838,7 +815,6 @@ mod tests {
         let resolved = assets.resolve_entity_materials(&NoGpu, &scene, entity, &meshes);
 
         assert_eq!(resolved.submeshes.len(), 3);
-        // Slot 0 drives the whole-mesh `unlit` + proxy albedo.
         assert!(resolved.unlit);
         assert_eq!(resolved.proxy_albedo, Vec3::new(1.0, 0.0, 0.0));
         assert_eq!(
@@ -849,7 +825,6 @@ mod tests {
             resolved.submeshes[1].base_color,
             Vec4::new(0.0, 1.0, 0.0, 1.0)
         );
-        // The out-of-range slot clamps to the last slot.
         assert_eq!(
             resolved.submeshes[2].base_color,
             Vec4::new(0.0, 1.0, 0.0, 1.0)
@@ -866,9 +841,10 @@ mod tests {
         };
         params.voxel_moments.transmission_mean = [scalar(transmission); 3];
         params.voxel_moments.thickness_mean = scalar(thickness_m);
-        let mut material = SubmeshMaterial::default();
-        material.thin_sheet = Some(thin_sheet_material(&params));
-        material
+        SubmeshMaterial {
+            thin_sheet: Some(thin_sheet_material(&params)),
+            ..SubmeshMaterial::default()
+        }
     }
 
     #[test]

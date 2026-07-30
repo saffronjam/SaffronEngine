@@ -1,26 +1,24 @@
 // The GPU visibility counters report the frame's real work, not plausible-looking numbers.
 //
-// A telemetry word that is wired to the wire but never incremented reads as a healthy zero, and a
-// zero is indistinguishable from "this frame did no such work". That makes counters uniquely easy
-// to ship broken: nothing looks wrong. So each one here is asserted against a scene where its true
-// value is known independently of the counter itself.
+// A telemetry word wired to the wire but never incremented reads as a healthy zero, and a zero is
+// indistinguishable from "this frame did no such work". So each counter is asserted against a scene
+// where its true value is known independently of the counter itself.
 //
-// The two added last are `bins` and `deformed`. `bins` counts executor buckets that received a
-// record, which is the number of indirect draws the frame issues — counted on the pass that already
-// touches every record rather than by scanning the bucket table afterwards. `deformed` counts the
-// instances a view composed deformed bounds for, which is deformation work that reached a view
-// rather than slots that merely carry the flag.
+// `bins` counts executor buckets that received a record, which is the number of indirect draws the
+// frame issues, counted on the pass that already touches every record rather than by scanning the
+// bucket table afterwards. `deformed` counts the instances a view composed deformed bounds for,
+// which is deformation work that reached a view rather than slots that merely carry the flag.
 
 import { afterAll, beforeAll, expect, test } from "bun:test";
-import type { GpuSceneStatsDto } from "@saffron/protocol";
+import type { GpuSceneMirrorStatsDto } from "@saffron/protocol";
 import type { Engine } from "./harness.ts";
 import { Cleaner, bootEngine, prepareScene } from "./test-utils.ts";
 
 const cleaner = new Cleaner();
 let engine: Engine;
-/// Counters with an empty scene, and after content arrives.
-let empty: GpuSceneStatsDto;
-let populated: GpuSceneStatsDto;
+// Counters with an empty scene, and after content arrives.
+let empty: GpuSceneMirrorStatsDto;
+let populated: GpuSceneMirrorStatsDto;
 
 beforeAll(async () => {
   engine = await bootEngine(cleaner, { SAFFRON_SCRATCH_PROJECT: "1" });
@@ -30,7 +28,7 @@ beforeAll(async () => {
     camera: { position: { x: 0, y: 2, z: 6 }, yaw: 0, pitch: -15 },
   });
   await engine.settle(900);
-  empty = await engine.call<GpuSceneStatsDto>("gpu-scene-stats");
+  empty = await engine.call<GpuSceneMirrorStatsDto>("gpu-scene-stats");
 
   await engine.call("add-entity", { preset: "plane" });
   for (const x of [-2, 0, 2]) {
@@ -46,7 +44,7 @@ beforeAll(async () => {
     });
   }
   await engine.settle(1200);
-  populated = await engine.call<GpuSceneStatsDto>("gpu-scene-stats");
+  populated = await engine.call<GpuSceneMirrorStatsDto>("gpu-scene-stats");
 }, 180_000);
 
 afterAll(async () => {
@@ -91,13 +89,13 @@ test("the reach view keeps what a gather can read, not what the camera can see",
   // cannot move at all, and without the box test everything would stay visible forever.
   await engine.call("set-camera", { position: { x: 100_000, y: 2, z: 100_000 }, yaw: 0, pitch: 0 });
   await engine.settle(900);
-  const away = await engine.call<GpuSceneStatsDto>("gpu-scene-stats");
+  const away = await engine.call<GpuSceneMirrorStatsDto>("gpu-scene-stats");
   expect(away.visibility.giReachCulled).toBeGreaterThan(0);
   expect(away.visibility.giReachVisible).toBe(0);
 
   await engine.call("set-camera", { position: { x: 0, y: 2, z: 6 }, yaw: 0, pitch: -15 });
   await engine.settle(900);
-  const back = await engine.call<GpuSceneStatsDto>("gpu-scene-stats");
+  const back = await engine.call<GpuSceneMirrorStatsDto>("gpu-scene-stats");
   expect(back.visibility.giReachVisible).toBeGreaterThan(0);
   expect(engine.validationErrors()).toEqual([]);
 }, 60_000);
@@ -145,16 +143,16 @@ test("covered samples count real lanes only while something is measuring", async
   // means anything if the counter is genuinely zero when nothing is measuring and genuinely
   // nonzero when something is. Both halves are asserted, because a counter that is always zero
   // reads as healthy and a counter that always fires costs an atomic per fragment forever.
-  const idle = await engine.call<GpuSceneStatsDto>("gpu-scene-stats");
+  const idle = await engine.call<GpuSceneMirrorStatsDto>("gpu-scene-stats");
   expect(idle.visibility.coveredSamples).toBe(0);
 
   await engine.call("profiler.set-mode", { mode: "timestamps" });
   await engine.settle(400);
-  const armed = await engine.call<GpuSceneStatsDto>("gpu-scene-stats");
+  const armed = await engine.call<GpuSceneMirrorStatsDto>("gpu-scene-stats");
   expect(armed.visibility.coveredSamples).toBeGreaterThan(0);
 
   await engine.call("profiler.set-mode", { mode: "off" });
   await engine.settle(400);
-  const stopped = await engine.call<GpuSceneStatsDto>("gpu-scene-stats");
+  const stopped = await engine.call<GpuSceneMirrorStatsDto>("gpu-scene-stats");
   expect(stopped.visibility.coveredSamples).toBe(0);
 });

@@ -157,9 +157,8 @@ fn run(
 }
 
 /// Loads an existing project's doc off-thread: read + parse + version-gate (`Manifest`), then the
-/// catalog reconcile (`Catalog`). Mirrors the ordered doc-half of the former synchronous
-/// `AssetServer::load_project`, minus the GPU idle + cache clear + `scene_from_json` (all main
-/// thread).
+/// catalog reconcile (`Catalog`). The GPU idle, cache clear, and `scene_from_json` stay on the main
+/// thread.
 fn load_open(
     selection: &str,
     sa_lua_defs: &str,

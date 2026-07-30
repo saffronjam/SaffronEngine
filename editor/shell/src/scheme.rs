@@ -72,8 +72,8 @@ wrap_resource_handler! {
 
     impl ResourceHandler {
         /// Kick the cache read off the CEF IO thread: report async handling (`handle_request = 0`),
-        /// fetch on the shared runtime, and signal completion with `callback.cont()`. The old blocking
-        /// `block_on` in `create` serialized every image on the one IO thread; this lets them overlap.
+        /// fetch on the shared runtime, and signal completion with `callback.cont()`, so a screenful
+        /// of images overlaps instead of serializing on the one IO thread.
         fn open(
             &self,
             _request: Option<&mut Request>,
@@ -149,7 +149,7 @@ wrap_resource_handler! {
             serve(&self.state, data_out, bytes_to_read, bytes_read)
         }
 
-        /// The deprecated read path, kept identical so whichever CEF calls, the buffer drains the same.
+        /// CEF may call either read entry point; both drain the buffer identically.
         fn read_response(
             &self,
             data_out: *mut u8,

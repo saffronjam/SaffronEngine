@@ -1,9 +1,9 @@
 //! GPU device-loss diagnostics: `VK_NV_device_diagnostic_checkpoints` + `VK_EXT_device_fault`.
 //!
-//! Every render-graph pass and one-off upload submission drops a named checkpoint into its
-//! command stream. When the device is lost, the queue reports the last checkpoint each pipeline
-//! stage reached — naming the submission that wedged the GPU — and the fault query adds the
-//! driver's fault kind and faulting GPU addresses, instead of a bare `ERROR_DEVICE_LOST`.
+//! Every render-graph pass and one-off upload submission drops a named checkpoint into its command
+//! stream. When the device is lost, the queue reports the last checkpoint each pipeline stage
+//! reached — naming the submission that wedged the GPU — and the fault query adds the driver's
+//! fault kind and faulting GPU addresses.
 
 use std::ffi::c_void;
 use std::sync::Mutex;

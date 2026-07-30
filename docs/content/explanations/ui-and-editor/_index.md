@@ -58,13 +58,16 @@ The [Zustand](https://zustand.docs.pmnd.rs/) store holds editor-facing state. It
 | [Profiler panel](profiler-panel/) | Capture controls, flame views, and trace export | `ProfilerPanel`, `spansToFlameTree` |
 | [Physics panel](physics-panel/) | Live body diagnostics, contacts, and ragdoll controls | `PhysicsPanel`, `physics-state`, `drain-contacts` |
 | [Script logs panel](script-logs-panel/) | Script log draining, filtering, and entity navigation | `ScriptLogsPanel`, `drain-script-logs` |
+| [Vegetation mode](vegetation-mode/) | Tool palette, brush strokes, layer transactions, cook and review | `VegetationPanel`, `commitStroke`, `VEGETATION_TOOLS` |
+| [Vegetation asset workspaces](vegetation-asset-workspaces/) | Plant and biome authoring panels around the asset preview | `AssetEditorWorkspace`, `PlantGraphPanel`, `BiomeGraphPanel` |
+| [Ecology and telemetry panels](ecology-and-telemetry-panels/) | Biological clock transport, stage times, and vegetation budgets | `EcologyTimelinePanel`, `VegetationTelemetryPanel` |
 
 ## In the code
 
 | What | File | Symbols |
 |---|---|---|
 | Editor application | `editor/src/app/App.tsx` | `App`, `startReconcile` |
-| Typed engine client | `editor/src/control/client.ts` | `call`, `client`, `ControlError` |
+| Typed engine client | `editor/src/control/client/` | `call`, `client`, `ControlError` |
 | Browser-to-shell IPC | `editor/shell/src/ipc.rs` | `CommandQueryHandler`, `browser_router` |
 | Native command dispatch | `editor/shell/src/commands.rs` | `dispatch` |
 | Platform contract | `editor/shell/src/backend/mod.rs` | `Handles`, `UiCompositor`, `presenter` |

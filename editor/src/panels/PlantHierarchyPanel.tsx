@@ -1,18 +1,11 @@
-/// The Plant workspace's hierarchy, voxel, and error view.
+/// The cooked cut and its declared errors: which nodes draw triangles, which draw an aggregate voxel
+/// brick, and the transition error each one declares, with a cut control that makes the preview
+/// beside it draw either representation.
 ///
-/// Two halves that only mean something together. The table says what the cooker produced — which
-/// nodes draw triangles, which draw an aggregate voxel brick, and the transition error each one
-/// declares. The cut control makes the preview beside it actually draw one or the other.
-///
-/// Pinning the cut is the part that was missing. A representation comparison needs the cut to move
-/// while the camera holds still: flying out to reach the aggregate shrinks the subject at the same
-/// time, so any difference you see conflates the two changes. That is why this is a control rather
-/// than a distance slider — and why it used to be a boot-time environment variable, which is no way
-/// to compare anything.
-///
-/// The error column is the number the cut selector reads, not a description of it. A node whose
-/// declared error saturates will never be selected while anything finer is resident, which is the
-/// correct outcome for a comb of thin blades and a surprising one until you can see it.
+/// The cut is pinnable rather than distance-driven because a representation comparison needs the cut
+/// to move while the camera holds still — flying out to reach the aggregate shrinks the subject at
+/// the same time, conflating the two changes. The error column is the number the cut selector reads:
+/// a node whose declared error saturates is never selected while anything finer is resident.
 import { useCallback, useEffect, useState } from "react";
 import { client } from "../control/client";
 import { errorText, notifyError } from "../lib/flash";

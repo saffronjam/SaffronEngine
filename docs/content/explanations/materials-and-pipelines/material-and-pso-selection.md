@@ -49,7 +49,7 @@ Blend mode belongs to a material slot rather than the whole mesh. Each submesh's
 
 At one sample, opaque and masked submeshes share the opaque PSO because the shader performs the alpha test. With MSAA, a masked submesh selects an alpha-to-coverage PSO. Translucent submeshes use blending with depth writes disabled; a GPU radix sort emits one back-to-front command slice per blend bucket, and the scene's translucent scope replays each slice with its blend PSO.
 
-The scene pass binds one mesh PSO per bucket, while each depth-family pass (depth prepass, shadows, G-buffer, motion) draws every bucket through one shared vertex-only executor PSO. Different texture handles and PBR factors do not split a bucket. Skinning and morphing add no permutations either — their outputs land in per-frame deformed buffers the executor vertex path pulls through device addresses. Displaced submeshes draw through the tessellation seam instead: the traversal skips their records, and per-pass `TessSceneDraw` indirect draws render the amplified geometry through the renderer's only vertex-input PSOs.
+The scene pass binds one mesh PSO per bucket, while each depth-family pass (depth prepass, shadows, G-buffer, motion) draws every bucket through one shared vertex-only executor PSO. Different texture handles and PBR factors do not split a bucket. Skinning and morphing add no permutations either — their outputs land in per-frame deformed buffers the executor vertex path pulls through device addresses. A displaced instance adds one bucket per live material class rather than a permutation: its records name the displaced representation in their `psoBin`, so the bucket's draw binds the amplification arena's index stream while sharing the pass's PSO.
 
 ## Pipeline state
 

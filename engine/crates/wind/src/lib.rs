@@ -9,8 +9,7 @@
 
 use glam::{DVec3, Vec3};
 
-/// The global wind parameter set one field samples from. Mirrors the authored
-/// `SceneEnvironment` wind settings; consumers build it once per frame.
+/// The global wind parameter set one field samples from.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct WindProfile {
     /// Horizontal direction in degrees, clockwise from world +Z.
@@ -91,8 +90,8 @@ pub struct LocalWindSource {
     pub falloff: f32,
 }
 
-/// The 0..1 influence weight of a source at a distance (1 inside the un-falloff'd
-/// core, fading linearly to the radius edge).
+/// The 0..1 influence weight of a source at a distance: 1 inside the core, fading
+/// linearly to the radius edge.
 fn source_weight(source: &LocalWindSource, distance: f32) -> f32 {
     if source.radius <= 0.0 || distance >= source.radius {
         return 0.0;
@@ -179,11 +178,9 @@ fn octave_phase(seed: u32, octave: u32, lane: u32) -> f32 {
     (hash as f32 / u32::MAX as f32) * core::f32::consts::TAU
 }
 
-/// Samples the field at a world position (metres) and monotonic simulation time
-/// (seconds). Pure and deterministic: equal inputs sample equal velocities.
-#[must_use]
 /// The height response of the mean speed: a power-law shear profile of the authored
 /// reference speed, clamped at ground level so subterranean samples stay finite.
+#[must_use]
 pub fn shear_factor(profile: &WindProfile, height_m: f32) -> f32 {
     if profile.height_exponent <= 0.0 {
         return 1.0;
@@ -194,6 +191,9 @@ pub fn shear_factor(profile: &WindProfile, height_m: f32) -> f32 {
         .powf(profile.height_exponent)
 }
 
+/// Samples the field at a world position (metres) and monotonic simulation time
+/// (seconds). Pure and deterministic: equal inputs sample equal velocities.
+#[must_use]
 pub fn sample(profile: &WindProfile, position: DVec3, time: f64) -> WindSample {
     if profile.speed <= 0.0 {
         return WindSample {
@@ -212,8 +212,7 @@ pub fn sample(profile: &WindProfile, position: DVec3, time: f64) -> WindSample {
     let gust_front = (front_phase.sin() * 0.5 + 0.5).powi(2);
 
     // Multiscale turbulence: fixed-phase sinusoid gradients advected with the mean
-    // flow. Amplitudes decay by the roughness ratio per octave; the horizontal
-    // components dominate with a small vertical lane.
+    // flow, amplitudes decaying by the roughness ratio per octave.
     let mut turbulence = Vec3::ZERO;
     let mut amplitude = 1.0_f32;
     let mut total = 0.0_f32;

@@ -101,7 +101,7 @@ unsubscribes them by token on detach, so a dangling subscription is a detectable
 | Snapshot + stop-propagation dispatch | `engine/crates/signal/src/lib.rs` | `publish` |
 | Typed window signals | `engine/crates/window/src/lib.rs` | `dispatch_window_event`, `on_resize`, `on_raw_event` |
 | Editor signals | `engine/crates/sceneedit/src/context.rs`, `play.rs` | `on_selection_changed`, `set_selection`, `on_play_state_changed`, `publish_transition` |
-| Host lifecycle markers | `engine/crates/host/src/layer.rs` | `install_play_state_hooks`, `play_hooks_live` |
+| Host lifecycle markers | `engine/crates/host/src/layer/` | `install_play_state_hooks`, `play_hooks_live` |
 | Player input wiring | `engine/crates/player/src/main.rs` | `wire_input` |
 
 ## Related

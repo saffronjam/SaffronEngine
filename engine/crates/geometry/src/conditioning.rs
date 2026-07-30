@@ -1,16 +1,15 @@
-//! Import-time **watertight conditioning** of a base mesh: welded-vertex identity, edge
-//! adjacency, UV-seam detection, and a per-welded displacement direction + seam-consistent
-//! tangent seed — plus the per-height-texture min-max pyramid.
+//! Import-time watertight conditioning of a base mesh: welded-vertex identity, edge adjacency,
+//! UV-seam detection, a per-welded displacement direction and seam-consistent tangent seed, and
+//! the per-height-texture min-max pyramid.
 //!
-//! These are the data the adaptive tessellator (Phase 3 factors, Phase 4 dice/weld) consumes to
-//! amplify a base triangle into displaced micro-geometry **without cracks**: a shared edge diced by
-//! both incident triangles resolves to one [`Edge`] (so both read the same tessellation factor), a
-//! welded vertex carries one agreed displacement direction (so every base copy of a seam vertex
-//! lands on one 3D point), and a seam edge is flagged so the two islands sample an equal height.
+//! The adaptive tessellator consumes these to amplify a base triangle into displaced
+//! micro-geometry without cracks: a shared edge diced by both incident triangles resolves to one
+//! [`Edge`], so both read the same tessellation factor; a welded vertex carries one agreed
+//! displacement direction, so every base copy of a seam vertex lands on one 3D point; and a seam
+//! edge is flagged so the two islands sample an equal height.
 //!
-//! Everything here is a **pure function of the mesh** (the seam *sampling mode* aside, which the
-//! material import may refine over the height image), so it is baked into every `.smesh` v5 and
-//! verified entirely on the CPU — no GPU, no dependence on the later dicer.
+//! Everything here is a pure function of the mesh apart from the seam sampling mode, which the
+//! material import may refine over the height image.
 
 use std::collections::HashMap;
 
@@ -25,17 +24,17 @@ pub const EDGE_BOUNDARY: u32 = 1 << 0;
 /// so watertight displacement requires both to read an *equal* height value there.
 pub const EDGE_SEAM: u32 = 1 << 1;
 /// Edge flag: referenced by more than two triangles — non-manifold, factored by a clamped
-/// world-space fallback at Phase 3 rather than cracking.
+/// world-space fallback rather than cracking.
 pub const EDGE_NON_MANIFOLD: u32 = 1 << 2;
-/// Edge flag (only meaningful with [`EDGE_SEAM`]): sample this seam's height in object space /
-/// triplanar so both islands read one value independent of UV. Clear ⇒ the default seam-aware
-/// dilation path ([`EDGE_SEAM`] alone), which the material import reconciles + verifies on the image.
+/// Edge flag (only meaningful with [`EDGE_SEAM`]): sample this seam's height in object space or
+/// triplanar so both islands read one value independent of UV. Clear selects the seam-aware
+/// dilation path, which the material import reconciles and verifies on the image.
 pub const EDGE_SEAM_OBJECT_SPACE: u32 = 1 << 3;
 
-/// One unique mesh edge, keyed on its **welded** endpoint pair (canonical `v0 < v1`).
+/// One unique mesh edge, keyed on its welded endpoint pair (canonical `v0 < v1`).
 ///
-/// Exactly 16 bytes, `#[repr(C)]` Pod: serializes into the `.smesh` conditioning section and uploads
-/// as a storage buffer with no re-pack. Both triangles sharing this edge resolve to the same record,
+/// Exactly 16 bytes, so it serializes into the `.smesh` conditioning section and uploads as a
+/// storage buffer with no re-pack. Both triangles sharing this edge resolve to the same record,
 /// so a per-edge tessellation factor is indexable identically by either.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Pod, Zeroable)]
@@ -52,8 +51,6 @@ pub struct Edge {
 
 /// A triangle's three edge indices into the unique-edge list, parallel to
 /// `indices.chunks_exact(3)`. `e[k]` is the edge between welded corner `k` and corner `(k+1)%3`.
-///
-/// Exactly 16 bytes, `#[repr(C)]` Pod.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Pod, Zeroable)]
 pub struct TriEdges {
@@ -63,18 +60,12 @@ pub struct TriEdges {
     pub _pad: u32,
 }
 
-/// The position + shading/displacement basis of one welded vertex.
+/// The position plus shading/displacement basis of one welded vertex.
 ///
-/// Exactly 64 bytes, `#[repr(C)]` Pod, std430-clean (four 16-byte vectors). `position.xyz` is the
-/// shared object-space position (every base copy of this welded vertex coincides here — the factor
-/// kernel reads endpoint positions from it, indexed by an [`Edge`]'s welded ids, and the dicer
-/// interpolates the base triangle from it). `direction.xyz` is the unit displacement direction (the
-/// averaged, renormalized geometric normal, so every copy displaces to one point). `tangent.xyz` is
-/// the seam-consistent tangent seed (Gram-Schmidt against the direction), `tangent.w` the ±1
-/// handedness. `uv.xy` is the representative base UV (`zw` = 0), stored last-write like `position` so
-/// both incident triangles of a shared edge read one agreed UV — the factor kernel samples the
-/// per-height min/max pyramid over each edge's UV span from it, giving per-region detail-adaptive LOD
-/// while staying a pure function of the shared endpoints (crack-free).
+/// Exactly 64 bytes and std430-clean (four 16-byte vectors). Every base copy of a welded vertex
+/// coincides at `position`, shares one `direction` so every copy displaces to the same point, and
+/// reads one representative `uv` so both incident triangles of a shared edge sample the min-max
+/// pyramid over the same span — which is what keeps detail-adaptive tessellation crack-free.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Pod, Zeroable)]
 pub struct WeldedVertex {
@@ -142,16 +133,14 @@ fn branchless_tangent(n: Vec3) -> Vec3 {
 }
 
 impl MeshConditioning {
-    /// Conditions a base mesh: weld first (so edges key on welded identity, not attribute-split base
-    /// identity — otherwise a UV seam reads as a boundary and its factor is never shared), then edge
-    /// adjacency + seam detection. A pure function of the mesh; the tangent seed reads the base
-    /// [`crate::Vertex::tangent`] frame [`crate::compute_tangents`] already produced.
+    /// Conditions a base mesh: weld first, so edges key on welded identity rather than
+    /// attribute-split base identity — otherwise a UV seam reads as a boundary and its factor is
+    /// never shared — then edge adjacency and seam detection.
     pub fn build(mesh: &Mesh) -> Self {
         let n = mesh.vertices.len();
         let (lo, hi) = aabb(mesh);
         let eps = weld_epsilon(lo, hi);
 
-        // --- Weld: base vertex → welded id, averaging direction + tangent per welded vertex. ---
         let mut cell: HashMap<[i64; 3], u32> = HashMap::new();
         let mut weld_id = vec![0u32; n];
         let mut welded_count = 0u32;
@@ -173,8 +162,8 @@ impl MeshConditioning {
         let mut handed_sum = vec![0.0f32; wc];
         for (i, v) in mesh.vertices.iter().enumerate() {
             let w = weld_id[i] as usize;
-            // All base copies of a welded vertex coincide, so any one is the shared position; the UV
-            // is representative (last-write) so both incident triangles of a shared edge agree on it.
+            // Base copies coincide, so any one is the shared position; the last-write UV is what
+            // makes both incident triangles of a shared edge agree.
             position[w] = v.position;
             uv[w] = v.uv0;
             dir_sum[w] += v.normal;
@@ -188,8 +177,8 @@ impl MeshConditioning {
                 direction = Vec3::Y;
             }
             let handed = if handed_sum[w] < 0.0 { -1.0 } else { 1.0 };
-            // Gram-Schmidt the averaged tangent against the welded direction, so both incident
-            // triangles at a seam start from one agreed frame.
+            // Gram-Schmidt against the welded direction, so both incident triangles at a seam
+            // start from one agreed frame.
             let mut tangent =
                 (tan_sum[w] - direction * direction.dot(tan_sum[w])).normalize_or_zero();
             if tangent.length_squared() < 0.5 || !tangent.is_finite() {
@@ -205,7 +194,6 @@ impl MeshConditioning {
             });
         }
 
-        // --- Edge adjacency over welded ids, with per-edge UV records for seam detection. ---
         let mut edge_map: HashMap<(u32, u32), u32> = HashMap::new();
         let mut edges: Vec<Edge> = Vec::new();
         let mut incident: Vec<u32> = Vec::new();
@@ -247,7 +235,6 @@ impl MeshConditioning {
             tri_edges.push(TriEdges { e: te, _pad: 0 });
         }
 
-        // --- Finalize edge flags: boundary / non-manifold / UV seam. ---
         const UV_EPS: f32 = 1e-5;
         for (i, edge) in edges.iter_mut().enumerate() {
             match incident[i] {
@@ -285,13 +272,12 @@ pub struct MinMaxLevel {
     pub texels: Vec<[f32; 2]>,
 }
 
-/// Builds a **min-max (max-mipmap) pyramid** over a height channel: level 0 is `(h, h)` per texel,
+/// Builds a min-max (max-mipmap) pyramid over a height channel: level 0 is `(h, h)` per texel,
 /// each coarser level the exact per-texel `(min, max)` of its up-to-2×2 children, down to 1×1.
 ///
-/// This is **not** a linear mip average — the prism march (Phase 9) and offset-limited parallax (D3)
-/// need a *conservative* bound, so it must be point-sampled with explicit LOD, never linearly
-/// filtered (linear filtering blends min with max and breaks the bound). Built CPU-side for exactness
-/// and self-verifiability. Returns an empty pyramid for a zero-extent input.
+/// This is not a linear mip average. The prism march and offset-limited parallax need a
+/// conservative bound, so the pyramid must be point-sampled with explicit LOD — linear filtering
+/// blends min with max and breaks the bound. A zero-extent input yields an empty pyramid.
 pub fn build_min_max_pyramid(height: &[f32], width: u32, height_px: u32) -> Vec<MinMaxLevel> {
     if width == 0 || height_px == 0 || (width as usize * height_px as usize) != height.len() {
         return Vec::new();
@@ -343,7 +329,7 @@ mod tests {
     use super::*;
     use crate::types::{Submesh, Vertex};
 
-    /// A flat quad on XZ (two triangles sharing the diagonal), UVs continuous from position.
+    /// A flat quad on XZ, two triangles sharing the diagonal, UVs continuous from position.
     fn quad() -> Mesh {
         let v = |x: f32, z: f32| Vertex {
             position: Vec3::new(x, 0.0, z),
@@ -366,7 +352,6 @@ mod tests {
     #[test]
     fn interior_edge_shared_by_two_triangles_boundary_by_one() {
         let c = MeshConditioning::build(&quad());
-        // 5 edges: 4 outer (boundary, 1 tri each) + 1 diagonal (interior, 2 tris).
         assert_eq!(c.edges.len(), 5);
         assert_eq!(c.tri_edges.len(), 2);
         let boundary = c

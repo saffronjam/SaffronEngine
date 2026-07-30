@@ -1,7 +1,4 @@
 //! The surface swapchain + its per-image sync, recreated as a unit on resize.
-//!
-//! The FIFO / clamped-extent / image-count selection is hand-rolled here, with
-//! per-image render-finished semaphores and borrowed-fence tracking.
 
 use ash::vk;
 

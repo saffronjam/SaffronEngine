@@ -69,7 +69,7 @@ call 6: set 6, on an RT device
 call 7: set 7, on an RT device
 ```
 
-Bucket replay changes pipelines but does not rebind these sets: every pass replays counted-indirect commands over the global pages arena, bound once as the index buffer, while the ubershader's `vertexMainExecutor` pulls vertices through buffer device address. `scene_draw_list_bind_count` reports five descriptor-binding calls for a non-RT scope and adds one for each RT set. This count is independent of the number of draw buckets.
+Bucket replay changes pipelines but does not rebind these sets: every pass replays counted-indirect commands over the global pages arena, bound once as the index buffer, while the ubershader's `vertexMainExecutor` pulls vertices through buffer device address. `scene_pass_bind_count` reports five descriptor-binding calls for a non-RT scope and adds one for each RT set. This count is independent of the number of draw buckets.
 
 Depth-family pipelines use compatible prefixes of the same layout. `record_executor_depth_family` records the depth prepass, the virtual-shadow pages, the G-buffer, motion, the wireframe overlay, and the reactive-coverage mask with one pipeline per pass, binding set 0 for the albedo alpha and set 2 for the record stream and material params, plus that pass's push-constant bytes.
 
@@ -83,11 +83,11 @@ Resource owners initialize neutral images and valid descriptor sets before drawi
 
 | What | File | Symbols |
 |---|---|---|
-| Device-global layout builders | `engine/crates/rendering/src/descriptors.rs` | `create_bindless_layout`, `create_light_layout`, `create_instance_layout`, `create_ibl_layout`, `create_ssao_mesh_layout` |
-| Pipeline layout assembly | `engine/crates/rendering/src/pipelines.rs` | `Pipelines::new`, `set_layouts`, `rt_enabled` |
+| Device-global layout builders | `engine/crates/rendering/src/descriptors/` | `create_bindless_layout`, `create_light_layout`, `create_instance_layout`, `create_ibl_layout`, `create_ssao_mesh_layout` |
+| Pipeline layout assembly | `engine/crates/rendering/src/pipelines/` | `Pipelines::new`, `set_layouts`, `rt_enabled` |
 | Mesh descriptor declarations | `engine/assets/shaders/lighting.slang`, `global_gpu_data.slang` | `vk::binding`, `LightGlobals`, `MaterialParams`, `GpuSceneAddressBlock`, `SAFFRON_NO_RT` |
-| Scope-level descriptor binding | `engine/crates/rendering/src/scene_pass.rs` | `bind_mesh_descriptor_sets`, `scene_draw_list_bind_count`, `record_executor_buckets`, `record_executor_depth_family` |
-| Frame sets 1 through 3 | `engine/crates/rendering/src/lighting.rs`, `instancing.rs`, `ibl.rs` | `Lighting::light_set`, `Instancing::instance_set`, `Ibl::set`, `ReflectionProbes::prepare_frame` |
+| Scope-level descriptor binding | `engine/crates/rendering/src/scene_pass.rs` | `bind_mesh_descriptor_sets`, `scene_pass_bind_count`, `record_executor_buckets`, `record_executor_depth_family` |
+| Frame sets 1 through 3 | `engine/crates/rendering/src/lighting/`, `instancing.rs`, `ibl.rs` | `Lighting::light_set`, `Instancing::instance_set`, `Ibl::set`, `ReflectionProbes::prepare_frame` |
 
 ## Related
 

@@ -1,17 +1,7 @@
-//! The device-shared screen-space-effects sub-state: the nearest G-buffer sampler,
-//! the two compute set layouts every screen-space pass binds, and the camera
-//! transforms + toggles the GTAO / contact-shadow / SSGI passes read.
-//!
-//! It owns the *device-shared* state only — the nearest sampler, the 2-binding
-//! (sampler+storage) and 3-binding (sampler+sampler+storage) compute layouts, the
-//! mesh set-4 layout, and the per-frame camera matrices. The descriptor *sets* that
-//! bind per-view images live in [`crate::ViewTarget`] (one set of each per editor
-//! pane), so a view switch never leaves a set bound to another view's images
-//! (README §2 per-view borrow split applied to compute sets).
-//!
-//! Built once in [`Ssao::new`], then borrowed `&Ssao` by the frame-graph build (its
-//! layouts/sampler are immutable after init); the camera + toggles are written
-//! through [`Ssao::set_camera`] / the toggle setters (`&mut self.ssao`).
+//! The device-shared screen-space-effects state: the nearest G-buffer sampler, the compute set
+//! layouts every screen-space pass binds, and the camera transforms + toggles the GTAO /
+//! contact-shadow / SSGI passes read. The descriptor sets that bind per-view images live in
+//! [`crate::ViewTarget`], so a view switch never leaves a set bound to another view's images.
 
 use std::sync::Arc;
 
@@ -466,7 +456,7 @@ impl Ssao {
 impl Drop for Ssao {
     fn drop(&mut self) {
         // SAFETY: the ash seam. The `Arc<DeviceResources>` keeps the device alive for
-        // the call; the run loop idled it before teardown (README §4). Each handle is
+        // the call; the run loop idled it before teardown. Each handle is
         // freed exactly once; the per-view sets free with the shared descriptor pool.
         let raw = self.resources.device();
         unsafe {
@@ -508,33 +498,12 @@ pub(crate) fn wants_gbuffer_prepass(
     gbuf_ready && (use_ssao || use_contact || use_ssgi || use_ssr)
 }
 
-/// A compute set layout with `sampler_count` leading combined-image-sampler bindings
-/// followed by one storage-image binding — the 2-binding (1 sampler) and 3-binding
-/// (2 sampler) shapes the screen-space chain uses. All bindings compute-stage.
+/// A compute set layout with `sampler_count` leading combined-image-sampler bindings followed by
+/// one storage-image binding — the shapes the screen-space chain uses.
 fn create_compute_layout(raw: &ash::Device, sampler_count: u32) -> Result<vk::DescriptorSetLayout> {
-    let mut bindings = Vec::with_capacity(sampler_count as usize + 1);
-    for b in 0..sampler_count {
-        bindings.push(
-            vk::DescriptorSetLayoutBinding::default()
-                .binding(b)
-                .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
-                .descriptor_count(1)
-                .stage_flags(vk::ShaderStageFlags::COMPUTE),
-        );
-    }
-    bindings.push(
-        vk::DescriptorSetLayoutBinding::default()
-            .binding(sampler_count)
-            .descriptor_type(vk::DescriptorType::STORAGE_IMAGE)
-            .descriptor_count(1)
-            .stage_flags(vk::ShaderStageFlags::COMPUTE),
-    );
-    let info = vk::DescriptorSetLayoutCreateInfo::default().bindings(&bindings);
-    // SAFETY: the ash seam. The bindings outlive the call; the layout is freed in `Drop`.
-    checked(
-        unsafe { raw.create_descriptor_set_layout(&info, None) },
-        "ssao compute layout",
-    )
+    let mut types = vec![vk::DescriptorType::COMBINED_IMAGE_SAMPLER; sampler_count as usize];
+    types.push(vk::DescriptorType::STORAGE_IMAGE);
+    crate::vk_write::compute_layout(raw, &types, "ssao compute layout")
 }
 
 /// The gi-resolve pass's single set layout (matches `gi_resolve.slang` set 0): b0 G-buffer sampler,

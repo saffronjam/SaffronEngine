@@ -1,11 +1,7 @@
-/// The asset editor's left panel (shown only for a rigged model): the bone hierarchy as a tree (the
-/// home bones never had in the scene outliner). Read-only navigation — expand/collapse and select a
-/// bone; selecting drives the preview overlay's highlight channel (set-skeleton-highlight, wired in
-/// AssetEditorWorkspace), never scene selection, so the selection-keyed animation state the timeline
-/// reads stays alive. Selection also flows in reverse — clicking a joint in the viewport drives the same
-/// channel — so the selected row scrolls into view here. Bone names render verbatim (they are the
-/// durable clip-binding keys); render joints are emphasized, intermediate nodes muted. Follows
-/// HierarchyTree's row/indent idiom.
+/// The asset editor's bone hierarchy, shown only for a rigged model. Selecting a bone drives the
+/// preview overlay's highlight channel, never scene selection, so the selection-keyed animation
+/// state the timeline reads stays alive; a viewport joint click flows back the same way. Bone names
+/// render verbatim — they are the durable clip-binding keys.
 import { useEffect, useMemo, useRef, useState } from "react";
 import { Bone, ChevronDown, ChevronRight } from "lucide-react";
 import { ScrollArea } from "@/components/ui/scroll-area";

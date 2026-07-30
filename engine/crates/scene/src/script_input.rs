@@ -1,14 +1,10 @@
 //! The gameplay-input snapshot scripts read: raw held keys + mouse, the derived per-tick
 //! key/button edges, and the pointer deltas.
 //!
-//! Lives in `saffron-scene` because both `saffron-script` and `saffron-sceneedit` import
-//! Scene, so the shared snapshot avoids a cross-crate edge (script depends only on core +
-//! scene). `saffron-sceneedit`
-//! re-exports these from here and holds the live snapshot on its `SceneEditContext`; the
-//! host forwards raw input over the script-input command, then calls
-//! [`derive_script_input_edges`] once per tick (before the script tick) to compute the
-//! edges/deltas against the previous tick and roll the memory forward; the script tick
-//! then lends the snapshot to the VM through the session guard.
+//! It lives here because both `saffron-script` and `saffron-sceneedit` import Scene, so the shared
+//! snapshot needs no cross-crate edge. The host forwards raw input over the script-input command,
+//! then calls [`derive_script_input_edges`] once per tick — before the script tick — to compute the
+//! edges against the previous tick and roll the memory forward.
 
 use std::collections::HashSet;
 
@@ -115,15 +111,12 @@ mod tests {
 
         derive_script_input_edges(&mut input);
 
-        // Nothing was down last tick, so every held key/button is a fresh press.
         assert_eq!(input.pressed, set(&["w", "a"]));
         assert!(input.released.is_empty());
         assert_eq!(input.mouse_pressed, set(&["left"]));
         assert!(input.mouse_released.is_empty());
-        // The delta is measured against the (zeroed) previous position.
         assert_eq!(input.mouse_dx, 10.0);
         assert_eq!(input.mouse_dy, 20.0);
-        // The memory rolled forward to this tick's raw state.
         assert_eq!(input.prev_held, set(&["w", "a"]));
         assert_eq!(input.prev_mouse_x, 10.0);
         assert_eq!(input.prev_mouse_y, 20.0);

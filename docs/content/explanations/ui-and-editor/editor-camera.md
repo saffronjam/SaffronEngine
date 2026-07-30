@@ -78,8 +78,8 @@ Project save writes `position`, `yaw`, `pitch`, and `fov` into the `editorCamera
 | Per-frame camera update | `engine/crates/sceneedit/src/camera.rs`, `smoothing.rs` | `SceneEditCameraInput`, `update_scene_edit_camera`, `SMOOTH_TAU` |
 | Native relative motion | `editor/shell/src/main.rs` | `Shell::device_event`, `look_accum`, `emit_to_js` |
 | Viewport input stream | `editor/src/panels/ViewportPanel.tsx` | `FLY_STREAM_MS`, `flyingRef`, `sendState`, `endFly` |
-| Host frame drain | `engine/crates/host/src/layer.rs` | `HostLayer::on_update`, `render_activity_reasons` |
-| Camera and focus commands | `engine/crates/control/src/commands_scene.rs` | `register_scene_commands`, `camera_dto`, `focus`, `get-camera`, `set-camera`, `fly-input` |
+| Host frame drain | `engine/crates/host/src/layer/` | `HostLayer::on_update`, `render_activity_reasons` |
+| Camera and focus commands | `engine/crates/control/src/commands_scene/` | `register_scene_commands`, `camera_dto`, `focus`, `get-camera`, `set-camera`, `fly-input` |
 | Save and load | `engine/crates/sceneedit/src/camera.rs`, `engine/crates/control/src/project_loader.rs` | `to_json`, `from_json`, `install_doc` |
 
 ## Related

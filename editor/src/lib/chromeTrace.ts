@@ -1,8 +1,6 @@
-/// Client-side Chrome Trace Event JSON from a ProfileCaptureDto, so the Profiler's Download
-/// works uniformly for single- and multi-frame captures (the engine writes large multi-frame
-/// traces to a file; the editor holds the structured spans and re-derives the same format).
-/// `M` events name the two lanes; `X` complete events carry µs ts/dur (the viewer derives
-/// nesting from time containment). Phase 9 layers the Perfetto-protobuf export on this module.
+/// Client-side Chrome Trace Event JSON from a `ProfileCaptureDto`, so the Profiler's Download works
+/// uniformly for single- and multi-frame captures. `M` events name the two lanes; `X` complete
+/// events carry µs ts/dur, and the viewer derives nesting from time containment.
 import type { ProfileCaptureDto } from "../protocol";
 
 const CPU_TID = 1;

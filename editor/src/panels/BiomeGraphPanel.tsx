@@ -1,9 +1,6 @@
-/// The biome graph panel: the authored biome graph document rendered read-only on the
-/// shared GraphCanvas — nodes labelled by operator with authority badges, pins typed
-/// from the engine's closed node schema (`vegetation-node-schema`: name/domain/required
-/// per operator; observed edges fill in for an unknown operator). Editing lands with
-/// the typed biome vocabulary; this panel is the inspection surface the asset
-/// workspace opens for biome subjects.
+/// The biome graph rendered read-only on the shared GraphCanvas: nodes labelled by operator with
+/// authority badges, pins typed from the engine's closed node schema (observed edges fill in for an
+/// unknown operator).
 import { useEffect, useMemo, useState } from "react";
 import type { Edge } from "@xyflow/react";
 import { client } from "../control/client";
@@ -135,7 +132,7 @@ export function BiomeGraphPanel() {
     void (async () => {
       try {
         const status = await client.vegetationRuntimeStatus();
-        const map = "Available" in status ? status.Available.map : null;
+        const map = status.state === "available" ? status.map : null;
         if (map === null) {
           notifyError("Bind the vegetation map to a scene field first");
           return;

@@ -2,19 +2,15 @@
 //! sections (vertices, indices, submeshes) plus two optional sections (skin, morph)
 //! selected by the header flags.
 //!
-//! The image is the canonical triple contract: disk bytes == in-memory payload == the
-//! GPU vertex buffer, so a `.smodel` MESH chunk slice and a standalone `.smesh` file
-//! read the same. The bytes are reinterpreted with **safe** `bytemuck` over
-//! `#[repr(C)]` Pod structs (`bytes_of` / `cast_slice` to write, `from_bytes` /
-//! `cast_slice` to read), so the crate's `#![deny(unsafe_code)]` holds. The required
-//! portable hierarchy envelope follows the conditioning section.
+//! The image is the canonical triple contract: disk bytes == in-memory payload == the GPU
+//! vertex buffer, so a `.smodel` MESH chunk slice and a standalone `.smesh` file read the
+//! same. The bytes are reinterpreted with `bytemuck` over `#[repr(C)]` Pod structs.
 //!
-//! One version lives in the format ([`MESH_FORMAT_VERSION`]). A flags word
-//! ([`MESH_FLAG_SKIN`] / [`MESH_FLAG_MORPH`] / [`MESH_FLAG_CONDITIONING`]) selects the optional
-//! sections; the loader accepts only the current version and reads each section when its flag is set.
-//! Morph target names are not in the binary — they ride in the container META, so the `.smesh` is
-//! pure fixed-stride Pod arrays. The trailing conditioning section carries the
-//! watertight-tessellation data ([`MeshConditioning`]), located by walking past the optional sections.
+//! A flags word ([`MESH_FLAG_SKIN`] / [`MESH_FLAG_MORPH`] / [`MESH_FLAG_CONDITIONING`])
+//! selects the optional sections, and the loader accepts only [`MESH_FORMAT_VERSION`]. Morph
+//! target names ride in the container META rather than the binary, keeping the `.smesh` pure
+//! fixed-stride Pod arrays. The trailing conditioning section carries the
+//! watertight-tessellation data, followed by the portable hierarchy envelope.
 
 use std::fs;
 use std::path::Path;
@@ -50,9 +46,8 @@ const MAGIC: [u8; 4] = *b"SMSH";
 /// The 80-byte fixed header; the required sections follow at the offsets, the optional
 /// sections behind the flags.
 ///
-/// `#[repr(C)]` Pod with a fixed field order and width. The offsets are self-relative
-/// (from the start of the image), so an embedded `.smodel` chunk slice reads
-/// identically to a standalone file.
+/// The offsets are self-relative, from the start of the image, so an embedded `.smodel`
+/// chunk slice reads identically to a standalone file.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Pod, Zeroable)]
 struct SMeshHeader {

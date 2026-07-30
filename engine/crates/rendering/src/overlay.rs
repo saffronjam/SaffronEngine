@@ -1,22 +1,14 @@
-//! The final post chain: the mandatory HDR→display tonemap, the analytic ground
-//! grid, and the editor overlay — the passes that run every frame after the scene +
-//! AA passes and complete the offscreen color the present blit / shm publish consume.
+//! The final post chain: the mandatory HDR→display tonemap, the analytic ground grid, and the
+//! editor overlay — the passes that complete the offscreen color the present blit / shm publish
+//! consume.
 //!
-//! - **Tonemap** is mandatory: an in-place compute pass on the offscreen color
-//!   (`StorageImageRwCompute`, GENERAL layout) that maps the scene's linear HDR
-//!   radiance to display range. Exposure is `exp2(exposure_ev)`.
-//! - **Grid** is an optional fullscreen depth-tested debug overlay drawn on the 1×
-//!   resolved color after tonemap; its fragment reconstructs the world ray from a
-//!   push-constant `inv_view_proj` and writes `SV_Depth` so scene geometry occludes
-//!   it.
-//! - **Overlay** is the editor gizmo (handles + entity billboards): a plain
-//!   [`OverlayVertex`] CPU stream uploaded into a grow-only per-frame vertex buffer
-//!   and drawn in two ranges — a depth-tested range (camera frustums, occluded) then
-//!   an always-on-top range (handles). Composited into the post-tonemap color so the
-//!   present-only blit embeds it too.
-//!
-//! The geometry itself is the host's native gizmo builder (PP-10); this module owns
-//! the vertex contract, the per-frame upload buffer, the pushes, and the recorders.
+//! Tonemap is an in-place compute pass on the offscreen color (`StorageImageRwCompute`, GENERAL
+//! layout); exposure is `exp2(exposure_ev)`. Grid is a fullscreen depth-tested pass that
+//! reconstructs the world ray from a push-constant `inv_view_proj` and writes `SV_Depth` so scene
+//! geometry occludes it. Overlay uploads a plain [`OverlayVertex`] stream into a grow-only
+//! per-frame vertex buffer and draws it in two ranges, depth-tested then always-on-top. The
+//! geometry itself is built by the host; this module owns the vertex contract, the upload buffer,
+//! the pushes, and the recorders.
 
 use std::sync::Arc;
 
@@ -514,7 +506,7 @@ impl GridPush {
 ///
 /// The pass body cannot hold `&mut Renderer`, so the buffer is prepared (grown +
 /// uploaded) *before* the graph build via [`OverlayState::prepare`]; the pass then
-/// captures only the resolved [`vk::Buffer`] handle + the counts (README §2).
+/// captures only the resolved [`vk::Buffer`] handle + the counts.
 /// Single-thread state — only the render thread touches it.
 pub struct OverlayState {
     resources: Arc<DeviceResources>,
@@ -572,7 +564,7 @@ impl OverlayState {
     /// Grows the `frame` slot's vertex buffer to fit the queued geometry and uploads
     /// it, returning the resolved draw info the graph captures — or `None` when no
     /// geometry is queued (the pass is skipped). Done before the graph build so the
-    /// pass body captures only the handle (README §2).
+    /// pass body captures only the handle.
     ///
     /// # Errors
     ///
@@ -616,12 +608,10 @@ impl OverlayState {
     }
 }
 
-/// The final-post-chain pass names that arm this frame, in graph order. The tonemap is
-/// mandatory (always present unless its PSO build failed); the grid arms only when shown,
-/// the overlay only when geometry is queued. Pure gate logic so the phase's
-/// "tonemap-always / grid-overlay-conditional" acceptance test runs without a device —
-/// it mirrors the `if let Some(..)` guards in [`crate::Renderer::add_tonemap_pass`] /
-/// [`crate::Renderer::add_grid_overlay_passes`].
+/// The final-post-chain pass names that arm this frame, in graph order. The tonemap is mandatory
+/// unless its PSO build failed; the grid arms only when shown, the overlay only when geometry is
+/// queued. Pure gate logic mirroring the guards in [`crate::Renderer::add_tonemap_pass`] /
+/// [`crate::Renderer::add_grid_overlay_passes`], so it is testable without a device.
 #[cfg(test)]
 pub(crate) fn final_post_pass_names(
     bloom_armed: bool,

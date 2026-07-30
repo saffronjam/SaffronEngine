@@ -93,9 +93,9 @@ sa set-wind --orientation 45 --speed 20 --gust 0.5
 | Cascaded shadow fill and sampling | `engine/assets/shaders/cloud_shadow.slang` · `clouds.slang` | `computeMain`, `cloudShadowVisibility` |
 | Cloud/fog/aerial ledger | `engine/assets/shaders/height_fog.slang` | `FogParams`, `computeMain` |
 | Directional god-rays | `engine/assets/shaders/fog_inject.slang` | `cloudShadowMap`, `fogDirectionalInScatter` |
-| GPU cloud state | `engine/crates/rendering/src/clouds.rs` | `Clouds`, `CloudShadowProjection`, `CloudRenderSettings` |
+| GPU cloud state | `engine/crates/rendering/src/clouds/` | `Clouds`, `CloudShadowProjection`, `CloudRenderSettings` |
 | Scene wind and cloud controls | `engine/crates/scene/src/environment.rs` | `WindSettings`, `CloudSettings` |
-| Control-plane updates | `engine/crates/protocol/src/dto.rs` · `engine/crates/control/src/commands_scene.rs` | `SetWindParams`, `SetCloudsParams`, `set-wind` |
+| Control-plane updates | `engine/crates/protocol/src/dto/` · `engine/crates/control/src/commands_scene/` | `SetWindParams`, `SetCloudsParams`, `set-wind` |
 
 ## Related
 

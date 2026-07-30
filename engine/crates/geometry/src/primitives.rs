@@ -1,15 +1,11 @@
 //! Procedural built-in primitive meshes: cube, plane, UV sphere.
 //!
-//! One authoritative source for the engine's parameter-free primitives. Each returns a
-//! [`Mesh`] with the same layout every importer produces — interleaved position / normal /
-//! uv0, 32-bit indices, one [`Submesh`]. Tangents are *not* stored (the [`Vertex`] format
-//! has none; the shaders derive the tangent frame per-fragment), so these match imported
-//! meshes byte-for-byte in shape.
+//! Each returns a [`Mesh`] with the layout every importer produces: interleaved
+//! position/normal/uv0, 32-bit indices, one [`Submesh`].
 //!
-//! Winding is **counter-clockwise as seen from outside**, matching the renderer's
-//! `FrontFace::COUNTER_CLOCKWISE` + back-face cull for solid materials (and glTF's mandated
-//! CCW front face). All primitives are origin-centered and unit-scaled; an entity's
-//! `Transform` sizes them.
+//! Winding is counter-clockwise as seen from outside, matching the renderer's
+//! `FrontFace::COUNTER_CLOCKWISE` back-face cull and glTF's mandated CCW front face. All
+//! primitives are origin-centred and unit-scaled; an entity's `Transform` sizes them.
 
 use glam::{Vec2, Vec3};
 

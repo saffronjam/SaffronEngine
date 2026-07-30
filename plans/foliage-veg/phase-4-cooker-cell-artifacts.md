@@ -101,14 +101,11 @@ Unknown/corrupt/version-incompatible sections fail with typed errors; no best-ef
 - [x] No `.svegcell` or `.splantc` appears in the asset catalog or project references.
 - [x] Imported plants from different source families normalize to the same `PlantFamily` contract.
 - [x] Cook commands, schemas, e2e fixtures, standard gate, and cooking docs are green.
-  (GREEN, verified together on 2026-07-26: `just engine` and
-  `just prepare-for-commit` EXIT=0; `cargo test --workspace` green; `just schema` EXIT=0 with all 249
-  manifest-driven control checks passing; `just e2e` at **328/328 across 51 files**, the first fully
-  clean full-suite run — the `alpha_blend` device-loss that held this box is fixed and its 4 cases pass;
-  and the docs three-check sweep at hugo EXIT=0, links none broken, style 0 errors / 0 warnings.)
-  The run covers the cook command family end to end — `vegetation-cook`, `-cook-status`,
-  `-cancel-cook`, `-cell-inspect`, `-manifest`, `-rejections`, `-topology-diff` — over the
-  `vegetation-phase3` fixture and the stress matrix.
+  (`just engine`, `just prepare-for-commit`, `cargo test --workspace`, `just schema` and `just e2e`
+  are the gate; `vegetation-cooking.md` is the docs page, checked by the docs-page skill's
+  `hugo --gc` + `check_links.py` + `check_style.py`. The e2e legs drive the cook command family end to
+  end — `vegetation-cook`, `-cook-status`, `-cancel-cook`, `-cell-inspect`, `-manifest`,
+  `-rejections`, `-topology-diff` — over the `vegetation-phase3` fixture and the stress matrix.)
 
 ## NO-LEGACY gate
 

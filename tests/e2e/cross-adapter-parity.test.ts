@@ -1,26 +1,17 @@
 // The same scene renders the same picture on the discrete GPU and on the software rasterizer.
 //
-// Every other pixel test in this suite compares one adapter against itself, which catches a
-// regression but says nothing about portability. A shader that leans on NVIDIA's rounding, a pass
-// that reads uninitialized memory the driver happens to zero, a subgroup path with no software
-// equivalent — each of those is invisible to a single-adapter run and shows up as "it looks wrong
-// on the other machine".
+// Every other pixel test compares one adapter against itself, which says nothing about
+// portability: a shader leaning on one vendor's rounding, a pass reading memory the driver happens
+// to zero, a subgroup path with no software equivalent. This boots two hosts differing only in
+// `VK_ICD_FILENAMES`, so scene, camera, and settle are identical by construction.
 //
-// This boots two hosts that differ in exactly one environment variable, `VK_ICD_FILENAMES`, so the
-// scene, camera, and settle time are identical by construction and only the driver differs.
+// `softwareGpu` is read back from `render-stats` rather than assumed, and the comparison is skipped
+// when the machine offers one adapter — if the loader ignored the override, both hosts would run
+// the same driver and every comparison would pass for the wrong reason.
 //
-// THE TWO HOSTS MUST ACTUALLY BE DIFFERENT, which is the trap this test would otherwise fall into.
-// If the loader ignored the override, both hosts would run the same adapter and every comparison
-// would pass for the wrong reason. `softwareGpu` from `render-stats` is read back rather than
-// assumed, and the whole comparison is skipped when the machine offers only one adapter — a
-// skipped test is honest, a vacuous pass is not.
-//
-// THE TOLERANCE IS MEASURED, NOT GUESSED. Two rasterizers will never be bit-identical: they differ
-// in sample positions, in interpolation precision, and in how they round a filtered texel. The
-// bound below is set from what this scene actually measures (~0.16 mean absolute per-channel
-// difference on 0-255), with room for the noise a driver update brings. It is deliberately far
-// tighter than "looks about right" — a real portability defect moves a frame by whole channel
-// values, not by fractions of one.
+// The tolerance is measured, not guessed: two rasterizers differ in sample positions,
+// interpolation precision, and filtered-texel rounding, and this scene measures ~0.16 mean
+// absolute per-channel difference on 0-255. A real portability defect moves whole channel values.
 
 import { afterAll, beforeAll, expect, test } from "bun:test";
 import type { RenderStatsDto } from "@saffron/protocol";
@@ -28,15 +19,15 @@ import { Engine } from "./harness.ts";
 import { Cleaner, captureViewport, prepareScene } from "./test-utils.ts";
 import { decodeRgb8Png, meanAbsoluteDifference, regionMean } from "./image.ts";
 
-/// The Mesa software rasterizer's ICD inside the build toolbox. Absent on macOS, where MoltenVK is
-/// the only adapter and the comparison correctly does not run.
+// The Mesa software rasterizer's ICD inside the build toolbox. Absent on macOS, where MoltenVK is
+// the only adapter and the comparison correctly does not run.
 const LLVMPIPE_ICD = "/usr/share/vulkan/icd.d/lvp_icd.x86_64.json";
 
-/// A pose showing lit ground, a lit object, and sky — three shading paths rather than one.
+// A pose showing lit ground, a lit object, and sky — three shading paths rather than one.
 const CAMERA = { position: { x: 0, y: 2, z: 6 }, yaw: 0, pitch: -15 } as const;
 
-/// Mean absolute per-channel difference (0-255) the two adapters may differ by. See the
-/// calibration note above: this scene measures ~0.16 between them.
+// Mean absolute per-channel difference (0-255) the two adapters may differ by. See the
+// calibration note above: this scene measures ~0.16 between them.
 const ADAPTER_TOLERANCE = 1.5;
 
 const cleaner = new Cleaner();
@@ -44,7 +35,7 @@ const frames: Record<string, Buffer> = {};
 const stats: Record<string, RenderStatsDto> = {};
 let bothAdaptersPresent = false;
 
-/// Boots a host on the named adapter, builds the scene, and captures one settled frame.
+// Boots a host on the named adapter, builds the scene, and captures one settled frame.
 async function captureOn(label: string, env: Record<string, string>): Promise<Buffer> {
   const engine = await Engine.boot({ SAFFRON_SCRATCH_PROJECT: "1", ...env });
   cleaner.defer(() => engine.shutdown());

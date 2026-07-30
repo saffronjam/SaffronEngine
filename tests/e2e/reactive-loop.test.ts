@@ -21,8 +21,8 @@ afterAll(async () => {
 const stats = () => engine.call<RenderStats>("render-stats");
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
-/// Polls render-stats until `idle` reaches `want` (bounded), since the keep-warm window must elapse
-/// first. render-stats is read-only, so polling it never itself re-arms the loop.
+// Polls render-stats until `idle` reaches `want` (bounded), since the keep-warm window must elapse
+// first. render-stats is read-only, so polling it never itself re-arms the loop.
 async function waitForIdle(want: boolean, tries = 50): Promise<boolean> {
   for (let i = 0; i < tries; i++) {
     if ((await stats()).idle === want) {

@@ -1,8 +1,8 @@
 // Global-SDF cull: bins the per-mesh MDF instances into the cascade(s) their world AABB touches.
 // One thread per SDF instance; each tests its world AABB against every cascade's world bounds and
 // atomic-appends its index into that cascade's segment of the compacted cull list. The composite
-// then iterates only the surviving instances per cascade, so the per-voxel `min()` cost no longer
-// scans the whole scene. The bindless brick arrays ride set 0 (the `mdf_brick` import provides the
+// then iterates only the surviving instances per cascade, keeping the per-voxel `min()` off the
+// whole scene. The bindless brick arrays ride set 0 (the `mdf_brick` import provides the
 // `SdfInstance` struct; the cull reads only the world AABB, not the bricks).
 
 import mdf_brick;

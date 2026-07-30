@@ -223,11 +223,11 @@ in the Plant workspace; world placement belongs in Vegetation mode.
   *(A stroke commits quantized `AuthoredFieldTileDto` grids — one chunk row per touched cell —
   never per-plant commands; the plant population is re-derived by the cell-scoped recook.)*
 - [x] Dock/graph/store/client unit tests, editor E2E, standard gate, and authoring docs are green.
-  *(Closing sweep: editor unit tests 425/425 (dock/graph/store/client suites) + production
-  `bun run build`; full e2e 308/308 across 44 files (3007 expects); workspace unit suites with
-  the device env — only the documented pre-existing physics `determinism_gate` red; docs build +
-  link + style checks clean; `just prepare-for-commit` exit 0. The macOS host has no toolbox, so
-  the gate ran as its parts rather than through `tools/ci/check.sh`.)*
+  *(`cd editor && bun run check` (protocol regen + typecheck) plus `bun test` over the dock, graph,
+  store and client suites and a production `bun run build`; `just e2e` for the control-plane legs;
+  `just prepare-for-commit` for fmt + clippy; the docs pages checked by the docs-page skill's
+  `hugo --gc` + `check_links.py` + `check_style.py`. On macOS there is no toolbox, so the gate runs as
+  its parts rather than through `tools/ci/check.sh`.)*
 
 ## NO-LEGACY gate
 

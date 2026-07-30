@@ -6,6 +6,92 @@
 
 import global_gpu_data;
 
+// One resident micro field tile's header in the fields arena; `sampleCount` u16 density samples
+// (padded to four bytes) follow, then `attributeCount` typed channels. `cell` packs the signed
+// level-zero owner-cell coordinates as lo/hi word pairs.
+public struct GpuFieldTileRecord
+{
+    public uint cell[6];
+    public uint dims[3];
+    public uint sampleCount;
+    public uint seed[4];
+    public uint attributeCount;
+    public uint reserved;
+};
+
+public static const uint GPU_FIELD_TILE_RECORD_SIZE = 64u;
+
+// One resident-tile directory entry the micro pass dispatches over.
+public struct GpuFieldDirectoryEntry
+{
+    public GpuHandle instance;
+    public uint tileOffset;
+    public uint predicted;
+};
+
+public static const uint GPU_FIELD_DIRECTORY_ENTRY_SIZE = 16u;
+
+// Indices in the shared micro-blade template (eight triangles over the strip).
+public static const uint MICRO_BLADE_INDEX_COUNT = 24u;
+
+// One generated micro-blade candidate: the frame-transient placement the executor vertex paths
+// reconstruct the blade from (GpuDrawRecord.contentIndex slots).
+public struct GpuMicroCandidate
+{
+    public float3 position;
+    public float height;
+    public float yaw;
+    public float width;
+    public uint phenotype;
+    public uint reserved;
+    public float2 windBend;
+    public float2 windBendPrevious;
+};
+
+public static const uint GPU_MICRO_CANDIDATE_SIZE = 48u;
+
+public GpuMicroCandidate gpuSceneMicroCandidate(GpuSceneAddressBlock addresses, uint index)
+{
+    GpuMicroCandidate* candidate = (GpuMicroCandidate*)(
+        addresses.candidates + uint64_t(index) * GPU_MICRO_CANDIDATE_SIZE);
+    return *candidate;
+}
+
+public struct GpuMicroBladeVertex
+{
+    public float3 position;
+    public float3 normal;
+    public float2 uv;
+};
+
+// One template vertex of a candidate's blade: a four-segment strip tapering toward the tip and
+// bowed along its facing, plus the candidate's stored analytic wind bend (tip-weighted, with a
+// parabolic tip drop so blades bend rather than stretch). `previous` selects the previous frame's
+// bend words for the motion pass. Vertex pairs (2i, 2i+1) sit left/right of the spine at segment
+// i; positions are world-space, since blade records ride an identity field instance.
+public GpuMicroBladeVertex gpuSceneMicroBladeVertex(
+    GpuMicroCandidate candidate, uint vertexIndex, bool previous)
+{
+    float t = float(vertexIndex / 2u) * 0.25;
+    float side = (vertexIndex & 1u) != 0u ? 1.0 : -1.0;
+    float3 facing = float3(cos(candidate.yaw), 0.0, sin(candidate.yaw));
+    float3 right = float3(-facing.z, 0.0, facing.x);
+    float halfWidth = candidate.width * 0.5 * (1.0 - t * 0.85);
+    float bow = t * t * candidate.height * 0.3;
+    float2 bendWords = previous ? candidate.windBendPrevious : candidate.windBend;
+    float3 bend = float3(bendWords.x, 0.0, bendWords.y) * (t * t);
+    GpuMicroBladeVertex vertex;
+    vertex.position = candidate.position
+        + right * (side * halfWidth)
+        + float3(0.0, candidate.height * t - dot(bend, bend) / max(2.0 * candidate.height, 0.1), 0.0)
+        + facing * bow
+        + bend;
+    float3 tangent = normalize(float3(0.0, 1.0, 0.0) + facing * (0.6 * t));
+    vertex.normal = normalize(cross(right, tangent));
+    vertex.uv = float2(side * 0.5 + 0.5, t);
+    return vertex;
+}
+
 // Texels one directory entry's workgroup covers; a larger tile raises the
 // record-pressure flag rather than silently thinning.
 public static const uint SCENE_MICRO_TEXEL_BUDGET = 4096u;

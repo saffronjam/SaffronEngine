@@ -19,6 +19,7 @@ belong to `saffron-vegetation` (`engine/crates/vegetation/AGENTS.md`).
 | `vegetation_promotion.rs` | The transient entity view a sparse subset of macro plants gains, and state write-back |
 | `vegetation_collision.rs` | Batched Jolt proxies per physics-facet-resident cell generation |
 | `vegetation_navigation.rs` | What vegetation *contributes* to a navigation system, and dirty-region delivery |
+| `vegetation_ecology.rs` | The world simulation clock biology advances on, and the catch-up it drives |
 | `vegetation_family.rs` | Per-session cache of resolved `.splant` family declarations |
 | `vegetation_telemetry.rs` | Counters and durations at the fixed synchronization point |
 
@@ -68,3 +69,26 @@ belong to `saffron-vegetation` (`engine/crates/vegetation/AGENTS.md`).
   diagnostic that costs a stall is not a diagnostic.
 - **Promotion runs only while play is active.** The host gates it; a promotion that survives into
   edit mode leaves entity views for plants the editor is also drawing in bulk.
+- **The play step is what earns an ecology tick; the synchronization point is what executes one.**
+  `step` folds its `dt` into `VegetationEcologyClock` in integer microseconds and nothing else does,
+  so a consumer that only ever calls `synchronize_vegetation` ages no biology. The clock reads no
+  calendar and no time of day — rewinding those previews a season, it does not un-grow a tree.
+- **A stopped clock runs no tick and pays off no arrears.** `wants_advance` is false in full while
+  stopped, because a pause that let owed ticks keep landing would not be a pause. An explicit
+  authored step goes through `advance_to`, which bypasses the accumulated time but not the clock's
+  declared weather, influence, and worker count — one place owns the rules a tick runs under.
+- **`wants_advance` keys on the arrears a region can pay, never on the total.** A region spanning
+  ground outside the streaming window owes ticks for as long as that ground stays out, which is the
+  normal condition in any world bigger than the window; polling on it rebuilds the whole world's
+  dependency-region closure every frame to run nothing. It tests `ticks_owed` (resident regions only)
+  and re-arms on `VegetationWorld::ecology_ground_revision`, which is what changes when a cell loads,
+  unloads, or gains plants. `ticks_awaiting_residency` is for reporting.
+- **A cell mid-catch-up publishes for no facet — a stalled one publishes.** Collision residency and
+  the navigation seam both gate on `VegetationWorld::simulation_facet_is_settled`. Mid-catch-up means
+  the cell's region is *resident* and behind world time: its lifecycle state changes every tick, so
+  publishing would both show biology from a moment nobody was meant to observe and rebuild the whole
+  cell once per executed tick. A cell whose region cannot run — a neighbour it depends on is not
+  resident — keeps publishing its last committed generation, because no tick is coming. Gating that
+  case on world time instead deletes vegetation collision and navigation across a streaming world
+  about a tick into play. Rendering deliberately does not gate — it draws whichever generation is
+  published.

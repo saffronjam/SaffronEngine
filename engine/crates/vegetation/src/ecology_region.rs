@@ -88,6 +88,71 @@ impl EcologyRegion {
     }
 }
 
+/// A uniform-grid hash over cell keys, so a radius query costs its own neighbourhood rather than a
+/// scan of every cell in the world.
+///
+/// Buckets are a `BTreeMap` and each bucket's cells stay sorted: a query's result is an input to a
+/// tick, so a container whose iteration order varied would let bucket layout reach published bytes.
+/// The bucket edge is the query radius, which bounds a query to at most four buckets per axis.
+pub(crate) struct CellSpatialIndex {
+    edge: i64,
+    buckets: BTreeMap<(u8, [i64; 3]), Vec<WorldCellKey>>,
+}
+
+impl CellSpatialIndex {
+    /// Indexes `cells` for queries at `radius`.
+    pub(crate) fn build(cells: impl IntoIterator<Item = WorldCellKey>, radius: u32) -> Self {
+        let edge = i64::from(radius).max(1);
+        let mut buckets: BTreeMap<(u8, [i64; 3]), Vec<WorldCellKey>> = BTreeMap::new();
+        for cell in cells {
+            buckets
+                .entry((cell.level(), bucket_of(cell.coordinates(), edge)))
+                .or_default()
+                .push(cell);
+        }
+        for bucket in buckets.values_mut() {
+            bucket.sort_unstable();
+        }
+        Self { edge, buckets }
+    }
+
+    /// The indexed cells within `radius` of `cell` on every axis at the same level, excluding
+    /// `cell` itself, in canonical order.
+    pub(crate) fn within(&self, cell: WorldCellKey, radius: u32) -> Vec<WorldCellKey> {
+        let radius = i64::from(radius);
+        let coordinates = cell.coordinates();
+        let low = bucket_of(
+            coordinates.map(|value| value.saturating_sub(radius)),
+            self.edge,
+        );
+        let high = bucket_of(
+            coordinates.map(|value| value.saturating_add(radius)),
+            self.edge,
+        );
+        let mut near = Vec::new();
+        for x in low[0]..=high[0] {
+            for y in low[1]..=high[1] {
+                for z in low[2]..=high[2] {
+                    let Some(bucket) = self.buckets.get(&(cell.level(), [x, y, z])) else {
+                        continue;
+                    };
+                    near.extend(bucket.iter().copied().filter(|candidate| {
+                        *candidate != cell && within(cell, *candidate, radius)
+                    }));
+                }
+            }
+        }
+        near.sort_unstable();
+        near
+    }
+}
+
+/// The bucket a cell coordinate triple falls in, floored so negative coordinates bucket like
+/// positive ones.
+fn bucket_of(coordinates: [i64; 3], edge: i64) -> [i64; 3] {
+    coordinates.map(|value| value.div_euclid(edge))
+}
+
 /// Groups `cells` into connected dependency regions under `radius`.
 ///
 /// Two cells share a region when they are within `radius` on every axis, and the relation is
@@ -95,7 +160,7 @@ impl EcologyRegion {
 /// link needs the next one's tick-`N` state.
 #[must_use]
 pub fn dependency_regions(cells: &BTreeSet<WorldCellKey>, radius: u32) -> Vec<EcologyRegion> {
-    let radius = i64::from(radius);
+    let index = CellSpatialIndex::build(cells.iter().copied(), radius);
     let mut remaining: BTreeSet<WorldCellKey> = cells.clone();
     let mut regions = Vec::new();
     // Canonical order in, canonical order out: the region list cannot depend on iteration luck.
@@ -104,15 +169,11 @@ pub fn dependency_regions(cells: &BTreeSet<WorldCellKey>, radius: u32) -> Vec<Ec
         let mut region = BTreeSet::from([seed]);
         let mut frontier = VecDeque::from([seed]);
         while let Some(current) = frontier.pop_front() {
-            let near: Vec<WorldCellKey> = remaining
-                .iter()
-                .copied()
-                .filter(|candidate| within(current, *candidate, radius))
-                .collect();
-            for cell in near {
-                remaining.remove(&cell);
-                region.insert(cell);
-                frontier.push_back(cell);
+            for candidate in index.within(current, radius) {
+                if remaining.remove(&candidate) {
+                    region.insert(candidate);
+                    frontier.push_back(candidate);
+                }
             }
         }
         regions.push(EcologyRegion { cells: region });
@@ -130,19 +191,26 @@ fn within(left: WorldCellKey, right: WorldCellKey, radius: i64) -> bool {
             .all(|(left, right)| left.abs_diff(right) <= radius.unsigned_abs())
 }
 
-/// How many ticks one catch-up call may run.
+/// How much work one catch-up call may do.
 ///
 /// A budget delays readiness; it never drops or reorders a tick. Whatever it does not run stays
-/// pending and runs next call, in the same order it would have.
+/// pending and runs next call, in the same order it would have. `workers` changes only how long the
+/// call takes: regions are disjoint and a region tick is a pure function of immutable state, and the
+/// results commit in canonical region order however many threads produced them.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct EcologyCatchUpBudget {
-    /// Ticks this call may advance.
+    /// Region ticks this call may advance.
     pub max_ticks: u32,
+    /// Threads the pure per-region rule evaluation may spread across.
+    pub workers: u32,
 }
 
 impl Default for EcologyCatchUpBudget {
     fn default() -> Self {
-        Self { max_ticks: 8 }
+        Self {
+            max_ticks: 8,
+            workers: 1,
+        }
     }
 }
 
@@ -157,7 +225,6 @@ pub struct EcologyCatchUp<'a> {
     pub influence: EcologyInfluence,
     /// Per-family rules, keyed by family value.
     pub rules: &'a BTreeMap<u64, EcologySpeciesRules>,
-    /// Declared species relations.
     pub relations: &'a EcologyRelations,
     /// Sampled weather for the ticks being run.
     pub weather: EcologyWeather,
@@ -176,8 +243,16 @@ pub struct EcologyCatchUpReport {
     pub regions_awaiting_residency: usize,
     /// Ticks executed by this call.
     pub ticks_run: u64,
-    /// Ticks still owed by regions behind world time.
+    /// Ticks owed by resident regions, which a following call runs. This is the actionable
+    /// arrears: a caller that polls for outstanding work keys on it, because a region awaiting
+    /// residency owes ticks no budget can spend.
     pub ticks_owed: u64,
+    /// Ticks owed by regions a cell they span is not resident, which nothing can run until that
+    /// ground loads.
+    pub ticks_awaiting_residency: u64,
+    /// Threads the call spread the pure per-region rule evaluation across: the configured worker
+    /// count, bounded by how many regions were ever due in one round.
+    pub workers: u32,
 }
 
 /// One region's committed result for one tick.
@@ -209,7 +284,6 @@ pub struct EcologyTickRules<'a> {
     pub influence: EcologyInfluence,
     /// Per-family rules, keyed by family value.
     pub rules: &'a BTreeMap<u64, EcologySpeciesRules>,
-    /// Declared species relations.
     pub relations: &'a EcologyRelations,
     /// Sampled weather for the tick.
     pub weather: EcologyWeather,
@@ -231,7 +305,8 @@ pub fn advance_region(
     tick: u64,
     rules: &EcologyTickRules<'_>,
 ) -> Result<EcologyRegionTick> {
-    let radius = i64::from(rules.influence.region_radius_cells());
+    let radius = rules.influence.region_radius_cells();
+    let halo = CellSpatialIndex::build(state.summaries.keys().copied(), radius);
     let mut mutations = Vec::with_capacity(region.len());
     let mut summaries = BTreeMap::new();
 
@@ -245,11 +320,10 @@ pub fn advance_region(
         // The halo: every summary within the influence radius, from the completed tick. Reading
         // them from `state` rather than from this tick's results is what keeps the step
         // double-buffered across cells as well as within one.
-        let neighbours: Vec<EcologyCellSummary> = state
-            .summaries
-            .iter()
-            .filter(|(neighbour, _)| **neighbour != cell && within(cell, **neighbour, radius))
-            .map(|(_, summary)| summary.clone())
+        let neighbours: Vec<EcologyCellSummary> = halo
+            .within(cell, radius)
+            .into_iter()
+            .filter_map(|neighbour| state.summaries.get(&neighbour).cloned())
             .collect();
         let output = advance_cell(&EcologyTickInputs {
             cell,
@@ -381,14 +455,10 @@ mod tests {
             1,
             &EcologyTickRules {
                 map: 0x5eed,
-
                 influence: EcologyInfluence::default(),
-
                 rules: &rules,
-
                 relations: &EcologyRelations::new(),
-
-                weather: weather,
+                weather,
             },
         )
         .unwrap();
@@ -405,14 +475,10 @@ mod tests {
             1,
             &EcologyTickRules {
                 map: 0x5eed,
-
                 influence: EcologyInfluence::default(),
-
                 rules: &rules,
-
                 relations: &EcologyRelations::new(),
-
-                weather: weather,
+                weather,
             },
         )
         .unwrap();
@@ -437,13 +503,9 @@ mod tests {
                 1,
                 &EcologyTickRules {
                     map: 0x5eed,
-
                     influence: EcologyInfluence::default(),
-
                     rules: &rules,
-
                     relations: &EcologyRelations::new(),
-
                     weather: EcologyWeather::default(),
                 },
             )
@@ -470,14 +532,10 @@ mod tests {
                 1,
                 &EcologyTickRules {
                     map: 0x5eed,
-
                     influence: EcologyInfluence::default(),
-
                     rules: &rules,
-
                     relations: &EcologyRelations::new(),
-
-                    weather: weather,
+                    weather,
                 },
             )
             .unwrap();
@@ -564,14 +622,10 @@ mod tests {
                     1,
                     &EcologyTickRules {
                         map: 0x5eed,
-
                         influence: EcologyInfluence::default(),
-
                         rules: &rules,
-
                         relations: &EcologyRelations::new(),
-
-                        weather: weather,
+                        weather,
                     },
                 )
                 .unwrap();
@@ -586,26 +640,97 @@ mod tests {
         );
     }
 
-    /// A budget bounds how much catch-up one call performs without changing what the ticks are:
-    /// the remainder stays pending, in order.
+    /// The grid index answers exactly what a full scan answers. It is what turns region building
+    /// and halo lookup from a walk of every cell in the world into a walk of a neighbourhood, so a
+    /// disagreement would silently change which neighbours a tick reads.
     #[test]
-    fn a_budget_delays_ticks_without_dropping_them() {
-        let clock = crate::EcologyClock::at(20);
-        let pending: Vec<u64> = clock.ticks_from(4).collect();
-        assert_eq!(pending.first().copied(), Some(5));
-        assert_eq!(pending.len(), 16);
+    fn the_grid_index_answers_exactly_what_a_scan_answers() {
+        let mut cells = BTreeSet::new();
+        for x in [-97_i64, -8, -1, 0, 1, 2, 7, 40, 41, 1_000_000] {
+            for z in [-13_i64, 0, 3, 4, 900] {
+                cells.insert(cell(x, z));
+            }
+        }
+        // A different level never neighbours a base cell, whatever the coordinates say.
+        cells.insert(WorldCellKey::new(0, 0, 0, 2).expect("level-two cell"));
 
-        let budget = EcologyCatchUpBudget { max_ticks: 6 };
-        let run: Vec<u64> = pending
-            .iter()
-            .copied()
-            .take(budget.max_ticks as usize)
-            .collect();
-        assert_eq!(run, vec![5, 6, 7, 8, 9, 10]);
+        for radius in [1_u32, 2, 5] {
+            let index = CellSpatialIndex::build(cells.iter().copied(), radius);
+            for &subject in &cells {
+                let scanned: Vec<WorldCellKey> = cells
+                    .iter()
+                    .copied()
+                    .filter(|candidate| {
+                        *candidate != subject && within(subject, *candidate, i64::from(radius))
+                    })
+                    .collect();
+                assert_eq!(
+                    index.within(subject, radius),
+                    scanned,
+                    "radius {radius} around {subject}"
+                );
+            }
+        }
+    }
 
-        // After running those, the region is at tick 10 and the rest are still queued in order.
-        let remaining: Vec<u64> = clock.ticks_from(*run.last().unwrap()).collect();
-        assert_eq!(remaining.first().copied(), Some(11));
-        assert_eq!(run.len() + remaining.len(), pending.len());
+    /// The deterministic half of a tick is translation-invariant: the same forest advanced at the
+    /// origin and a million cells away reaches the same health, moisture, fuel, and boundary
+    /// summary. A rule that folded a cell coordinate or a cell-local offset into that arithmetic
+    /// would separate the two.
+    ///
+    /// The stochastic channels are deliberately excluded — their random domain carries the owner
+    /// cell, so two identical forests in different places are not clones of each other — so the
+    /// rules here declare zero chance and the test compares what must not vary.
+    #[test]
+    fn the_deterministic_tick_is_translation_invariant() {
+        let rules = BTreeMap::from([(
+            7,
+            EcologySpeciesRules {
+                propagation_chance: UnitInterval::ZERO,
+                deadfall_chance: UnitInterval::ZERO,
+                regrowth_chance: UnitInterval::ZERO,
+                ..EcologySpeciesRules::default()
+            },
+        )]);
+        let weather = EcologyWeather {
+            water: UnitInterval::from_bits(40_000),
+            warmth: UnitInterval::from_bits(45_000),
+        };
+        let outcome = |origin: i64| {
+            let cells = [cell(origin, 0), cell(origin + 1, 0)];
+            let state = region_state(&cells);
+            let region = dependency_regions(&cells.iter().copied().collect(), 1)
+                .pop()
+                .expect("one region");
+            let result = advance_region(
+                &region,
+                &state,
+                1,
+                &EcologyTickRules {
+                    map: 0x5eed,
+                    influence: EcologyInfluence::default(),
+                    rules: &rules,
+                    relations: &EcologyRelations::new(),
+                    weather,
+                },
+            )
+            .expect("the region ticks wherever it sits");
+            let summaries: Vec<EcologyCellSummary> = result.summaries.into_values().collect();
+            let mutations: Vec<Vec<VegetationMutation>> = result
+                .mutations
+                .into_iter()
+                .map(|(_, mutations)| mutations)
+                .collect();
+            (summaries, mutations)
+        };
+
+        let (near_summaries, near_mutations) = outcome(0);
+        let (far_summaries, far_mutations) = outcome(1_000_000);
+        assert!(
+            near_mutations.iter().any(|cell| !cell.is_empty()),
+            "the tick changed something, so the comparison has something to compare",
+        );
+        assert_eq!(near_summaries, far_summaries);
+        assert_eq!(near_mutations, far_mutations);
     }
 }

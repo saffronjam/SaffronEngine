@@ -56,13 +56,7 @@ test("a WindSource component round-trips through the registry", async () => {
     json: { kind: "vortex", strength: 7.5, radius: 33, falloff: 0.25, enabled: true },
   });
   const info = await engine.call<InspectResult>("inspect", { entity: entity.id });
-  const source = info.components.WindSource as {
-    kind: string;
-    strength: number;
-    radius: number;
-    falloff: number;
-    enabled: boolean;
-  };
+  const source = info.components.WindSource!;
   expect(source.kind).toBe("vortex");
   expect(source.strength).toBeCloseTo(7.5);
   expect(source.radius).toBeCloseTo(33);

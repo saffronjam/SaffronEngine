@@ -1,8 +1,3 @@
-// The in-memory blob cache + `bytes()` serving path is consumed only by the `saffron-img://` CEF
-// scheme handler — the display-gated visual piece (thumbnails/gallery). The connector download path
-// (`file`/`derived`) is live; keep the serving path intact so wiring the scheme is drop-in.
-#![allow(dead_code)]
-
 //! The shared resource cache: the one place the bridge fetches a remote resource, keeps it on
 //! disk (persisting across restarts), and serves it back — to the webview (thumbnails / gallery
 //! previews, via the `saffron-img://` scheme) and to Rust callers (connector downloads, extracted
@@ -18,8 +13,8 @@
 //!   crashed or half-finished build never looks cached.
 //!
 //! A bounded [`Semaphore`] caps upstream concurrency: only cache misses acquire a permit, so a
-//! screenful of thumbnails drains through the gate instead of stampeding a provider (which is what
-//! made the CDN drop requests and show broken images).
+//! screenful of thumbnails drains through the gate instead of stampeding a provider into dropping
+//! requests.
 
 use std::collections::HashMap;
 use std::path::PathBuf;

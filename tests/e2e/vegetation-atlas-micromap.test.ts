@@ -1,85 +1,45 @@
 // A plant family with a real coverage texture packs an atlas and derives opacity micromaps.
 //
-// Every other vegetation fixture in this suite binds materials with no textures at all, so no
-// family cooks an atlas, none derives a micromap, and both runtime paths — the atlas the family's
-// UVs address, and the micromaps its BLAS geometries reference — never run under test. A green
-// suite proved those changes regressed nothing; it could not prove either works.
+// The other vegetation fixtures bind materials with no textures, so no family cooks an atlas and
+// none derives a micromap. This is the only end-to-end coverage of the atlas a family's UVs address
+// and the micromaps its BLAS geometries reference.
 //
-// THE FIXTURE HAD TO GO IN THROUGH A NATIVE FAMILY. The other vegetation tests import a `.splant`
-// whose material comes from an OBJ, and only the glTF importer ever sets `AlphaMode::Mask`
-// (`gltf_import.rs`), so an OBJ-sourced family cannot express a masked material at all. A native
+// The fixture goes in through a native family. A `.splant` whose material comes from an OBJ cannot
+// express a masked material at all, because only the glTF importer sets `AlphaMode::Mask`; a native
 // family binds catalog materials directly, which is the one path where a test can author the
 // coverage it wants to see.
 //
-// WHAT MAKES THE ASSERTIONS NON-VACUOUS. A uniformly opaque texture is useless here and would look
-// like working code: every micro-triangle would be uniformly covered, which correctly emits the
-// micromap format's special index and no block at all. The texture below is a diagonal cutout, so
-// triangles actually straddle the alpha cutoff and the derivation has something to prove.
+// A uniformly opaque texture would look like working code: every micro-triangle would be uniformly
+// covered, which correctly emits the format's special index and no block. The texture below is a
+// diagonal cutout, so triangles straddle the alpha cutoff and the derivation has something to
+// prove.
 
 import { afterAll, beforeAll, expect, test } from "bun:test";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
-import { deflateSync } from "node:zlib";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { RenderStatsDto } from "@saffron/protocol";
 import { Engine } from "./harness.ts";
 import { Cleaner, bootEngine, captureViewport, prepareScene } from "./test-utils.ts";
-import { meanAbsoluteDifference, decodeRgb8Png } from "./image.ts";
+import { decodeRgb8Png, encodeRgba8Png, meanAbsoluteDifference } from "./image.ts";
 
 const cleaner = new Cleaner();
 let engine: Engine;
-/// The cooked family and the material carrying its cutout coverage.
+// The cooked family and the material carrying its cutout coverage.
 let plant: string;
 let stats: RenderStatsDto;
-/// Settled frames from two hosts differing only in `SAFFRON_OMM`.
+// Settled frames from two hosts differing only in `SAFFRON_OMM`.
 const frames: Record<string, Buffer> = {};
 let offStats: RenderStatsDto;
 
-/// A minimal RGBA PNG whose alpha is a diagonal cutout, written by hand.
-///
-/// Encoded here rather than imported so the fixture is one file with no binary blob beside it, and
-/// so the cutout is visible as intent rather than as opaque bytes.
+// A minimal RGBA PNG whose alpha is a diagonal cutout.
+//
+// Generated rather than checked in so the cutout is visible as intent rather than as opaque bytes.
 function cutoutPng(edge: number): Buffer {
-  const raw: number[] = [];
-  for (let y = 0; y < edge; y += 1) {
-    raw.push(0); // PNG filter byte: none
-    for (let x = 0; x < edge; x += 1) {
-      raw.push(255, 255, 255, x + y < edge ? 255 : 0);
-    }
-  }
-  const crcTable = Array.from({ length: 256 }, (_, n) => {
-    let c = n;
-    for (let k = 0; k < 8; k += 1) c = c & 1 ? 0xedb88320 ^ (c >>> 1) : c >>> 1;
-    return c >>> 0;
-  });
-  const crc = (buf: Buffer) => {
-    let c = 0xffffffff;
-    for (const byte of buf) c = crcTable[(c ^ byte) & 0xff]! ^ (c >>> 8);
-    return (c ^ 0xffffffff) >>> 0;
-  };
-  const chunk = (type: string, data: Buffer) => {
-    const head = Buffer.alloc(4);
-    head.writeUInt32BE(data.length);
-    const body = Buffer.concat([Buffer.from(type, "ascii"), data]);
-    const tail = Buffer.alloc(4);
-    tail.writeUInt32BE(crc(body));
-    return Buffer.concat([head, body, tail]);
-  };
-  const ihdr = Buffer.alloc(13);
-  ihdr.writeUInt32BE(edge, 0);
-  ihdr.writeUInt32BE(edge, 4);
-  ihdr[8] = 8; // bit depth
-  ihdr[9] = 6; // colour type: RGBA
-  return Buffer.concat([
-    Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]),
-    chunk("IHDR", ihdr),
-    // PNG IDAT carries a zlib stream, not raw deflate — `node:zlib` wraps it, Bun's does not.
-    chunk("IDAT", deflateSync(Buffer.from(raw))),
-    chunk("IEND", Buffer.alloc(0)),
-  ]);
+  return encodeRgba8Png(edge, edge, (x, y) => [255, 255, 255, x + y < edge ? 255 : 0]);
 }
 
-/// A thin-sheet foliage surface whose coverage comes from the albedo alpha, with OMM enabled.
+// A thin-sheet foliage surface whose coverage comes from the albedo alpha, with OMM enabled.
 function thinSheetSurface() {
   return {
     model: "thin-sheet-foliage",
@@ -107,8 +67,8 @@ function thinSheetSurface() {
         thicknessMeanBits: 327,
         normalSecondMomentsBits: [1, 2, 3, 4, 5, 6],
       },
-      // Widest thresholds: the derivation is then bounded only by what it can PROVE, which is the
-      // property the box's "OMM removes cost, never correctness" claim rests on.
+      // Widest thresholds, so the derivation is bounded only by what it can PROVE — the property
+      // "a micromap removes cost, never correctness" rests on.
       opacityMicromap: {
         enabled: true,
         maxSubdivision: 5,
@@ -120,7 +80,7 @@ function thinSheetSurface() {
   };
 }
 
-/// Builds the textured family on `host` and returns its id.
+// Builds the textured family on `host` and returns its id.
 async function buildFamily(host: Engine): Promise<string> {
   await prepareScene(host, {
     width: 320,
@@ -252,10 +212,9 @@ test("a micromap removes classifier work without changing a pixel", () => {
   if (!stats.rtSupported || !stats.ommSupported) {
     return;
   }
-  // The box's whole claim, stated as a measurement. A micromap settles a micro-triangle only where
-  // the derivation PROVED every point of its footprint classifies that way, so traversal reaches
-  // the same verdict with less work — EXACTLY equal, not within a tolerance, because a micromap
-  // that shifted a pixel would mean the proof was wrong.
+  // A micromap settles a micro-triangle only where the derivation PROVED every point of its
+  // footprint classifies that way, so traversal reaches the same verdict with less work. Exactly
+  // equal, not within a tolerance: a micromap that shifted a pixel would mean the proof was wrong.
   const on = decodeRgb8Png(frames.on);
   const off = decodeRgb8Png(frames.off);
   expect(on.width).toBe(off.width);
@@ -274,10 +233,8 @@ test("a wind edit invalidates history under its own name", async () => {
 });
 
 test("vegetation stages appear as spans in a capture", async () => {
-  // Before this the capture showed the frame's render passes against a GAP where residency,
-  // promotion, collision and navigation actually ran — nothing outside the rendering crate could
-  // open a span. The stages are timed on the same monotonic clock the renderer stamps with, so
-  // they land inside the frame they belong to rather than on a second timeline.
+  // The vegetation stages are timed on the same monotonic clock the renderer stamps with, so they
+  // land inside the frame they belong to rather than on a second timeline.
   await engine.call("profiler.set-mode", { mode: "timestamps" });
   await engine.call("profiler.capture-start", { mode: "single" });
   await engine.settle(900);

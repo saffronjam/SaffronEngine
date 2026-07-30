@@ -1,49 +1,37 @@
 // A plant drawn as an aggregate voxel brick still moves in the wind.
 //
 // The aggregate branch applies the same stored sway as the triangle path — every raster pass adds
-// `gpuSceneWindDeform` at its world-compose line with no representation branch around it — so a far
-// plant should keep its near-field motion. This measures that rather than asserting it.
+// `gpuSceneWindDeform` at its world-compose line with no representation branch — so a far plant
+// keeps its near-field motion. This measures that rather than asserting it.
 //
-// A PREVIOUS ATTEMPT AT THIS TEST WAS DELETED FOR PASSING WHEN IT SHOULD NOT HAVE. It forced the
-// coarsest cut, confirmed `voxelRecords > 0`, measured motion under a gale, and passed — and it
-// ALSO passed with the aggregate branch's sway mutated to zero. The counters explained it: the
-// frame drew 6 records, of which 1 was the aggregate and 5 were micro-blade grass candidates. The
-// motion it measured was the grass.
-//
-// Grass is reconstructed GPU-side and scatters across the whole ground, so no screen region
-// contains the plant and not the blades — picking a region cannot separate them. The only honest
-// separation is to stop drawing the blades, which is what `SAFFRON_MICRO_FIELD=off` now does, and
-// the counters below assert the separation actually happened rather than trusting the flag.
+// Forcing the coarsest cut and measuring motion under a gale is not enough on its own: the frame
+// also draws micro-blade grass candidates, and the motion measured is then the grass, which passes
+// even with the aggregate branch's sway mutated to zero. Grass is reconstructed GPU-side and
+// scatters across the whole ground, so no screen region contains the plant and not the blades, and
+// picking a region cannot separate them. `SAFFRON_MICRO_FIELD=off` stops drawing the blades, and
+// the counters below assert the separation happened rather than trusting the flag.
 
 import { afterAll, beforeAll, expect, test } from "bun:test";
-import { readFileSync } from "node:fs";
-import { dirname, join } from "node:path";
-import { fileURLToPath } from "node:url";
 import type {
   EntityRef,
-  GpuSceneStatsDto,
-  ImportVegetationAssetResult,
-  VegetationCookJobDto,
+  GpuSceneMirrorStatsDto,
   VegetationRuntimeQueryResult,
 } from "@saffron/protocol";
 import type { Engine } from "./harness.ts";
 import { Cleaner, bootEngine, captureViewport, prepareScene } from "./test-utils.ts";
 import { decodeRgb8Png, meanAbsoluteDifference } from "./image.ts";
-import { authoredAssets, awaitCook, installTrunkObj, type VegetationFixture } from "./vegetation-utils.ts";
-
-const HERE = dirname(fileURLToPath(import.meta.url));
-const FIXTURE_PATH = join(HERE, "fixtures", "vegetation-phase3.json");
-const CELL = { coordinates: ["0", "0", "0"], level: 0 } as const;
-const BOUNDS = {
-  minTicks: ["0", "0", "0"],
-  maxTicksExclusive: ["262144", "262144", "262144"],
-} as const;
+import {
+  BOUNDS,
+  cookCells,
+  importVegetationPackage,
+  loadFixture,
+} from "./vegetation-utils.ts";
 
 const cleaner = new Cleaner();
 let engine: Engine;
-/// Counters with the plant resident, the cut pinned coarse, and the micro field suppressed.
-let stats: GpuSceneStatsDto;
-/// Two frames a moment apart under a gale, and two under a still field.
+// Counters with the plant resident, the cut pinned coarse, and the micro field suppressed.
+let stats: GpuSceneMirrorStatsDto;
+// Two frames a moment apart under a gale, and two under a still field.
 const gale: Buffer[] = [];
 const still: Buffer[] = [];
 
@@ -57,12 +45,8 @@ beforeAll(async () => {
   });
   await prepareScene(engine, { width: 480, height: 270 });
 
-  const fixture = JSON.parse(readFileSync(FIXTURE_PATH, "utf8")) as VegetationFixture;
-  const sources = authoredAssets(cleaner, fixture, "distant-wind");
-  await installTrunkObj(engine, fixture);
-  for (const path of [sources.plant, sources.biome, sources.map]) {
-    await engine.call<ImportVegetationAssetResult>("import-vegetation-asset", { path });
-  }
+  const fixture = loadFixture("vegetation-phase3");
+  await importVegetationPackage(engine, cleaner, fixture, "distant-wind");
   const world = await engine.call<EntityRef>("create-entity", { name: "Distant vegetation" });
   await engine.call("add-component", { entity: world.id, component: "VegetationField" });
   await engine.call("set-component", {
@@ -70,12 +54,7 @@ beforeAll(async () => {
     component: "VegetationField",
     json: { map: fixture.map, enabled: true },
   });
-  const cook = await engine.call<VegetationCookJobDto>("vegetation-cook", {
-    map: fixture.map,
-    scope: { kind: "cells", cells: [CELL] },
-    workers: 1,
-  });
-  await awaitCook(engine, cook.job);
+  await cookCells(engine, fixture.map);
 
   // The camera is set HERE rather than through `prepareScene`, and it is the framing
   // `vegetation-wind-visual` established — residency is camera-driven, so the view has to be in
@@ -99,7 +78,7 @@ beforeAll(async () => {
     await engine.settle(50);
   }
   await engine.settle(800);
-  stats = await engine.call<GpuSceneStatsDto>("gpu-scene-stats");
+  stats = await engine.call<GpuSceneMirrorStatsDto>("gpu-scene-stats");
 
   await engine.call("set-wind", { speed: 14, gust: 0.8 });
   await engine.settle(500);

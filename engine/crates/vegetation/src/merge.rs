@@ -3,8 +3,9 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use saffron_core::Uuid;
-use saffron_spatial::{FieldChannel, FieldDerivative, WorldCellKey};
+use saffron_spatial::WorldCellKey;
 
+use crate::cell_facet::{field_tile_key, projection_tile_key, rejection_code};
 use crate::hash::sha256;
 use crate::memory::reserve_exact;
 use crate::{
@@ -15,15 +16,12 @@ use crate::{
     QuantizedSurfaceProjectionTile, RejectedCandidate, Result,
 };
 
-/// Merges overlapping local-biome outputs for one map cell through the canonical evaluator result.
+/// Merges overlapping local-biome outputs for one map cell into one evaluator result.
 ///
-/// Inputs are ordered by biome-instance GUID before composition, so worker completion order cannot
-/// affect bytes. Every instance-local node, candidate, provenance, query-tile, diagnostic, and
-/// reconstruction-seed identity is domain-separated by that GUID. Micro tiles sharing a
-/// `(cell, family)` key must have identical dimensions; density and like-named attribute lanes
-/// combine with element-wise saturating addition (`u16::MAX` and `i32::{MIN,MAX}` respectively).
-/// The output seed hashes the family and ordered `(instance, source seed)` set rather than selecting
-/// one contributor.
+/// Inputs compose in biome-instance GUID order and every instance-local identity is
+/// domain-separated by that GUID, so worker completion order cannot affect bytes. Micro tiles
+/// sharing a `(cell, family)` key must agree on dimensions; their density and like-named
+/// attribute lanes combine with saturating addition.
 pub fn merge_graph_evaluation_results(
     mut inputs: Vec<(u128, GraphEvaluationResult)>,
 ) -> Result<GraphEvaluationResult> {
@@ -122,10 +120,10 @@ fn namespace_result(
     }
     result
         .surface_projection_tiles
-        .sort_unstable_by_key(projection_key);
+        .sort_unstable_by_key(projection_tile_key);
     reject_adjacent(
         &result.surface_projection_tiles,
-        projection_key,
+        projection_tile_key,
         "surfaceProjectionTiles",
     )?;
 
@@ -144,10 +142,10 @@ fn namespace_result(
     }
     result
         .surface_field_query_tiles
-        .sort_unstable_by_key(field_query_key);
+        .sort_unstable_by_key(field_tile_key);
     reject_adjacent(
         &result.surface_field_query_tiles,
-        field_query_key,
+        field_tile_key,
         "surfaceFieldQueryTiles",
     )?;
 
@@ -346,7 +344,7 @@ fn merge_macro_points(inputs: &[(u128, GraphEvaluationResult)]) -> Result<PlantP
         let source = &inputs[input].1.macro_points;
         macro_rules! push_column {
             ($field:ident) => {
-                merged.$field.push(source.$field[row].clone())
+                merged.$field.push(source.$field[row])
             };
         }
         push_column!(ids);
@@ -499,7 +497,10 @@ fn merge_projection_tiles(
     let mut tiles = BTreeMap::new();
     for (_, result) in inputs {
         for tile in &result.surface_projection_tiles {
-            if tiles.insert(projection_key(tile), tile.clone()).is_some() {
+            if tiles
+                .insert(projection_tile_key(tile), tile.clone())
+                .is_some()
+            {
                 return Err(merge_error(
                     "surfaceProjectionTiles",
                     "namespaced projection tile identity collided",
@@ -516,7 +517,7 @@ fn merge_field_query_tiles(
     let mut tiles = BTreeMap::new();
     for (_, result) in inputs {
         for tile in &result.surface_field_query_tiles {
-            if tiles.insert(field_query_key(tile), tile.clone()).is_some() {
+            if tiles.insert(field_tile_key(tile), tile.clone()).is_some() {
                 return Err(merge_error(
                     "surfaceFieldQueryTiles",
                     "namespaced field-query tile identity collided",
@@ -725,40 +726,12 @@ fn checked_add(destination: &mut u64, source: u64) -> Result<()> {
     Ok(())
 }
 
-fn projection_key(tile: &QuantizedSurfaceProjectionTile) -> (u128, u32, [u8; 32]) {
-    (
-        tile.node,
-        tile.node_semantic_revision,
-        tile.provider_set_hash,
-    )
-}
-
-fn field_query_key(
-    tile: &QuantizedSurfaceFieldQueryTile,
-) -> (u128, u32, FieldChannel, FieldDerivative, [u8; 32]) {
-    (
-        tile.node,
-        tile.node_semantic_revision,
-        tile.channel,
-        tile.derivative,
-        tile.provider_set_hash,
-    )
-}
-
 fn rejected_key(value: &RejectedCandidate) -> (CandidateIdentity, u8, ProvenanceHandle) {
-    (value.candidate, rejection_reason(value), value.provenance)
-}
-
-fn rejection_reason(value: &RejectedCandidate) -> u8 {
-    match value.reason {
-        crate::CandidateRejectionReason::SurfaceMiss => 0,
-        crate::CandidateRejectionReason::Threshold => 1,
-        crate::CandidateRejectionReason::WeightedElimination => 2,
-        crate::CandidateRejectionReason::PriorityExclusion => 3,
-        crate::CandidateRejectionReason::Competition => 4,
-        crate::CandidateRejectionReason::ForeignOwner => 5,
-        crate::CandidateRejectionReason::NoSpecies => 6,
-    }
+    (
+        value.candidate,
+        rejection_code(value.reason),
+        value.provenance,
+    )
 }
 
 fn reject_adjacent<T, K: Eq>(
@@ -779,22 +752,23 @@ fn checked_handle_capacity(length: usize) -> Result<()> {
     Ok(())
 }
 
-fn namespace_u128(domain: &[u8], instance: u128, value: u128) -> u128 {
+fn namespace_digest(domain: &[u8], instance: u128, value: &[u8]) -> [u8; 32] {
     let mut bytes = b"saffron-anima/map-biome-instance-namespace/v1\0".to_vec();
     bytes.extend_from_slice(&(domain.len() as u64).to_be_bytes());
     bytes.extend_from_slice(domain);
     bytes.extend_from_slice(&instance.to_be_bytes());
-    bytes.extend_from_slice(&value.to_be_bytes());
-    u128::from_be_bytes(sha256(&bytes)[..16].try_into().unwrap())
+    bytes.extend_from_slice(value);
+    sha256(&bytes)
+}
+
+fn namespace_u128(domain: &[u8], instance: u128, value: u128) -> u128 {
+    let digest = namespace_digest(domain, instance, &value.to_be_bytes());
+    u128::from_be_bytes(digest[..16].try_into().unwrap())
 }
 
 fn namespace_u64(domain: &[u8], instance: u128, value: u64) -> u64 {
-    let mut bytes = b"saffron-anima/map-biome-instance-namespace/v1\0".to_vec();
-    bytes.extend_from_slice(&(domain.len() as u64).to_be_bytes());
-    bytes.extend_from_slice(domain);
-    bytes.extend_from_slice(&instance.to_be_bytes());
-    bytes.extend_from_slice(&value.to_be_bytes());
-    u64::from_be_bytes(sha256(&bytes)[..8].try_into().unwrap())
+    let digest = namespace_digest(domain, instance, &value.to_be_bytes());
+    u64::from_be_bytes(digest[..8].try_into().unwrap())
 }
 
 fn merge_error(path: impl Into<String>, reason: impl Into<String>) -> Error {

@@ -63,7 +63,7 @@ The LUT is a `256²` `R16G16B16A16_SFLOAT` 2D image with only R and G written. T
 |---|---|---|
 | Integral + geometry term | `engine/assets/shaders/ibl_brdf.slang` | `integrateBRDF` (scale `a`, bias `b`), `geometrySchlickGGX` (IBL $k = \alpha^2/2$) |
 | Sampling + output | `engine/assets/shaders/ibl_brdf.slang` | `importanceSampleGGX`, `hammersley`, `radicalInverseVdC`, `computeMain`, `outLut` |
-| LUT format + size | `engine/crates/rendering/src/ibl.rs` | `IBL_LUT_SIZE` (256), `IBL_COLOR_FORMAT` |
+| LUT format + size | `engine/crates/rendering/src/ibl/` | `IBL_LUT_SIZE` (256), `IBL_COLOR_FORMAT` |
 | Applied at runtime | `engine/assets/shaders/lighting.slang` | ambient block — `F0 * ab.x + ab.y` |
 
 ## Related

@@ -10,8 +10,8 @@
 //! pin names (`a` / `b` / `t`), and the `mesh`-vs-preview context differences must
 //! reproduce byte-for-byte or a graph material silently miscompiles.
 //!
-//! There is no `slangc` here — this module produces and tests the *strings* and the
-//! *fold decision*; phase 6 compiles them.
+//! There is no `slangc` here — this module produces the *strings* and the *fold decision*;
+//! [`crate::codegen`] compiles them.
 
 use std::collections::HashMap;
 

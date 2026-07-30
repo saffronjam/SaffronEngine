@@ -1,10 +1,6 @@
-/// Per-axis lock toggle grid for a `glm::bvec3` field (RigidbodyComponent.lockPosition /
-/// lockRotation). Three small toggle buttons labeled X / Y / Z; an active (locked) axis is
-/// tinted with the gizmo axis accent (X red / Y green / Z blue, echoing VectorEditor), an
-/// inactive one reads muted. This is Unity's Constraints "Freeze Position/Rotation" grid and
-/// Godot's axis lock, adapted to the bvec3 the wire carries. Each toggle emits a one-key
-/// patch; the Inspector reassembles `{ ...value, [axis]: next }` so the read-modify-write DTO
-/// stays whole. A discrete toggle fires `onChange` once → one undo entry, no drag bracket.
+/// Per-axis lock toggles for a `bvec3` field. A locked axis is tinted with the gizmo axis accent
+/// (X red / Y green / Z blue). Each toggle emits a one-key patch, which the Inspector reassembles so
+/// the read-modify-write DTO stays whole; a discrete toggle is one undo entry, with no drag bracket.
 import { cn } from "@/lib/utils";
 
 /// Active-axis tints matching the viewport gizmo (X red, Y green, Z blue).

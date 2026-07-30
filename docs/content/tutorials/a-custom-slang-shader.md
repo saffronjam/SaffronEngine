@@ -103,7 +103,7 @@ them. Unused fields can be ignored (here: texture, pbr, emissive), but the order
 > [!NOTE]
 > The entry points must be named `vertexMain` and `fragmentMain` — that's what
 > `build_mesh_pipeline` looks up when it builds the stage create-infos
-> (`engine/crates/rendering/src/pipelines.rs`). The vertex input layout (3 attributes) and
+> (`engine/crates/rendering/src/pipelines/`). The vertex input layout (3 attributes) and
 > set 2 (instances) are baked into that pipeline layout.
 
 ## Build it
@@ -122,8 +122,8 @@ If `slangc` rejects the file, the run fails with the line and message. The `.spv
 ## Draw with it
 
 The renderer picks a pipeline per material. The renderer's `Material` carries a `shader` path
-(default `"shaders/mesh.spv"`), and `request_mesh_pipeline` builds and caches one PSO per
-distinct `(shader, unlit)` key. Point a material at the new shader:
+(default `"shaders/mesh.spv"`), and `request_executor_mesh_pipeline` builds and caches one PSO
+per distinct `(shader, unlit)` key. Point a material at the new shader:
 
 ```rust
 let mut flat = Material::default();

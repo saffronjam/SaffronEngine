@@ -1,10 +1,10 @@
 //! Recording the executor draws into the scene + depth-family command buffers.
 //!
 //! Every geometry pass replays the frame's binned counted-indirect commands over the
-//! pages-arena index stream ([`record_executor_buckets`] with per-bucket PSOs for the
-//! scene, [`record_executor_depth_family`] with one PSO for the depth family), then
-//! the tessellation seam's amplified draws ([`record_tess_scene_draws`] /
-//! [`record_tess_depth_draws`]). The sorted transparent streams replay through
+//! index stream each bucket's representation reads — the pages arena for page-resident
+//! geometry, the displacement arena for a displaced bucket ([`record_executor_buckets`]
+//! with per-bucket PSOs for the scene, [`record_executor_depth_family`] with one PSO for
+//! the depth family). The sorted transparent streams replay through
 //! [`record_executor_transparent_stream`].
 
 use ash::vk;
@@ -29,11 +29,7 @@ pub fn record_executor_buckets(
     transparent: bool,
     mesh_dispatch: Option<&ash::ext::mesh_shader::Device>,
 ) -> u32 {
-    let live: Vec<_> = draws
-        .iter()
-        .filter(|(_, blend, _)| *blend == transparent)
-        .collect();
-    let Some((_, _, first)) = live.first() else {
+    let Some((_, _, first)) = draws.iter().find(|(_, blend, _)| *blend == transparent) else {
         return 0;
     };
     bind_mesh_descriptor_sets(
@@ -55,13 +51,9 @@ pub fn record_executor_buckets(
         sets.rt_mesh,
         sets.restir_mesh,
     );
-    // SAFETY: the ash seam. The pages arena is the executor's index stream this frame.
-    unsafe {
-        raw.cmd_bind_index_buffer(cmd, page_index_buffer, 0, vk::IndexType::UINT32);
-    }
     let mut recorded = 0;
-    for (bucket_index, (bucket, _, pso)) in draws.iter().enumerate() {
-        if draws[bucket_index].1 != transparent {
+    for (bucket_index, (bucket, blend, pso)) in draws.iter().enumerate() {
+        if *blend != transparent {
             continue;
         }
         // The mesh PSOs declare dynamic cull: a double-sided bucket disables
@@ -69,6 +61,12 @@ pub fn record_executor_buckets(
         // SAFETY: the ash seam; `cmd` is recording.
         unsafe {
             raw.cmd_set_cull_mode(cmd, bucket_cull_mode(*bucket));
+            raw.cmd_bind_index_buffer(
+                cmd,
+                bucket_index_buffer(*bucket, page_index_buffer, inputs.displaced_indices),
+                0,
+                vk::IndexType::UINT32,
+            );
         }
         let draw = crate::ExecutorBucketDraw {
             bucket: *bucket,
@@ -111,6 +109,27 @@ pub fn record_executor_buckets(
     recorded
 }
 
+/// The index stream a draw bucket fetches through: the displacement arena for a displaced
+/// bucket, the pages arena for every page-resident representation. Both are u32 streams, so
+/// the bucket's counted-indirect draw is otherwise identical.
+///
+/// A view that reads the undisplaced surface (a shadow page, the GI reach walk) passes a null
+/// `displaced_indices`; the arena is a per-frame allocation those views never bind, and a
+/// displaced bucket there falls back to the pages arena.
+pub fn bucket_index_buffer(
+    bucket: crate::ExecutorBucket,
+    page_index_buffer: vk::Buffer,
+    displaced_indices: vk::Buffer,
+) -> vk::Buffer {
+    let displaced = (bucket.pso_bin >> crate::GPU_PSO_REPRESENTATION_SHIFT) & 0x3
+        == crate::GpuRepresentation::DisplacedMicro as u32;
+    if displaced && displaced_indices != vk::Buffer::null() {
+        displaced_indices
+    } else {
+        page_index_buffer
+    }
+}
+
 /// The dynamic cull mode a draw bucket's material class selects: `NONE` for a
 /// double-sided class, `BACK` otherwise.
 fn bucket_cull_mode(bucket: crate::ExecutorBucket) -> vk::CullModeFlags {
@@ -125,13 +144,13 @@ fn bucket_cull_mode(bucket: crate::ExecutorBucket) -> vk::CullModeFlags {
     }
 }
 
-/// Records the depth-family executor draws (depth-prepass, shadow, point-shadow,
-/// G-buffer, motion, wireframe overlay, reactive coverage): ONE pipeline for every
-/// selected bucket, sets 0 + 2 (their fragments never read set 1), the pass's push
-/// bytes, the pages arena as the index stream, then per-bucket counted indirect
-/// draws. `transparent` selects which bucket class draws (the reactive-coverage mask
-/// draws the blend buckets; every depth pass draws the rest). Returns the recorded
-/// bucket count.
+/// Records the depth-family executor draws (depth-prepass, the `vsm-pages` shadow
+/// pass, G-buffer, motion, wireframe overlay, reactive coverage): one pipeline for
+/// every selected bucket, sets 0 + 2 (their fragments never read set 1), the pass's
+/// push bytes, then per-bucket counted indirect draws over the index stream
+/// [`bucket_index_buffer`] selects. `transparent` selects which bucket class draws
+/// (the reactive-coverage mask draws the blend buckets; every depth pass draws the
+/// rest). Returns the recorded bucket count.
 #[allow(clippy::too_many_arguments)]
 pub fn record_executor_depth_family(
     raw: &ash::Device,
@@ -172,7 +191,6 @@ pub fn record_executor_depth_family(
             &[],
         );
         raw.cmd_push_constants(cmd, pipeline.1, push_stages, 0, push_bytes);
-        raw.cmd_bind_index_buffer(cmd, page_index_buffer, 0, vk::IndexType::UINT32);
     }
     let mut recorded = 0;
     for (bucket_index, (bucket, blend, _)) in draws.iter().enumerate() {
@@ -181,6 +199,12 @@ pub fn record_executor_depth_family(
         }
         // SAFETY: the ash seam, as above.
         unsafe {
+            raw.cmd_bind_index_buffer(
+                cmd,
+                bucket_index_buffer(*bucket, page_index_buffer, inputs.displaced_indices),
+                0,
+                vk::IndexType::UINT32,
+            );
             if draw_indirect_count {
                 raw.cmd_draw_indexed_indirect_count(
                     cmd,
@@ -243,20 +267,22 @@ pub fn record_executor_transparent_stream(
         sets.rt_mesh,
         sets.restir_mesh,
     );
-    // SAFETY: the ash seam. The sorted streams + their count were built this frame;
-    // the pages arena is the executor's index stream.
-    unsafe {
-        raw.cmd_bind_index_buffer(cmd, page_index_buffer, 0, vk::IndexType::UINT32);
-    }
     // The slice stride stays the full record capacity — that is how the reorder pass addresses
     // each bucket's stream — while the draw count follows the records that exist.
     let draws = inputs.draw_bound.min(inputs.record_capacity);
     for (group_slot, (bucket, _, pso)) in blend.iter().enumerate() {
         let offset = group_slot as u64 * u64::from(inputs.record_capacity) * 20;
-        // SAFETY: the ash seam, as above.
+        // SAFETY: the ash seam. The sorted streams + their count were built this frame; each
+        // bucket binds the index stream its representation reads.
         unsafe {
             raw.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, pso.handle());
             raw.cmd_set_cull_mode(cmd, bucket_cull_mode(*bucket));
+            raw.cmd_bind_index_buffer(
+                cmd,
+                bucket_index_buffer(*bucket, page_index_buffer, inputs.displaced_indices),
+                0,
+                vk::IndexType::UINT32,
+            );
             if draw_indirect_count {
                 raw.cmd_draw_indexed_indirect_count(
                     cmd,
@@ -273,125 +299,6 @@ pub fn record_executor_transparent_stream(
         }
     }
     blend.len() as u32
-}
-
-/// Records the tessellation seam's scene draws: per displaced instance of the selected
-/// blend class, its mesh PSO (vertex input over the amplified stream), dynamic cull,
-/// its transient VB/IB, and the GPU-seeded indirect command. The roster + viewProj
-/// push (re)bind through the first draw's layout, so the scope is self-contained.
-/// Returns the recorded draw count.
-pub fn record_tess_scene_draws(
-    raw: &ash::Device,
-    cmd: vk::CommandBuffer,
-    view_proj: Mat4,
-    sets: MeshPassSets,
-    draws: &[crate::TessSceneDraw],
-    transparent: bool,
-) -> u32 {
-    let live: Vec<_> = draws
-        .iter()
-        .filter(|draw| draw.blend == transparent && draw.draw.is_some())
-        .collect();
-    let Some(first) = live.first() else {
-        return 0;
-    };
-    bind_mesh_descriptor_sets(
-        raw,
-        cmd,
-        first.pso.layout(),
-        view_proj,
-        vk::ShaderStageFlags::VERTEX,
-        sets.bindless,
-        sets.light,
-        sets.instance,
-        sets.ibl,
-        sets.ssao_mesh,
-        sets.ddgi_mesh,
-        sets.rt_mesh,
-        sets.restir_mesh,
-    );
-    for draw in &live {
-        let handles = draw.draw.expect("filtered above");
-        // SAFETY: the ash seam. The PSO declares dynamic cull; the transient VB/IB +
-        // args are pinned by the frame's `RenderGraphResources` until this slot's
-        // fence; `cmd` is recording inside the pass's rendering scope.
-        unsafe {
-            raw.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, draw.pso.handle());
-            raw.cmd_set_cull_mode(cmd, draw.cull);
-            raw.cmd_bind_vertex_buffers(cmd, 0, &[handles.vertex_buffer], &[0]);
-            raw.cmd_bind_index_buffer(cmd, handles.index_buffer, 0, vk::IndexType::UINT32);
-            raw.cmd_draw_indexed_indirect(cmd, handles.args_buffer, handles.args_offset, 1, 20);
-        }
-    }
-    live.len() as u32
-}
-
-/// Records the tessellation seam's depth-family draws: the pass's vertex-input PSO
-/// once (sets 0/2 + the pass's push bytes), then per non-blend displaced instance its
-/// transient VB/IB + GPU-seeded indirect command. `motion` also binds the previous
-/// micro-vertex stream on binding 1 (the motion PSO's prev-position input). Returns
-/// the recorded draw count.
-#[allow(clippy::too_many_arguments)]
-pub fn record_tess_depth_draws(
-    raw: &ash::Device,
-    cmd: vk::CommandBuffer,
-    pipeline: (vk::Pipeline, vk::PipelineLayout),
-    push_stages: vk::ShaderStageFlags,
-    push_bytes: &[u8],
-    bindless_set: vk::DescriptorSet,
-    instance_set: vk::DescriptorSet,
-    draws: &[crate::TessSceneDraw],
-    motion: bool,
-) -> u32 {
-    let live: Vec<_> = draws
-        .iter()
-        .filter(|draw| !draw.blend && draw.draw.is_some())
-        .collect();
-    if live.is_empty() {
-        return 0;
-    }
-    // SAFETY: the ash seam. The PSO/sets are valid this frame; the push spans the
-    // pass's declared range.
-    unsafe {
-        raw.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, pipeline.0);
-        raw.cmd_bind_descriptor_sets(
-            cmd,
-            vk::PipelineBindPoint::GRAPHICS,
-            pipeline.1,
-            0,
-            &[bindless_set],
-            &[],
-        );
-        raw.cmd_bind_descriptor_sets(
-            cmd,
-            vk::PipelineBindPoint::GRAPHICS,
-            pipeline.1,
-            2,
-            &[instance_set],
-            &[],
-        );
-        raw.cmd_push_constants(cmd, pipeline.1, push_stages, 0, push_bytes);
-    }
-    for draw in &live {
-        let handles = draw.draw.expect("filtered above");
-        // SAFETY: the ash seam. The transient VB/IB + args are pinned by the frame's
-        // `RenderGraphResources` until this slot's fence; `cmd` is recording.
-        unsafe {
-            if motion {
-                raw.cmd_bind_vertex_buffers(
-                    cmd,
-                    0,
-                    &[handles.vertex_buffer, handles.prev_vertex_buffer],
-                    &[0, 0],
-                );
-            } else {
-                raw.cmd_bind_vertex_buffers(cmd, 0, &[handles.vertex_buffer], &[0]);
-            }
-            raw.cmd_bind_index_buffer(cmd, handles.index_buffer, 0, vk::IndexType::UINT32);
-            raw.cmd_draw_indexed_indirect(cmd, handles.args_buffer, handles.args_offset, 1, 20);
-        }
-    }
-    live.len() as u32
 }
 
 /// The mesh pass's full descriptor-set roster for one executor pass record.
@@ -420,10 +327,9 @@ pub struct MeshPassSets {
 ///
 /// Sets 0, {1,2}, 3, 4, 5 are five bind operations that hold regardless of draw count
 /// (bindless textures + per-record indices keep the path O(1) in draws); the RT sets
-/// 6 + 7 add one each when present on an RT device. `0` when nothing draws (no draws,
-/// no binds). The single source of truth for the renderer's `render-stats` accounting.
+/// 6 + 7 add one each when present on an RT device. `0` when nothing draws.
 #[must_use]
-pub fn scene_draw_list_bind_count(
+pub fn scene_pass_bind_count(
     has_draws: bool,
     rt_mesh_set: vk::DescriptorSet,
     restir_mesh_set: vk::DescriptorSet,

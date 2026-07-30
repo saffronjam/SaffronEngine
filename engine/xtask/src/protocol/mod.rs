@@ -1,23 +1,9 @@
-//! `xtask gen-protocol`: the TypeScript, envelope, OpenRPC, manifest, and Luau emitters.
+//! `xtask gen-protocol`: assembles the five editor-facing artifacts from the `saffron-protocol`
+//! DTOs — `sa-types.ts`, the reply envelope, the OpenRPC document, the command manifest, and the
+//! `sa.*` Luau defs. Field metadata comes from the `ts-rs` derives, OpenRPC schemas from the
+//! `schemars` fragments.
 //!
-//! The DTO crate (`saffron-protocol`) is the single source of truth: its `ts-rs` derives give
-//! the field metadata (via [`saffron_protocol::ts_decls`]) and its `schemars` fragments give the
-//! OpenRPC per-DTO schemas (via [`saffron_protocol::schema_fragments`]). This module assembles
-//! the five editor-facing artifacts:
-//!
-//! - `editor/src/protocol/sa-types.ts` — header, the `WireUuid` alias, the complete DTO inventory,
-//!   and the `CommandParamsMap`/`CommandResultMap`.
-//! - `schemas/control/envelope.schema.json` — the shared success/failure reply envelope.
-//! - `schemas/control/openrpc.generated.json` — the `{ openrpc, info, methods, components.schemas
-//!   }` envelope, with methods in command-table order and schemas generated from Rust DTOs.
-//! - `schemas/control/command-manifest.generated.json` — the fixture/skip ledger.
-//! - `schemas/control/sa.generated.luau` — the single Luau defs file: the `sa.*` API surface
-//!   ([`luau::emit_api_defs`], from the `saffron-script` binding table) followed by the
-//!   `:get_component` component snapshots ([`luau::emit_component_defs`]), generated from one
-//!   source (no hand-written `library/sa.lua` overlay; the regen-freshness diff is the drift
-//!   guard).
-//!
-//! Field declaration order is load-bearing (positional-CLI / OpenRPC-`required` order); ts-rs
+//! Field declaration order is load-bearing (positional-CLI and OpenRPC-`required` order); ts-rs
 //! and `serde_json`'s `preserve_order` keep it.
 
 use std::collections::HashMap;
@@ -46,8 +32,7 @@ pub struct Artifacts {
     pub openrpc: String,
     /// `schemas/control/command-manifest.generated.json`.
     pub manifest: String,
-    /// `schemas/control/sa.generated.luau` — the single Luau defs file: the `sa.*` API surface
-    /// plus the typed `:get_component` component snapshots, both from the one binding source.
+    /// `schemas/control/sa.generated.luau`.
     pub luau_defs: String,
 }
 
@@ -102,8 +87,8 @@ pub fn run(repo_root: &Path) -> Result<Vec<std::path::PathBuf>> {
     Ok(written)
 }
 
-/// The generated control reply envelope. The failure branch is the standalone schemars model for
-/// [`ControlFailureDto`]; the open success payload remains unconstrained for command-specific DTOs.
+/// The control reply envelope: the failure branch is the schemars model for [`ControlFailureDto`],
+/// the success payload stays open for command-specific DTOs.
 fn emit_envelope_schema() -> String {
     let Value::Object(mut failure) = standalone_schema_for::<ControlFailureDto>() else {
         unreachable!("ControlFailureDto schema is an object")
@@ -145,9 +130,7 @@ fn emit_envelope_schema() -> String {
     pretty(&document)
 }
 
-/// The parsed `ts-rs` declarations, indexed by ident, plus the parsed enum-union strings — the
-/// field-metadata model the TS emitter walks. `ts-rs` is the parser; this only re-models its
-/// output.
+/// The parsed `ts-rs` declarations the TS emitter walks, indexed by ident.
 pub struct DtoDecls {
     /// DTO identifiers in the canonical Rust inventory order.
     ordered: Vec<String>,
@@ -180,9 +163,8 @@ impl DtoDecls {
     }
 }
 
-/// Parse a `ts-rs` `type X = ...;` declaration into a [`Decl`]. A `{ ... }` object body becomes
-/// ordered struct fields; `Record<string, never>` is an empty struct; anything else (an enum
-/// union or the `string` alias) is kept verbatim as an [`Decl::Alias`].
+/// Parses a `ts-rs` `type X = ...;` declaration: a `{ ... }` body becomes ordered struct fields,
+/// `Record<string, never>` an empty struct, anything else a verbatim [`Decl::Alias`].
 fn parse_decl(decl: &str) -> Decl {
     let rhs = decl
         .split_once('=')
@@ -199,9 +181,8 @@ fn parse_decl(decl: &str) -> Decl {
     Decl::Alias(rhs.to_owned())
 }
 
-/// Whether a declaration contains a union separator outside every object/array/generic group.
-/// Tagged enums from ts-rs have the shape `{ kind: "a", ... } | { kind: "b", ... }`; treating
-/// that as one object would emit an invalid TypeScript interface.
+/// Whether a declaration has a union separator outside every object/array/generic group. A ts-rs
+/// tagged enum reads `{ kind: "a", … } | { kind: "b", … }`, which is not one interface.
 fn has_top_level_union(value: &str) -> bool {
     let mut depth = 0_i32;
     let mut quoted = false;
@@ -228,9 +209,8 @@ fn has_top_level_union(value: &str) -> bool {
     false
 }
 
-/// Split a `ts-rs` object body into ordered `(field, type)` pairs, dropping the `/** ... */`
-/// doc-comment blocks ts-rs interleaves (the committed wire TS carries no field docs) and
-/// honoring `<>`/`{}`/`[]` nesting when splitting on the top-level commas.
+/// Splits a `ts-rs` object body into ordered `(field, type)` pairs, dropping the interleaved
+/// `/** … */` blocks and honoring `<>`/`{}`/`[]` nesting at the top-level commas.
 fn parse_fields(inner: &str) -> Vec<(String, String)> {
     let without_docs = strip_doc_comments(inner).replace('\n', " ");
     let mut fields = Vec::new();
@@ -320,8 +300,7 @@ fn emit_openrpc() -> String {
     pretty(&doc)
 }
 
-/// The command manifest. Each command carries exactly one of a fixture or a skip; neither is a
-/// build error.
+/// The command manifest: each command carries exactly one of a fixture or a skip.
 fn emit_manifest() -> String {
     let commands: Vec<Value> = COMMANDS
         .iter()
@@ -356,8 +335,7 @@ fn emit_manifest() -> String {
     pretty(&doc)
 }
 
-/// 2-space indent, a trailing newline, raw non-ASCII (the em-dash in command summaries stays a
-/// literal UTF-8 byte).
+/// 2-space indent, a trailing newline, and raw UTF-8 (no `\u` escapes).
 fn pretty(value: &Value) -> String {
     let mut buf = Vec::new();
     let formatter = serde_json::ser::PrettyFormatter::with_indent(b"  ");
@@ -373,7 +351,6 @@ mod tests {
     use super::*;
 
     fn repo_root() -> std::path::PathBuf {
-        // `engine/xtask/` -> repo root is three parents up.
         std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .parent()
             .and_then(Path::parent)
@@ -405,9 +382,6 @@ mod tests {
         assert_eq!(emit().luau_defs, committed);
     }
 
-    /// The `sa.*` defs are generated from one source, so a hand-written `library/sa.lua` overlay,
-    /// a components-only `.luau` artifact, and a `check-script-defs` drift tripwire must not exist
-    /// anywhere in the tree.
     #[test]
     fn no_legacy_overlay_or_tripwire() {
         let root = repo_root();
@@ -421,8 +395,6 @@ mod tests {
                 "legacy artifact must not exist in the Rust tree: {absent}"
             );
         }
-        // A generated `.luau` def file is the only Lua-type artifact: no `sa.lua` overlay is
-        // committed under these trees.
         for tree in [
             "engine/crates",
             "engine/xtask",
@@ -442,7 +414,7 @@ mod tests {
         }
     }
 
-    /// A small recursive file walk (no external crate), skipping `node_modules`/`target`.
+    /// A recursive file walk skipping `node_modules`/`target`.
     fn walk(dir: &Path) -> Vec<std::path::PathBuf> {
         let mut out = Vec::new();
         let Ok(read) = std::fs::read_dir(dir) else {

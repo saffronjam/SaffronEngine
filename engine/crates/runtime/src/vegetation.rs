@@ -280,7 +280,7 @@ impl VegetationRuntimeScheduler {
             // does not decode against this generation is a hard error: importing it would apply
             // another world's state to this one.
             let baseline = assets
-                .vegetation_artifact_store()
+                .vegetation_state_store()
                 .read_baseline_if_present(identity)
                 .map_err(|error| VegetationRuntimeError::Asset(Box::new(error)))?;
             if let Some(bytes) = baseline {
@@ -357,7 +357,10 @@ impl VegetationRuntimeScheduler {
         Ok(())
     }
 
-    fn publish_completed(&mut self, world: &VegetationWorld) -> Result<(), VegetationRuntimeError> {
+    fn publish_completed(
+        &mut self,
+        world: &mut VegetationWorld,
+    ) -> Result<(), VegetationRuntimeError> {
         let cells = self.workers.keys().copied().collect::<Vec<_>>();
         for cell in cells {
             let completed = self

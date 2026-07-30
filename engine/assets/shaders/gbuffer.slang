@@ -8,20 +8,10 @@
 import coverage;
 import global_gpu_data;
 import material_params;
+import scene_micro_common;
 
 [[vk::binding(0, 0)]] Sampler2D albedoTextures[1024];
 
-struct Instance
-{
-    float4x4 model;
-    float4x4 normalMatrix;
-    float4x4 prevModel;
-    float4 baseColor;
-    uint4 texture;
-    float4 pbr;
-    float4 emissive;
-};
-[[vk::binding(0, 2)]] StructuredBuffer<Instance> instances;
 [[vk::binding(2, 2)]] StructuredBuffer<MaterialParams> materialParams;
 
 struct Push
@@ -30,13 +20,6 @@ struct Push
     float4x4 view;       // world -> view
 };
 [[vk::push_constant]] Push pc;
-
-struct VertexInput
-{
-    [[vk::location(0)]] float3 position;
-    [[vk::location(1)]] float3 normal;
-    [[vk::location(2)]] float2 uv0;
-};
 
 struct VertexOutput
 {
@@ -53,30 +36,6 @@ struct VertexOutput
     nointerpolation uint transition : TEXCOORD6;
 };
 
-[shader("vertex")]
-VertexOutput vertexMain(VertexInput input, uint instanceIndex : SV_VulkanInstanceID)
-{
-    Instance inst = instances[instanceIndex];
-    VertexOutput output;
-    float4 worldPos = mul(inst.model, float4(input.position, 1.0));
-    float4 viewPos = mul(pc.view, worldPos);
-    output.position = mul(pc.viewProj, worldPos);
-    float3 worldNormal = mul((float3x3)inst.normalMatrix, input.normal);
-    output.viewNormal = mul((float3x3)pc.view, worldNormal);
-    output.viewZ = viewPos.z;
-    MaterialParams mat = materialParams[inst.texture.w];
-    output.roughness = (mat.tex1.w & FEATURE_THIN_SHEET) != 0u
-        ? mat.thinReflection.z
-        : inst.pbr.y;
-    output.worldPos = worldPos.xyz;
-    output.uv0 = input.uv0;
-    output.materialIndex = inst.texture.w;
-    output.coverageAnchor = input.position;
-    output.viewDirection = -viewPos.xyz;
-    output.transition = 0u;
-    return output;
-}
-
 // The frame's semantic record stream (layout parity with the mesh module's binding).
 [[vk::binding(4, 2)]] StructuredBuffer<GpuDrawRecord> executorRecords;
 
@@ -85,7 +44,8 @@ VertexOutput vertexMain(VertexInput input, uint instanceIndex : SV_VulkanInstanc
 // deformation), and the material resolves to its resident parameter block — roughness
 // comes from the params (interned per override variant), never a per-instance word.
 [shader("vertex")]
-VertexOutput vertexMainExecutor(uint vertexIndex : SV_VertexID, uint recordIndex : SV_VulkanInstanceID)
+VertexOutput vertexMainExecutor(
+    uint vertexIndex : SV_VulkanVertexID, uint recordIndex : SV_VulkanInstanceID)
 {
     let addresses = gpuSceneAddresses;
     let record = executorRecords[recordIndex];
@@ -135,6 +95,12 @@ VertexOutput vertexMainExecutor(uint vertexIndex : SV_VertexID, uint recordIndex
         }
         localNormal = normalize(n);
         uv = float2(0.0);
+    }
+    else if (record.representation == GPU_REPRESENTATION_DISPLACED_MICRO)
+    {
+        // `vertexIndex` is the absolute micro-vertex slot in the frame's amplification
+        // arena; its position and normal are already displaced.
+        gpuSceneDisplacedVertex(addresses, vertexIndex, false, local, localNormal, uv);
     }
     else if (record.deformation.index != 0xFFFFFFFFu
         && instance.deformation.index == record.deformation.index)

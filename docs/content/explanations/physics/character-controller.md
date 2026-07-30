@@ -76,10 +76,10 @@ change direction or set the desired velocity to zero without rebuilding the cont
 | What | File | Symbols |
 |---|---|---|
 | Component and authored defaults | `engine/crates/scene/src/component.rs`, `serde.rs` | `CharacterController`, `SceneSerialize for CharacterController` |
-| Creation, stepping, and write-back | `engine/crates/physics/src/world.rs` | `World::add_character`, `World::step_characters`, `World::step` |
+| Creation, stepping, and write-back | `engine/crates/physics/src/world/` | `World::add_character`, `World::step_characters`, `World::step` |
 | Jolt bridge | `engine/crates/physics-sys/src/lib.rs`, `shim/jolt_bridge.cpp` | `add_character`, `character_set_linear_velocity`, `character_extended_update`, `character_on_ground` |
 | Play-world population | `engine/crates/runtime/src/session.rs` | `RuntimeSession::populate_world` |
-| Control protocol | `engine/crates/control/src/commands_physics.rs`, `engine/crates/protocol/src/dto.rs` | `register_physics_commands`, `MoveCharacterParams`, `MoveCharacterResult` |
+| Control protocol | `engine/crates/control/src/commands_physics.rs`, `engine/crates/protocol/src/dto/` | `register_physics_commands`, `MoveCharacterParams`, `MoveCharacterResult` |
 
 ## Related
 

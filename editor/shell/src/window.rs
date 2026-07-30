@@ -42,11 +42,6 @@ impl ShellWindow {
         self.window.set_maximized(!self.window.is_maximized());
     }
 
-    #[allow(dead_code)]
-    pub fn is_maximized(&self) -> bool {
-        self.window.is_maximized()
-    }
-
     pub fn drag_window(&self) {
         let _ = self.window.drag_window();
     }
@@ -62,11 +57,6 @@ impl ShellWindow {
     /// level and routes relative motion through `DeviceEvent::MouseMotion`.
     pub fn set_pointer_lock(&self, locked: bool) {
         backend::window::set_pointer_lock(&self.window, locked);
-    }
-
-    #[allow(dead_code)]
-    pub fn scale_factor(&self) -> f64 {
-        self.window.scale_factor()
     }
 
     /// Replaces `getCurrentWindow().show()`; gated behind CEF's first paint.

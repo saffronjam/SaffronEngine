@@ -83,12 +83,12 @@ The ragdoll commands require a live physics world, so they run while the scene i
 
 | What | File | Symbols |
 |---|---|---|
-| Motor drive and blend state | `engine/crates/physics/src/world.rs` | `World::drive_ragdolls_to_pose`, `World::advance_ragdoll_blend`, `World::set_ragdoll_blend`, `World::ragdoll_state` |
-| Pose write-back | `engine/crates/physics/src/world.rs` | `World::write_ragdoll_poses`, `PURE_PHYSICS_WEIGHT`, `RAGDOLL_WEIGHT_RATE` |
+| Motor drive and blend state | `engine/crates/physics/src/world/` | `World::drive_ragdolls_to_pose`, `World::advance_ragdoll_blend`, `World::set_ragdoll_blend`, `World::ragdoll_state` |
+| Pose write-back | `engine/crates/physics/src/world/` | `World::write_ragdoll_poses`, `PURE_PHYSICS_WEIGHT`, `RAGDOLL_WEIGHT_RATE` |
 | Jolt motor bridge | `engine/crates/physics-sys/src/lib.rs`, `shim/jolt_bridge.cpp` | `ragdoll_set_swing_twist_motor`, `bone_motor_settings`, `BonePart` |
-| Animation target and tick order | `engine/crates/animation/src/runtime.rs`, `engine/crates/runtime/src/session.rs` | `AnimationRuntime::last_poses`, `RuntimeSession::step`, `PoseTarget` |
+| Animation target and tick order | `engine/crates/animation/src/runtime/`, `engine/crates/runtime/src/session.rs` | `AnimationRuntime::last_poses`, `RuntimeSession::step`, `PoseTarget` |
 | Import defaults | `engine/crates/assets/src/spawn.rs` | `autofit_bone_physics` |
-| Control protocol | `engine/crates/control/src/commands_physics.rs`, `engine/crates/protocol/src/dto.rs` | `register_physics_commands`, `SetRagdollParams`, `GetRagdollParams`, `RagdollResult` |
+| Control protocol | `engine/crates/control/src/commands_physics.rs`, `engine/crates/protocol/src/dto/` | `register_physics_commands`, `SetRagdollParams`, `GetRagdollParams`, `RagdollResult` |
 
 ## Related
 

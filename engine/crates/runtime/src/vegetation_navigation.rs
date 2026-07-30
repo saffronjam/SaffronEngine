@@ -1,14 +1,18 @@
 //! Vegetation's navigation contribution seam.
 //!
-//! Navigation is not implemented here and never will be: this module publishes what vegetation
-//! *contributes* to whatever navigation system consumes it — cell-addressed obstacle and
-//! traversal-cost payloads, plus the world bounds that changed since the consumer last looked.
-//! There is no foliage-private navmesh, no tile builder, and no pathfinding.
+//! Navigation is not implemented here and never will be. This module publishes only what vegetation
+//! *contributes* to whatever consumes it: cell-addressed obstacle and traversal-cost payloads, plus
+//! the world bounds that changed since the consumer last looked. There is no foliage-private navmesh,
+//! no tile builder, and no pathfinding.
 //!
-//! Each plant declares exactly one contribution, derived from its interaction policy and its
-//! family's navigation proxies: no effect, a traversal-cost field, a static obstacle, or — while a
-//! promoted entity owns it — a dynamic obstacle, because the plant is moving and a static tile
-//! rebuild would be stale before it finished.
+//! Each plant declares exactly one contribution, derived from its interaction policy and its family's
+//! navigation proxies. A promoted plant contributes a *dynamic* obstacle, because it is moving and a
+//! static tile rebuild would be stale before it finished.
+//!
+//! A cell mid-catch-up publishes nothing. Its lifecycle state changes every tick, and a consumer
+//! that rebuilt a tile per intermediate tick would spend the whole catch-up rebuilding ground the
+//! player never saw. A cell whose region cannot run at all keeps publishing its last committed
+//! generation, because that is the newest one there will be until the ground it depends on loads.
 
 use std::collections::BTreeMap;
 
@@ -16,7 +20,8 @@ use glam::DVec3;
 use saffron_assets::AssetServer;
 use saffron_spatial::{PlantId, ResidencyFacet, WorldBounds, WorldCellKey};
 use saffron_vegetation::{
-    InteractionPolicy, PlantNavigationProxy, VegetationNavigationContribution, VegetationWorld,
+    EcologyInfluence, InteractionPolicy, PlantNavigationProxy, VegetationNavigationContribution,
+    VegetationWorld,
 };
 
 use crate::vegetation_family::PlantFamilyCache;
@@ -88,12 +93,14 @@ impl VegetationNavigationSeam {
         vegetation: &VegetationWorld,
         assets: &AssetServer,
         families: &mut PlantFamilyCache,
+        influence: EcologyInfluence,
     ) {
         let mut desired = BTreeMap::new();
         for (cell, generation) in vegetation.resident_cells() {
             if generation
                 .resident_facets()
                 .contains(ResidencyFacet::Navigation)
+                && vegetation.simulation_facet_is_settled(cell, influence)
             {
                 desired.insert(cell, generation);
             }

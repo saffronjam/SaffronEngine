@@ -46,8 +46,8 @@ async function screenshot(tag: string): Promise<Buffer> {
   return captureViewport(engine, caseCleaner, `matrender-${tag}`);
 }
 
-/// mapped-material.glb is imported once (the bake is expensive); each call instantiates a fresh entity
-/// from the cached asset and registers it for per-test cleanup.
+// mapped-material.glb is imported once (the bake is expensive); each call instantiates a fresh entity
+// from the cached asset and registers it for per-test cleanup.
 async function mintMappedEntity(): Promise<EntityRef> {
   mappedAsset ??= (await engine.call<{ id: string }>("import-model", { path: MAPPED })).id;
   return trackEntity(
@@ -57,9 +57,9 @@ async function mintMappedEntity(): Promise<EntityRef> {
   );
 }
 
-/// The albedo + packed-ORM texture ids on the mapped entity's referenced `.smat`, plus the slot
-/// material and count — read from the entity's MaterialSet. The override/normal cases assign these
-/// real imported textures; keeping the read here dedupes it across cases.
+// The albedo + packed-ORM texture ids on the mapped entity's referenced `.smat`, plus the slot
+// material and count — read from the entity's MaterialSet. The override/normal cases assign these
+// real imported textures; keeping the read here dedupes it across cases.
 async function mintTextureId(
   entity: string,
 ): Promise<{ material: string; slots: number; albedo: string; orm: string }> {

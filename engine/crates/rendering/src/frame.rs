@@ -1,10 +1,6 @@
-//! The per-frame command/sync ring.
-//!
-//! A `MAX_FRAMES_IN_FLIGHT` ring of frame slots — one command pool + buffer +
-//! image-available semaphore + in-flight fence per slot. It owns its handles and
-//! frees them in [`FrameRing::destroy`] (called by the renderer before the device
-//! is torn down, since these handles borrow the device and cannot Drop themselves
-//! without it).
+//! The per-frame command/sync ring: `MAX_FRAMES_IN_FLIGHT` slots, each one command pool + buffer +
+//! image-available semaphore + in-flight fence. The handles borrow the device and cannot Drop
+//! themselves, so the renderer calls [`FrameRing::destroy`] before device teardown.
 
 use ash::vk;
 

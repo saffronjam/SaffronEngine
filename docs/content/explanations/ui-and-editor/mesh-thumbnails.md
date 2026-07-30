@@ -87,12 +87,12 @@ The in-flight map lets concurrent consumers share one retry loop per asset. Repl
 
 | What | File | Symbols |
 |---|---|---|
-| Request classification and disk cache | `engine/crates/assets/src/thumbnail.rs` | `request_thumbnail`, `PreviewRenderKind`, `PreviewRenderJob`, `THUMBNAIL_CACHE_VERSION`, `write_thumbnail_cache` |
-| Preview scene and framing | `engine/crates/control/src/commands_asset.rs` | `PreviewSubject`, `build_preview_scene_for_thumbnail`, `compute_preview_bounds`, `frame_preview_camera` |
-| Queue drain and convergence | `engine/crates/host/src/layer.rs` | `HostLayer::drive_preview_render_queue`, `render_preview_scene_to_png` |
-| Offscreen view isolation | `engine/crates/rendering/src/renderer.rs` | `ViewId::Thumbnail`, `scene_ibl`, `encode_active_offscreen_png`, `restore_active_view_no_reset` |
+| Request classification and disk cache | `engine/crates/assets/src/thumbnail/` | `request_thumbnail`, `PreviewRenderKind`, `PreviewRenderJob`, `THUMBNAIL_CACHE_VERSION`, `write_thumbnail_cache` |
+| Preview scene and framing | `engine/crates/control/src/commands_asset/` | `PreviewSubject`, `build_preview_scene_for_thumbnail`, `compute_preview_bounds`, `frame_preview_camera` |
+| Queue drain and convergence | `engine/crates/host/src/layer/` | `HostLayer::drive_preview_render_queue`, `render_preview_scene_to_png` |
+| Offscreen view isolation | `engine/crates/rendering/src/renderer/` | `ViewId::Thumbnail`, `scene_ibl`, `encode_active_offscreen_png`, `restore_active_view_no_reset` |
 | PNG conversion | `engine/crates/rendering/src/thumbnail.rs` | `convert_to_rgb`, `encode_to_png`, `ThumbnailPng` |
-| Thumbnail commands | `engine/crates/control/src/commands_asset.rs` | `thumbnail_result`, `get-thumbnail`, `view-asset`, `thumbnail-cache` |
+| Thumbnail commands | `engine/crates/control/src/commands_asset/` | `thumbnail_result`, `get-thumbnail`, `view-asset`, `thumbnail-cache` |
 | Blob URL cache and retries | `editor/src/state/store.ts` | `getThumbnailUrl`, `getCachedThumbnailUrl`, `base64ToBlob`, `invalidateThumbnails` |
 | Grid tile display | `editor/src/components/AssetTile.tsx` | `AssetTile`, `THUMBNAIL_FETCH_SIZE`, `ThumbnailLoading` |
 

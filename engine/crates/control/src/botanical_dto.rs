@@ -398,9 +398,7 @@ pub(crate) fn graph_from_dto(dto: &BotanicalGraphDto) -> Result<BotanicalGraphDo
             })
             .collect::<Result<Vec<_>>>()?,
     };
-    graph
-        .validate()
-        .map_err(|error| Error::command(error.to_string()))?;
+    graph.validate().map_err(Error::command)?;
     Ok(graph)
 }
 
@@ -546,7 +544,7 @@ fn operator_from_dto(operator: &BotanicalOperatorDto) -> Result<BotanicalOperato
                     .map(|point| (unit(point.at), fixed(point.factor_bits)))
                     .collect(),
             )
-            .map_err(|error| Error::command(error.to_string()))?,
+            .map_err(Error::command)?,
             segments: *segments,
         },
         BotanicalOperatorDto::Branch {

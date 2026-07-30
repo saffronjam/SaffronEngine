@@ -1,17 +1,11 @@
 //! The JSON↔Lua bridge for the component read/write surface: total conversions
 //! between `serde_json::Value` and `mlua::Value`.
 //!
-//! The two halves of `get_component` / `set_component`. Both are total over the
-//! component DTO shapes: nothing aborts, an unrepresentable input degrades to `nil` /
-//! `null`.
-//!
-//! - [`json_to_lua`] (the read half): objects→tables, arrays→1-based tables, strings
-//!   (a uuid stays its decimal string), booleans, floats; an unsigned integer past
-//!   `i64::MAX` falls back to `f64` (so a u64 uuid that slipped through as a number does
-//!   not wrap negative), every other integer to a Lua integer, and `null`→`nil`.
-//! - [`lua_to_json`] (the write half): a `sa.Vec3` userdata → `{x,y,z}` object (the
-//!   shape the per-component serde reads), a string-keyed table → object, a 1-based
-//!   sequence → array, scalars 1:1, and anything else → `null`.
+//! Both halves are total over the component DTO shapes: nothing aborts, and an unrepresentable
+//! input degrades to `nil` or `null`. Arrays cross as 1-based tables, a uuid stays its decimal
+//! string, and an unsigned integer past `i64::MAX` falls back to `f64` so a u64 uuid that slipped
+//! through as a number does not wrap negative. Writing back, a `sa.Vec3` userdata becomes the
+//! `{x, y, z}` object the per-component serde reads.
 
 use mlua::{Lua, Value as LuaValue};
 use serde_json::{Map, Value as JsonValue};

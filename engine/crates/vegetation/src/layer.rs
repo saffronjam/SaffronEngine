@@ -44,16 +44,13 @@ pub struct ProvenanceDecision {
     pub operator: GraphOperator,
     /// Sampler candidate identity.
     pub candidate: u64,
-    /// Stable decision outcome.
     pub outcome: ProvenanceDecisionOutcome,
 }
 
 /// Complete lineage for an accepted or rejected vegetation candidate.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ProvenanceRecord {
-    /// Vegetation map.
     pub map: Uuid,
-    /// Stable layer identity.
     pub layer: u128,
     /// Root biome asset.
     pub biome: Uuid,
@@ -65,7 +62,6 @@ pub struct ProvenanceRecord {
     pub family: Option<Uuid>,
     /// Accepted stable plant identity, absent for rejected candidates.
     pub plant: Option<PlantId>,
-    /// Selected family variation.
     pub variation: u32,
 }
 
@@ -250,7 +246,6 @@ impl ProvenanceTable {
         self.records.get(handle.0 as usize)
     }
 
-    /// Resolves one candidate decision.
     #[must_use]
     pub fn decision(&self, handle: ProvenanceDecisionHandle) -> Option<&ProvenanceDecision> {
         self.decisions.get(handle.0 as usize)
@@ -428,7 +423,6 @@ pub struct FieldTileLayer {
     pub channel: FieldChannel,
     /// Stable tile-set identity in the map package.
     pub tile_set: u128,
-    /// Quantized blend operation.
     pub blend: FieldBlendOperator,
     /// Layer opacity/weight.
     pub weight: UnitInterval,
@@ -437,7 +431,6 @@ pub struct FieldTileLayer {
 /// One family weight in a species-palette layer.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SpeciesWeight {
-    /// Plant-family asset.
     pub family: Uuid,
     /// Canonical palette weight.
     pub weight: UnitInterval,
@@ -457,7 +450,6 @@ pub struct VolumeLayer {
 /// A world-space authored spline influence.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SplineLayer {
-    /// Stable spline identity.
     pub spline: u128,
     /// Exact quantized world control points.
     pub points: Vec<WorldPosition>,
@@ -500,13 +492,10 @@ pub enum VegetationLayerOperator {
     ScalarField(FieldTileLayer),
     /// Quantized vector field tiles.
     VectorField {
-        /// Shared channel identity.
         channel: FieldChannel,
-        /// Stable tile-set identity.
         tile_set: u128,
         /// Fixed vector added/replaced per tile sample.
         value: DecisionVec3,
-        /// Blend operation.
         blend: FieldBlendOperator,
     },
     /// Family/community palette weights.
@@ -515,7 +504,6 @@ pub enum VegetationLayerOperator {
     Density(FieldTileLayer),
     /// Include/exclude mask tile.
     Mask {
-        /// Stable tile-set identity.
         tile_set: u128,
         /// Inclusion semantics.
         operation: InclusionOperator,
@@ -528,13 +516,11 @@ pub enum VegetationLayerOperator {
     Anchors(Vec<PlantId>),
     /// Procedural identities pinned across recooks.
     Pins(Vec<PlantId>),
-    /// Persistent authored transform overrides.
     TransformOverrides(Vec<PlantTransformOverride>),
     /// Persistent authored biological/interaction overrides.
     StateOverrides(Vec<PlantStateOverride>),
     /// Signed blocker field with a typed category bitset.
     Blocker {
-        /// Stable tile-set identity.
         tile_set: u128,
         /// Blocker categories affected by this layer.
         categories: u32,
@@ -546,13 +532,10 @@ pub enum VegetationLayerOperator {
 pub struct VegetationLayer {
     /// Stable authored identity.
     pub id: u128,
-    /// Human label.
     pub name: String,
-    /// Coordinate space.
     pub coordinate_space: LayerCoordinateSpace,
     /// Conservative exact bounds.
     pub bounds: WorldBounds,
-    /// Typed operation.
     pub operator: VegetationLayerOperator,
     /// Stable IDs of layers/assets this operation reads.
     pub dependencies: Vec<u128>,

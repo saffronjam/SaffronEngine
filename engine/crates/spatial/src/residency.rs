@@ -1,7 +1,7 @@
 //! Deterministic multi-source facet residency and generation-safe publication.
 
 use std::cmp::Ordering;
-use std::collections::{BTreeMap, BTreeSet, BinaryHeap};
+use std::collections::{BTreeMap, BTreeSet};
 use std::num::NonZeroUsize;
 use std::sync::{Arc, RwLock};
 
@@ -54,9 +54,7 @@ impl ResidencyFacet {
 pub struct ResidencyMask(u8);
 
 impl ResidencyMask {
-    /// No facets.
     pub const NONE: Self = Self(0);
-    /// Every defined facet.
     pub const ALL: Self = Self((1 << FACET_COUNT) - 1);
 
     /// A mask containing one facet.
@@ -65,13 +63,11 @@ impl ResidencyMask {
         Self(1 << facet as u8)
     }
 
-    /// Adds a facet.
     #[must_use]
     pub const fn with(self, facet: ResidencyFacet) -> Self {
         Self(self.0 | (1 << facet as u8))
     }
 
-    /// Whether the facet is present.
     #[must_use]
     pub const fn contains(self, facet: ResidencyFacet) -> bool {
         self.0 & (1 << facet as u8) != 0
@@ -167,6 +163,19 @@ pub struct ResidencySnapshot {
     pub priority: i32,
 }
 
+impl ResidencySnapshot {
+    /// The one admission order consumers spend a facet budget in: highest priority first, then
+    /// ascending cell. Total over any snapshot set, so worker count and arrival order change
+    /// latency only.
+    #[must_use]
+    pub fn admission_order(&self, other: &Self) -> Ordering {
+        other
+            .priority
+            .cmp(&self.priority)
+            .then_with(|| self.cell.cmp(&other.cell))
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 struct Claim {
     cell: WorldCellKey,
@@ -189,7 +198,6 @@ impl Default for ResidencyManager {
 }
 
 impl ResidencyManager {
-    /// Creates an empty manager.
     #[must_use]
     pub fn new() -> Self {
         Self::default()
@@ -426,100 +434,6 @@ impl<T> GenerationSlot<T> {
     }
 }
 
-/// A total deterministic priority key. Higher priority pops first; every tie uses stable identity.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct JobPriorityKey {
-    /// Source priority.
-    pub priority: i32,
-    /// Target cell.
-    pub cell: WorldCellKey,
-    /// Target facet.
-    pub facet: ResidencyFacet,
-    /// Generation.
-    pub generation: u64,
-    /// Stable logical job identity assigned by the producer.
-    pub job_id: u128,
-}
-
-impl Ord for JobPriorityKey {
-    fn cmp(&self, other: &Self) -> Ordering {
-        self.priority
-            .cmp(&other.priority)
-            .then_with(|| other.cell.cmp(&self.cell))
-            .then_with(|| other.facet.cmp(&self.facet))
-            .then_with(|| other.generation.cmp(&self.generation))
-            .then_with(|| other.job_id.cmp(&self.job_id))
-    }
-}
-
-impl PartialOrd for JobPriorityKey {
-    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        Some(self.cmp(other))
-    }
-}
-
-struct JobEntry<T> {
-    key: JobPriorityKey,
-    payload: T,
-}
-
-impl<T> PartialEq for JobEntry<T> {
-    fn eq(&self, other: &Self) -> bool {
-        self.key == other.key
-    }
-}
-
-impl<T> Eq for JobEntry<T> {}
-
-impl<T> Ord for JobEntry<T> {
-    fn cmp(&self, other: &Self) -> Ordering {
-        self.key.cmp(&other.key)
-    }
-}
-
-impl<T> PartialOrd for JobEntry<T> {
-    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        Some(self.cmp(other))
-    }
-}
-
-/// A deterministic job queue whose insertion/worker order cannot change priority order.
-pub struct SpatialJobQueue<T> {
-    heap: BinaryHeap<JobEntry<T>>,
-}
-
-impl<T> Default for SpatialJobQueue<T> {
-    fn default() -> Self {
-        Self {
-            heap: BinaryHeap::new(),
-        }
-    }
-}
-
-impl<T> SpatialJobQueue<T> {
-    /// Pushes a job with a complete total key.
-    pub fn push(&mut self, key: JobPriorityKey, payload: T) {
-        self.heap.push(JobEntry { key, payload });
-    }
-
-    /// Pops the next job.
-    pub fn pop(&mut self) -> Option<(JobPriorityKey, T)> {
-        self.heap.pop().map(|entry| (entry.key, entry.payload))
-    }
-
-    /// Number of queued jobs.
-    #[must_use]
-    pub fn len(&self) -> usize {
-        self.heap.len()
-    }
-
-    /// Whether the queue is empty.
-    #[must_use]
-    pub fn is_empty(&self) -> bool {
-        self.heap.is_empty()
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -633,74 +547,25 @@ mod tests {
     }
 
     #[test]
-    fn shuffled_queue_insertion_has_one_pop_order() {
-        let cell = WorldCellKey::base(0, 0, 0);
-        let keys = [
-            JobPriorityKey {
-                priority: 1,
-                cell,
-                facet: ResidencyFacet::Render,
-                generation: 1,
-                job_id: 9,
-            },
-            JobPriorityKey {
-                priority: 2,
-                cell,
-                facet: ResidencyFacet::Render,
-                generation: 1,
-                job_id: 7,
-            },
-            JobPriorityKey {
-                priority: 2,
-                cell,
-                facet: ResidencyFacet::Render,
-                generation: 1,
-                job_id: 3,
-            },
+    fn shuffled_snapshots_reach_one_admission_order() {
+        let snapshot = |x: i64, priority: i32| ResidencySnapshot {
+            cell: WorldCellKey::base(x, 0, 0),
+            reference_counts: [1; FACET_COUNT],
+            priority,
+        };
+        let expected = vec![
+            snapshot(1, 7),
+            snapshot(4, 7),
+            snapshot(9, 7),
+            snapshot(-2, 3),
+            snapshot(5, 3),
         ];
-        let mut first = SpatialJobQueue::default();
-        let mut second = SpatialJobQueue::default();
-        for key in keys {
-            first.push(key, key.job_id);
+        for rotation in 0..expected.len() {
+            let mut shuffled = expected.clone();
+            shuffled.rotate_left(rotation);
+            shuffled.reverse();
+            shuffled.sort_unstable_by(ResidencySnapshot::admission_order);
+            assert_eq!(shuffled, expected, "rotation {rotation}");
         }
-        for key in keys.into_iter().rev() {
-            second.push(key, key.job_id);
-        }
-        let drain = |queue: &mut SpatialJobQueue<u128>| {
-            std::iter::from_fn(|| queue.pop().map(|(_, payload)| payload)).collect::<Vec<_>>()
-        };
-        assert_eq!(drain(&mut first), drain(&mut second));
-        assert_eq!(drain(&mut SpatialJobQueue::default()), Vec::<u128>::new());
-    }
-
-    #[test]
-    fn worker_count_cannot_change_canonical_result_bytes() {
-        let cell = WorldCellKey::base(-4, 7, 2);
-        let keys: Vec<JobPriorityKey> = (0_u128..128)
-            .map(|job_id| JobPriorityKey {
-                priority: (job_id % 7) as i32,
-                cell,
-                facet: ResidencyFacet::Simulation,
-                generation: 3,
-                job_id,
-            })
-            .collect();
-        let evaluate = |workers: usize| {
-            let mut queue = SpatialJobQueue::default();
-            for key in keys.iter().rev() {
-                queue.push(*key, key.job_id.to_be_bytes());
-            }
-            let mut outputs = vec![Vec::<[u8; 16]>::new(); workers];
-            let mut worker = 0;
-            while let Some((_, bytes)) = queue.pop() {
-                outputs[worker].push(bytes);
-                worker = (worker + 1) % workers;
-            }
-            let mut merged: Vec<[u8; 16]> = outputs.into_iter().flatten().collect();
-            merged.sort_unstable();
-            merged
-        };
-        assert_eq!(evaluate(1), evaluate(2));
-        assert_eq!(evaluate(1), evaluate(17));
     }
 }

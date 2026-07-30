@@ -9,7 +9,7 @@ import type { RenderStats } from "@saffron/protocol";
 
 
 let engine: Engine;
-const stats = () => engine.call<RenderStats & Record<string, unknown>>("render-stats");
+const stats = () => engine.call<RenderStats>("render-stats");
 
 beforeAll(async () => {
   // import-model needs a loaded project; SAFFRON_SCRATCH_PROJECT makes one (under the harness temp appdata dir).
@@ -28,7 +28,7 @@ const BOOLEAN_TOGGLES = [
   { cmd: "set-ibl", field: "ibl" },
   { cmd: "set-clustered", field: "clustered" },
   { cmd: "set-depth-prepass", field: "depthPrepass" },
-];
+] as const;
 
 for (const { cmd, field } of BOOLEAN_TOGGLES) {
   test(`${cmd} round-trips through render-stats`, async () => {

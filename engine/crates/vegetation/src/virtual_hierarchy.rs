@@ -103,9 +103,9 @@ pub fn plant_hierarchy_input(
     })
 }
 
-/// One active-use mask per (variation, phenotype): a use draws when its part is active
-/// in both the phenotype and its variation, and its prototype's source contributes to
-/// the variation. Empty authored active sets mean "all".
+/// One active-use mask per (variation, phenotype): a use draws when its part is active in both
+/// the phenotype and its variation and its prototype's source contributes to the variation.
+/// Empty authored active sets mean "all".
 fn use_combinations(
     asset: &PlantFamilyAsset,
     family: &NormalizedPlantFamily,
@@ -150,8 +150,7 @@ fn use_combinations(
     combinations
 }
 
-/// The part an exact Part-destination semantic target binds this normalized row to —
-/// the binding the compile's partition made total for every multi-part source.
+/// The part an exact Part-destination semantic target binds this normalized row to.
 fn target_part_for_mesh(asset: &PlantFamilyAsset, mesh: &NormalizedPlantMesh) -> Option<u128> {
     let crate::PlantFamilySource::Imported(recipe) = &asset.source else {
         return None;
@@ -191,9 +190,8 @@ fn disconnected_foliage(semantic: PlantPartSemantic) -> bool {
     )
 }
 
-/// The canonical prototype identity hash binding one normalized source mesh to its
-/// hierarchy prototype — the runtime loader verifies decoded geometry rows against
-/// `GeometryPrototype::selector_hash` with this.
+/// The canonical prototype identity binding one normalized source mesh to its hierarchy
+/// prototype, checked against `GeometryPrototype::selector_hash` when geometry decodes.
 pub fn plant_prototype_selector_hash(
     source: u128,
     selector: &PlantSourceSelector,
@@ -343,8 +341,6 @@ mod tests {
         }
     }
 
-    /// Two phenotypes over one variation: the healthy phenotype keeps every part, the
-    /// harvested one drops the fruit part — its mask clears exactly that use's bit.
     #[test]
     fn phenotype_active_parts_mask_the_uses() {
         let fixed = |value: i32| DecisionScalar::from_integer(value).expect("scalar");

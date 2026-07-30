@@ -1,22 +1,10 @@
-//! The editor fly-camera: its data, the backend-neutral per-frame fly input, the
-//! yaw/pitch → forward/view math, the per-frame `update_scene_edit_camera` (the eye eases
-//! toward a target pose + WASD/Space/Shift move), and the serde the control caller
-//! round-trips into `project.json`.
+//! The editor fly-camera — the scene-view eye, distinct from any ECS `Camera`.
 //!
-//! The camera eases toward a target each rendered frame with the shared `SMOOTH_TAU`, so the
-//! ~60 Hz control samples become continuous motion at render FPS. It has two modes:
-//!
-//! - **Free fly** (the scene view): the eye carries a target pose
-//!   (`target_position`/`target_yaw`/`target_pitch`) it eases toward; WASD moves the eye and
-//!   its target together (instant translation); an absolute `set-camera` snaps both.
-//! - **Orbit** (the preview panes): `orbit` is `Some` and the eye is *derived* on the arc as
-//!   `pivot - forward(yaw,pitch) · distance`. The pivot, distance, and angles ease toward their
-//!   targets, so a fast drag sweeps the circle at a fixed radius instead of the eye lerping
-//!   straight across it (a chord). Preview enter frames into orbit mode; exit restores the
-//!   stashed free camera.
-//!
-//! These are the scene-view eye, distinct from any ECS `Camera` / game camera. SceneEdit
-//! stays SDL-free — `look_delta` and the move bools arrive as plain data the host fills.
+//! It eases toward a target each rendered frame with the shared `SMOOTH_TAU`, so ~60 Hz control
+//! samples become continuous motion at render FPS. Free fly eases the eye toward a target pose and
+//! WASD translates eye and target together. Orbit instead *derives* the eye on the arc as
+//! `pivot - forward(yaw, pitch) * distance`, easing the pivot, distance, and angles, so a fast drag
+//! sweeps the circle at a fixed radius rather than lerping the eye across the chord.
 
 use glam::{Mat4, Vec2, Vec3};
 use saffron_json::json_f32_or;

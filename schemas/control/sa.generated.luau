@@ -39,7 +39,7 @@ function Vec3:lerp(other, t) end ---@param other sa.Vec3 @param t number @return
 ---@field body_weight number
 ---@field bones integer
 
----@alias sa.ComponentName "Name"|"Transform"|"Mesh"|"VegetationField"|"Camera"|"MaterialSet"|"ModelInstance"|"Script"|"AnimationPlayer"|"DirectionalLight"|"PointLight"|"SpotLight"|"ReflectionProbe"|"FogVolume"|"Relationship"|"SkinnedMesh"|"Morph"|"Bone"|"FootIk"|"BonePhysics"|"Rigidbody"|"Collider"|"KinematicBones"|"CharacterController"
+---@alias sa.ComponentName "Name"|"Transform"|"Mesh"|"VegetationField"|"Camera"|"MaterialSet"|"ModelInstance"|"Script"|"AnimationPlayer"|"DirectionalLight"|"PointLight"|"SpotLight"|"ReflectionProbe"|"FogVolume"|"WindSource"|"Relationship"|"SkinnedMesh"|"Morph"|"Bone"|"FootIk"|"BonePhysics"|"Rigidbody"|"Collider"|"KinematicBones"|"CharacterController"
 
 ---@class sa.Entity
 local Entity = {}
@@ -289,6 +289,13 @@ function sa.delay(seconds, fn) end ---@param seconds number @param fn any @retur
 ---@field map string
 ---@field enabled boolean
 
+---@class sa.WindSource
+---@field kind "directional"|"point"|"vortex"|"wake"|"volume"
+---@field strength number
+---@field radius number
+---@field falloff number
+---@field enabled boolean
+
 ---@overload fun(self: sa.Entity, name: "AnimationPlayer"): sa.AnimationPlayer?
 ---@overload fun(self: sa.Entity, name: "Bone"): sa.Bone?
 ---@overload fun(self: sa.Entity, name: "BonePhysics"): sa.BonePhysics?
@@ -313,4 +320,5 @@ function sa.delay(seconds, fn) end ---@param seconds number @param fn any @retur
 ---@overload fun(self: sa.Entity, name: "SpotLight"): sa.SpotLight?
 ---@overload fun(self: sa.Entity, name: "Transform"): sa.Transform?
 ---@overload fun(self: sa.Entity, name: "VegetationField"): sa.VegetationField?
+---@overload fun(self: sa.Entity, name: "WindSource"): sa.WindSource?
 function Entity:get_component(name) end  ---@param name sa.ComponentName @return table?

@@ -189,8 +189,8 @@ obstacle while promoted.
   target; no UUID sentinel/truncation remains. (The `WorldHitTarget` migration slice: physics
   `RayHit`/`ContactEvent`/`BodyInfo`, `ScriptHitTarget` + the Luau `entity`/`plant` marshalling,
   `WorldHitTargetDto`, the `sa` `entity=`/`plant=`/`unowned` formatter, and the editor PhysicsPanel
-  labels. e2e physics-query/physics-triggers/physics-falling-box all pass on the tagged shapes; the
-  full suite is green apart from the unrelated alpha_blend hang.)
+  labels. `tests/e2e/physics-query.test.ts`, `physics-triggers.test.ts` and
+  `physics-falling-box.test.ts` cover the tagged shapes end to end.)
 - [x] Promotion stress proves exactly one render/collision/simulation owner at every synchronization
   point, including save/unload/recook during transition. (e2e: promoting a plant DROPS the bulk
   `residentBodies` and flips its nav contribution to `DynamicObstacle` in the same pass the entity
@@ -213,14 +213,12 @@ obstacle while promoted.
   emits none. The reducer errors on a transaction id reused with DIFFERENT contents, and
   `committed_records_emit_one_typed_transition_and_replays_emit_none` pins the emission contract.)
 - [x] Standard gate, Jolt determinism tests, Luau/control E2E, and interaction/query docs are green.
-  (GREEN, verified together on 2026-07-26: `just engine` and
-  `just prepare-for-commit` EXIT=0; `cargo test --workspace` green; `just schema` EXIT=0 with all 249
-  manifest-driven control checks passing; `just e2e` at **328/328 across 51 files**, the first fully
-  clean full-suite run — the `alpha_blend` device-loss that held this box is fixed and its 4 cases pass;
-  and the docs three-check sweep at hugo EXIT=0, links none broken, style 0 errors / 0 warnings.)
-  The Jolt `determinism_gate` passes 5x in fresh processes after the scene-ordering fix, every phase-12
-  crate suite is green, and the run includes the `vegetation-interaction` acceptance driver and the
-  whole vegetation graph/stress matrix.
+  (`just engine`, `just prepare-for-commit`, `just schema`, `cargo test --workspace` and `just e2e`
+  are the gate; the docs pages `vegetation-collision.md`, `vegetation-navigation.md` and
+  `plant-promotion.md` are checked by the docs-page skill's `hugo --gc` + `check_links.py` +
+  `check_style.py`. The Jolt `determinism_gate` holds across repeated fresh processes after the
+  scene-ordering fix, and the e2e legs for this phase are `tests/e2e/vegetation-interaction.test.ts`
+  as the acceptance driver plus the vegetation graph and stress suites.)
 
 ## NO-LEGACY gate
 

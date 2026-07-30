@@ -1,13 +1,7 @@
-/// The Plant workspace's collision and navigation view.
-///
-/// The surface is the preview itself: the toggles here draw the family's derived capsules and
-/// footprints over the plant, through the same overlay the scene uses for physics colliders. The
-/// table beside them is the legend, not the view — a list of half-extents tells you nothing about
-/// whether a capsule actually wraps the trunk it was fitted to.
-///
-/// Proxies are DERIVED, like the dimensions and the spines: they are a result of what grew, so there
-/// is nothing here to edit. What an author checks is whether the result is right, which is a
-/// question only the drawing answers.
+/// The Plant workspace's collision and navigation view: the toggles draw the family's derived
+/// capsules and footprints over the preview through the same overlay the scene uses for physics
+/// colliders, and the table beside them is the legend. Proxies are derived, so there is nothing here
+/// to edit.
 import { useCallback, useEffect, useState } from "react";
 import { client } from "../control/client";
 import { errorText, notifyError } from "../lib/flash";

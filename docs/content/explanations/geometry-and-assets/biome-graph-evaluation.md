@@ -190,12 +190,12 @@ message.
 
 | What | File | Symbols |
 |---|---|---|
-| Typed graph compiler and estimates | `engine/crates/vegetation/src/graph.rs` | `compile_biome_graph`, `CompiledBiomeGraph`, `GraphSafetyLimits` |
-| Canonical and parallel evaluator | `engine/crates/vegetation/src/evaluator.rs` | `BiomeGraphEvaluator`, `GraphEvaluationJobInputs`, `GraphEvaluationPreflight`, `GlobalStageEvaluationInputs` |
-| Scheduling and qualification corpus | `engine/crates/vegetation/src/graph_gpu.rs` | `GraphExecutionPlan`, `GraphGpuProgram`, `GraphComputeExecutor`, `qualification_corpus` |
+| Typed graph compiler and estimates | `engine/crates/vegetation/src/graph/` | `compile_biome_graph`, `CompiledBiomeGraph`, `GraphSafetyLimits` |
+| Canonical and parallel evaluator | `engine/crates/vegetation/src/evaluator/` | `BiomeGraphEvaluator`, `GraphEvaluationJobInputs`, `GraphEvaluationPreflight`, `GlobalStageEvaluationInputs` |
+| Scheduling and qualification corpus | `engine/crates/vegetation/src/graph_gpu/` | `GraphExecutionPlan`, `GraphGpuProgram`, `GraphComputeExecutor`, `qualification_corpus` |
 | Slang compute adapter | `engine/crates/vegetation-gpu/src/executor.rs` | `VulkanGraphComputeExecutor` |
 | Generic compute and artifact seam | `engine/crates/rendering/src/compute_dispatch.rs`, `shader_artifact.rs` | `ComputeDispatch`, `ShaderArtifactContract` |
-| Catalog-backed input assembly | `engine/crates/assets/src/vegetation.rs` | `compile_catalog_biome_instance_graph`, `assemble_biome_graph_evaluation_job` |
+| Catalog-backed input assembly | `engine/crates/assets/src/vegetation/` | `compile_catalog_biome_instance_graph`, `assemble_biome_graph_evaluation_job` |
 | Asynchronous control surface | `engine/crates/control/src/commands_vegetation.rs`, `vegetation_jobs.rs` | `register_vegetation_commands`, `VegetationEvaluationJobs` |
 
 ## Related

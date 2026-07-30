@@ -232,15 +232,11 @@ mod tests {
         }
     }
 
-    /// THE KEYSTONE: a micromap may remove work but never change an answer.
-    ///
-    /// For every micro-triangle the derivation calls settled, the classifier must agree at
-    /// every point inside it, under every spatial-hash salt, anchor and temporal phase — the
-    /// hash is exactly what a naive derivation would get wrong, because it makes coverage
-    /// depend on where the plant stands rather than on alpha alone.
-    ///
-    /// Unknown states are not asserted: they mean the classifier still runs, so whatever it
-    /// decides is by definition correct.
+    /// A micromap may remove work but never change an answer: for every micro-triangle the
+    /// derivation calls settled, the classifier must agree at every point inside it, under
+    /// every spatial-hash salt, anchor and temporal phase — the hash makes coverage depend on
+    /// where the plant stands rather than on alpha alone. Unknown states are not asserted:
+    /// they mean the classifier still runs, so whatever it decides is correct.
     #[test]
     fn settled_micro_triangles_agree_with_the_classifier_under_every_hash() {
         use saffron_geometry::{
@@ -249,11 +245,8 @@ mod tests {
         };
         use saffron_material::{AlphaClassification, OpacityMicromapDerivation, SurfaceUnit};
 
-        // A full-range gradient, deliberately: micro-triangles then tile every alpha level, so
-        // a derivation that settles at the wrong threshold has somewhere to be caught. A
-        // soft-edged card looks more realistic and is a far weaker fixture — its ramp is narrow
-        // enough that a badly-placed threshold still lands outside every settled block, and the
-        // test passes while proving nothing.
+        // A full-range gradient: micro-triangles tile every alpha level, so a derivation that
+        // settles at the wrong threshold has somewhere to be caught.
         const EXTENT: u32 = 64;
         let alpha: Vec<u8> = (0..EXTENT * EXTENT)
             .map(|i| ((i % EXTENT) * 255 / (EXTENT - 1)) as u8)

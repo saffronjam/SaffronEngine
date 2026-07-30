@@ -5,7 +5,7 @@
 // are Edit-safe, then report the live world while playing; apply-impulse pushes a dynamic body).
 //
 // One boot: the empty-world lifecycle runs first (no bodies), then the falling-box scene is
-// authored and reused for the live-telemetry cases so the box's landing feeds a real contact.
+// authored and reused for the live-telemetry cases so the landing feeds a real contact.
 
 import { afterAll, beforeAll, expect, test } from "bun:test";
 import { Engine } from "./harness.ts";

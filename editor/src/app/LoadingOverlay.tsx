@@ -1,12 +1,7 @@
-/// Overlay shown over the viewport region while the renderer is not ready. The
-/// reparented X11 child always paints on top of its rect once mapped, so this
-/// overlay is only meaningful while the native window is NOT yet mapped (before
-/// the first successful attach) or after a crash (window gone) — exactly the
-/// phases where phase !== 'ready'. On 'error' it offers Retry and Restart.
-///
-/// It MUST stay an absolutely-positioned sibling layer over the viewport region
-/// (NOT a Radix Dialog/portal): the engine maps the native window only after
-/// attach, so this must paint inline within the viewport panel.
+/// Shown over the viewport region while the renderer is not ready — the phases where the native
+/// surface is not yet mapped, or is gone after a crash. It MUST stay an absolutely-positioned
+/// sibling layer rather than a Radix Dialog/portal, because it has to paint inline within the
+/// viewport panel.
 import { useState } from "react";
 import { Loader2 } from "lucide-react";
 import { client } from "../control/client";

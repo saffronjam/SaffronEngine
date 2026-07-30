@@ -110,12 +110,12 @@ The same `set-bloom` request can patch `dirtTexture`, `dirtIntensity`, `dirtTint
 | What | File | Symbols |
 |---|---|---|
 | Compute shader | `engine/assets/shaders/bloom.slang` | `computeMain`, `downsample13`, `upsampleTent`, `streakBlur`, `Push` |
-| Pyramid and composite scheduling | `engine/crates/rendering/src/renderer.rs` | `acquire_bloom_mips`, `acquire_bloom_streak`, `add_bloom_pass`, `set_bloom` |
+| Pyramid and composite scheduling | `engine/crates/rendering/src/renderer/` | `acquire_bloom_mips`, `acquire_bloom_streak`, `add_bloom_pass`, `set_bloom` |
 | Push constants | `engine/crates/rendering/src/overlay.rs` | `BloomPush` |
 | Keyed transient images | `engine/crates/rendering/src/transient.rs` | `BLOOM_MIP_KEYS`, `BLOOM_STREAK_KEYS` |
-| Descriptors and pipeline | `engine/crates/rendering/src/descriptors.rs`, `engine/crates/rendering/src/pipelines.rs` | `MAX_BLOOM_MIPS`, `BLOOM_PASSES_PER_FRAME`, `create_bloom_layout`, `request_bloom` |
-| Per-view bindings | `engine/crates/rendering/src/view_target.rs` | `write_bloom_sets`, `BloomCompositeBindings` |
-| Control contract | `engine/crates/protocol/src/dto.rs`, `engine/crates/control/src/commands_render.rs` | `SetBloomParams`, `AnamorphicParams`, `set-bloom` |
+| Descriptors and pipeline | `engine/crates/rendering/src/descriptors/`, `engine/crates/rendering/src/pipelines/` | `MAX_BLOOM_MIPS`, `BLOOM_PASSES_PER_FRAME`, `create_bloom_layout`, `request_bloom` |
+| Per-view bindings | `engine/crates/rendering/src/view_target/` | `write_bloom_sets`, `BloomCompositeBindings` |
+| Control contract | `engine/crates/protocol/src/dto/`, `engine/crates/control/src/commands_render/` | `SetBloomParams`, `AnamorphicParams`, `set-bloom` |
 | Project persistence | `engine/crates/rendering/src/render_settings.rs` | `RenderSettings`, `settings_to_json`, `parse_render_settings` |
 | Editor controls | `editor/src/panels/PostProcessPanel.tsx` | `PostProcessPanel`, `bloomFrom`, `applyBloom` |
 

@@ -60,9 +60,8 @@ fn emit_declaration(decls: &DtoDecls, name: &str) -> String {
     }
 }
 
-/// Map a `ts-rs` type token to its TS spelling, returning `(type, optional)`. `T | null` is
-/// optional; `Array<T>` -> `T[]`; `bigint` -> `number`; `Uuid` -> `WireUuid`; `JsonValue` ->
-/// `unknown`; named DTOs and primitives pass through.
+/// Maps a `ts-rs` type token to its TS spelling, returning `(type, optional)`. `T | null` is the
+/// optional form; `bigint` narrows to `number` and `Uuid` to the `WireUuid` alias.
 fn ts_type(ty: &str) -> (String, bool) {
     let (core, optional) = match ty.strip_suffix("| null") {
         Some(inner) => (inner.trim(), true),
@@ -97,7 +96,6 @@ mod tests {
     #[test]
     fn empty_struct_emits_blank_body() {
         let decls = DtoDecls::load();
-        // `PingParams`/`EmptyParams` are `Record<string, never>` -> `{\n\n}`.
         assert_eq!(
             emit_declaration(&decls, "PingParams"),
             "export interface PingParams {\n\n}"

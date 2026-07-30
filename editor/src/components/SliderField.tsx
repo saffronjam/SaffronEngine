@@ -1,9 +1,7 @@
-/// Bounded scalar field rendered as a shadcn Slider + a monospace numeric readout
-/// (used for `slider`-kind fields like Material.metallic/roughness, clamped 0..1).
-/// Renders drag-local state (useScrubValue) so the thumb never waits on the wire;
-/// the panel owns coalescing and drag-gating. The Radix Slider's `onValueChange` is
-/// the live scrub (drag) and `onValueCommit` is the end, so they bracket
-/// onDragStart/onDragEnd exactly like NumberDrag's pointer scrub.
+/// A bounded scalar as a Slider plus a monospace readout. Renders drag-local state so the thumb
+/// never waits on the wire; `onValueChange` is the live scrub and `onValueCommit` the end, so they
+/// bracket onDragStart/onDragEnd exactly like NumberDrag's pointer scrub. The panel owns coalescing
+/// and drag-gating.
 import { Slider } from "@/components/ui/slider";
 import { useScrubValue } from "@/lib/useScrubValue";
 

@@ -228,9 +228,8 @@ pub struct UiCompositor {
     /// with the theme background, so the editor's transparent regions resolve against it (not the
     /// desktop). The engine viewport subsurfaces sit between this and the toplevel.
     backdrop_surface: WlSurface,
-    #[allow(dead_code)]
-    // held so the subsurface relationship persists for the compositor's lifetime
-    backdrop_subsurface: WlSubsurface,
+    /// Held so the subsurface relationship outlives every frame; never read after setup.
+    _backdrop_subsurface: WlSubsurface,
     backdrop_fd: Option<OwnedFd>,
     backdrop_base: *mut u8,
     backdrop_mapped: usize,
@@ -336,7 +335,7 @@ impl UiCompositor {
             frame: 0,
             first_commit: true,
             backdrop_surface,
-            backdrop_subsurface,
+            _backdrop_subsurface: backdrop_subsurface,
             backdrop_fd: None,
             backdrop_base: std::ptr::null_mut(),
             backdrop_mapped: 0,

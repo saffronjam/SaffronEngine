@@ -110,7 +110,7 @@ second editable plant source, and no native-only renderer path exists.
   is its axis identity, so it survives a parameter change; `plant-graph-set` no longer carries any
   derived value across a regrow.)
 - [x] Atlases and coverage-preserving textures, aggregate-voxel appearance error, and RT/OMM
-  derivation inputs. Each needs a generator of its own; none is built, and none is faked.
+  derivation inputs. Each needs a generator of its own, and none may be faked.
   *(ATLAS PACKING IS BUILT (`atlas.rs`): a deterministic shelf/skyline packer over `(slot, width,
   height)` entries that returns the smallest power-of-two square holding them, plus `remap` from a
   slot-local UV into atlas space. Tallest-first with the slot breaking ties, so the layout never
@@ -140,9 +140,10 @@ second editable plant source, and no native-only renderer path exists.
   it asserted that widening actually happened. It now cooks a comb of thin separated blades, which
   is the case the estimate is blind to — a brick fills the gaps and reads as a slab while the
   triangles read as a comb, and bounds plus occupancy cannot see the difference.
-  ALL FOUR GENERATORS NOW REACH A COOK, which is what closes this box — the four had been built,
-  unit-tested, and called by nothing, and a generator with no caller produces nothing.
-  In `build_plant_sections`, in the order their dependencies force: `atlas_normalized_family` packs
+  ALL FOUR GENERATORS REACH A COOK, which is what closes this box — a generator with no caller
+  produces nothing.
+  In `build_plant_sections` (`plant_cook/publish.rs`), in the order their dependencies force:
+  `atlas_normalized_family` packs
   the family's coverage into one atlas (`generate_family_atlas`, which builds the coverage-preserving
   mip chain in the same call, because packing without compositing leaves a caller to write a
   transparent-black gutter that filters into a dark fringe); `calibrate_voxel_appearance_error`
@@ -159,14 +160,11 @@ second editable plant source, and no native-only renderer path exists.
   `a_cooked_plant_declares_an_error_every_transition_fits_within`, and
   `a_cooked_family_derives_micromaps_that_only_ever_remove_work`. The e2e
   `vegetation-atlas-micromap` carries it to the GPU.
-  THE APPEARANCE-ERROR GENERATOR WAS THE FIRST OF THE FOUR to reach a cook.
-  `build_plant_sections` calls it over the canonical fixtures between cooking the hierarchy and
-  taking any section bytes, and `CookVersionSet.compiler` went 2 → 3 so existing artifacts recook.
-  `a_cooked_plant_declares_an_error_every_transition_fits_within` proves it on a published artifact
-  rather than a unit fixture, and removing the call fails that test with a measured silhouette error
-  of 4294967295 against a declared 196608 — the comb counterexample reproducing on a real plant.
-  That closes the phase-11 triangle↔aggregate transition box. THIS box stays open on the other
-  three generators.
+  THE APPEARANCE-ERROR CALIBRATION runs over the canonical fixtures between cooking the hierarchy and
+  taking any section bytes, which is also what closes the phase-11 triangle↔aggregate transition box.
+  Removing the call fails `a_cooked_plant_declares_an_error_every_transition_fits_within` with a
+  measured silhouette error of 4294967295 against a declared 196608 — the comb counterexample
+  reproducing on a real plant.
   COVERAGE-PRESERVING FAMILY TEXTURES ARE BUILT (`generate_family_atlas`), and packing and mipping
   happen together because splitting them invites the bug: packing alone leaves a caller to
   composite, and a naive composite writes transparent BLACK into the gutter, which filters into the
@@ -183,11 +181,7 @@ second editable plant source, and no native-only renderer path exists.
   address atlas space, so a pyramid over the unpacked image would answer about texels the GPU never
   reads. `the_generated_plane_drives_a_real_opacity_micromap_derivation` runs the actual Phase 11
   `derive_opacity_micromap` over the generated plane with UVs remapped through the layout, and
-  requires it to prove opaque inside a solid slot — an end-to-end check rather than a shape check.
-  ALL FOUR GENERATORS EXIST AND NONE IS FAKED, which is what the box asks for. THE BOX STAYS OPEN
-  on the wiring: nothing yet drives the packer, the texture generator, the calibrator, or the plane
-  from a cook stage. They are the algorithms, not the pipeline steps, and a native family's cook
-  still resolves its materials without packing them.)*
+  requires it to prove opaque inside a solid slot — an end-to-end check rather than a shape check.)*
 - [x] `plant-create` is the authoring front door: it mints a native family from the starter graph
   (`BotanicalGraphDocument::sapling`) and saves it to the catalog. Before this, a `.splant` could only
   be produced by writing Rust — the format, compiler, cooker, and runtime were all reachable and the
@@ -363,8 +357,8 @@ second editable plant source, and no native-only renderer path exists.
   `a_module_table_round_trips_and_is_matched_against_the_graph` (both binding directions plus
   self-reference), and at the asset layer `a_module_call_composes_the_referenced_family`,
   `a_module_call_requires_a_module_role`, `a_module_cycle_is_rejected_rather_than_grown`.
-  Gates: `just engine`, `just prepare-for-commit`, `just schema` 250/250, `just test`, `just e2e`
-  361/361 across 62 files, docs 3× clean (botanical-graph.md gains "Presets are ordinary plants").)*
+  Gates: `just engine`, `just prepare-for-commit`, `just schema`, `just test`, `just e2e`, and the
+  docs three checks (botanical-graph.md gains "Presets are ordinary plants").)*
 
 ## Point and plant interchange
 

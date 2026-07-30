@@ -73,7 +73,7 @@ test("export-app stages a runnable app folder that the player boots clean", asyn
 
   // The exported player boots the staged folder headless-offscreen for a few frames, loading the
   // project and running a validation-clean frame loop — no editor, no control plane.
-  const runEnv = {
+  const runEnv: Record<string, string | undefined> = {
     ...process.env,
     SAFFRON_EDITOR_NATIVE_VIEWPORT: "1",
     SAFFRON_EXIT_AFTER_FRAMES: "8",

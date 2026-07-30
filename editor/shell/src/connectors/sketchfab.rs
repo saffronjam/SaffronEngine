@@ -120,7 +120,6 @@ impl StoreConnector for Sketchfab {
     fn oauth_config(&self) -> Option<OAuthLoopbackConfig> {
         Some(OAuthLoopbackConfig {
             authorize_url: "https://sketchfab.com/oauth2/authorize/".to_owned(),
-            token_url: "https://sketchfab.com/oauth2/token/".to_owned(),
             client_id: std::env::var("SAFFRON_SKETCHFAB_CLIENT_ID").unwrap_or_default(),
             scope: String::new(),
             response_type: "token".to_owned(),

@@ -75,8 +75,8 @@ can affect which lights survive the cap. The CPU functions `cluster_aabb`,
 | Unproject to view space | `engine/assets/shaders/light_cull.slang` | `screenToView` |
 | Slice rays at Z planes | `engine/assets/shaders/light_cull.slang` | `rayToZ`, `tileNear`/`tileFar` |
 | The view-space AABB | `engine/assets/shaders/light_cull.slang` | `aabbMin`/`aabbMax` |
-| View and inverse-projection inputs | `engine/crates/rendering/src/lighting.rs` | `ClusterParams` (`view`, `inverse_projection`) |
-| CPU mirror for tests | `engine/crates/rendering/src/lighting.rs` | `cluster_aabb`, `light_intersects_cluster`, `cull_clusters_cpu` |
+| View and inverse-projection inputs | `engine/crates/rendering/src/lighting/` | `ClusterParams` (`view`, `inverse_projection`) |
+| CPU mirror for tests | `engine/crates/rendering/src/lighting/` | `cluster_aabb`, `light_intersects_cluster`, `cull_clusters_cpu` |
 
 ## Related
 

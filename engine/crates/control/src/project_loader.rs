@@ -1,14 +1,12 @@
-//! The non-blocking project loader — the once-per-frame state machine that brings a project up
-//! without ever stalling the host main loop.
+//! The non-blocking project loader: a once-per-frame state machine that brings a project up
+//! without stalling the host main loop.
 //!
-//! A load is seeded by setting [`SceneEditContext::project_load_inbox`] (a lifecycle command or
-//! the startup bootstrap). Each frame the host calls [`ProjectLoader::advance`] with the live
-//! renderer + editor + asset borrows; it advances **one bounded step** — spawn the off-thread
-//! [`ProjectDocWorker`] (read + parse + cold catalog scan), install the returned doc on the main
-//! thread (idle + swap + `scene_from_json`), then stream GPU residency a few assets per frame —
-//! so between steps the loop keeps draining the control socket and publishing frames. `Loading`
-//! therefore has real duration, and the dispatch gate (Phase 1) discards non-allow-listed commands
-//! for its whole span instead of queuing them.
+//! A load is seeded through [`SceneEditContext::project_load_inbox`]. Each frame
+//! [`ProjectLoader::advance`] takes one bounded step — spawn the off-thread [`ProjectDocWorker`]
+//! (read, parse, cold catalog scan), install the returned doc on the main thread, then stream GPU
+//! residency a few assets per frame — so between steps the loop keeps draining the control socket
+//! and publishing frames. `Loading` therefore has real duration, and the dispatch gate discards
+//! non-allow-listed commands for its whole span rather than queuing them.
 
 use std::collections::VecDeque;
 use std::time::{Duration, Instant};

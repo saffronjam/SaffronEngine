@@ -68,7 +68,6 @@ pub fn derive_procedural_plant_id(input: ProceduralPlantIdentity) -> PlantId {
 /// Complete inputs to a deterministic cooked plant identity.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ProceduralPlantIdentity {
-    /// Vegetation-map identity.
     pub map: Uuid,
     /// Stable authored layer identity.
     pub layer_guid: u128,
@@ -82,9 +81,7 @@ pub struct ProceduralPlantIdentity {
     pub ancestor: u64,
     /// Named seed namespace owned by the biome/module.
     pub seed_namespace: u128,
-    /// Canonical owner cell.
     pub owner: WorldCellKey,
-    /// Plant-family identity.
     pub family: Uuid,
 }
 

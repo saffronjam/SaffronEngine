@@ -11,8 +11,8 @@
 
 static const float PI = 3.14159265;
 
-// Set 0: the same bindless albedo array the mesh samples (any uploaded texture, incl. a
-// loaded sky panorama). Size matches MaxBindlessTextures in renderer.cppm.
+// The same bindless albedo array the mesh samples (any uploaded texture, including a loaded
+// sky panorama). The length matches the renderer's bindless texture capacity.
 [[vk::binding(0, 0)]] Sampler2D albedoTextures[1024];
 // Set 1: the procedural environment cube the IBL bake produced (shared with the lighting).
 [[vk::binding(0, 1)]] SamplerCube envCube;

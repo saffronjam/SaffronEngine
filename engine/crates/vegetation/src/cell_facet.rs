@@ -66,24 +66,19 @@ pub enum VegetationCellFacet {
 /// One typed render-reference row.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct VegetationRenderReference {
-    /// Stable plant identity.
     pub plant: PlantId,
     /// Compiled plant-family identity.
     pub family: Uuid,
-    /// Family variation.
     pub variation: u32,
-    /// Ecological phenotype.
     pub phenotype: u32,
     /// Renderer-independent representation class.
     pub representation_class: u32,
-    /// Biological lifecycle state.
     pub lifecycle: PlantLifecycle,
 }
 
 /// One typed render-bounds row.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct VegetationRenderBounds {
-    /// Stable plant identity.
     pub plant: PlantId,
     /// Conservative world bounds.
     pub bounds: WorldBounds,
@@ -92,80 +87,58 @@ pub struct VegetationRenderBounds {
 /// One typed collision-input row.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct VegetationCollisionInput {
-    /// Stable plant identity.
     pub plant: PlantId,
     /// Compiled plant-family identity.
     pub family: Uuid,
-    /// Exact world position.
     pub position: WorldPosition,
-    /// Quantized orientation.
     pub orientation: QuantizedOrientation,
     /// Q15.16 scale.
     pub scale: [DecisionScalar; 3],
     /// Conservative world bounds.
     pub bounds: WorldBounds,
-    /// Gameplay interaction policy.
     pub interaction_policy: InteractionPolicy,
-    /// Biological lifecycle state.
     pub lifecycle: PlantLifecycle,
 }
 
 /// One typed navigation-contribution row.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct VegetationNavigationContribution {
-    /// Stable plant identity.
     pub plant: PlantId,
     /// Compiled plant-family identity.
     pub family: Uuid,
     /// Conservative obstacle bounds.
     pub bounds: WorldBounds,
-    /// Gameplay interaction policy.
     pub interaction_policy: InteractionPolicy,
-    /// Biological lifecycle state.
     pub lifecycle: PlantLifecycle,
 }
 
 /// One cross-cell ecology boundary row.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct VegetationEcologyBoundary {
-    /// Stable plant identity.
     pub plant: PlantId,
     /// Compiled plant-family identity.
     pub family: Uuid,
     /// Conservative influence bounds.
     pub bounds: WorldBounds,
-    /// Biological simulation tick.
     pub ecology_tick: u64,
-    /// Persistent health.
     pub health: UnitInterval,
-    /// Persistent moisture.
     pub moisture: UnitInterval,
-    /// Persistent fuel.
     pub fuel: UnitInterval,
-    /// Current phenology phase.
     pub phenology: UnitInterval,
 }
 
 /// One deterministic ecology checkpoint row.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct VegetationEcologyCheckpoint {
-    /// Stable plant identity.
     pub plant: PlantId,
     /// Compiled plant-family identity.
     pub family: Uuid,
-    /// Biological lifecycle state.
     pub lifecycle: PlantLifecycle,
-    /// Ecological phenotype.
     pub phenotype: u32,
-    /// Biological simulation tick.
     pub ecology_tick: u64,
-    /// Persistent health.
     pub health: UnitInterval,
-    /// Persistent moisture.
     pub moisture: UnitInterval,
-    /// Persistent fuel.
     pub fuel: UnitInterval,
-    /// Current phenology phase.
     pub phenology: UnitInterval,
     /// Authored/runtime state flags.
     pub flags: PlantFlags,
@@ -176,7 +149,6 @@ pub struct VegetationEcologyCheckpoint {
 pub struct VegetationRejectionDiagnosticsFacet {
     /// Total candidates seen by output stages.
     pub candidate_count: u64,
-    /// Accepted macro-point count.
     pub accepted_count: u64,
     /// Canonically ordered rejected candidates.
     pub rejected: Vec<RejectedCandidate>,
@@ -233,9 +205,8 @@ pub fn decode_vegetation_cell_facet(
     })
 }
 
-/// Encodes the exact current micro-field facet — the encode mirror of
-/// [`decode_vegetation_micro_fields`]. Tiles must be strictly `(cell, family)`-ordered,
-/// the section's canonical order.
+/// Encodes the micro-field facet. Tiles must arrive in the section's canonical
+/// `(cell, family)` order.
 pub fn encode_vegetation_micro_fields(tiles: &[MicroFieldTile]) -> Result<Vec<u8>> {
     let mut sink = crate::canonical::ByteSink::new();
     use crate::canonical::CanonicalSink as _;
@@ -896,7 +867,7 @@ fn rejection_reason(value: u8) -> Result<CandidateRejectionReason> {
     }
 }
 
-const fn rejection_code(value: CandidateRejectionReason) -> u8 {
+pub(crate) const fn rejection_code(value: CandidateRejectionReason) -> u8 {
     match value {
         CandidateRejectionReason::SurfaceMiss => 0,
         CandidateRejectionReason::Threshold => 1,
@@ -1029,7 +1000,7 @@ fn diagnostic_key(
     (&stream.node, stream.label.as_str(), stream.scope)
 }
 
-fn projection_tile_key(tile: &QuantizedSurfaceProjectionTile) -> (u128, u32, [u8; 32]) {
+pub(crate) fn projection_tile_key(tile: &QuantizedSurfaceProjectionTile) -> (u128, u32, [u8; 32]) {
     (
         tile.node,
         tile.node_semantic_revision,
@@ -1037,7 +1008,7 @@ fn projection_tile_key(tile: &QuantizedSurfaceProjectionTile) -> (u128, u32, [u8
     )
 }
 
-fn field_tile_key(
+pub(crate) fn field_tile_key(
     tile: &QuantizedSurfaceFieldQueryTile,
 ) -> (u128, u32, FieldChannel, FieldDerivative, [u8; 32]) {
     (

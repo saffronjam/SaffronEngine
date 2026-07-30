@@ -104,10 +104,10 @@ change SSGI and contact-shadow sampling, not GTAO's fixed sample count.
 | Half-resolution trace | `engine/assets/shaders/gtao.slang` | `computeMain`, `viewPosFromUv`, `sliceCount`, `stepCount`, `bias` |
 | Bilateral upsample | `engine/assets/shaders/ao_blur.slang` | `computeMain`, `aoRaw`, `gbuffer`, `aoOut` |
 | Push constants and defaults | `engine/crates/rendering/src/ssao.rs` | `GtaoPush`, `Ssao::gtao_push`, `radius`, `strength` |
-| Pass scheduling | `engine/crates/rendering/src/renderer.rs` | `add_screen_space_passes`, `gtao`, `ao-blur` |
-| Targets and descriptors | `engine/crates/rendering/src/view_target.rs` | `ao_raw`, `ao_map`, `gtao_set`, `ao_blur_set` |
+| Pass scheduling | `engine/crates/rendering/src/renderer/` | `add_screen_space_passes`, `gtao`, `ao-blur` |
+| Targets and descriptors | `engine/crates/rendering/src/view_target/` | `ao_raw`, `ao_map`, `gtao_set`, `ao_blur_set` |
 | Lighting integration | `engine/assets/shaders/lighting.slang` | `aoMap`, `counts.w`, `specAO`, `evalLighting` |
-| Quality control | `engine/crates/rendering/src/quality.rs`, `engine/crates/control/src/commands_render.rs` | `gtao_enabled`, `set-render-quality`, `get-render-quality` |
+| Quality control | `engine/crates/rendering/src/quality.rs`, `engine/crates/control/src/commands_render/` | `gtao_enabled`, `set-render-quality`, `get-render-quality` |
 
 ## Related
 

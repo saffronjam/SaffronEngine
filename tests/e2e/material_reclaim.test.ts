@@ -1,4 +1,4 @@
-// Phase 15 (bindless slot reclamation): a destroyed GpuTexture returns its bindless slot to a shared
+// Bindless slot reclamation: a destroyed GpuTexture returns its bindless slot to a shared
 // free-list, which the next upload reuses — so a hot-reloaded / churny scene keeps the pool bounded
 // instead of marching nextBindlessIndex to the 1024 limit. new-project clears the asset caches, which
 // drops the imported textures' Refs and reclaims their slots; render-stats exposes the counts.

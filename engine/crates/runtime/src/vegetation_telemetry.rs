@@ -1,12 +1,10 @@
 //! Compact vegetation telemetry.
 //!
 //! Everything here is a counter or a duration accumulated at the fixed synchronization point. Nothing
-//! reads back per-instance data, and nothing walks a resident cell to answer a query: a diagnostic
-//! that costs a pass over every plant stops being usable exactly when a scene gets big enough to need
-//! it. A caller that wants per-instance detail asks for a capture through the inspection commands,
-//! which is an explicit mode rather than a per-frame tax.
+//! reads back per-instance data and nothing walks a resident cell to answer a query; a caller wanting
+//! per-instance detail asks for a capture through the inspection commands instead.
 //!
-//! The durations are the wall clock of one synchronization, split by the stage that spent it, so a
+//! The durations are the wall clock of one synchronization split by the stage that spent it, so a
 //! frame that got slower says which stage did.
 
 use std::time::{Duration, Instant};

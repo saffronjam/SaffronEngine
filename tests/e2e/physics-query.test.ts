@@ -1,4 +1,4 @@
-// Phase 7 of the physics plan: scene queries. raycast / shapecast hit the physics shapes at their
+// Scene queries. raycast / shapecast hit the physics shapes at their
 // simulated transforms (not the render AABBs the editor `pick` uses), mapping the hit body back to
 // its entity. A shape-sweep tolerates an edge a thin ray misses. Queries refuse in Edit (the world
 // exists only in play). The same entry point backs the control commands and the Lua sa.raycast.

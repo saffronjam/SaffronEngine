@@ -12,27 +12,18 @@ thread_local! {
     static RNG: RefCell<SplitMix64> = RefCell::new(SplitMix64::seeded());
 }
 
-/// A stable 64-bit identity.
+/// A stable 64-bit identity, carried by anything serialized because ECS entity
+/// values are not stable across runs.
 ///
-/// `entt`/ECS entity values are not stable across runs, so anything serialized
-/// carries a `Uuid` instead.
-///
-/// # Wire encoding
-///
-/// On the JSON wire a `Uuid` is encoded as a **decimal string**, not a number,
-/// because ids span the full `u64` range past JavaScript's `2^53` safe-integer
-/// limit; on read the wire accepts a string *or* a number. That encoding is
-/// frozen and lives in `saffron-protocol` (the `serde_with` field attribute) so
-/// there is exactly one place it is decided — this newtype carries no serde
-/// derive of its own.
+/// On the JSON wire a `Uuid` is a **decimal string**, not a number: ids span the
+/// full `u64` range past JavaScript's `2^53` safe-integer limit. That encoding is
+/// decided in exactly one place, the `serde_with` field attribute in
+/// `saffron-protocol`, so this newtype carries no serde derive of its own.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, Default)]
 pub struct Uuid(pub u64);
 
 impl Uuid {
     /// Mints a fresh id, uniformly drawn from `[1024, u64::MAX]`.
-    ///
-    /// The low range `< 1024` is reserved (see [`RESERVED_BELOW`]); a minted id
-    /// is therefore always `>= 1024` and never collides with a reserved one.
     #[must_use]
     pub fn new() -> Self {
         let raw = RNG.with(|rng| rng.borrow_mut().next());
@@ -47,8 +38,6 @@ impl Uuid {
     }
 }
 
-/// Renders the id as its decimal-string wire form. The `serde_with` field
-/// attribute in `saffron-protocol` reuses this `Display` to emit the JSON string.
 impl fmt::Display for Uuid {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{}", self.0)
@@ -58,26 +47,19 @@ impl fmt::Display for Uuid {
 impl FromStr for Uuid {
     type Err = std::num::ParseIntError;
 
-    /// Parses the decimal-string wire form back into a `Uuid` (the read side of
-    /// the frozen wire contract: a `u64` decimal string).
     fn from_str(s: &str) -> core::result::Result<Self, Self::Err> {
         s.parse::<u64>().map(Uuid)
     }
 }
 
-/// A minimal deterministic-period `u64` PRNG used to mint ids.
-///
-/// SplitMix64 keeps the crate free of an RNG dependency: a per-thread generator
-/// seeded once from entropy. The exact bit-stream is irrelevant — ids only need
-/// to be unique, not reproducible.
+/// A per-thread SplitMix64 generator for minting ids. Ids need to be unique, not
+/// reproducible, so the exact bit-stream carries no contract.
 struct SplitMix64 {
     state: u64,
 }
 
 impl SplitMix64 {
     fn seeded() -> Self {
-        // Seed from a high-resolution clock; uniqueness, not reproducibility, is
-        // the contract, so a wall-clock nanosecond mix is sufficient entropy.
         let nanos = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map_or(0, |d| d.as_nanos() as u64);
@@ -121,8 +103,6 @@ mod tests {
 
     #[test]
     fn decimal_string_round_trip() {
-        // The wire form is a decimal string (not hex, not a number); a full-range
-        // id past 2^53 must survive the string round-trip exactly.
         for id in [Uuid(0), Uuid(1023), Uuid(1024), Uuid(42), Uuid(u64::MAX)] {
             let s = id.to_string();
             assert!(s.chars().all(|c| c.is_ascii_digit()));

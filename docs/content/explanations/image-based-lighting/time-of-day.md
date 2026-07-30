@@ -63,9 +63,9 @@ sa set-time-of-day --manualOverride true
 |---|---|---|
 | Scene state | `engine/crates/scene/src/environment.rs` | `TimeOfDaySettings`, `TodCurve`, `TodTintCurve` |
 | Clock and ephemerides | `engine/crates/assets/src/time_of_day.rs` | `advance_time_of_day`, `solar_position`, `lunar_position`, `world_from_equatorial` |
-| Frame application | `engine/crates/assets/src/render_scene.rs` | `drive_time_of_day`, `CelestialDirectionOverrides`, `TimeOfDayFrame` |
+| Frame application | `engine/crates/assets/src/render_scene/` | `drive_time_of_day`, `CelestialDirectionOverrides`, `TimeOfDayFrame` |
 | Curve evaluation | `engine/crates/assets/src/time_of_day.rs` | `eval_monotone_curve` |
-| Control command | `engine/crates/protocol/src/dto.rs` · `engine/crates/control/src/commands_scene.rs` | `SetTimeOfDayParams`, `set-time-of-day` |
+| Control command | `engine/crates/protocol/src/dto/` · `engine/crates/control/src/commands_scene/` | `SetTimeOfDayParams`, `set-time-of-day` |
 | Editor controls | `editor/src/panels/EnvironmentPanel.tsx` | `EnvironmentPanel`, `patchTod`, `todCoalescerFor` |
 
 ## Related

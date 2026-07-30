@@ -32,7 +32,9 @@ ALLOW = re.compile(
     r"|deferred to the (end|next)"
     r"|deferred-work seam"
     r"|visibility is deferred"
-    r"|(work )?deferred from pass",
+    r"|(work )?deferred from pass"
+    r"|planned cell"
+    r"|awaiting a rebuild",
     re.IGNORECASE,
 )
 

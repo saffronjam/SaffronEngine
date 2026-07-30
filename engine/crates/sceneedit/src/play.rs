@@ -1,16 +1,12 @@
-//! Editor play mode: the `Edit → Playing ↔ Paused → Edit` state machine, the
-//! JSON-roundtrip play duplicate, the `play_step_dt` simulation gate, `render_camera_view`,
-//! and the bounded script error/log rings.
+//! Editor play mode: the `Edit → Playing ↔ Paused → Edit` state machine. All of it lives on
+//! [`SceneEditContext`](crate::SceneEditContext), never on `Scene`, and never serializes into the
+//! project.
 //!
-//! Session policy — these live on [`SceneEditContext`](crate::SceneEditContext), never on
-//! `Scene`, and never serialize into the project.
-//!
-//! Play has no undo: the duplicate *is* the playground, and dropping it on `stop_play`
-//! *is* the restore. The authored scene is never writable through
-//! [`active_scene`](crate::SceneEditContext::active_scene) during play, so there is no
-//! restore step to get wrong. The duplicate is produced by a `scene_to_json` →
-//! `scene_from_json` round-trip — exactly "what a save/load would produce" — not a
-//! structural `World` clone, so the duplicate can never diverge from the on-disk format.
+//! Play needs no undo: the duplicate *is* the playground and dropping it on `stop_play` *is* the
+//! restore, so there is no restore step to get wrong. The authored scene is never writable through
+//! [`active_scene`](crate::SceneEditContext::active_scene) during play. The duplicate comes from a
+//! `scene_to_json` / `scene_from_json` round-trip rather than a structural `World` clone, so it
+//! cannot diverge from the on-disk format.
 
 /// Editor play mode: `Edit → Playing ↔ Paused → Edit`.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]

@@ -1,16 +1,8 @@
 //! The engine's logging install and line format.
 //!
-//! Every process renders the same compact line —
-//! `HH:MM:SS.mmm  LEVEL  subsystem  [span fields] message` — built on `tracing`. The
-//! subsystem column is derived from the event's target (the emitting crate, `saffron_`
-//! stripped), span fields carry per-event context (e.g. a script's `entity`), and the
-//! level is colored only on a real terminal so piped/captured output stays plain ASCII.
-//!
-//! [`init_logging`] installs the global subscriber once; it is the single seam where a
-//! future file or editor-channel sink is added as one more layer.
-//!
-//! This crate has no Saffron dependencies so both the engine host and the out-of-workspace
-//! editor bridge can share one formatter without pulling the engine into the editor build.
+//! Every process renders the same `tracing` line —
+//! `HH:MM:SS.mmm  LEVEL  subsystem  [span fields] message` — colored only on a real
+//! terminal so piped or captured output stays plain ASCII.
 
 #![deny(unsafe_code)]
 
@@ -39,18 +31,13 @@ const SUBSYSTEM_WIDTH: usize = 10;
 
 static INIT: Once = Once::new();
 
-/// The default `EnvFilter` directive when `RUST_LOG` is unset: our crates at `debug`, but the
-/// chatty third-party HTTP/TLS stack (pulled in by the editor's connector `reqwest`) pinned to
-/// `warn`, and `winit` to `info` (its debug stream narrates internal event queuing), so they
-/// don't drown the engine's own lines.
+/// The `EnvFilter` directive used when `RUST_LOG` is unset: Saffron crates at `debug`, with the
+/// third-party HTTP/TLS stack and `winit` pinned higher so they do not drown the engine's lines.
 const DEFAULT_FILTER: &str =
     "debug,hyper=warn,hyper_util=warn,reqwest=warn,rustls=warn,h2=warn,tower=warn,winit=info";
 
-/// Installs the global `tracing` subscriber: an `EnvFilter` (honoring `RUST_LOG`, default
-/// [`DEFAULT_FILTER`]) feeding the [`CompactFormatter`] to stdout.
-///
-/// Idempotent and panic-free — a second call (a re-entered test, a second binary path)
-/// is a no-op rather than the panic a bare `init` would raise.
+/// Installs the global `tracing` subscriber: an `EnvFilter` honoring `RUST_LOG` (default
+/// [`DEFAULT_FILTER`]) feeding the compact formatter to stdout. Idempotent and panic-free.
 pub fn init_logging() {
     INIT.call_once(|| {
         let fmt_layer = tracing_subscriber::fmt::layer()
@@ -62,7 +49,6 @@ pub fn init_logging() {
         let (filter, handle) = reload::Layer::new(filter);
         let _ = FILTER_HANDLE.set(handle);
 
-        // `try_init` (not `init`) so a subscriber already set elsewhere can't panic us.
         let _ = registry().with(filter).with(fmt_layer).try_init();
     });
 }
@@ -71,10 +57,7 @@ pub fn init_logging() {
 static FILTER_HANDLE: std::sync::OnceLock<reload::Handle<EnvFilter, registry::Registry>> =
     std::sync::OnceLock::new();
 
-/// Silence a log target for the remainder of the process. For a third-party dependency whose
-/// global hooks keep emitting after its lifecycle in this process has ended (e.g. a windowing
-/// library's handlers observing stray platform events after its event loop finished) — the
-/// target's lines carry no signal past that boundary.
+/// Silences a log target for the remainder of the process.
 pub fn silence_target(target: &str) {
     let Some(handle) = FILTER_HANDLE.get() else {
         return;
@@ -144,7 +127,6 @@ where
         let subsystem = subsystem_of(meta.target());
         write!(writer, "{subsystem:<SUBSYSTEM_WIDTH$} ")?;
 
-        // Span context (outermost → innermost), e.g. `[entity=42]` from a script span.
         if let Some(scope) = ctx.event_scope() {
             for span in scope.from_root() {
                 let ext = span.extensions();
@@ -220,8 +202,6 @@ mod tests {
 
     #[test]
     fn subsystem_keeps_explicit_target() {
-        // An explicit, non-`saffron_` target (the Vulkan messenger, the editor bridge)
-        // is kept as-is rather than collapsed.
         assert_eq!(subsystem_of("vulkan"), "vulkan");
         assert_eq!(subsystem_of("viewport"), "viewport");
     }

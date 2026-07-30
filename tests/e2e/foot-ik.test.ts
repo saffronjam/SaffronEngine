@@ -1,4 +1,4 @@
-// Foot IK as a blend-layer producer (Phase 13): a two-bone analytic solver writes into the
+// Foot IK as a blend-layer producer: a two-bone analytic solver writes into the
 // PoseBuffer override_/weight layer so an animated rig's foot plants on a ground plane instead
 // of clipping/floating. The leg.gltf fixture is a 3-joint hip→knee→ankle chain whose KneeBend
 // clip drops the ankle; with the ground raised, foot IK lifts the ankle back up to track it.

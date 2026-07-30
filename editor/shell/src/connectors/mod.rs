@@ -4,8 +4,7 @@
 //! canonical [`StoreResult`], and download a deliverable to a local path the host importer
 //! reads.
 //!
-//! The single switch every later capability branches on is [`AuthKind`]; Phase 1 only
-//! constructs [`AuthKind::None`].
+//! [`AuthKind`] is the single switch every credential-dependent capability branches on.
 
 mod ambientcg;
 mod cache;
@@ -260,9 +259,6 @@ pub trait StoreConnector: Send + Sync {
 /// The connector runtime: the registry, the shared resource cache, plus live search sessions.
 pub struct ConnectorRuntime {
     registry: ConnectorRegistry,
-    /// Read by `cache()` for the `saffron-img://` scheme handler (the display-gated visual piece);
-    /// held here (and passed to every connector) so wiring the scheme is drop-in.
-    #[allow(dead_code)]
     cache: Arc<ResourceCache>,
     sessions: StdMutex<HashMap<String, Arc<AsyncMutex<SearchSession>>>>,
     next_id: AtomicU64,
@@ -280,8 +276,7 @@ impl ConnectorRuntime {
         }
     }
 
-    /// The shared resource cache — used by the `saffron-img://` scheme to serve thumbnails.
-    #[allow(dead_code)] // consumed by the display-gated `saffron-img://` scheme handler
+    /// The shared resource cache the `saffron-img://` scheme serves thumbnails from.
     pub fn cache(&self) -> Arc<ResourceCache> {
         Arc::clone(&self.cache)
     }

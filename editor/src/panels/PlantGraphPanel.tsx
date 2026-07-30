@@ -1,14 +1,10 @@
-/// The Plant Graph panel: the structure a native family grows, its variations, its addressable
-/// elements, and its validation state — with every change recorded as one undoable semantic operation.
-///
-/// A native family's structure is a *result*: the graph grows it, and parts, dimensions, spines, and
-/// proxies are all derived. So this panel never edits those. It edits the graph and the variation list,
+/// The structure a native family grows, its variations, its addressable elements, and its validation
+/// state. A native family's structure is a *result* — parts, dimensions, spines, and proxies are all
+/// derived from growing the graph — so this panel edits the graph document and the variation list
 /// and reads everything else back.
 ///
-/// Undo is at semantic granularity, not keystroke granularity. One recorded edit is one thing an artist
-/// would say they did — "Add variation", "Set trunk length" — and its inverse is the previous graph
-/// document replayed through the same one write path. That is what keeps undo honest for a derived
-/// model: nothing reconstructs the old parts by hand, because regrowing the old graph produces them.
+/// One recorded edit is one semantic operation, and its inverse is the previous graph document
+/// replayed through the same single write path; nothing reconstructs the old parts by hand.
 import { useCallback, useEffect, useState } from "react";
 import { client } from "../control/client";
 import { errorText, notify, notifyError } from "../lib/flash";

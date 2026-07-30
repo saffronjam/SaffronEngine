@@ -1,5 +1,5 @@
-//! The material alpha/blend mode — the glTF `alphaMode` axis, shared by the scene
-//! components, the asset resolve, and the renderer so there is one vocabulary for it.
+//! The material alpha/blend mode (the glTF `alphaMode` axis), shared by the scene
+//! components, the asset resolve, and the renderer.
 
 /// How a material's alpha resolves at raster time (glTF `alphaMode`).
 ///
@@ -48,7 +48,6 @@ mod tests {
         for mode in [BlendMode::Opaque, BlendMode::Masked, BlendMode::Blend] {
             assert_eq!(BlendMode::from_wire(mode.as_wire()), mode);
         }
-        // Unknown tokens are opaque; the default is opaque.
         assert_eq!(BlendMode::from_wire("nonsense"), BlendMode::Opaque);
         assert_eq!(BlendMode::default(), BlendMode::Opaque);
     }

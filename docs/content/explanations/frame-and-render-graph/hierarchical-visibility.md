@@ -129,9 +129,10 @@ over zero-filled no-op commands.
 
 ### The mesh executor
 
-A second executor reaches the same records through `VK_EXT_mesh_shader` where the device offers
-it. It is genuinely a second path, not a replacement: MoltenVK has no mesh shaders and runs the
-indexed one at full quality.
+A second executor reaches the same records through `VK_EXT_mesh_shader`. It is opt-in:
+`SAFFRON_MESH_EXECUTOR=1` selects it, and only on a device that offers a mesh stage, which
+MoltenVK does not. The indexed executor is what a frame runs otherwise, at full quality rather
+than as a reduced fallback.
 
 What keeps the two honest is that the mesh path consumes the binner's command stream **as data
 rather than as draw arguments**. Workgroup and draw are recovered from `SV_DrawIndex` and the
@@ -203,7 +204,7 @@ the triangles read as a comb — and it is invisible until you can read the numb
 | Per-view tuning | `visibility.rs`, `renderer.rs` | `SceneViewClass`, `TraversalTuning`, `Renderer::traversal_tuning` |
 | Hierarchy traversal | `scene_traversal.slang` | `add_traversal_pass`, `SceneTraversalPush`, `GpuDrawRecord` |
 | The node cull | `scene_traversal.slang`, `virtual_hierarchy.rs` | `nodeCulled`, `close_subtree_bounds`, `SCENE_VISIBILITY_COUNTER_CULLED_NODES` |
-| The mesh executor | `scene_executor_depth_mesh.slang`, `visibility.rs`, `pipelines.rs` | `record_executor_bucket_draw_mesh`, `record_executor_mesh_prefix`, `request_scene_executor_depth_mesh` |
+| The mesh executor | `mesh.slang`, `visibility/executor.rs`, `pipelines/build.rs`, `scene_pass.rs` | `meshMainExecutor`, `record_executor_bucket_draw_mesh`, `PsoKey::mesh_shader`, `SAFFRON_MESH_EXECUTOR` |
 | Binning and the executor draws | `scene_bin_count.slang`, `scene_bin_seed.slang`, `scene_bin_scatter.slang`, `scene_pass.rs` | `add_binning_passes`, `record_executor_buckets`, `record_executor_depth_family`, `ExecutorDrawInputs` |
 | Survivor chain | `visibility.rs`, `hzb.rs` | `add_survivor_snapshot_pass`, `add_bucket_count_clear_pass`, `HzbPyramid::add_rebuild_passes` |
 | Frame integration | `renderer.rs` | `Renderer::page_demand_view`, the cull/retest/traversal blocks in `record_scene_graph` |

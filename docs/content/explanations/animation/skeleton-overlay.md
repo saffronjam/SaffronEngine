@@ -87,14 +87,14 @@ joint stands out.
 
 | What | File | Symbols |
 |---|---|---|
-| Skeleton geometry builder | `engine/crates/host/src/overlay.rs` | `build_skeleton_overlay`, `build_scene_edit_overlay` |
-| Feathered primitives | `engine/crates/host/src/overlay.rs` | `add_line_flat`, `add_circle_fill` |
+| Skeleton geometry builder | `engine/crates/host/src/overlay/` | `build_skeleton_overlay`, `build_scene_edit_overlay` |
+| Feathered primitives | `engine/crates/host/src/overlay/` | `add_line_flat`, `add_circle_fill` |
 | Viewport projection | `engine/crates/sceneedit/src/gizmo.rs` | `viewport_project` |
 | Overlay options | `engine/crates/sceneedit/src/overlay.rs` | `SkeletonOverlayOptions` |
 | Rig resolution | `engine/crates/scene/src/hierarchy.rs` | `Scene::model_rig_entity` |
 | Bone + parent components | `engine/crates/scene/src/component.rs` | `SkinnedMesh`, `Bone`, `Relationship` |
 | Control commands | `engine/crates/control/src/commands_animation.rs` | `set-skeleton-overlay`, `get-skeleton-overlay`, `set-skeleton-highlight`, `pick-skeleton-joint` |
-| On-top vs depth-tested PSOs | `engine/crates/rendering/src/pipelines.rs` | `request_overlay`, `request_overlay_depth` |
+| On-top vs depth-tested PSOs | `engine/crates/rendering/src/pipelines/` | `request_overlay`, `request_overlay_depth` |
 
 ## Related
 

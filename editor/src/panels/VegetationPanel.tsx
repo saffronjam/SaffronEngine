@@ -27,7 +27,6 @@ import {
 import { VEGETATION_TOOLS, isBrushTool } from "./vegetationTools";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
-import { Label } from "@/components/ui/label";
 import {
   Select,
   SelectContent,
@@ -38,14 +37,7 @@ import {
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { Separator } from "@/components/ui/separator";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
-
-function SectionLabel({ children }: { children: React.ReactNode }) {
-  return (
-    <Label className="text-[10px] font-medium tracking-wide text-muted-foreground uppercase">
-      {children}
-    </Label>
-  );
-}
+import { SectionLabel } from "../components/PanelRows";
 
 function BrushField({ label, children }: { label: string; children: React.ReactNode }) {
   return (
@@ -131,7 +123,7 @@ function useVegetationMap(): {
     const tick = async () => {
       try {
         const status = await client.vegetationRuntimeStatus();
-        const bound = "Available" in status ? status.Available.map : null;
+        const bound = status.state === "available" ? status.map : null;
         if (live) {
           known = bound;
           setMap(bound);

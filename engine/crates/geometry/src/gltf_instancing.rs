@@ -1,9 +1,8 @@
 //! Reading glTF `EXT_mesh_gpu_instancing` placements.
 //!
 //! The extension puts a node's instances in accessors rather than in the node graph, so a scatter of
-//! ten thousand trees is one node. Reading it is deliberately separate from model import: a model
-//! import wants geometry and materials, while this wants only where the instances are, and composing
-//! the two would drag a mesh decode into a placement read.
+//! ten thousand trees is one node. Reading placements stays separate from model import so a
+//! placement read never drags a mesh decode along with it.
 //!
 //! Instance transforms are in the instanced node's local space, so each one composes with the node's
 //! own transform and its whole ancestor chain — a scatter parented under a scaled group is scaled.

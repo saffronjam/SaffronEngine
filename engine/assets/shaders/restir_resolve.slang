@@ -70,6 +70,7 @@ float rayShadow(float3 p, float3 l, float dist)
                 sceneAddresses,
                 albedoTextures,
                 q.CandidateInstanceID(),
+                q.CandidateGeometryIndex(),
                 q.CandidatePrimitiveIndex(),
                 q.CandidateTriangleBarycentrics()))
         {

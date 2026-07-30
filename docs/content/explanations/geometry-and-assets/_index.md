@@ -34,6 +34,6 @@ crate owns the CPU types and byte codecs; `saffron-assets` owns the catalog, imp
 | `botanical-graph` | Typed authoring IR that grows a plant family, plus its manual edit layer | `vegetation/src/botanical.rs` · `grow`, `BotanicalGraphDocument` |
 | `point-interchange` | Instanced points in and out of content-creation tools | `vegetation/src/interchange.rs` · `interchange_to_anchors`, `read_houdini_points` |
 | `biome-graph-evaluation` | Typed biome compilation, deterministic cells, executors, and provenance | `vegetation/src/graph.rs` · `BiomeGraphEvaluator` |
-| `vegetation-cooking` | Staged plant, cell, and manifest cooking | `vegetation/src/cook.rs` · `CookGraph`, `VegetationBaseManifest` |
+| `vegetation-cooking` | Staged plant, cell, and manifest cooking, and the two roots it writes to | `vegetation/src/cook.rs` · `CookGraph`, `VegetationBaseManifest` |
 | `virtual-geometry` | Portable triangle/voxel hierarchy and global GPU records | `geometry/src/virtual_hierarchy.rs`; `rendering/src/global_gpu_data.rs` |
 | `plant-rendering` | Cooked families to GPU instances: assembly, macro adapter, micro fields | `assets/src/plant_render.rs` · `load_plant_family`, `sync_vegetation` |

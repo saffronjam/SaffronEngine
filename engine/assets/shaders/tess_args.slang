@@ -1,6 +1,6 @@
-// Global emit-dispatch args (Phase 3b, one thread): turns the scan's global micro-vertex total into
-// the `VkDispatchIndirectCommand` that sizes the Phase-4 emit dispatch (one thread per micro-vertex,
-// 64 per group), so the GPU-computed count drives the dispatch with no CPU readback.
+// Global emit-dispatch args, one thread: the scan's global micro-vertex total into the
+// `VkDispatchIndirectCommand` that sizes the emit dispatch (one thread per micro-vertex, 64 per
+// group), so the GPU-computed count drives the dispatch with no CPU readback.
 
 [[vk::binding(0, 0)]] StructuredBuffer<uint> globalTotals;    // [microVertTotal, microTriTotal]
 [[vk::binding(1, 0)]] RWStructuredBuffer<uint> dispatchArgs;  // VkDispatchIndirectCommand { x, y, z }

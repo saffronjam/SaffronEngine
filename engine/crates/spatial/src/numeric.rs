@@ -46,13 +46,11 @@ impl<const FRACTION_BITS: u32> FixedI32<FRACTION_BITS> {
         1_i128 << FRACTION_BITS
     }
 
-    /// Constructs a value from its canonical signed bits.
     #[must_use]
     pub const fn from_bits(bits: i32) -> Self {
         Self(bits)
     }
 
-    /// The canonical signed bits.
     #[must_use]
     pub const fn bits(self) -> i32 {
         self.0
@@ -97,7 +95,6 @@ impl<const FRACTION_BITS: u32> FixedI32<FRACTION_BITS> {
         f64::from(self.0) / Self::scale_i128() as f64
     }
 
-    /// Checked addition.
     pub fn checked_add(self, other: Self) -> Result<Self> {
         self.0
             .checked_add(other.0)
@@ -105,7 +102,6 @@ impl<const FRACTION_BITS: u32> FixedI32<FRACTION_BITS> {
             .ok_or(Error::NumericOverflow)
     }
 
-    /// Checked subtraction.
     pub fn checked_sub(self, other: Self) -> Result<Self> {
         self.0
             .checked_sub(other.0)
@@ -158,28 +154,19 @@ pub type DecisionScalar = FixedI32<16>;
 /// A three-axis decision vector.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub struct DecisionVec3 {
-    /// X component.
     pub x: DecisionScalar,
-    /// Y component.
     pub y: DecisionScalar,
-    /// Z component.
     pub z: DecisionScalar,
 }
 
 /// A symmetric three-dimensional Hessian in canonical component order.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub struct DecisionHessian3 {
-    /// Second derivative along X.
     pub xx: DecisionScalar,
-    /// Mixed X/Y derivative.
     pub xy: DecisionScalar,
-    /// Mixed X/Z derivative.
     pub xz: DecisionScalar,
-    /// Second derivative along Y.
     pub yy: DecisionScalar,
-    /// Mixed Y/Z derivative.
     pub yz: DecisionScalar,
-    /// Second derivative along Z.
     pub zz: DecisionScalar,
 }
 
@@ -188,18 +175,14 @@ pub struct DecisionHessian3 {
 pub struct UnitInterval(u16);
 
 impl UnitInterval {
-    /// Zero.
     pub const ZERO: Self = Self(0);
-    /// One.
     pub const ONE: Self = Self(u16::MAX);
 
-    /// Constructs from canonical bits.
     #[must_use]
     pub const fn from_bits(bits: u16) -> Self {
         Self(bits)
     }
 
-    /// Canonical bits.
     #[must_use]
     pub const fn bits(self) -> u16 {
         self.0
@@ -242,7 +225,6 @@ impl SignedUnit {
         Ok(Self(bits))
     }
 
-    /// Canonical bits.
     #[must_use]
     pub const fn bits(self) -> i16 {
         self.0
@@ -271,7 +253,6 @@ impl SignedUnit {
 pub struct QuantizedOrientation([SignedUnit; 4]);
 
 impl QuantizedOrientation {
-    /// Identity orientation.
     #[must_use]
     pub fn identity() -> Self {
         Self([
@@ -304,7 +285,6 @@ impl QuantizedOrientation {
         ))
     }
 
-    /// Canonical signed normalized lane bits.
     #[must_use]
     pub fn bits(self) -> [i16; 4] {
         self.0.map(SignedUnit::bits)
@@ -330,7 +310,6 @@ impl CanonicalF32 {
         Ok(Self(if value == 0.0 { 0.0 } else { value }))
     }
 
-    /// The finite value.
     #[must_use]
     pub const fn get(self) -> f32 {
         self.0
@@ -390,7 +369,6 @@ impl DecisionCurve {
         Ok(())
     }
 
-    /// The canonical points.
     #[must_use]
     pub fn points(&self) -> &[(UnitInterval, DecisionScalar)] {
         &self.points

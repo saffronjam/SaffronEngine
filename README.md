@@ -42,5 +42,3 @@ Other convenience recipes (`just --list` for the full set): `just run-engine` bo
 
 - Concept-by-concept docs: [`docs/content/overview.md`](docs/content/overview.md) (Hugo site).
 - Toolchain, architecture, conventions, code style: [`AGENTS.md`](AGENTS.md).
-</content>
-</invoke>

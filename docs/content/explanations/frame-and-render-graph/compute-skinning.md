@@ -168,7 +168,7 @@ AS-build → AS-build-read barrier handing the finished BLASes to the TLAS build
 
 ## Related
 
-- [Compute displacement](../compute-displacement/) — the sibling deform path through the tessellation seam
+- [Compute displacement](../compute-displacement/) — the sibling deform path, through the amplification arena
 - [Morph targets](../../animation/morph-targets/) — blend shapes writing the same buffer before skin
 - [Barrier derivation](../usage-and-barrier-derivation/) — how the compute→vertex barrier is derived
 - [Motion vectors](../../screen-space-and-post/motion-vectors/) — the pass that reads both deformed buffers

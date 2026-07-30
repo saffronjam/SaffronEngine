@@ -8,6 +8,7 @@ import type {
   PlantCreateResult,
   PlantElementsResult,
   PlantGraphResult,
+  PlantSourceLocatorDto,
   PlantValidationResult,
 } from "@saffron/protocol";
 import type { Engine } from "./harness.ts";
@@ -24,7 +25,7 @@ afterAll(async () => {
   await cleaner.cleanup();
 });
 
-/// Two materials for the graph's slots: bark and leaves.
+// Two materials for the graph's slots: bark and leaves.
 let slots: string[] = [];
 async function materials() {
   if (slots.length === 0) {
@@ -201,7 +202,10 @@ test("a graft declares its hero mesh on the family and the graph names it", asyn
   const source = "3e".repeat(16);
   const graft = {
     id: source,
-    locator: { kind: "file", uri: "file:///plants/hero-branch.glb" },
+    locator: {
+      kind: "file",
+      uri: "file:///plants/hero-branch.glb",
+    } satisfies PlantSourceLocatorDto,
     selector: { kind: "whole" },
     settings: { units: "centimeters", upAxis: "positive-z" },
     provenance: {

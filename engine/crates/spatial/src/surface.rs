@@ -26,7 +26,6 @@ pub struct SurfaceTagId(pub u64);
 /// One weighted classification on a hit or field sample.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct WeightedSurfaceTag {
-    /// Stable tag identity.
     pub tag: SurfaceTagId,
     /// Canonical normalized contribution.
     pub weight: UnitInterval,
@@ -35,7 +34,6 @@ pub struct WeightedSurfaceTag {
 /// A stable attachment to one provider primitive.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SurfaceAttachment {
-    /// Provider identity.
     pub provider: SurfaceProviderId,
     /// Primitive identity within the provider.
     pub primitive: SurfacePrimitiveId,
@@ -177,7 +175,6 @@ pub struct SurfaceCoordinates {
 /// A complete nearest surface hit.
 #[derive(Clone, Debug, PartialEq)]
 pub struct SurfaceHit {
-    /// Stable provider identity.
     pub provider: SurfaceProviderId,
     /// Exact quantized world position.
     pub position: WorldPosition,
@@ -215,7 +212,6 @@ pub struct SurfaceCapabilities {
 /// Immutable provider metadata used for planning and diagnostics.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SurfaceProviderDescriptor {
-    /// Stable identity.
     pub id: SurfaceProviderId,
     /// Monotonic content revision.
     pub revision: SurfaceRevision,
@@ -306,29 +302,21 @@ impl SurfaceNearestQuery {
 /// Canonical scalar/vector channels exposed by surface providers.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum FieldChannel {
-    /// World altitude.
     Altitude,
-    /// Surface slope.
     Slope,
     /// Mean curvature.
     Curvature,
-    /// Concavity.
     Concavity,
     /// Drainage accumulation.
     Drainage,
-    /// Moisture.
     Moisture,
-    /// Temperature.
     Temperature,
-    /// Precipitation.
     Precipitation,
     /// Direct and indirect sunlight availability.
     Sunlight,
     /// Exposure to open sky and wind.
     Exposure,
-    /// Distance to water.
     WaterDistance,
-    /// Water depth.
     WaterDepth,
     /// Signed blocker distance.
     SignedBlocker,
@@ -339,7 +327,7 @@ pub enum FieldChannel {
 }
 
 impl FieldChannel {
-    /// Returns the stable canonical tag and user payload used by persisted vegetation formats.
+    /// The stable canonical tag and user payload used by persisted vegetation formats.
     #[must_use]
     pub const fn canonical_code(self) -> (u8, u64) {
         match self {
@@ -365,12 +353,11 @@ impl FieldChannel {
 /// Which derivative is requested for a field channel.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum FieldDerivative {
-    /// Sample the value.
     #[default]
     Value,
-    /// Sample the first spatial derivative.
+    /// The first spatial derivative.
     Gradient,
-    /// Sample the second spatial derivative.
+    /// The second spatial derivative.
     Hessian,
 }
 
@@ -388,9 +375,7 @@ pub enum FieldAvailability {
 /// A canonical quantized tile descriptor for authoritative field evaluation.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SurfaceTileDescriptor {
-    /// Provider owning the tile.
     pub provider: SurfaceProviderId,
-    /// Provider revision.
     pub revision: SurfaceRevision,
     /// Covered exact world bounds.
     pub bounds: WorldBounds,
@@ -403,39 +388,31 @@ pub struct SurfaceTileDescriptor {
 /// One canonical scalar field result.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct FieldSample {
-    /// Sampled channel.
     pub channel: FieldChannel,
-    /// Requested derivative.
     pub derivative: FieldDerivative,
     /// Canonical scalar value.
     pub value: DecisionScalar,
-    /// Provider revision.
     pub revision: SurfaceRevision,
 }
 
 /// One canonical vector field result.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct VectorFieldSample {
-    /// Sampled channel.
     pub channel: FieldChannel,
-    /// Requested derivative.
     pub derivative: FieldDerivative,
     /// Canonical vector value.
     pub value: DecisionVec3,
-    /// Provider revision.
     pub revision: SurfaceRevision,
 }
 
 /// One canonical symmetric Hessian field result.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct HessianFieldSample {
-    /// Sampled channel.
     pub channel: FieldChannel,
-    /// Requested derivative, always [`FieldDerivative::Hessian`].
+    /// Always [`FieldDerivative::Hessian`].
     pub derivative: FieldDerivative,
     /// Canonical symmetric Hessian.
     pub value: DecisionHessian3,
-    /// Provider revision.
     pub revision: SurfaceRevision,
 }
 
@@ -444,7 +421,6 @@ pub struct HessianFieldSample {
 pub struct SurfaceDirtyRegion {
     /// Changed exact world bounds.
     pub bounds: WorldBounds,
-    /// Revision containing the change.
     pub revision: SurfaceRevision,
 }
 

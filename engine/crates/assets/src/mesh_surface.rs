@@ -69,18 +69,21 @@ impl CanonicalCpuCoverage {
     }
 }
 
+/// The index of the submesh whose index range covers `triangle_index`.
+fn submesh_of_triangle(submeshes: &[Submesh], triangle_index: u32) -> Option<usize> {
+    let index_offset = triangle_index.saturating_mul(3);
+    submeshes.iter().position(|submesh| {
+        let end = submesh.first_index.saturating_add(submesh.index_count);
+        index_offset >= submesh.first_index && index_offset < end
+    })
+}
+
 pub(crate) fn coverage_for_triangle<'a>(
     submeshes: &[Submesh],
     coverage: &'a [CanonicalCpuCoverage],
     triangle_index: u32,
 ) -> Option<&'a CanonicalCpuCoverage> {
-    let index_offset = triangle_index.saturating_mul(3);
-    submeshes.iter().enumerate().find_map(|(index, submesh)| {
-        let end = submesh.first_index.saturating_add(submesh.index_count);
-        (index_offset >= submesh.first_index && index_offset < end)
-            .then(|| coverage.get(index))
-            .flatten()
-    })
+    coverage.get(submesh_of_triangle(submeshes, triangle_index)?)
 }
 
 /// Complete immutable inputs for one static-mesh surface-provider snapshot.
@@ -374,17 +377,13 @@ impl StaticMeshSurfaceProvider {
     }
 
     fn tags_for_triangle(&self, triangle_index: u32) -> Vec<WeightedSurfaceTag> {
-        let index_offset = triangle_index.saturating_mul(3);
-        let tag = self.submeshes.iter().find_map(|submesh| {
-            let end = submesh.first_index.saturating_add(submesh.index_count);
-            (index_offset >= submesh.first_index && index_offset < end)
-                .then(|| {
-                    self.material_tags
-                        .get(submesh.material_slot as usize)
-                        .copied()
-                })
-                .flatten()
-        });
+        let tag = submesh_of_triangle(&self.submeshes, triangle_index)
+            .and_then(|index| self.submeshes.get(index))
+            .and_then(|submesh| {
+                self.material_tags
+                    .get(submesh.material_slot as usize)
+                    .copied()
+            });
         tag.map_or_else(Vec::new, |tag| {
             vec![WeightedSurfaceTag {
                 tag,

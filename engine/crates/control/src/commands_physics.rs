@@ -1,13 +1,11 @@
-//! The 12 physics-domain control commands: world state + body listing, impulse,
-//! contact-event draining, collider/bone auto-fit, kinematic bones, character movement,
-//! ray/sphere queries, and the ragdoll surface.
+//! The physics-domain control commands: world state and body listing, impulse, contact-event
+//! draining, collider and bone auto-fit, kinematic bones, character movement, ray/sphere queries,
+//! and the ragdoll surface.
 //!
-//! This is the one domain that touches the **nullable** [`EngineContext::physics`] field
-//! — the live play world, `None` in Edit. Every world-querying handler guards the null
-//! and returns an inactive/empty result so the editor can poll unconditionally;
-//! mutation/query-on-world handlers return the typed "no physics world" error. The
-//! collider/bone-fit + kinematic/ragdoll-config handlers reach `sceneEdit` instead (they
-//! configure authored components and work in Edit).
+//! The one domain that touches the nullable [`EngineContext::physics`] field — the live play world,
+//! `None` in Edit. A querying handler guards the null and returns an inactive result so the editor
+//! can poll unconditionally; a handler that needs the world returns the typed "no physics world"
+//! error. The fit and config handlers reach `sceneEdit` instead and work in Edit.
 
 use saffron_physics::{ContactKind, MotionType, World};
 use saffron_protocol::{
@@ -316,7 +314,7 @@ pub fn register_physics_commands(reg: &mut CommandRegistry) {
                 let world = ctx.physics.as_deref_mut().ok_or_else(no_world)?;
                 world
                     .enable_ragdoll(ctx.scene_edit.active_scene(), rig)
-                    .map_err(|e| Error::command(e.to_string()))?;
+                    .map_err(Error::command)?;
             } else {
                 ctx.physics
                     .as_deref_mut()
@@ -347,7 +345,7 @@ pub fn register_physics_commands(reg: &mut CommandRegistry) {
                 let world = ctx.physics.as_deref_mut().ok_or_else(no_world)?;
                 world
                     .enable_ragdoll(ctx.scene_edit.active_scene(), rig)
-                    .map_err(|e| Error::command(e.to_string()))?;
+                    .map_err(Error::command)?;
             }
             ctx.physics
                 .as_deref_mut()
@@ -359,7 +357,7 @@ pub fn register_physics_commands(reg: &mut CommandRegistry) {
                     params.bone,
                     params.weight,
                 )
-                .map_err(|e| Error::command(e.to_string()))?;
+                .map_err(Error::command)?;
             ctx.scene_edit.animation_version += 1;
             let world = ctx.physics.as_deref().ok_or_else(no_world)?;
             Ok(ragdoll_result_for(world, ctx.scene_edit.active_scene(), rig))

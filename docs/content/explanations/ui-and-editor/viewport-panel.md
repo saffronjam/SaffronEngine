@@ -76,7 +76,7 @@ Drop sends one final preview position followed by `phase: "commit"`; leaving the
 | View selection and parking policy | `editor/src/app/App.tsx` | `activeRenderView`, `sceneParked`, `assetParked` |
 | Shell command bridge | `editor/shell/src/commands.rs` | `set_viewport_bounds`, `set_viewport_parked` |
 | Shared view state and presenters | `editor/shell/src/viewport.rs` · `editor/shell/src/backend/*/presenter.rs` | `Viewports`, `ViewportShared`, `install` |
-| Render view and input commands | `engine/crates/control/src/commands_render.rs` · `commands_asset.rs` · `commands_scene.rs` | `set-viewport-size`, `viewport-native-info`, `set-active-view`, `asset-placement`, `script-input` |
+| Render view and input commands | `engine/crates/control/src/commands_render/` · `commands_asset.rs` · `commands_scene.rs` | `set-viewport-size`, `viewport-native-info`, `set-active-view`, `asset-placement`, `script-input` |
 
 ## Related
 

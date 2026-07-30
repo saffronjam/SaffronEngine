@@ -1,8 +1,0 @@
-fixture: instance_data.offsets
-bytes: 965
-sha256: 53cbd783499940b58bb7b9b383b0fba55eb8023c276c37483a8af40cc99de13b
-source: C++ engine-old renderer_types.cppm InstanceData (:1868)
-generator: fixtures/golden/gen/gen_golden.cpp
-commit: d8b4cea
-nlohmann_json: v3.12.0
-compiler: clang++ 21 -std=c++26 (saffron-build toolbox)

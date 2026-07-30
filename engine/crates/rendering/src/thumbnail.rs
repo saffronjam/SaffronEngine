@@ -1,9 +1,5 @@
 //! Screenshot/thumbnail read-back encode: the captured-framebuffer → RGB conversion and the PNG
 //! encode.
-//!
-//! The PNG encode uses the `image` crate's [`image::codecs::png::PngEncoder`] rather
-//! than an stb binding — the bytes are an internal preview artifact, not a hash-parity
-//! wire contract, so any conforming RGB8 PNG encoder is correct.
 
 use ash::vk;
 use image::ImageEncoder;

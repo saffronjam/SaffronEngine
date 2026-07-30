@@ -21,11 +21,13 @@ flowchart TD
     B -->|HDRI| E[Light three-sphere environment rig]
     B -->|Material| F[Shade studio sphere by material id]
     B -->|Built-in mesh id| G[Instantiate primitive]
+    B -->|Plant family| I[Compile family and place it on the floor]
     C --> H[Frame preview camera]
     D --> H
     E --> H
     F --> H
     G --> H
+    I --> H
 ```
 
 Model metadata determines which panels open. `get-asset-model` returns counts, rig availability, a parent-indexed bone tree, and the clips stored in the container.
@@ -37,6 +39,8 @@ Model metadata determines which panels open. `get-asset-model` returns counts, r
 | Animation clips | Clip list, details, and timeline |
 
 A material subject also opens the Material panel, pinned to that material. The Tools menu can add render statistics to the asset-editor dock space.
+
+A plant, biome, or vegetation-map subject opens a [vegetation workspace](../vegetation-asset-workspaces/) in the same tab. A plant previews its compiled family mesh; a biome or map has no renderable form, so its tab skips the preview and works from the summary panel.
 
 ## Isolated scene state
 
@@ -81,9 +85,9 @@ A material preview binds the `.smat` asset by id to a studio sphere. Material gr
 | What | File | Symbols |
 |---|---|---|
 | Preview state and scene routing | `engine/crates/sceneedit/src/context.rs` | `SceneEditContext`, `active_scene`, `previewing` |
-| Subject resolution and preview construction | `engine/crates/control/src/commands_asset.rs` | `register_asset_commands`, `enter_asset_preview`, `build_preview_scene`, `furnish_preview_scene` |
-| View activation and state restoration | `engine/crates/control/src/commands_asset.rs` | `activate_asset_preview_view`, `activate_preview_view`, `deactivate_preview_view`, `leave_asset_preview` |
-| Per-view render resources | `engine/crates/rendering/src/renderer.rs` | `ViewId`, `Renderer::set_active_view`, `Renderer::reset_view_temporal` |
+| Subject resolution and preview construction | `engine/crates/control/src/commands_asset/` | `register_asset_commands`, `enter_asset_preview`, `build_preview_scene`, `furnish_preview_scene` |
+| View activation and state restoration | `engine/crates/control/src/commands_asset/` | `activate_asset_preview_view`, `activate_preview_view`, `deactivate_preview_view`, `leave_asset_preview` |
+| Per-view render resources | `engine/crates/rendering/src/renderer/` | `ViewId`, `Renderer::set_active_view`, `Renderer::reset_view_temporal` |
 | Workspace and capability-driven panels | `editor/src/panels/AssetEditorWorkspace.tsx` | `AssetEditorWorkspace` |
 | Preview panels | `editor/src/panels/assetEditorPanels.tsx` | `AssetPreviewPanel`, `AssetSkeletonPanel`, `AssetClipsPanel`, `AssetTimelinePanel` |
 | Tab routing and view parking | `editor/src/state/store.ts`, `editor/src/app/App.tsx` | `openAssetEditorForAsset`, `mountedAssetId`, `setActiveView` |
@@ -95,4 +99,5 @@ A material preview binds the `.smat` asset by id to a studio sphere. Material gr
 - [Skeleton overlay](../../animation/skeleton-overlay/) - joint lines, axes, highlighting, and picking
 - [Timeline](../../animation/timeline/) - the shared animation transport and scrub surface
 - [Material graph live preview](../material-graph-live-preview/) - material editing through the same preview view
+- [Vegetation asset workspaces](../vegetation-asset-workspaces/) - the plant and biome panels hosted in this tab
 - [Viewport compositing](../viewport-compositing/) - shared-memory presentation below the CEF interface

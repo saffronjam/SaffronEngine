@@ -45,7 +45,7 @@ async function entries(): Promise<Entry[]> {
   return (await engine.call<{ entities: Entry[] }>("list-entities")).entities;
 }
 
-/// Find the entity in the imported hierarchy that actually carries the AnimationPlayer component.
+// Find the entity in the imported hierarchy that actually carries the AnimationPlayer component.
 async function findPlayerEntity(): Promise<string | undefined> {
   for (const e of await entries()) {
     const info = await engine.call<{ components: Record<string, unknown> }>("inspect", {
@@ -58,8 +58,8 @@ async function findPlayerEntity(): Promise<string | undefined> {
   return undefined;
 }
 
-/// The mesh-bearing entity carrying the durable `Morph` component (import seeds it on the mesh node,
-/// which the single-node model may collapse onto the instantiated root).
+// The mesh-bearing entity carrying the durable `Morph` component (import seeds it on the mesh node,
+// which the single-node model may collapse onto the instantiated root).
 async function morphEntity(): Promise<string> {
   for (const e of await entries()) {
     const info = await engine.call<{ components: Record<string, unknown> }>("inspect", {
@@ -72,7 +72,7 @@ async function morphEntity(): Promise<string> {
   throw new Error("no entity carries a Morph component");
 }
 
-/// Capture the viewport and wait for the deferred write to land on disk.
+// Capture the viewport and wait for the deferred write to land on disk.
 async function screenshot(tag: string): Promise<Buffer> {
   return captureViewport(engine, cleaner, `deform-${tag}`);
 }

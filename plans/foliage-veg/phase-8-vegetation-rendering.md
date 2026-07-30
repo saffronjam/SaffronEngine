@@ -111,8 +111,9 @@ coverage, visibility, page, picking, and diagnostic infrastructure as ordinary g
   parent↔child transition; output transition/reactive state to TAA. *(A cross-frame state table
   keyed (instance slot, page) remembers each flip node; on a flip both representations draw for
   `GPU_TRANSITION_FRAMES` frames carrying `record.transition` = phase | direction | 16-bit flip id.
-  Every raster pass (`scene_executor_depth`/`gbuffer`/`motion`/`mesh` forward + masked prepass)
-  tests the same frame-free dither via `gpuTransitionCovered` — the incoming side keeps pixels
+  Every raster pass tests the same frame-free dither via `gpuTransitionCovered` — `mesh.slang`'s
+  `fragmentMain` and `depthPrepassFragment`, `gbuffer.slang` and `motion.slang`, over the one
+  definition in `global_gpu_data.slang` — the incoming side keeps pixels
   below the phase threshold, the outgoing keeps the complement, so the shares partition every
   pixel exactly: no holes, no double-draw, one flip per pixel per sweep. Transitioning records
   draw into the TAA reactive mask (`vertexMainReactiveTransition` keys on `transition != 0`).
@@ -197,12 +198,15 @@ conifer needles) require authored botanical assets and land with the phase-14 in
   columns only.)*
 - [x] Depth/main/current shadow/selection coverage agrees for modeled and residual-masked foliage.
   *(One canonical coverage contract everywhere: `sampleCanonicalCoverage` in the depth prepass
-  (mirroring `fragmentMain` exactly), forward, gbuffer, motion, and point-shadow passes, and
+  (mirroring `fragmentMain` exactly), forward, gbuffer, motion and the `vsm-pages` shadow pass, and
   `classify_canonical_coverage` in the CPU surface provider the selection ray consumes.)*
 - [x] Every representation and fixture renders at full quality on MoltenVK's indexed executor.
-  *(The `moltenvk_renders_every_cooked_representation_through_indexed_draws` device test plus the
-  stress matrix and the canonical vegetation e2e all execute on MoltenVK — triangle clusters,
-  aggregate voxels, assemblies, and micro blades through the one indexed-MDI executor.)*
+  *(`the_depth_prepass_rasterizes_every_cooked_representation` (rendering, `visibility/tests/executor.rs`)
+  puts triangle clusters, the same hierarchy pinned coarse to its aggregate voxel surface, and the
+  reconstructed micro-blade field through the production depth-family recorder in one frame, reading
+  the representation back from the record stream so a run that produced a different one fails rather
+  than passing on somebody else's coverage. It runs on whatever device is present — MoltenVK on the
+  Apple machine — and the stress matrix and the canonical vegetation e2e execute there too.)*
 - [x] Standard gate, validation runs, visual comparisons, and vegetation-rendering docs are green.
   *(Gate, validation boots, and docs checks are green and continuously re-verified; the visual
   comparison leg is a human-at-the-screen confirmation, listed per slice in READMEFABLE's

@@ -1,24 +1,20 @@
 // The partitioned top-level acceleration structure: same picture, less work per frame.
 //
-// A KHR top level is rebuilt whole every frame. A partitioned one holds its instances in
-// partitions and advances by an op stream naming only what changed, so a settled frame
-// costs the instances it touched rather than the instances that exist. Both claims are
-// asserted here, and the first is the load-bearing one: a structure that traces a DIFFERENT
-// picture has not saved anything, it has broken something.
+// A KHR top level is rebuilt whole every frame. A partitioned one holds its instances in partitions
+// and advances by an op stream naming only what changed, so a settled frame costs the instances it
+// touched rather than the instances that exist. The picture claim is the load-bearing one: a
+// structure that traces a different picture has broken something, not saved anything.
 //
-// The comparison runs two hosts over one scene — one with the partitioned structure, one
-// without — because on a device that has the extension there is no other way to see the KHR
-// path, and a self-comparison could not tell a correct structure from a consistently wrong
-// one.
+// The comparison runs two hosts over one scene, because on a device that has the extension there is
+// no other way to reach the KHR path, and a self-comparison cannot tell a correct structure from a
+// consistently wrong one.
 //
-// TWO VALIDATION MESSAGES ARE EXPECTED AND WHITELISTED BY VUID, which is why this suite
-// exists apart from the rest rather than being folded into `rt-telemetry`. The SDK layers
-// ship the extension's header but do not model it: a partitioned structure has no SPIR-V
-// form for a shader variable to declare (the extension defines no SPIR-V capability, so the
-// shader declares an ordinary acceleration structure and the layer calls that a descriptor
-// mismatch), and it is memory rather than an object, so the layer cannot resolve its address
-// to an acceleration structure. Neither is reachable from engine code. Every OTHER validation
-// message still fails this suite, so the whitelist cannot hide a real one.
+// Two validation messages are expected and whitelisted by VUID, which is why this suite sits apart
+// from `rt-telemetry`. The SDK layers ship the extension's header but do not model it: a partitioned
+// structure has no SPIR-V form for a shader variable to declare, so the shader declares an ordinary
+// acceleration structure and the layer calls that a descriptor mismatch, and it is memory rather
+// than an object, so the layer cannot resolve its address. Neither is reachable from engine code,
+// and every other validation message still fails this suite.
 
 import { afterAll, beforeAll, expect, test } from "bun:test";
 import type { RenderStatsDto } from "@saffron/protocol";
@@ -26,7 +22,7 @@ import type { Engine } from "./harness.ts";
 import { decodeRgb8Png, meanAbsoluteDifference } from "./image.ts";
 import { Cleaner, bootEngine, captureViewport, prepareScene } from "./test-utils.ts";
 
-/// The layer gaps this suite tolerates, by VUID. Anything else is a real failure.
+// The layer gaps this suite tolerates, by VUID. Anything else is a real failure.
 const EXPECTED_VUIDS = [
   "VUID-VkGraphicsPipelineCreateInfo-layout-07990",
   "VUID-vkCmdDrawIndexedIndirectCount-None-08114",

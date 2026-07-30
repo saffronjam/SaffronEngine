@@ -1,7 +1,8 @@
 import { existsSync, readFileSync, rmSync } from "node:fs";
 import { Engine } from "./harness.ts";
 
-type Cleanup = () => void | Promise<void>;
+// A cleanup's own return value is discarded, so any expression body registers as-is.
+type Cleanup = () => unknown;
 
 /** Runs registered cleanup functions once, in reverse registration order. */
 export class Cleaner {
@@ -11,7 +12,7 @@ export class Cleaner {
     this.cleanups.push(cleanup);
   }
 
-  track<T>(value: T, cleanup: (value: T) => void | Promise<void>): T {
+  track<T>(value: T, cleanup: (value: T) => unknown): T {
     this.defer(() => cleanup(value));
     return value;
   }
@@ -79,7 +80,7 @@ export function trackEntity<T extends string | { id: string }>(
   entity: T,
 ): T {
   const id = typeof entity === "string" ? entity : entity.id;
-  cleaner.defer(() => engine.call("destroy-entity", { entity: id }).then(() => undefined));
+  cleaner.defer(() => engine.call("destroy-entity", { entity: id }));
   return entity;
 }
 

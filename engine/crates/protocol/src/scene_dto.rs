@@ -225,6 +225,33 @@ pub struct FogVolume {
     pub speed: f32,
 }
 
+/// The influence shape of a local wind source.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema, TS)]
+#[serde(rename_all = "lowercase")]
+#[ts(export)]
+pub enum WindSourceKindDto {
+    Directional,
+    Point,
+    Vortex,
+    Wake,
+    Volume,
+}
+
+/// A serialized local wind influence composited over the environment wind.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema, TS)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[ts(export)]
+pub struct WindSource {
+    pub kind: WindSourceKindDto,
+    /// Peak speed in metres per second; the global scale factor for `volume`.
+    pub strength: f32,
+    /// Influence radius in metres.
+    pub radius: f32,
+    /// Edge-falloff fraction of the radius, in 0..1.
+    pub falloff: f32,
+    pub enabled: bool,
+}
+
 /// A serialized hierarchy parent reference.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema, TS)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -437,6 +464,8 @@ pub struct Components {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub fog_volume: Option<FogVolume>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub wind_source: Option<WindSource>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub relationship: Option<Relationship>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub skinned_mesh: Option<SkinnedMesh>,
@@ -477,6 +506,7 @@ pub enum ComponentBody {
     SpotLight(SpotLight),
     ReflectionProbe(ReflectionProbe),
     FogVolume(FogVolume),
+    WindSource(WindSource),
     Relationship(Relationship),
     SkinnedMesh(SkinnedMesh),
     Morph(Morph),
@@ -705,6 +735,7 @@ pub const COMPONENT_NAMES: &[&str] = &[
     "SpotLight",
     "ReflectionProbe",
     "FogVolume",
+    "WindSource",
     "Relationship",
     "SkinnedMesh",
     "Morph",

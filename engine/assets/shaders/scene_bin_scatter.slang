@@ -1,7 +1,8 @@
 // Executor bucketing, pass 3: scatter each record into its bucket's command slice,
 // building its VkDrawIndexedIndirectCommand. The pages arena is the executor's index
-// buffer; firstInstance carries the record index. A cursor passing the bucket's slice
-// end raises the pressure flag and drops the command (never a partial write).
+// buffer for page-resident geometry and the displacement arena's index stream for a
+// displaced row; firstInstance carries the record index. A cursor passing the bucket's
+// slice end raises the pressure flag and drops the command (never a partial write).
 
 import global_gpu_data;
 import scene_bin_common;
@@ -79,6 +80,25 @@ void computeMain(uint3 tid : SV_DispatchThreadID)
         command.firstIndex = pc.microFirstIndex;
         commands[slot] = command;
         writeMeshArgs(slot, command.indexCount);
+        return;
+    }
+    if (record.representation == GPU_REPRESENTATION_DISPLACED_MICRO)
+    {
+        // A displaced record draws its row of the amplification arena: the exact packed
+        // index count the emit kernel produced, over the arena's index stream rather than
+        // the pages arena. contentIndex is the arena row, never a page handle. The
+        // traversal cannot know the count (the arena is sized on device), so the frame's
+        // rasterized-triangle counter gains this draw's share here.
+        uint indexCount;
+        uint firstIndex;
+        uint vertexBase;
+        gpuSceneDisplacedDraw(addresses, record.contentIndex, indexCount, firstIndex, vertexBase);
+        command.indexCount = indexCount;
+        command.firstIndex = firstIndex;
+        command.vertexOffset = int(vertexBase);
+        commands[slot] = command;
+        writeMeshArgs(slot, command.indexCount);
+        InterlockedAdd(counters[8], indexCount / 3u);
         return;
     }
 

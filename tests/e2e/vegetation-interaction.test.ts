@@ -4,13 +4,7 @@
 // plane — asserting the one-owner rule at each synchronization point and a validation-clean log.
 
 import { afterAll, beforeAll, expect, test } from "bun:test";
-import { readFileSync } from "node:fs";
-import { dirname, join } from "node:path";
-import { fileURLToPath } from "node:url";
 import type {
-  EntityRef,
-  ImportVegetationAssetResult,
-  VegetationCookJobDto,
   VegetationDrainEventsResult,
   VegetationMutateResult,
   VegetationNavigationResult,
@@ -20,16 +14,15 @@ import type {
   VegetationRuntimeStatusDto,
 } from "@saffron/protocol";
 import type { Engine } from "./harness.ts";
-import { Cleaner, bootEngine, trackEntity } from "./test-utils.ts";
-import { authoredAssets, awaitCook, installTrunkObj, type VegetationFixture } from "./vegetation-utils.ts";
-
-const HERE = dirname(fileURLToPath(import.meta.url));
-const FIXTURE_PATH = join(HERE, "fixtures", "vegetation-phase3.json");
-const CELL = { coordinates: ["0", "0", "0"], level: 0 } as const;
-const BOUNDS = {
-  minTicks: ["0", "0", "0"],
-  maxTicksExclusive: ["262144", "262144", "262144"],
-} as const;
+import { Cleaner, bootEngine } from "./test-utils.ts";
+import {
+  BOUNDS,
+  CELL,
+  bindVegetationField,
+  cookCells,
+  importVegetationPackage,
+  loadFixture,
+} from "./vegetation-utils.ts";
 
 const cleaner = new Cleaner();
 let engine: Engine;
@@ -42,7 +35,7 @@ afterAll(async () => {
   await cleaner.cleanup();
 });
 
-/// The available status block, which every assertion below reads.
+// The available status block, which every assertion below reads.
 async function available() {
   const status = await engine.call<VegetationRuntimeStatusDto>("vegetation-runtime-status");
   if (status.state !== "available") {
@@ -52,31 +45,12 @@ async function available() {
 }
 
 test("a resident cell drives collision, promotion, felling, events, and navigation", async () => {
-  const fixture = JSON.parse(readFileSync(FIXTURE_PATH, "utf8")) as VegetationFixture;
-  const sources = authoredAssets(cleaner, fixture, "interaction");
-  await installTrunkObj(engine, fixture);
-  for (const path of [sources.plant, sources.biome, sources.map]) {
-    await engine.call<ImportVegetationAssetResult>("import-vegetation-asset", { path });
-  }
+  const fixture = loadFixture("vegetation-phase3");
+  await importVegetationPackage(engine, cleaner, fixture, "interaction");
 
-  const world = trackEntity(
-    cleaner,
-    engine,
-    await engine.call<EntityRef>("create-entity", { name: "Interaction vegetation" }),
-  );
-  await engine.call("add-component", { entity: world.id, component: "VegetationField" });
-  await engine.call("set-component", {
-    entity: world.id,
-    component: "VegetationField",
-    json: { map: fixture.map, enabled: true },
-  });
+  const world = await bindVegetationField(engine, cleaner, fixture, "Interaction vegetation");
 
-  const cook = await engine.call<VegetationCookJobDto>("vegetation-cook", {
-    map: fixture.map,
-    scope: { kind: "cells", cells: [CELL] },
-    workers: 1,
-  });
-  await awaitCook(engine, cook.job);
+  await cookCells(engine, fixture.map);
 
   // Park the camera over the cell so its facets claim residency, then start play: collision
   // bodies and promotion both belong to a live play world.

@@ -1,9 +1,6 @@
-/// The Script component's Inspector body: an ordered list of script slots (the
-/// runtime executes them top-to-bottom), each with assign/reorder/remove plus the
-/// script's declared fields rendered as widgets. Field defaults live in the .lua
-/// (fetched via get-script-schema); editing a widget writes only that slot's
-/// override (set-script-override) — never the default. An overridden field shows
-/// a reset affordance that clears it back to the declared default.
+/// The Script component's Inspector body: the ordered slot list the runtime executes top-to-bottom,
+/// each with its declared fields as widgets. Defaults live in the `.lua`; editing a widget writes
+/// only that slot's override, never the default, and an overridden field offers a reset back to it.
 import { useEffect, useRef, useState } from "react";
 import { ArrowDown, ArrowUp, FileCode, FilePlus2, FolderOpen, RotateCcw, X } from "lucide-react";
 import { invoke, open } from "../shell";

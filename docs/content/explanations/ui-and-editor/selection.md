@@ -66,8 +66,8 @@ Opening an asset preview stashes the authored selection and selects the preview 
 | What | File | Symbols |
 |---|---|---|
 | Selection state and signal | `engine/crates/sceneedit/src/context.rs` | `SceneEditContext::selected`, `SceneEditContext::set_selection`, `on_selection_changed` |
-| Selection and pick commands | `engine/crates/control/src/commands_scene.rs` | `select`, `get-selection`, `deselect`, `pick`, `pick_billboard` |
-| Exact mesh picking | `engine/crates/assets/src/render_scene.rs` | `pick_entity`, `pick_scene_surface` |
+| Selection and pick commands | `engine/crates/control/src/commands_scene/` | `select`, `get-selection`, `deselect`, `pick`, `pick_billboard` |
+| Exact mesh picking | `engine/crates/assets/src/render_scene/` | `pick_entity`, `pick_scene_surface` |
 | Model-container resolution | `engine/crates/scene/src/hierarchy.rs` | `Scene::model_root_of` |
 | Store mirror and reconcile | `editor/src/state/store.ts` | `selectedId`, `selectEntity`, `startReconcile`, `selectionVersion` |
 | Hierarchy selection | `editor/src/panels/HierarchyPanel.tsx` | `HierarchyPanel`, `onSelect` |

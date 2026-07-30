@@ -1,14 +1,8 @@
-//! Phase 4 command surface: the name-dispatched command handlers.
-//! The frontend bridge calls `invoke(name, args)`, which the IPC transport delivers here as
-//! `{ command, args }`. `control` is the generic passthrough (all ~120 typed control commands); the
-//! rest are the dedicated non-passthrough commands. Runs on an IPC worker thread — every handler is
-//! thread-safe (socket / `std::process` / `fs`).
-//!
-//! Every command group is wired: `control` (passthrough), engine lifecycle, file/OS/trace helpers,
-//! settings/recents, window controls, viewport geometry (`set_viewport_*`/`viewport_refresh_hz`),
-//! the Asset Store (`store_*`/`connector_*` → [`crate::store_commands`]), and native dialogs
-//! (`dialog_*` → [`crate::dialog`]). The only display-gated remnants are the *visual* pieces behind
-//! these commands — the subsurface present loop and the `saffron-img://` thumbnail scheme.
+//! The name-dispatched command handlers. The frontend bridge calls `invoke(name, args)`, which the
+//! IPC transport delivers here as `{ command, args }`: `control` is the generic passthrough for
+//! every typed control command, the rest are the dedicated shell commands (engine lifecycle,
+//! file/OS/trace helpers, settings and recents, window controls, viewport geometry, the Asset Store,
+//! and native dialogs). Runs on an IPC worker thread, so every handler is thread-safe.
 
 use crate::control::{ControlError, control_request_with_params};
 use crate::engine;

@@ -1,13 +1,9 @@
-//! The control plane: the synchronous `AF_UNIX` command server, the fn-pointer
-//! command registry, the `EngineContext` borrow seam, and the wire dispatch from
-//! request DTOs (`saffron-protocol`) to engine subsystems.
+//! The control plane: the synchronous `AF_UNIX` command server, the fn-pointer command registry,
+//! the `EngineContext` borrow seam, and the wire dispatch from request DTOs to engine subsystems.
 //!
-//! A non-blocking, single-threaded socket drained once per frame from the host's
-//! main loop — no async runtime, no worker thread. A request is one
-//! newline-delimited compact-JSON line; the reply echoes the request `id` and
-//! carries `ok` plus exactly one of `result` / `error`. The two builtin commands
-//! `ping` and `help` land here; the domain phases register their handlers onto
-//! the registry.
+//! A non-blocking, single-threaded socket drained once per frame from the host's main loop — no
+//! async runtime, no worker thread. One request is one newline-delimited compact-JSON line; the
+//! reply echoes the request `id` and carries `ok` plus exactly one of `result` / `error`.
 
 #![deny(unsafe_code)]
 

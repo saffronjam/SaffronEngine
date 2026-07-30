@@ -91,7 +91,7 @@ engine into its build.
 | Line format + subsystem column | `engine/crates/log/src/lib.rs` | `CompactFormatter`, `subsystem_of` |
 | Emit at a call site | anywhere | `tracing::{error, warn, info, debug, trace}!` |
 | Script span context | `engine/crates/script/src/runtime.rs` | `call_instance_method` |
-| Vulkan funnel + validation tally | `engine/crates/rendering/src/device.rs` | `debug_callback`, `validation_issue_count` |
+| Vulkan funnel + validation tally | `engine/crates/rendering/src/device/` | `debug_callback`, `validation_issue_count` |
 | Log-grep clean gates | `tests/e2e/harness.ts`, `tools/ci/check.sh` | `validationErrors` |
 
 ## Related

@@ -47,10 +47,10 @@ The BRDF LUT is a two-dimensional `IblImage`, not a cube. The nine diffuse SH co
 
 | What | File | Symbols |
 |---|---|---|
-| Cube image and sampling view | `engine/crates/rendering/src/ibl.rs` | `IblCube`, `IblCube::new` |
-| Per-mip storage views | `engine/crates/rendering/src/ibl.rs` | `IblCube::storage_view` |
-| Source mip generation | `engine/crates/rendering/src/ibl.rs` | `generate_cube_mips` |
-| Sizes and mip count | `engine/crates/rendering/src/ibl.rs` | `IBL_ENV_SIZE`, `IBL_PREFILTER_SIZE`, `IBL_PREFILTER_MIPS`, `IBL_LUT_SIZE` |
+| Cube image and sampling view | `engine/crates/rendering/src/ibl/` | `IblCube`, `IblCube::new` |
+| Per-mip storage views | `engine/crates/rendering/src/ibl/` | `IblCube::storage_view` |
+| Source mip generation | `engine/crates/rendering/src/ibl/` | `generate_cube_mips` |
+| Sizes and mip count | `engine/crates/rendering/src/ibl/` | `IBL_ENV_SIZE`, `IBL_PREFILTER_SIZE`, `IBL_PREFILTER_MIPS`, `IBL_LUT_SIZE` |
 | Mip and roughness contract | `engine/assets/shaders/lighting.slang` | `IblPrefilterMaxMip`, `prefilterLod` |
 
 > [!NOTE]

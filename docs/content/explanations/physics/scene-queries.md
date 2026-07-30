@@ -94,9 +94,9 @@ end
 
 | What | File | Symbols |
 |---|---|---|
-| Public query API and hit mapping | `engine/crates/physics/src/world.rs`, `src/types.rs` | `World::raycast`, `World::sphere_cast`, `World::map_ray_hit`, `RayHit` |
+| Public query API and hit mapping | `engine/crates/physics/src/world/`, `src/types.rs` | `World::raycast`, `World::sphere_cast`, `World::map_ray_hit`, `RayHit` |
 | Jolt narrow-phase bridge | `engine/crates/physics-sys/src/lib.rs`, `shim/jolt_bridge.cpp` | `raycast`, `sphere_cast`, `jolt_raycast`, `jolt_sphere_cast` |
-| Control protocol | `engine/crates/control/src/commands_physics.rs`, `engine/crates/protocol/src/dto.rs` | `register_physics_commands`, `RaycastParams`, `ShapecastParams`, `RaycastResult` |
+| Control protocol | `engine/crates/control/src/commands_physics.rs`, `engine/crates/protocol/src/dto/` | `register_physics_commands`, `RaycastParams`, `ShapecastParams`, `RaycastResult` |
 | Lua bindings and POD seam | `engine/crates/script/src/bindings.rs`, `bridge.rs` | `sa.raycast`, `sa.spherecast`, `ScriptHostBridge`, `ScriptRayHit` |
 | Runtime bridge | `engine/crates/runtime/src/bridge.rs`, `session.rs` | `RuntimeScriptBridge`, `RuntimeSession::step` |
 

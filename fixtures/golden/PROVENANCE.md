@@ -20,7 +20,6 @@ same `nlohmann::json` version as the reference writer.
 | `cube.sanim` | `geometry.cppm` | `saveAnimationToBuffer` / `SANimHeader` / `SANimTrackRecord` (`:406`, `:1619`) |
 | `cube.smodel` | `geometry.cppm` | `writeContainer` / `SModelHeader` / `TocEntry` (`:296`) |
 | `material.smat` | `engine-old/source/saffron/assets/assets.cppm` | `materialAssetToJson` + `.dump(2)` (`:1488`, `:2137`) |
-| `instance_data.offsets` | `engine-old/source/saffron/rendering/renderer_types.cppm` | `InstanceData` (`:1868`) |
 | `material_params_data.offsets` | `engine/crates/rendering/src/gpu_types.rs`, `engine/assets/shaders/material_params.slang` | `MaterialParamsData` |
 | `gpu_light.offsets` | `renderer_types.cppm` | `GpuLight` (`:2018`) |
 | `shm_header.layout` | `engine-old/source/saffron/rendering/renderer_capture.cpp` | `recreateShmSegment` header init (`:129`) |

@@ -1,15 +1,11 @@
 //! Anti-aliasing mode selection + the motion-vector prepass the temporal modes need.
 //!
-//! The three AA modes are mutually exclusive: MSAA (multisampled scene targets resolved
-//! into the offscreen), FXAA (scene → scratch, a compute edge-blur → offscreen), and TAA
-//! (motion-vector reprojection + a compute resolve with two ping-pong history images).
-//! [`Aa`] is the single selector — [`Aa::set`] enforces the exclusivity in one place
-//! (MSAA wins if `samples > 1`) and clamps the requested count to what the color + depth
-//! formats actually support. There is one AA state, not three independent toggles that can
-//! contradict (the phase's NO-LEGACY note).
-//!
-//! The motion prepass push ([`MotionPush`]) lives here
-//! too, since the motion vectors are the temporal AA's (and SSGI's) shared dependency.
+//! The three AA modes are mutually exclusive: MSAA (multisampled scene targets resolved into the
+//! offscreen), FXAA (scene → scratch, a compute edge-blur → offscreen), and TAA (motion-vector
+//! reprojection + a compute resolve with two ping-pong history images). [`Aa::set`] enforces the
+//! exclusivity — MSAA wins if `samples > 1` — and clamps the requested count to what the color +
+//! depth formats support. The motion prepass push ([`MotionPush`]) lives here too, since motion
+//! vectors are the shared dependency of temporal AA and SSGI.
 
 use ash::vk;
 use saffron_geometry::glam::Mat4;
@@ -236,9 +232,8 @@ pub struct MotionPush {
 
 const _: () = assert!(size_of::<MotionPush>() == 128);
 
-/// The runtime TAA resolve tuning (replaces the old fixed history-weight constant). All are
-/// live-tunable over the control plane; the defaults are the balanced reference values
-/// (Karis/Lottes/Playdead).
+/// The runtime TAA resolve tuning, live-tunable over the control plane. The defaults are the
+/// balanced reference values (Karis/Lottes/Playdead).
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct TaaParams {
     /// History weight under fast motion / shading change (the floor). ~0.88.

@@ -28,10 +28,9 @@ impl Default for JointPose {
 
 /// A skeleton-sized pose, indexed 1:1 with a skinned mesh's bones.
 ///
-/// `local` is the sampled/animated TRS; `override_` is where external producers
-/// (IK/physics) write; `weight` is the inert per-bone blend layer (v1 leaves it
-/// `0`, meaning pure animation). `override_`/`weight` stay empty/zero until a
-/// producer fills them.
+/// `local` is the sampled/animated TRS, `override_` is where external producers (IK/physics) write,
+/// and `weight` is the per-bone blend layer — `0` meaning pure animation. `override_` and `weight`
+/// stay empty/zero until a producer fills them.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct PoseBuffer {
     /// The sampled/animated local TRS per joint.
