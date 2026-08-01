@@ -4,13 +4,15 @@
 //! cook graph are reproducible from authored sources, so `<project>/cache/vegetation/` may be
 //! deleted at any time. A baseline is not: it is a snapshot of runtime mutations an author chose to
 //! keep, and no authored source regenerates it. It therefore lives under
-//! `<project>/state/vegetation/`, which nothing treats as a cache.
+//! `<project>/state/vegetation/`, which nothing treats as a cache — one baseline per authored map,
+//! naming inside itself the generation it was reduced against.
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use atomic_write_file::AtomicWriteFile;
-use saffron_vegetation::ContentHash;
+use saffron_core::Uuid;
+use saffron_vegetation::{ContentHash, VegetationState};
 
 use crate::{Error, Result};
 
@@ -33,24 +35,30 @@ impl VegetationStateStore {
         &self.root
     }
 
-    /// Resolves the baseline path for one cooked generation.
+    /// Resolves the baseline path for one authored vegetation map.
     #[must_use]
-    pub fn baseline_path(&self, manifest: ContentHash) -> PathBuf {
+    pub fn baseline_path(&self, map: Uuid) -> PathBuf {
         self.root
             .join("baselines")
-            .join(format!("{manifest}.svegstate"))
+            .join(format!("{}.svegstate", map.value()))
     }
 
-    /// Publishes one initial persistent-state baseline, keyed by the manifest it belongs to rather
-    /// than content-addressed: a generation has exactly one starting state.
+    /// Publishes the map's persistent-state baseline: the state a world binding this map boots
+    /// into, keyed by the map rather than by a generation, because a recook replaces the
+    /// generation and must not orphan the one file no cook reproduces.
     ///
     /// # Errors
     ///
     /// [`Error::Io`] when the write fails, and a vegetation error when the snapshot does not decode
     /// against `manifest`.
-    pub fn publish_baseline(&self, manifest: ContentHash, bytes: &[u8]) -> Result<PathBuf> {
+    pub fn publish_baseline(
+        &self,
+        map: Uuid,
+        manifest: ContentHash,
+        bytes: &[u8],
+    ) -> Result<PathBuf> {
         saffron_vegetation::VegetationState::from_canonical_bytes(bytes, manifest.bytes())?;
-        let path = self.baseline_path(manifest);
+        let path = self.baseline_path(map);
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).map_err(|error| Error::Io(error.to_string()))?;
         }
@@ -64,14 +72,17 @@ impl VegetationStateStore {
         Ok(path)
     }
 
-    /// Reads the baseline for one generation, absent when the generation ships none.
+    /// Reads the map's baseline, decoded against whichever generation it was recorded on, and
+    /// absent when the map has none.
     ///
     /// # Errors
     ///
-    /// [`Error::Io`] when the read fails.
-    pub fn read_baseline_if_present(&self, manifest: ContentHash) -> Result<Option<Vec<u8>>> {
-        match std::fs::read(self.baseline_path(manifest)) {
-            Ok(bytes) => Ok(Some(bytes)),
+    /// [`Error::Io`] when the read fails, and a vegetation error when the container is malformed.
+    pub fn read_baseline_if_present(&self, map: Uuid) -> Result<Option<VegetationState>> {
+        match std::fs::read(self.baseline_path(map)) {
+            Ok(bytes) => Ok(Some(VegetationState::from_canonical_bytes_as_declared(
+                &bytes,
+            )?)),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
             Err(error) => Err(Error::Io(error.to_string())),
         }
@@ -141,7 +152,9 @@ mod tests {
         .unwrap();
         let baseline_bytes = state.canonical_bytes().unwrap();
         let store = assets.vegetation_state_store();
-        let baseline_path = store.publish_baseline(identity, &baseline_bytes).unwrap();
+        let baseline_path = store
+            .publish_baseline(populated.map, identity, &baseline_bytes)
+            .unwrap();
         assert!(
             !baseline_path.starts_with(&assets.vegetation_cache_root),
             "persistent state must not live inside the disposable cache"
@@ -172,7 +185,10 @@ mod tests {
             assert_eq!(&std::fs::read(path).unwrap(), expected);
         }
         assert_eq!(
-            store.read_baseline_if_present(identity).unwrap(),
+            store
+                .read_baseline_if_present(populated.map)
+                .unwrap()
+                .map(|state| state.canonical_bytes().unwrap()),
             Some(baseline_bytes)
         );
 

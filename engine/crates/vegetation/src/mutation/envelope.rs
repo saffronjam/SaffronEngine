@@ -1,19 +1,8 @@
-//! Save, editor-journal, and network envelopes over the same reduced state.
+//! The save and network envelopes over the same reduced state.
 
 use crate::{ContentHash, CookVersionSet, Error, Result};
 
 use super::{VegetationMutationRecord, VegetationState, reduce_mutations};
-
-/// Editor-only journal envelope retaining gesture grouping and exact inverse/preimage operations.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct EditorJournalEnvelope {
-    /// Editor gesture identity.
-    pub gesture: u128,
-    /// Forward records passed to the reducer.
-    pub forward: Vec<VegetationMutationRecord>,
-    /// Inverse records computed from captured preimages at gesture creation.
-    pub inverse: Vec<VegetationMutationRecord>,
-}
 
 /// Exact compatibility identity required by a persistent vegetation state container.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -61,15 +50,19 @@ impl SaveStateEnvelope {
     }
 }
 
-/// Future network envelope with transport sequence separate from simulation logical ticks.
+/// Sequenced network envelope: transport ordering held separate from simulation logical ticks.
+///
+/// Retention is a sliding window rather than a durable tail. A sender keeps operations only until
+/// their sequence is accepted, and a receiver too far behind to be caught up by operations is
+/// corrected with the authoritative snapshot instead.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct NetworkMutationEnvelope {
-    /// Monotonic transport sequence.
+    /// Monotonic transport sequence, numbered from one.
     pub sequence: u64,
     /// Exact manifest understood by sender and receiver.
     pub manifest_identity: [u8; 32],
     /// Sequenced idempotent operations.
     pub operations: Vec<VegetationMutationRecord>,
-    /// Optional authoritative snapshot for joining or correction.
+    /// Authoritative snapshot carried when the receiver is joining or being corrected.
     pub snapshot: Option<VegetationState>,
 }

@@ -92,7 +92,9 @@ pub(super) fn transition_for(
             .and_then(|cell| cell.plants.get(plant))
     };
     let (plant, kind) = match &record.mutation {
-        VegetationMutation::FieldTilePatch { .. } => return None,
+        VegetationMutation::FieldTilePatch { .. } | VegetationMutation::FieldTileClear { .. } => {
+            return None;
+        }
         VegetationMutation::AnchorAddition(point) | VegetationMutation::Planting(point) => {
             (Some(point.id), VegetationTransitionKind::Planted)
         }
@@ -103,7 +105,8 @@ pub(super) fn transition_for(
         | VegetationMutation::PromotionOriginState { plant, .. } => {
             (Some(*plant), VegetationTransitionKind::Moved)
         }
-        VegetationMutation::StateOverride { plant, .. } => {
+        VegetationMutation::StateOverride { plant, .. }
+        | VegetationMutation::PlantDeltaRestore { plant, .. } => {
             (Some(*plant), VegetationTransitionKind::StateReplaced)
         }
         VegetationMutation::Damage { plant, amount, .. } => (
@@ -168,7 +171,8 @@ pub(super) fn transition_for(
                 phenotype: *phenotype,
             },
         ),
-        VegetationMutation::DisturbanceMask { categories, .. } => (
+        VegetationMutation::DisturbanceMask { categories, .. }
+        | VegetationMutation::DisturbanceMaskClear { categories, .. } => (
             None,
             VegetationTransitionKind::Disturbed {
                 categories: *categories,

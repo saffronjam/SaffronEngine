@@ -4,7 +4,7 @@
 use saffron_spatial::UnitInterval;
 
 use super::frame::{decode_frame, encode_frame};
-use super::state::{decode_state, encode_state};
+use super::state::{decode_plant_state, decode_state, encode_plant_state, encode_state};
 use super::values::*;
 use super::{SAVE_COMMIT, SAVE_FORMAT, SAVE_MAGIC, SAVE_VERSION, save_schema_identity};
 use crate::binary::{BinaryReader, BinaryWriter};
@@ -246,6 +246,26 @@ pub(super) fn encode_record(record: &VegetationMutationRecord) -> Result<Vec<u8>
                 writer.u16(*value as u16);
             }
         }
+        VegetationMutation::PlantDeltaRestore { plant, delta } => {
+            encode_plant_id(&mut writer, *plant);
+            writer.bool(delta.is_some());
+            if let Some(delta) = delta {
+                encode_plant_state(&mut writer, delta)?;
+            }
+        }
+        VegetationMutation::FieldTileClear {
+            layer,
+            channel,
+            tile,
+        } => {
+            writer.u128(*layer);
+            encode_field_channel(&mut writer, *channel);
+            writer.u128(*tile);
+        }
+        VegetationMutation::DisturbanceMaskClear { categories, tile } => {
+            writer.u32(*categories);
+            writer.u128(*tile);
+        }
     }
     Ok(writer.finish())
 }
@@ -350,6 +370,23 @@ pub(super) fn decode_record(bytes: &[u8]) -> Result<VegetationMutationRecord> {
                 values,
             }
         }
+        16 => VegetationMutation::PlantDeltaRestore {
+            plant: decode_plant_id(&mut reader)?,
+            delta: if reader.bool()? {
+                Some(Box::new(decode_plant_state(&mut reader, SAVE_FORMAT)?))
+            } else {
+                None
+            },
+        },
+        17 => VegetationMutation::FieldTileClear {
+            layer: reader.u128()?,
+            channel: decode_field_channel(&mut reader, SAVE_FORMAT)?,
+            tile: reader.u128()?,
+        },
+        18 => VegetationMutation::DisturbanceMaskClear {
+            categories: reader.u32()?,
+            tile: reader.u128()?,
+        },
         _ => {
             return Err(Error::ArtifactFormat {
                 format: SAVE_FORMAT,

@@ -9,8 +9,8 @@ use super::*;
 use crate::point::sample_plant_point;
 use crate::{
     CookPlatformProfile, CookVersionSet, InteractionPolicy, MutationHeader, PlantId,
-    PlantLifecycle, PromotionOriginState, QuantizedOrientation, VegetationMutation,
-    VegetationMutationRecord, VegetationSeedNamespace, reduce_mutations,
+    PlantLifecycle, PlantPersistentState, PromotionOriginState, QuantizedOrientation,
+    VegetationMutation, VegetationMutationRecord, VegetationSeedNamespace, reduce_mutations,
 };
 
 fn binding(seed: u128) -> VegetationStateBinding {
@@ -307,7 +307,52 @@ fn every_mutation_variant_round_trips_exactly() {
             tile: 18,
             values: vec![-19, 20],
         },
+        VegetationMutation::Ignite { plant: runtime },
+        VegetationMutation::Extinguish { plant: runtime },
+        VegetationMutation::PlantDeltaRestore {
+            plant: runtime,
+            delta: Some(Box::new(PlantPersistentState {
+                addition: Some(sample_plant_point(runtime, cell)),
+                tombstoned: true,
+                transform: Some((
+                    position,
+                    QuantizedOrientation::identity(),
+                    [DecisionScalar::from_integer(3).unwrap(); 3],
+                )),
+                lifecycle: Some(PlantLifecycle::Mature),
+                phenotype: Some(21),
+                ecology_tick: Some(22),
+                health: Some(UnitInterval::from_bits(23)),
+                moisture: Some(UnitInterval::from_bits(24)),
+                fuel: Some(UnitInterval::from_bits(25)),
+                interaction_policy: Some(InteractionPolicy::Harvestable),
+                ignited: true,
+                promotion_origin: Some(promotion),
+            })),
+        },
+        VegetationMutation::PlantDeltaRestore {
+            plant: explicit,
+            delta: None,
+        },
+        VegetationMutation::FieldTileClear {
+            layer: 26,
+            channel: FieldChannel::Drainage,
+            tile: 27,
+        },
+        VegetationMutation::DisturbanceMaskClear {
+            categories: 28,
+            tile: 29,
+        },
     ];
+    let covered = mutations
+        .iter()
+        .map(crate::mutation::mutation_tag)
+        .collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(
+        covered,
+        (0..=18).collect(),
+        "every mutation tag needs a round trip here"
+    );
     for (index, mutation) in mutations.into_iter().enumerate() {
         let record = VegetationMutationRecord {
             header: MutationHeader {

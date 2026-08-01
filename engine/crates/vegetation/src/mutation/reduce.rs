@@ -180,6 +180,32 @@ fn validate_cell_ownership(record: &VegetationMutationRecord) -> Result<()> {
                 "transformed point must be recorded in its canonical owner cell".to_owned(),
             ));
         }
+        VegetationMutation::PlantDeltaRestore {
+            plant,
+            delta: Some(delta),
+        } => {
+            if let Some(point) = &delta.addition {
+                point.validate()?;
+                if point.id != *plant || point.owner != record.header.cell {
+                    return Err(Error::Mutation(
+                        "restored delta names a different plant or cell than its addition"
+                            .to_owned(),
+                    ));
+                }
+            }
+            let transformed = delta
+                .transform
+                .map(|(position, ..)| position)
+                .into_iter()
+                .chain(delta.promotion_origin.map(|origin| origin.position));
+            for position in transformed {
+                if position.cell() != record.header.cell {
+                    return Err(Error::Mutation(
+                        "transformed point must be recorded in its canonical owner cell".to_owned(),
+                    ));
+                }
+            }
+        }
         _ => {}
     }
     Ok(())
@@ -399,6 +425,31 @@ fn apply_mutation(state: &mut VegetationState, record: &VegetationMutationRecord
                 },
                 values.clone(),
             );
+        }
+        VegetationMutation::PlantDeltaRestore { plant, delta } => match delta {
+            Some(delta) => {
+                cell.plants.insert(*plant, delta.as_ref().clone());
+            }
+            None => {
+                cell.plants.remove(plant);
+            }
+        },
+        VegetationMutation::FieldTileClear {
+            layer,
+            channel,
+            tile,
+        } => {
+            cell.field_tiles.remove(&FieldTileKey {
+                layer: *layer,
+                channel: *channel,
+                tile: *tile,
+            });
+        }
+        VegetationMutation::DisturbanceMaskClear { categories, tile } => {
+            cell.disturbance_masks.remove(&DisturbanceTileKey {
+                categories: *categories,
+                tile: *tile,
+            });
         }
     }
     Ok(())

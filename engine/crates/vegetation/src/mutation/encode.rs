@@ -5,7 +5,9 @@ use saffron_spatial::{DecisionScalar, FieldChannel, UnitInterval, WorldPosition}
 use crate::hash::sha256;
 use crate::{Error, PlantId, PlantPointColumns, QuantizedOrientation, Result};
 
-use super::{PromotionOriginState, VegetationMutation, VegetationMutationRecord};
+use super::{
+    PlantPersistentState, PromotionOriginState, VegetationMutation, VegetationMutationRecord,
+};
 
 pub(crate) fn record_order_key(
     record: &VegetationMutationRecord,
@@ -162,6 +164,67 @@ pub(super) fn push_record(bytes: &mut Vec<u8>, record: &VegetationMutationRecord
                 bytes.extend_from_slice(&value.to_be_bytes());
             }
         }
+        VegetationMutation::PlantDeltaRestore { plant, delta } => {
+            bytes.extend_from_slice(&plant.bytes());
+            match delta {
+                Some(delta) => {
+                    bytes.push(1);
+                    push_plant_delta(bytes, delta)?;
+                }
+                None => bytes.push(0),
+            }
+        }
+        VegetationMutation::FieldTileClear {
+            layer,
+            channel,
+            tile,
+        } => {
+            bytes.extend_from_slice(&layer.to_be_bytes());
+            push_field_channel(bytes, *channel);
+            bytes.extend_from_slice(&tile.to_be_bytes());
+        }
+        VegetationMutation::DisturbanceMaskClear { categories, tile } => {
+            bytes.extend_from_slice(&categories.to_be_bytes());
+            bytes.extend_from_slice(&tile.to_be_bytes());
+        }
+    }
+    Ok(())
+}
+
+fn push_plant_delta(bytes: &mut Vec<u8>, delta: &PlantPersistentState) -> Result<()> {
+    match &delta.addition {
+        Some(point) => {
+            bytes.push(1);
+            bytes.extend_from_slice(
+                &PlantPointColumns::from_points(vec![point.clone()])?.canonical_bytes()?,
+            );
+        }
+        None => bytes.push(0),
+    }
+    bytes.push(u8::from(delta.tombstoned));
+    match delta.transform {
+        Some((position, orientation, scale)) => {
+            bytes.push(1);
+            push_position(bytes, position);
+            push_orientation(bytes, orientation);
+            push_scale(bytes, scale);
+        }
+        None => bytes.push(0),
+    }
+    push_option_u32(bytes, delta.lifecycle.map(|value| value as u32));
+    push_option_u32(bytes, delta.phenotype);
+    push_option_u64(bytes, delta.ecology_tick);
+    push_option_unit(bytes, delta.health);
+    push_option_unit(bytes, delta.moisture);
+    push_option_unit(bytes, delta.fuel);
+    push_option_u32(bytes, delta.interaction_policy.map(|value| value as u32));
+    bytes.push(u8::from(delta.ignited));
+    match delta.promotion_origin {
+        Some(origin) => {
+            bytes.push(1);
+            push_promotion(bytes, origin);
+        }
+        None => bytes.push(0),
     }
     Ok(())
 }
@@ -184,6 +247,9 @@ pub(crate) fn mutation_tag(mutation: &VegetationMutation) -> u8 {
         VegetationMutation::DisturbanceMask { .. } => 13,
         VegetationMutation::Ignite { .. } => 14,
         VegetationMutation::Extinguish { .. } => 15,
+        VegetationMutation::PlantDeltaRestore { .. } => 16,
+        VegetationMutation::FieldTileClear { .. } => 17,
+        VegetationMutation::DisturbanceMaskClear { .. } => 18,
     }
 }
 
@@ -203,10 +269,12 @@ fn mutation_plant_id(mutation: &VegetationMutation) -> Option<PlantId> {
         | VegetationMutation::Ignite { plant }
         | VegetationMutation::Extinguish { plant }
         | VegetationMutation::Regrow { plant, .. }
+        | VegetationMutation::PlantDeltaRestore { plant, .. }
         | VegetationMutation::PromotionOriginState { plant, .. } => Some(*plant),
-        VegetationMutation::FieldTilePatch { .. } | VegetationMutation::DisturbanceMask { .. } => {
-            None
-        }
+        VegetationMutation::FieldTilePatch { .. }
+        | VegetationMutation::FieldTileClear { .. }
+        | VegetationMutation::DisturbanceMask { .. }
+        | VegetationMutation::DisturbanceMaskClear { .. } => None,
     }
 }
 

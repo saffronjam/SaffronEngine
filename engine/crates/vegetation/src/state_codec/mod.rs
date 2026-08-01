@@ -23,7 +23,7 @@ const STATE_VERSION: u32 = 1;
 const SAVE_FORMAT: &str = "vegetation save state";
 const SAVE_MAGIC: &[u8; 8] = b"SVEGSV01";
 const SAVE_COMMIT: &[u8; 8] = b"SVEGVC01";
-const SAVE_VERSION: u32 = 1;
+const SAVE_VERSION: u32 = 2;
 
 fn state_schema_identity() -> ContentHash {
     ContentHash::of(
@@ -33,7 +33,7 @@ fn state_schema_identity() -> ContentHash {
 
 fn save_schema_identity() -> ContentHash {
     ContentHash::of(
-        b"saffron-anima/vegetation-save/schema/v1/manifest+graph+versions+seed-namespaces+framed-snapshot+ordered-mutation-tail",
+        b"saffron-anima/vegetation-save/schema/v2/manifest+graph+versions+seed-namespaces+framed-snapshot+ordered-mutation-tail",
     )
 }
 
@@ -105,6 +105,19 @@ impl VegetationState {
     /// Strictly decodes a canonical snapshot for the expected immutable manifest.
     pub fn from_canonical_bytes(bytes: &[u8], expected_manifest: [u8; 32]) -> Result<Self> {
         state::decode_state(bytes, expected_manifest)
+    }
+
+    /// Decodes a canonical snapshot against the generation it names, whichever that is.
+    ///
+    /// Durable state outlives the generation it was recorded against — a recook publishes a new
+    /// one — so a reader that has to decide whether to bind or rebase reads it this way and
+    /// compares afterwards.
+    ///
+    /// # Errors
+    ///
+    /// A vegetation error when the container is malformed or non-canonical.
+    pub fn from_canonical_bytes_as_declared(bytes: &[u8]) -> Result<Self> {
+        state::decode_state(bytes, state::declared_manifest_identity(bytes)?)
     }
 }
 

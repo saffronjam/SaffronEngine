@@ -49,6 +49,19 @@ pub(crate) fn encode_state(state: &VegetationState) -> Result<Vec<u8>> {
     )
 }
 
+/// The generation identity a framed snapshot names, read before deciding what to do about it.
+pub(super) fn declared_manifest_identity(bytes: &[u8]) -> Result<[u8; 32]> {
+    let payload = decode_frame(
+        bytes,
+        STATE_FORMAT,
+        STATE_MAGIC,
+        STATE_VERSION,
+        state_schema_identity(),
+        STATE_COMMIT,
+    )?;
+    BinaryReader::new(payload, STATE_FORMAT).array()
+}
+
 pub(super) fn decode_state(bytes: &[u8], expected_manifest: [u8; 32]) -> Result<VegetationState> {
     let payload = decode_frame(
         bytes,
@@ -264,7 +277,7 @@ fn decode_cell_state(reader: &mut BinaryReader<'_>) -> Result<(WorldCellKey, Veg
     let mut previous_plant = None;
     for _ in 0..plant_count {
         let id = PlantId::from_bytes(reader.array()?)?;
-        let plant = decode_plant_state(reader)?;
+        let plant = decode_plant_state(reader, STATE_FORMAT)?;
         validate_plant_state(cell, id, &plant)?;
         if previous_plant.is_some_and(|previous| previous >= id)
             || plants.insert(id, plant).is_some()
@@ -358,7 +371,10 @@ fn validate_plant_state(
     Ok(())
 }
 
-fn encode_plant_state(writer: &mut BinaryWriter, state: &PlantPersistentState) -> Result<()> {
+pub(super) fn encode_plant_state(
+    writer: &mut BinaryWriter,
+    state: &PlantPersistentState,
+) -> Result<()> {
     encode_optional_point(writer, state.addition.as_ref())?;
     writer.bool(state.tombstoned);
     writer.bool(state.transform.is_some());
@@ -382,8 +398,11 @@ fn encode_plant_state(writer: &mut BinaryWriter, state: &PlantPersistentState) -
     Ok(())
 }
 
-fn decode_plant_state(reader: &mut BinaryReader<'_>) -> Result<PlantPersistentState> {
-    let addition = decode_optional_point(reader, STATE_FORMAT)?;
+pub(super) fn decode_plant_state(
+    reader: &mut BinaryReader<'_>,
+    format: &'static str,
+) -> Result<PlantPersistentState> {
+    let addition = decode_optional_point(reader, format)?;
     let tombstoned = reader.bool()?;
     let transform = if reader.bool()? {
         Some((

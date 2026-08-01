@@ -147,6 +147,30 @@ pub enum VegetationMutation {
         /// Packed signed values.
         values: Vec<i16>,
     },
+    /// Install one plant's whole persistent delta, or drop it when the delta is absent.
+    ///
+    /// The absolute form every plant-addressed mutation inverts to: the incremental forms raise a
+    /// value but cannot clear one, so returning a plant to a preimage takes the whole delta.
+    PlantDeltaRestore {
+        plant: PlantId,
+        /// The delta to install; absent removes the plant's delta from the cell.
+        delta: Option<Box<PlantPersistentState>>,
+    },
+    /// Drop one field tile, which a patch cannot express.
+    FieldTileClear {
+        /// Stable owning layer.
+        layer: u128,
+        /// Shared field vocabulary.
+        channel: FieldChannel,
+        /// Stable tile identity within the cell.
+        tile: u128,
+    },
+    /// Drop one disturbance-mask tile, which a patch cannot express.
+    DisturbanceMaskClear {
+        /// Stable disturbance class/category bits.
+        categories: u32,
+        tile: u128,
+    },
 }
 
 /// One mutation with its required common metadata.

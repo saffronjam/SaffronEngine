@@ -76,4 +76,25 @@ impl VegetationState {
     pub fn canonical_bytes(&self) -> Result<Vec<u8>> {
         crate::state_codec::encode_state(self)
     }
+
+    /// Binds this state to a different immutable base, carrying every delta across.
+    ///
+    /// A recook publishes a new base and re-keys the generation, but it does not re-key the world:
+    /// a plant's identity derives from authoring ancestry rather than from the cook that placed it,
+    /// and a delta is addressed by plant and cell. So nothing is dropped here — a delta the new
+    /// base has no plant or no cell for is inert until, and unless, that ground comes back, exactly
+    /// like the tombstone of a plant that is already gone. Deciding for the author which of their
+    /// accumulated world is worth keeping is how a recook silently destroys it.
+    ///
+    /// # Errors
+    ///
+    /// A vegetation error when the manifest does not encode.
+    pub fn rebase(&self, manifest: &crate::VegetationBaseManifest) -> Result<Self> {
+        Ok(Self {
+            manifest_identity: manifest.identity()?.bytes(),
+            cells: self.cells.clone(),
+            applied_transactions: self.applied_transactions.clone(),
+            ecology: self.ecology.clone(),
+        })
+    }
 }
