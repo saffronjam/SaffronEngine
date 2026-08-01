@@ -88,7 +88,7 @@ export function worldToCell(position: [number, number, number]): {
 export function anchorRecord(
   position: [number, number, number],
   family: string,
-): { record: VegetationMutationRecordDto; plant: string; cell: WorldCellDto } {
+): VegetationMutationRecordDto {
   const { cell, localTicks, globalTicks } = worldToCell(position);
   const plant = freshExplicitPlantId();
   const horizontal = 8n * TICKS_PER_METER;
@@ -132,5 +132,5 @@ export function anchorRecord(
       surfaceProjectionBits: [0, 0, 0],
     },
   };
-  return { record: mutationRecord(cell, mutation), plant, cell };
+  return mutationRecord(cell, mutation);
 }

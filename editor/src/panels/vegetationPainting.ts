@@ -21,15 +21,18 @@ const DEFAULT_DIMENSIONS: [number, number, number] = [64, 1, 64];
 const DEFAULT_QUANTUM_BITS = 256;
 const UNIT_Q16 = 65536;
 
+/// How one stamp combines with the texels it covers: `add` accumulates `sign · weight`, `level`
+/// drives each texel toward `level` by `weight` (what the Density tool paints).
+export type BrushBlend = { kind: "add"; sign: 1 | -1 } | { kind: "level"; level: number };
+
 /// One brush stamp along the stroke path (world metres).
 export interface BrushStamp {
   position: [number, number, number];
   radius: number;
   falloff: number;
-  /// Pointer pressure 0..1 scaling the stamp's density contribution.
+  /// Pointer pressure 0..1 scaling the stamp's contribution.
   pressure: number;
-  /// +1 paints density in, -1 erases.
-  sign: 1 | -1;
+  blend: BrushBlend;
 }
 
 function floorDiv(value: bigint, divisor: bigint): bigint {
@@ -38,7 +41,10 @@ function floorDiv(value: bigint, divisor: bigint): bigint {
 }
 
 /// The chunk cell holding a world position at the map's chunk level.
-function chunkCell(position: [number, number, number], level: number): [bigint, bigint, bigint] {
+export function chunkCell(
+  position: [number, number, number],
+  level: number,
+): [bigint, bigint, bigint] {
   const edge = CELL_TICKS << BigInt(level);
   return [
     floorDiv(BigInt(Math.round(position[0] * 4096)), edge),
@@ -51,7 +57,7 @@ function cellKeyString(cell: [bigint, bigint, bigint]): string {
   return `${cell[0]},${cell[1]},${cell[2]}`;
 }
 
-function chunkKey(target: VegetationPaintTarget, cell: [bigint, bigint, bigint]) {
+export function chunkKey(target: VegetationPaintTarget, cell: [bigint, bigint, bigint]) {
   return {
     layer: target.layer,
     tile: {
@@ -112,6 +118,13 @@ function tileFromGrid(target: VegetationPaintTarget, grid: TileGrid): AuthoredFi
   };
 }
 
+/// Applies one weighted sample to a texel under the stamp's blend.
+function blendTexel(current: number, weight: number, blend: BrushBlend): number {
+  return blend.kind === "add"
+    ? current + blend.sign * weight
+    : current + (blend.level - current) * Math.min(1, weight);
+}
+
 /// Splats one stamp into a cell's grid and reports whether any texel changed.
 /// The grid spans the cell's horizontal bounds in the engine's packed order
 /// (`(x · dimY + y) · dimZ + z`, y collapsed to one slab); the weight is 1 inside
@@ -144,9 +157,11 @@ function splat(
         continue;
       }
       const weight =
-        normalized <= inner || inner >= 1 ? 1 : Math.max(0, 1 - (normalized - inner) / (1 - inner));
+        (normalized <= inner || inner >= 1
+          ? 1
+          : Math.max(0, 1 - (normalized - inner) / (1 - inner))) * stamp.pressure;
       const index = x * dimY * dimZ + z;
-      grid.densities[index] = grid.densities[index]! + stamp.sign * weight * stamp.pressure;
+      grid.densities[index] = blendTexel(grid.densities[index]!, weight, stamp.blend);
       touched = true;
     }
   }
@@ -182,7 +197,7 @@ function strokeBounds(stamps: BrushStamp[]): {
 
 /// Queues a cell-scoped recook so the committed stroke manifests in the world,
 /// publishing the job id for the panel's progress/cancel row.
-async function cookCells(map: string, keys: VegetationMapChunkKeyDto[]): Promise<void> {
+export async function cookCells(map: string, keys: VegetationMapChunkKeyDto[]): Promise<void> {
   const cells = keys.flatMap((key) => (key.tile.kind === "cell" ? [key.tile.cell] : []));
   if (cells.length === 0) {
     return;
@@ -278,6 +293,75 @@ export async function togglePin(
   };
 }
 
+/// Replaces the target layer's tile inside a prior field payload, keeping every other layer's
+/// tiles and the payload's other slot untouched. Blocker layers write the `blockers` set, which is
+/// the slot the evaluator reads a signed-blocker channel from.
+function payloadWithTile(
+  target: VegetationPaintTarget,
+  prior: { fields: AuthoredFieldTileDto[]; blockers: AuthoredFieldTileDto[] } | null,
+  priorTile: AuthoredFieldTileDto | null,
+  tile: AuthoredFieldTileDto,
+) {
+  const fields = prior?.fields ?? [];
+  const blockers = prior?.blockers ?? [];
+  return target.slot === "blocker"
+    ? {
+        kind: "field" as const,
+        fields,
+        blockers: [...blockers.filter((row) => row !== priorTile), tile],
+      }
+    : {
+        kind: "field" as const,
+        fields: [...fields.filter((row) => row !== priorTile), tile],
+        blockers,
+      };
+}
+
+/// The tile the target layer already owns in a prior payload, or null when it owns none.
+function priorTileOf(
+  target: VegetationPaintTarget,
+  prior: { fields: AuthoredFieldTileDto[]; blockers: AuthoredFieldTileDto[] } | null,
+): AuthoredFieldTileDto | null {
+  const rows = target.slot === "blocker" ? (prior?.blockers ?? []) : (prior?.fields ?? []);
+  return (
+    rows.find(
+      (tile) =>
+        tile.layer === target.layer &&
+        JSON.stringify(tile.channel) === JSON.stringify(target.channel),
+    ) ?? null
+  );
+}
+
+/// Replays a captured payload set over fresh revisions and generation, then recooks what it
+/// touched. Both halves of every stroke's undo/redo pair go through this.
+function replayChunks(target: VegetationPaintTarget) {
+  return async (
+    payloads: VegetationMapChunkDto[],
+    removals: VegetationMapChunkKeyDto[],
+  ): Promise<unknown> => {
+    const current = (await client.vegetationMapChunkRead({
+      map: target.map,
+      keys: [...payloads.map((chunk) => chunk.key), ...removals],
+    })) as ChunkReadResult;
+    const revisions = new Map(
+      current.chunks.map((chunk) => [JSON.stringify(chunk.key), chunk.revision]),
+    );
+    const touched = [...payloads.map((chunk) => chunk.key), ...removals];
+    await client.vegetationMapChunkCommit({
+      map: target.map,
+      expectedGeneration: current.generation,
+      upserts: payloads.map((chunk) => ({
+        ...chunk,
+        revision: (BigInt(revisions.get(JSON.stringify(chunk.key)) ?? "0") + 1n).toString(),
+      })),
+      removals: removals.filter((key) =>
+        current.chunks.some((chunk) => JSON.stringify(chunk.key) === JSON.stringify(key)),
+      ),
+    });
+    return cookCells(target.map, touched);
+  };
+}
+
 /// Applies a captured stroke: reads the touched chunks, splats every stamp into
 /// per-cell grids seeded from the existing tiles, and commits the replacement
 /// chunks in one transaction. Returns the undo/redo pair (each re-reads current
@@ -319,12 +403,7 @@ export async function commitStroke(
   for (const cell of cells.values()) {
     const prior = priorByCell.get(cellKeyString(cell));
     const priorPayload = prior?.payload.kind === "field" ? prior.payload : null;
-    const priorTile =
-      priorPayload?.fields.find(
-        (tile) =>
-          tile.layer === target.layer &&
-          JSON.stringify(tile.channel) === JSON.stringify(target.channel),
-      ) ?? null;
+    const priorTile = priorTileOf(target, priorPayload);
     const grid = priorTile ? gridFromTile(priorTile) : freshGrid();
     let touched = false;
     for (const stamp of stamps) {
@@ -333,8 +412,6 @@ export async function commitStroke(
     if (!touched) {
       continue;
     }
-    const tile = tileFromGrid(target, grid);
-    const otherFields = priorPayload?.fields.filter((row) => row !== priorTile) ?? [];
     const key = chunkKey(target, cell);
     if (!prior) {
       created.push(key);
@@ -342,11 +419,7 @@ export async function commitStroke(
     upserts.push({
       key,
       revision: (BigInt(prior?.revision ?? "0") + 1n).toString(),
-      payload: {
-        kind: "field",
-        fields: [...otherFields, tile],
-        blockers: priorPayload?.blockers ?? [],
-      },
+      payload: payloadWithTile(target, priorPayload, priorTile, tileFromGrid(target, grid)),
     });
   }
   if (upserts.length === 0) {
@@ -366,34 +439,54 @@ export async function commitStroke(
 
   const priorChunks = [...priorByCell.values()];
   const strokeChunks = upserts.map((chunk) => ({ ...chunk }));
-  /// Replays a captured payload set over fresh revisions and generation.
-  const replay = async (
-    payloads: VegetationMapChunkDto[],
-    removals: VegetationMapChunkKeyDto[],
-  ): Promise<unknown> => {
-    const current = (await client.vegetationMapChunkRead({
-      map: target.map,
-      keys: [...payloads.map((chunk) => chunk.key), ...removals],
-    })) as ChunkReadResult;
-    const revisions = new Map(
-      current.chunks.map((chunk) => [JSON.stringify(chunk.key), chunk.revision]),
-    );
-    const touched = [...payloads.map((chunk) => chunk.key), ...removals];
-    await client.vegetationMapChunkCommit({
-      map: target.map,
-      expectedGeneration: current.generation,
-      upserts: payloads.map((chunk) => ({
-        ...chunk,
-        revision: (BigInt(revisions.get(JSON.stringify(chunk.key)) ?? "0") + 1n).toString(),
-      })),
-      removals: removals.filter((key) =>
-        current.chunks.some((chunk) => JSON.stringify(chunk.key) === JSON.stringify(key)),
-      ),
-    });
-    return cookCells(target.map, touched);
-  };
+  const replay = replayChunks(target);
   return {
     undo: () => replay(priorChunks, created),
     redo: () => replay(strokeChunks, []),
+  };
+}
+
+/// Lays `level` across the whole authored tile of the chunk cell holding `position` — the Fill
+/// gesture. One cell, one transaction, one recook: fill is bounded by the cell it lands in rather
+/// than flooding the map, so a click can never queue an unbounded cook.
+export async function commitFill(
+  target: VegetationPaintTarget,
+  position: [number, number, number],
+  level: number,
+): Promise<{ undo: () => Promise<unknown>; redo: () => Promise<unknown> } | null> {
+  if (target.channel === null || target.locked) {
+    return null;
+  }
+  const cell = chunkCell(position, target.chunkLevel);
+  const key = chunkKey(target, cell);
+  const read = (await client.vegetationMapChunkRead({
+    map: target.map,
+    keys: [key],
+  })) as ChunkReadResult;
+  const prior = read.chunks[0] ?? null;
+  const priorPayload = prior?.payload.kind === "field" ? prior.payload : null;
+  const priorTile = priorTileOf(target, priorPayload);
+  const grid = priorTile ? gridFromTile(priorTile) : freshGrid();
+  const clamped = Math.min(1, Math.max(0, level));
+  if (grid.densities.every((value) => value === clamped)) {
+    return null;
+  }
+  grid.densities.fill(clamped);
+  const filled: VegetationMapChunkDto = {
+    key,
+    revision: (BigInt(prior?.revision ?? "0") + 1n).toString(),
+    payload: payloadWithTile(target, priorPayload, priorTile, tileFromGrid(target, grid)),
+  };
+  await client.vegetationMapChunkCommit({
+    map: target.map,
+    expectedGeneration: read.generation,
+    upserts: [filled],
+    removals: [],
+  });
+  await cookCells(target.map, [key]);
+  const replay = replayChunks(target);
+  return {
+    undo: () => replay(prior ? [prior] : [], prior ? [] : [key]),
+    redo: () => replay([filled], []),
   };
 }

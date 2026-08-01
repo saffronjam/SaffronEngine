@@ -10,8 +10,8 @@ import { useEditorStore } from "../../state/store";
 import { LoadingOverlay } from "../../app/LoadingOverlay";
 import { VegetationViewportToolbar } from "../VegetationViewportToolbar";
 import { mutationRecord } from "../vegetationPlanting";
-import { type BrushStamp } from "../vegetationPainting";
-import { findPanelLeaf } from "../../state/dockLayout";
+import { applyVegetationGesture, pushVegetationGesture } from "../vegetationGesture";
+import type { VegetationMutationRecordDto } from "../../protocol";
 import { useSubsurfaceBounds } from "../../lib/useSubsurfaceBounds";
 import {
   ASSET_DND_MIME,
@@ -23,7 +23,14 @@ import { errorText, notify, notifyError } from "../../lib/flash";
 import { useEngineAttachProbe } from "./useEngineAttachProbe";
 import { useFlyCamera } from "./useFlyCamera";
 import { useScriptInputForwarding } from "./useScriptInputForwarding";
-import { pinAt, plantAt, reapplyCommit, strokeCommit } from "./viewportVegetation";
+import {
+  beginVegetationPress,
+  clickVegetationTool,
+  finishVegetationPress,
+  moveVegetationPress,
+  vegetationModeActive,
+  type VegetationPress,
+} from "./vegetationPress";
 import {
   DRAG_THRESHOLD_PX,
   GIZMO_STREAM_MS,
@@ -79,16 +86,16 @@ export function ViewportPanel() {
     async ({ u, v }: Uv): Promise<void> => {
       try {
         const result = await client.pick(u, v);
-        const setPlant = useEditorStore.getState().setVegetationSelectedPlant;
+        const setPlants = useEditorStore.getState().setVegetationSelectedPlants;
         if (result.hit && result.id) {
-          setPlant(null);
+          setPlants([]);
           setSelectedId(result.id);
         } else if (result.hit && result.plant) {
           // A macro plant: nonpersistent vegetation selection beside the entity one.
-          setPlant(result.plant);
+          setPlants([result.plant]);
           setSelectedId(null);
         } else {
-          setPlant(null);
+          setPlants([]);
           setSelectedId(null);
         }
       } catch {
@@ -152,20 +159,9 @@ export function ViewportPanel() {
     // Undo capture for a gizmo manipulation: the selected entity + its Transform before
     // the drag + the active op, recorded as one entry when a drag ends.
     let gizmoGesture: { id: string; prior: object; op: string } | null = null;
-    // A vegetation brush stroke in flight: stamps accumulate along the drag (one
-    // serialized pick at a time; new stamps land at brush-spacing intervals) and
-    // the release commits them as one transaction. Non-null suppresses the gizmo
-    // pointer stream for the whole press.
-    let vegStroke: {
-      stamps: BrushStamp[];
-      last: [number, number, number] | null;
-      picking: boolean;
-      sign: 1 | -1;
-      /// A reapply stroke recooks its region instead of committing tile edits.
-      reapply: boolean;
-      /// Latest pointer pressure (0..1; mice report a constant while pressed).
-      pressure: number;
-    } | null = null;
+    // A vegetation gesture in flight (a brush stroke, a lasso trace, a volume drag). Non-null
+    // suppresses the gizmo pointer stream for the whole press; the release commits it.
+    let vegPress: VegetationPress | null = null;
 
     // A macro-plant move drag in flight: the press picked the already-selected
     // plant; samples stream transform-override mutations preserving the plant's
@@ -178,7 +174,10 @@ export function ViewportPanel() {
         orientation: [number, number, number, number];
         scaleBits: [number, number, number];
       } | null;
-      current: [string, string, string] | null;
+      /// The engine's inverse for the first applied sample, which restores the pre-drag delta.
+      /// Later samples move the plant again from an already-changed state, so only the first
+      /// reply reaches back past the whole drag.
+      inverse: VegetationMutationRecordDto[] | null;
       picking: boolean;
       confirmed: boolean;
     } | null = null;
@@ -203,7 +202,7 @@ export function ViewportPanel() {
             String(Math.round(position[1] * 4096)),
             String(Math.round(position[2] * 4096)),
           ];
-          await client.vegetationMutate([
+          const inverse = await applyVegetationGesture([
             mutationRecord(drag.cell, {
               kind: "transform-override",
               plant: drag.plant,
@@ -214,94 +213,11 @@ export function ViewportPanel() {
               },
             }),
           ]);
-          drag.current = ticks;
+          drag.inverse ??= inverse;
         } catch {
           // Busy engine; the next move retries.
         } finally {
           drag.picking = false;
-        }
-      })();
-    };
-
-    /// The stroke mode when the current tool routes this press to the brush:
-    /// paint/erase need an armed paintable layer; reapply needs any active layer
-    /// (it recooks the touched region without an authored edit).
-    const strokeMode = (): { sign: 1 | -1; reapply: boolean } | null => {
-      const state = useEditorStore.getState();
-      const target = state.vegetationActiveLayer;
-      if (
-        !target ||
-        findPanelLeaf(state.dockLayouts.scene, "vegetation") === null ||
-        state.playState !== "edit"
-      ) {
-        return null;
-      }
-      if (state.vegetationTool === "reapply") {
-        return { sign: 1, reapply: true };
-      }
-      const sign =
-        state.vegetationTool === "paint" ? 1 : state.vegetationTool === "erase" ? -1 : null;
-      if (sign === null || target.channel === null || target.locked) {
-        return null;
-      }
-      return { sign, reapply: false };
-    };
-
-    /// Picks the ground under `uv` and appends a stamp once the pointer has
-    /// travelled the brush spacing. One pick in flight; extra samples drop.
-    /// The brush's projection re-lands a "down" sample by a straight-down cast
-    /// above the view hit, and its slope limit drops samples on steep surfaces.
-    const sampleStroke = (uv: Uv): void => {
-      const stroke = vegStroke;
-      if (!stroke || stroke.picking) {
-        return;
-      }
-      stroke.picking = true;
-      void (async () => {
-        try {
-          const picked = await client.pick(uv.u, uv.v);
-          let position = picked.position ?? null;
-          let normal = picked.normal ?? null;
-          const brush = useEditorStore.getState().vegetationBrush;
-          if (position && brush.projection === "down") {
-            const cast = await client.querySurfaceRay({
-              originM: [position[0], position[1] + 100, position[2]],
-              direction: [0, -1, 0],
-            });
-            position = cast.position ?? null;
-            normal = cast.normal ?? null;
-          }
-          if (!position) {
-            return;
-          }
-          if (normal && brush.maxSlopeDeg < 90 && !stroke.reapply) {
-            const tilt = (Math.acos(Math.min(1, Math.max(-1, normal[1]))) * 180) / Math.PI;
-            if (tilt > brush.maxSlopeDeg) {
-              return;
-            }
-          }
-          if (
-            stroke.last &&
-            Math.hypot(
-              position[0] - stroke.last[0],
-              position[1] - stroke.last[1],
-              position[2] - stroke.last[2],
-            ) < brush.spacing
-          ) {
-            return;
-          }
-          stroke.last = position;
-          stroke.stamps.push({
-            position,
-            radius: brush.radius,
-            falloff: brush.falloff,
-            pressure: stroke.pressure,
-            sign: stroke.sign,
-          });
-        } catch {
-          // The engine may be briefly busy; the next move retries.
-        } finally {
-          stroke.picking = false;
         }
       })();
     };
@@ -326,41 +242,35 @@ export function ViewportPanel() {
       startClientY = event.clientY;
       dragging = false;
       el.setPointerCapture(event.pointerId);
-      // A paint/erase/reapply press with an armed layer is a brush stroke: it owns
-      // the whole press (no gizmo stream, no transform snapshot) and samples its
-      // first stamp at the press point.
-      const mode = strokeMode();
-      if (mode !== null) {
-        vegStroke = {
-          stamps: [],
-          last: null,
-          picking: false,
-          sign: mode.sign,
-          reapply: mode.reapply,
-          pressure: event.pressure > 0 ? event.pressure : 1,
-        };
+      // A vegetation gesture (brush stroke, lasso trace, volume drag) owns the whole press: no
+      // gizmo stream, no transform snapshot.
+      vegPress = beginVegetationPress(startUv, event.pressure);
+      if (vegPress !== null) {
         gizmoGesture = null;
-        sampleStroke(startUv);
         return;
       }
-      // A press with the Select tool while a macro plant is selected may become a
+      // A press with the Select tool while exactly one macro plant is selected may become a
       // plant move: confirm asynchronously (the press must pick that same plant)
       // and capture its transform for orientation/scale-preserving overrides. An
       // unconfirmed press stays an ordinary click.
       {
         const state = useEditorStore.getState();
+        const onlySelected =
+          state.vegetationSelectedPlants.size === 1
+            ? [...state.vegetationSelectedPlants][0]!
+            : null;
         if (
           state.vegetationTool === "select" &&
-          state.vegetationSelectedPlant !== null &&
-          findPanelLeaf(state.dockLayouts.scene, "vegetation") !== null &&
+          onlySelected !== null &&
+          vegetationModeActive() &&
           state.playState === "edit"
         ) {
-          const plant = state.vegetationSelectedPlant;
+          const plant = onlySelected;
           const drag = {
             plant,
             cell: null,
             prior: null,
-            current: null,
+            inverse: null,
             picking: true,
             confirmed: false,
           } as NonNullable<typeof plantDrag>;
@@ -435,9 +345,8 @@ export function ViewportPanel() {
         dragging = true;
         setDragActive(true);
       }
-      if (vegStroke) {
-        vegStroke.pressure = event.pressure > 0 ? event.pressure : 1;
-        sampleStroke(uv);
+      if (vegPress) {
+        moveVegetationPress(vegPress, uv, event.pressure);
         return;
       }
       if (plantDrag) {
@@ -454,27 +363,30 @@ export function ViewportPanel() {
         return;
       }
       const uv = eventToUv(el, event);
-      if (vegStroke) {
-        // The stroke owns this press: commit the captured stamps (waiting out any
-        // pick still in flight) and skip the gizmo/pick paths entirely.
-        const stroke = vegStroke;
-        vegStroke = null;
+      if (vegPress) {
+        // The vegetation gesture owns this press: commit what it captured and skip the
+        // gizmo/pick paths entirely.
+        const press = vegPress;
+        const pressed = startUv;
+        vegPress = null;
         pointerId = null;
         startUv = null;
         if (el.hasPointerCapture(event.pointerId)) {
           el.releasePointerCapture(event.pointerId);
         }
+        const wasDragging = dragging;
         if (dragging) {
           dragging = false;
           setDragActive(false);
         }
-        const waitForPick = (): Promise<void> =>
-          stroke.picking
-            ? new Promise((resolve) => setTimeout(resolve, 32)).then(waitForPick)
-            : Promise.resolve();
-        void waitForPick().then(() =>
-          stroke.reapply ? reapplyCommit(stroke.stamps) : strokeCommit(stroke.stamps),
-        );
+        // A volume drag that never moved is a stray click, not a zero-thickness box.
+        if (press.kind === "volume" && !wasDragging) {
+          if (pressed) {
+            void runPick(pressed);
+          }
+          return;
+        }
+        void finishVegetationPress(press, uv);
         return;
       }
       if (plantDrag) {
@@ -497,27 +409,8 @@ export function ViewportPanel() {
             ? new Promise((resolve) => setTimeout(resolve, 32)).then(waitForSample)
             : Promise.resolve();
         void waitForSample().then(() => {
-          if (drag.confirmed && drag.current && drag.prior && drag.cell) {
-            // A confirmed move: one undoable edit restoring the captured transform.
-            const { cell, plant, prior } = drag;
-            const current = drag.current;
-            const override = (ticks: [string, string, string]) => () =>
-              client.vegetationMutate([
-                mutationRecord(cell, {
-                  kind: "transform-override",
-                  plant,
-                  transform: {
-                    globalTicks: ticks,
-                    orientation: prior.orientation,
-                    scaleBits: prior.scaleBits,
-                  },
-                }),
-              ]);
-            useEditorStore.getState().pushEdit({
-              label: "Move plant",
-              undo: override(prior.ticks),
-              redo: override(current),
-            });
+          if (drag.confirmed && drag.inverse) {
+            pushVegetationGesture("Move plant", drag.inverse);
           } else if (!wasPlantDragging && downUv) {
             // Never confirmed and never dragged: an ordinary selection click.
             void runPick(downUv);
@@ -568,24 +461,9 @@ export function ViewportPanel() {
             })
             .catch(() => {});
         }
-      } else if (downUv) {
-        // No drag: a plain left-click. The vegetation Single/Anchor tool plants at
-        // the picked ground; every other case ray-picks selection.
-        const state = useEditorStore.getState();
-        const vegetationMode =
-          findPanelLeaf(state.dockLayouts.scene, "vegetation") !== null &&
-          state.playState === "edit";
-        if (
-          vegetationMode &&
-          state.vegetationTool === "single" &&
-          state.vegetationSpecies.size > 0
-        ) {
-          void plantAt(downUv);
-        } else if (vegetationMode && state.vegetationTool === "pin") {
-          void pinAt(downUv);
-        } else {
-          void runPick(downUv);
-        }
+      } else if (downUv && !clickVegetationTool(downUv)) {
+        // No drag and no vegetation click gesture: a plain left-click ray-picks selection.
+        void runPick(downUv);
       }
     };
 
