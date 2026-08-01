@@ -26,7 +26,7 @@ impl CookVersionSet {
     pub const fn current() -> Self {
         Self {
             schema: 2,
-            compiler: 5,
+            compiler: 6,
             evaluator: 5,
             numeric: 1,
             simulation: 1,

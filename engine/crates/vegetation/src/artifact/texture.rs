@@ -633,6 +633,7 @@ mod tests {
             ("vkFormat", 12),
             ("typeSize", 16),
             ("pixelWidth", 20),
+            ("pixelHeight", 24),
             ("pixelDepth", 28),
             ("layerCount", 32),
             ("faceCount", 36),
@@ -650,6 +651,7 @@ mod tests {
             ),
             ("keyValueLength", key_values),
             ("orientation", key_values + 4 + 15),
+            ("keyValuePadding", key_values + 4 + KEY_VALUES[0].len()),
         ] {
             let mut corrupt = bytes.clone();
             corrupt[mutate] ^= 0x01;

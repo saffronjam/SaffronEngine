@@ -26,7 +26,7 @@ pub use texture::{
 /// Current `.svegcell` container version.
 pub const VEGETATION_CELL_ARTIFACT_VERSION: u32 = 1;
 /// Current `.splantc` container version.
-pub const PLANT_COMPILED_ARTIFACT_VERSION: u32 = 5;
+pub const PLANT_COMPILED_ARTIFACT_VERSION: u32 = 6;
 /// Current `.svegcell` section payload version.
 pub const VEGETATION_CELL_SECTION_VERSION: u32 = 1;
 /// Current `.splantc` section payload version.
