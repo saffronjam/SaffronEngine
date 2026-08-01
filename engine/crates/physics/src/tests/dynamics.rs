@@ -153,3 +153,136 @@ fn layer_matrix_pins_v1_policy() {
     assert!(layers_collide(ObjectLayer::Moving, ObjectLayer::Static));
     assert!(layers_collide(ObjectLayer::Debris, ObjectLayer::Character));
 }
+
+/// The shared wind field reaches the sim through the body's authored coupling: a coupled box in
+/// a steady wind is carried downwind, while an uncoupled one in the same gale traces exactly the
+/// trajectory it would with no field bound at all.
+#[test]
+fn wind_carries_a_coupled_body_and_leaves_an_uncoupled_one_bit_identical() {
+    let _guard = jolt_guard();
+
+    fn run(profile: Option<saffron_wind::WindProfile>, wind_factor: f32) -> (f32, Vec<[u8; 12]>) {
+        let mut scene = Scene::new();
+        let _floor = spawn_box(&mut scene, "Floor", Vec3::ZERO, None);
+        let dynamic = Rigidbody {
+            motion: Motion::Dynamic,
+            wind_factor,
+            ..Rigidbody::default()
+        };
+        let falling = spawn_box(
+            &mut scene,
+            "Falling",
+            Vec3::new(0.0, 5.0, 0.0),
+            Some(dynamic),
+        );
+        let mut world = World::new().expect("world creation");
+        let mut cook = no_cook;
+        world.populate(&mut scene, &mut cook);
+        if let Some(profile) = profile {
+            world.set_wind(profile, &[], 0.0);
+        }
+        let mut trace = Vec::new();
+        for _ in 0..120 {
+            world.step(&mut scene, FIXED_STEP);
+            let entity = scene.find_entity_by_uuid(falling).unwrap();
+            let t = scene.component::<Transform>(entity).unwrap().translation;
+            let mut bytes = [0u8; 12];
+            bytes[0..4].copy_from_slice(&t.x.to_le_bytes());
+            bytes[4..8].copy_from_slice(&t.y.to_le_bytes());
+            bytes[8..12].copy_from_slice(&t.z.to_le_bytes());
+            trace.push(bytes);
+        }
+        let entity = scene.find_entity_by_uuid(falling).unwrap();
+        let z = scene.component::<Transform>(entity).unwrap().translation.z;
+        (z, trace)
+    }
+
+    // Orientation 0 blows along world +Z, so displacement shows up on z alone.
+    let gale = saffron_wind::WindProfile {
+        orientation: 0.0,
+        speed: 40.0,
+        gust: 0.0,
+        turbulence_octaves: 0,
+        height_exponent: 0.0,
+        ..saffron_wind::WindProfile::default()
+    };
+    let (still_z, still_trace) = run(None, 1.0);
+    let (blown_z, blown_trace) = run(Some(gale), 1.0);
+    assert!(
+        blown_z > still_z + 0.25,
+        "the gale carried the coupled body downwind (still {still_z}, blown {blown_z})"
+    );
+    assert_ne!(
+        still_trace, blown_trace,
+        "the gale left the coupled step trace untouched"
+    );
+
+    // Aerodynamic coupling is authored, so the same gale over a body that did not ask for it is
+    // not merely small — it is absent, and the trace is the no-field one byte for byte.
+    let (_, uncoupled_still) = run(None, 0.0);
+    let (_, uncoupled_gale) = run(Some(gale), 0.0);
+    assert_eq!(
+        uncoupled_still, uncoupled_gale,
+        "the gale perturbed a body that authored no wind coupling"
+    );
+
+    // A calm profile is the same no-op on a coupled body: zero speed and no sources sample a zero
+    // field, so nothing is added to the step.
+    let (_, calm_trace) = run(
+        Some(saffron_wind::WindProfile {
+            speed: 0.0,
+            ..saffron_wind::WindProfile::default()
+        }),
+        1.0,
+    );
+    assert_eq!(
+        still_trace, calm_trace,
+        "a calm profile perturbed the step trace"
+    );
+}
+
+/// The physics query onto the seam is the same function every other consumer evaluates.
+#[test]
+fn the_physics_wind_query_agrees_with_the_shared_seam() {
+    let _guard = jolt_guard();
+    let profile = saffron_wind::WindProfile {
+        orientation: 35.0,
+        speed: 9.0,
+        ..saffron_wind::WindProfile::default()
+    };
+    let shelter = saffron_wind::LocalWindSource {
+        kind: saffron_wind::WindSourceKind::Volume,
+        position: glam::DVec3::new(20.0, 0.0, 0.0),
+        direction: Vec3::Z,
+        strength: 0.0,
+        radius: 5.0,
+        falloff: 0.0,
+    };
+    let mut world = World::new().expect("world creation");
+    world.set_wind(profile, &[shelter], 3.5);
+    for position in [
+        Vec3::new(0.0, 2.0, 0.0),
+        Vec3::new(20.0, 1.0, 0.0),
+        Vec3::new(-7.0, 12.0, 4.0),
+    ] {
+        let expected = saffron_wind::sample_composed(
+            &profile,
+            &[shelter],
+            glam::DVec3::new(
+                f64::from(position.x),
+                f64::from(position.y),
+                f64::from(position.z),
+            ),
+            3.5,
+        );
+        assert_eq!(world.sample_wind(position), expected);
+    }
+    assert!(
+        world
+            .sample_wind(Vec3::new(20.0, 1.0, 0.0))
+            .velocity
+            .length()
+            < 1e-4,
+        "the volume source shelters its interior on the physics query too"
+    );
+}

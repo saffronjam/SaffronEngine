@@ -25,6 +25,7 @@ use saffron_core::Uuid;
 use saffron_geometry::Mesh;
 use saffron_physics_sys::{self as sys, JoltWorld};
 use saffron_scene::{Entity, IdComponent, Scene};
+use saffron_wind::{LocalWindSource, WindProfile, WindSample};
 
 use crate::error::{Error, Result};
 use crate::types::{ContactEvent, MotionType};
@@ -46,6 +47,11 @@ struct BodyEntry {
     /// Whether the collider is a sensor (trigger volume); sets [`ContactEvent::sensor`] when this
     /// body is one half of a contact pair.
     sensor: bool,
+    /// Reference cross-section in square metres the wind pushes on: the collider's mean
+    /// axis-aligned face area scaled by the body's authored wind factor, zero on a body that
+    /// authored no aerodynamic coupling. A per-orientation projection would cost a shape query
+    /// per body per substep for a force this coarse.
+    drag_area: f32,
 }
 
 /// One `CharacterVirtual` sweep object, paired with its owner entity. The shim owns the Jolt
@@ -121,6 +127,14 @@ pub struct World {
     step_count: i64,
     /// The fixed-step accumulator (seconds of unspent `dt`).
     accumulator: f32,
+    /// The global wind parameters this world samples, and the local sources composited over
+    /// them. A default profile has zero speed, so a world nobody set wind on takes no wind
+    /// force at all and steps exactly as it would without the seam.
+    wind: WindProfile,
+    /// Placed local wind sources, in scene order.
+    wind_sources: Vec<LocalWindSource>,
+    /// The monotonic simulation clock the field is sampled at, in seconds.
+    wind_time_s: f64,
 }
 
 /// Tear down the process-global Jolt state ([`saffron_physics_sys::shutdown`]): `UnregisterTypes`
@@ -157,6 +171,12 @@ impl World {
             dynamic_body_count: 0,
             step_count: 0,
             accumulator: 0.0,
+            wind: WindProfile {
+                speed: 0.0,
+                ..WindProfile::default()
+            },
+            wind_sources: Vec::new(),
+            wind_time_s: 0.0,
         })
     }
 }

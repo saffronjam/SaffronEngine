@@ -289,6 +289,8 @@ namespace saffron::physics
     void jolt_body_add_force(JoltWorld &world, std::uint32_t id, const std::array<float, 3> &force);
     void jolt_body_set_linear_velocity(JoltWorld &world, std::uint32_t id,
                                        const std::array<float, 3> &velocity);
+    void jolt_body_set_angular_velocity(JoltWorld &world, std::uint32_t id,
+                                        const std::array<float, 3> &velocity);
     void jolt_move_kinematic(JoltWorld &world, std::uint32_t id, const std::array<float, 3> &position,
                              const std::array<float, 4> &rotation, float dt);
 

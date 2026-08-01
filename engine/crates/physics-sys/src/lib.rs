@@ -174,6 +174,12 @@ pub fn body_set_linear_velocity(world: &mut UniquePtr<JoltWorld>, id: u32, veloc
     bridge::ffi::jolt_body_set_linear_velocity(world.pin_mut(), id, &velocity);
 }
 
+/// Activate the body and set its angular velocity (`xyz`, radians per second about each world
+/// axis).
+pub fn body_set_angular_velocity(world: &mut UniquePtr<JoltWorld>, id: u32, velocity: [f32; 3]) {
+    bridge::ffi::jolt_body_set_angular_velocity(world.pin_mut(), id, &velocity);
+}
+
 /// Moves a Kinematic body toward `position` (`xyz`) / `rotation` (`xyzw`) over `dt` through
 /// `BodyInterface::MoveKinematic`, so the swept motion imparts contact velocity rather than
 /// teleporting. `dt` must be the fixed substep that feeds the step, or the derived velocity will

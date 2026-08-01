@@ -117,6 +117,7 @@ impl World {
             id,
             motion,
             sensor: collider.is_sensor,
+            drag_area: wind_drag_area(&collider, rigidbody.as_ref()),
         });
         if motion == MotionType::Dynamic {
             self.dynamic_body_count += 1;
@@ -208,6 +209,7 @@ impl World {
                     id,
                     motion: MotionType::Kinematic,
                     sensor: false,
+                    drag_area: 0.0,
                 });
             }
         }
@@ -256,6 +258,7 @@ impl World {
                 id,
                 motion: MotionType::Static,
                 sensor: row.sensor,
+                drag_area: 0.0,
             });
         }
         ids
@@ -331,6 +334,32 @@ fn allowed_dofs(rb: &Rigidbody) -> u8 {
         dofs &= !DOF_ROTATION_Z;
     }
     dofs
+}
+
+/// The cross-section in square metres the wind pushes this body on: the collider's own mean
+/// axis-aligned face area, scaled by the body's authored [`Rigidbody::wind_factor`]. A body with
+/// no rigidbody, or one left at the default factor, returns zero and the step skips it.
+///
+/// The geometric term is the mean of the three face areas of the box the half extents describe,
+/// which is what a tumbling body presents on average. A sphere's extents carry the radius in `x`
+/// and a capsule's the radius in `x` and the half-height in `y`, so each is squared out to the
+/// box it inscribes first.
+fn wind_drag_area(collider: &Collider, rigidbody: Option<&Rigidbody>) -> f32 {
+    let factor = rigidbody.map_or(0.0, |rb| rb.wind_factor);
+    if factor <= 0.0 {
+        return 0.0;
+    }
+    let extents = match collider.shape {
+        Shape::Sphere => Vec3::splat(collider.half_extents.x),
+        Shape::Capsule => Vec3::new(
+            collider.half_extents.x,
+            collider.half_extents.y,
+            collider.half_extents.x,
+        ),
+        Shape::Box | Shape::ConvexHull | Shape::Mesh => collider.half_extents,
+    }
+    .abs();
+    factor * 4.0 * (extents.x * extents.y + extents.y * extents.z + extents.z * extents.x) / 3.0
 }
 
 /// The raw shape discriminant the bridge's `BodyCreate.shape` carries, mapping the scene

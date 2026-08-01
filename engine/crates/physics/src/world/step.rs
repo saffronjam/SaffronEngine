@@ -16,6 +16,13 @@ use super::*;
 /// `dt` cannot spiral into an unbounded catch-up.
 const MAX_SUBSTEPS: u32 = 8;
 
+/// Sea-level air density in kg/m³, the medium the wind drag acts through.
+const AIR_DENSITY_KG_M3: f32 = 1.225;
+
+/// The drag coefficient every body takes. A cube's, which is the blunt end of the range —
+/// collider shapes are approximations, so a per-shape coefficient would be false precision.
+const DRAG_COEFFICIENT: f32 = 1.05;
+
 impl World {
     /// Advance the sim by `dt` in fixed substeps, then write every Dynamic body's world pose back
     /// into its entity's [`Transform`].
@@ -34,6 +41,7 @@ impl World {
             // motion over this same fixed dt imparts contact velocity to the dynamics it hits
             // (never a teleport, which gives zero contact velocity).
             self.move_kinematic_bodies(scene);
+            self.apply_wind_drag();
             sys::world_step(&mut self.world, FIXED_STEP, 1);
             // Advance every CharacterVirtual against the just-settled world: gravity integration +
             // the desired-velocity clamp, then stick-to-floor + WalkStairs via ExtendedUpdate.
@@ -78,6 +86,39 @@ impl World {
         }
 
         self.drain_into_ring();
+    }
+
+    /// Push every awake wind-coupled dynamic body with the air it is moving through, sampling the
+    /// shared wind field at the body's own position so a body and the vegetation beside it feel
+    /// one field.
+    ///
+    /// The force is the quadratic drag `½ρ·Cd·A·|v_rel|·v_rel` on the body's velocity relative to
+    /// the air, so a light wide body is carried and a dense compact one barely moves. `A` is the
+    /// body's authored coupling, zero unless a `Rigidbody` asked for it, so an untouched world
+    /// takes no wind force and its bodies stay bit-exact across targets.
+    fn apply_wind_drag(&mut self) {
+        if self.wind.speed <= 0.0 && self.wind_sources.is_empty() {
+            return;
+        }
+        for index in 0..self.bodies.len() {
+            let entry = self.bodies[index];
+            if entry.motion != MotionType::Dynamic
+                || entry.drag_area <= 0.0
+                || !sys::body_is_active(&self.world, entry.id)
+            {
+                continue;
+            }
+            let position = Vec3::from_array(sys::body_position(&self.world, entry.id));
+            let velocity = Vec3::from_array(sys::body_linear_velocity(&self.world, entry.id));
+            let relative = self.sample_wind(position).velocity - velocity;
+            let speed = relative.length();
+            if speed <= f32::EPSILON {
+                continue;
+            }
+            let force =
+                relative * (0.5 * AIR_DENSITY_KG_M3 * DRAG_COEFFICIENT * entry.drag_area * speed);
+            sys::body_add_force(&mut self.world, entry.id, force.to_array());
+        }
     }
 
     /// Drain the contact transitions Jolt buffered on its job threads (across this frame's

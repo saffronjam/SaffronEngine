@@ -57,6 +57,38 @@ impl World {
         emitters
     }
 
+    /// Bind the shared wind field this world samples: the global profile, the local sources
+    /// composited over it, and the monotonic simulation clock the sample is taken at.
+    ///
+    /// The field is the one `saffron-wind` serves every other consumer, so a body and the
+    /// vegetation beside it feel the same air. It is same-binary reproducible rather than
+    /// bit-exact across targets (it evaluates `sin`/`cos`), which a body that authored a wind
+    /// coupling inherits; a body that did not takes no wind force and keeps the stronger
+    /// guarantee.
+    pub fn set_wind(&mut self, profile: WindProfile, sources: &[LocalWindSource], time_s: f64) {
+        self.wind = profile;
+        self.wind_sources.clear();
+        self.wind_sources.extend_from_slice(sources);
+        self.wind_time_s = time_s;
+    }
+
+    /// Sample the composed wind field at a world position, at the clock [`World::set_wind`] bound.
+    /// This is the physics-side query onto the shared seam — the identical function the renderer's
+    /// prepass, the fog march, and `sample-wind` evaluate.
+    #[must_use]
+    pub fn sample_wind(&self, position: Vec3) -> WindSample {
+        saffron_wind::sample_composed(
+            &self.wind,
+            &self.wind_sources,
+            glam::DVec3::new(
+                f64::from(position.x),
+                f64::from(position.y),
+                f64::from(position.z),
+            ),
+            self.wind_time_s,
+        )
+    }
+
     /// Apply a center-of-mass impulse to the Dynamic body owned by `entity`. A non-Dynamic /
     /// unmapped target is a no-op with a warning (never a panic).
     pub fn apply_impulse(&mut self, entity: Uuid, impulse: Vec3) {
@@ -88,6 +120,18 @@ impl World {
             Some(id) => sys::body_set_linear_velocity(&mut self.world, id, velocity.to_array()),
             None => tracing::warn!(
                 "physics: set-velocity on a non-Dynamic / unmapped body ({})",
+                entity.0
+            ),
+        }
+    }
+
+    /// Set the angular velocity (radians per second about each world axis) of the Dynamic body
+    /// owned by `entity`. A non-Dynamic / unmapped target is a no-op with a warning.
+    pub fn set_angular_velocity(&mut self, entity: Uuid, velocity: Vec3) {
+        match self.dynamic_body_id(entity) {
+            Some(id) => sys::body_set_angular_velocity(&mut self.world, id, velocity.to_array()),
+            None => tracing::warn!(
+                "physics: set-angular-velocity on a non-Dynamic / unmapped body ({})",
                 entity.0
             ),
         }

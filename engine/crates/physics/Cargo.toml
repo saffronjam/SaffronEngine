@@ -17,6 +17,7 @@ saffron-geometry = { path = "../geometry" }
 saffron-scene = { path = "../scene" }
 saffron-animation = { path = "../animation" }
 saffron-physics-sys = { path = "../physics-sys" }
+saffron-wind = { path = "../wind" }
 
 # The bridge hands back `cxx::UniquePtr<JoltWorld>`, which `World` owns; glam is the engine math
 # vocabulary (re-exported by saffron-geometry, but named directly here for the result types).

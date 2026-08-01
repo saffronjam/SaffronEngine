@@ -233,6 +233,10 @@ pub mod ffi {
         /// `ActivateBody` then `SetLinearVelocity`. Dynamic bodies only.
         fn jolt_body_set_linear_velocity(world: Pin<&mut JoltWorld>, id: u32, velocity: &[f32; 3]);
 
+        /// `ActivateBody` then `SetAngularVelocity`, radians per second about each world axis.
+        /// Dynamic bodies only.
+        fn jolt_body_set_angular_velocity(world: Pin<&mut JoltWorld>, id: u32, velocity: &[f32; 3]);
+
         /// `BodyInterface::MoveKinematic`, which derives the body's velocity from the swept motion
         /// so it imparts contact velocity where a teleport would impart none. `dt` must be the same
         /// fixed step that feeds `Update`, or the derived velocity will not match it. Kinematic

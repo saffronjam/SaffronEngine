@@ -481,6 +481,15 @@ namespace saffron::physics
         bi.SetLinearVelocity(body, JPH::Vec3(velocity[0], velocity[1], velocity[2]));
     }
 
+    void jolt_body_set_angular_velocity(JoltWorld &world, std::uint32_t id,
+                                        const std::array<float, 3> &velocity)
+    {
+        JPH::BodyInterface &bi = world.system.GetBodyInterface();
+        const JPH::BodyID body = body_id(id);
+        bi.ActivateBody(body);
+        bi.SetAngularVelocity(body, JPH::Vec3(velocity[0], velocity[1], velocity[2]));
+    }
+
     void jolt_move_kinematic(JoltWorld &world, std::uint32_t id, const std::array<float, 3> &position,
                              const std::array<float, 4> &rotation, float dt)
     {
