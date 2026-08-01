@@ -94,7 +94,7 @@ Parameter meanings and defaults live in the `.smat` asset (see [native materials
 
 | Type | JSON key | Fields (default) |
 |---|---|---|
-| `Rigidbody` | `Rigidbody` | `motion: Motion (Dynamic)`; `mass: f32 1.0`; `linear_damping: f32 0.05`; `angular_damping: f32 0.05`; `gravity_factor: f32 1.0`; `lock_position: BVec3`; `lock_rotation: BVec3`; `collision_layer: i32 0` |
+| `Rigidbody` | `Rigidbody` | `motion: Motion (Dynamic)`; `mass: f32 1.0`; `linear_damping: f32 0.05`; `angular_damping: f32 0.05`; `gravity_factor: f32 1.0`; `wind_factor: f32 0.0`; `lock_position: BVec3`; `lock_rotation: BVec3`; `collision_layer: i32 0` |
 | `Collider` | `Collider` | `shape: Shape (Box)`; `half_extents: Vec3 {0.5,0.5,0.5}`; `source_mesh: Uuid 0`; `offset: Vec3 {0,0,0}`; `material: PhysicsMaterial`; `is_sensor: bool false` |
 | `KinematicBones` | `KinematicBones` | `enabled: bool true`; `driven: Vec<i32>` (joint indices; empty = every joint) |
 | `CharacterController` | `CharacterController` | `max_speed: f32 4.0`; `max_slope_angle: f32 ~0.785`; `max_step_height: f32 0.3`; `gravity_factor: f32 1.0`; plus runtime velocity/ground state |

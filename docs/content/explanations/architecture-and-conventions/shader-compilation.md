@@ -56,8 +56,9 @@ pub const SLANGC_SPV_FLAGS: &[&str] = &[
 `-o <out>`, and one `-D<name>` per feature define.
 
 - `-emit-spirv-directly` emits SPIR-V from Slang's own IR instead of routing through GLSL.
-- `-fvk-use-entrypoint-name` preserves entry-point names, so one `mesh.spv` serves `vertexMain`,
-  `vertexMainSkinned`, `fragmentMain`, and `depthPrepassFragment` to different PSOs.
+- `-fvk-use-entrypoint-name` preserves entry-point names, so one `mesh.spv` serves
+  `vertexMainExecutor`, `meshMainExecutor`, `fragmentMain`, and `depthPrepassFragment` to
+  different PSOs.
 - `-matrix-layout-column-major` matches glam's column-major matrices; a CPU-side transform
   arrives in the shader unchanged.
 - `-capability` declares everything the shaders use beyond `glsl_450` (bindless non-uniform

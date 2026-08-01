@@ -67,6 +67,12 @@ Constructors and builders:
 `RgAttachment::clear_store(resource)` creates the common clear-and-store attachment without a
 resolve target.
 
+The frame's async-compute lane is the global-distance-field build, `gdf-cull` and `gdf-composite`:
+its cascade volumes are read much later in the frame, so it overlaps the depth and gbuffer raster.
+Every buffer and volume it touches is a declared access, which is what lets the graph derive the
+release/acquire pair and the cross-queue timeline. A device with no independent compute family runs
+the identical passes on graphics.
+
 ## Buffers
 
 `RgBufferRange::new(offset, size)` creates a non-empty half-open byte range and rejects end
@@ -86,6 +92,16 @@ buffer access asserts that the allocation carries the Vulkan usage flag required
 `RgExternalState::new(layout)` seeds an image layout before first use. Its slot later carries the
 resolved layout, queue identity, ownership family, and synchronization scope. An
 `RgExternalBufferState` slot carries the equivalent state per byte range.
+
+Neither carries a pass index. A pass index names a position in the graph that produced it, so
+across a frame boundary it would point at whatever pass now sits there — including a later one,
+which would make a batch wait on a batch the submit has not reached. Ownership crosses the frame
+through the queue and family alone, and a foreign owner is answered by the entry-release prologue.
+
+A pass that prefers the async lane still gets the graphics queue unless the graph can derive an
+ownership transfer for every resource it touches. An imported buffer therefore needs either a
+cross-frame state slot or an earlier pass in the same graph covering its range — without one the
+lane is silently declined, which `render-stats.asyncComputeBatches` reports as zero.
 
 | Method | Effect |
 |---|---|

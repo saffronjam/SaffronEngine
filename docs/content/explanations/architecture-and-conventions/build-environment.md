@@ -99,6 +99,27 @@ The recipe also wires the GPU prelude and a per-run control socket, so parallel 
 collide. `tools/ci/check.sh`, the gate `just check` wraps, boots the host the same bounded way for
 its validation-clean smoke step.
 
+## Performance budgets in the gate
+
+`benchmarks/foliage-veg/phase-1-<device>.json` records what one fixed scene costs on one named
+device: the scene-gather and frame-time distributions, draw and shadow submission, exact instance
+traffic, and retained mesh memory. Each record derives acceptance ceilings from its own
+steady-state p95, and the gate grades a fresh measurement against them. A recorded number nothing
+reads back is a note, not a budget.
+
+The comparison is per device, never per vendor. `check.ts` re-measures the fixture through the same
+`measureBaseline` the recording recipe uses, finds the record whose `platform.gpu` matches this
+machine, and fails when a live p95 or counter exceeds that record's ceiling. A machine with no
+record of its own defers, as does one that lands on the software rasterizer or serves no GPU
+timestamps — so a checkout on unmeasured hardware reports a deferral instead of borrowing a
+threshold measured elsewhere. `just bench-foliage-check` runs the step alone.
+
+A ceiling gets no extra allowance at comparison time, because the 25% headroom is already in the
+derivation. What a breach must do instead is reproduce: the step measures a second time and fails
+only if the same leg goes over twice, which rejects a sample contaminated by other load without
+ever moving the threshold. A companion `cargo test` holds the records themselves to that
+derivation, so a hand-edited ceiling fails the gate on a machine with no GPU at all.
+
 ## Build profiles
 
 A debug build optimizes its dependencies:
@@ -118,9 +139,12 @@ across the Rust/C++ boundary.
 | `slangc` resolution + shader step | `engine/xtask/src/shaders.rs` | `Config::resolve`, `find_slangc`, `run` |
 | Bounded + headless run | `crates/app/src/lib.rs` | `frame_limit_from_env`, `HostMode` |
 | The reproducible gate | `tools/ci/check.sh` | `probe_host`, `pass_step`, `defer_step` |
+| Baseline measurement + grading | `tools/bench-foliage-phase1/` | `measureBaseline`, `deriveBudgets`, `requireComparable`, `grade` |
+| The records and their derivation test | `benchmarks/foliage-veg/`, `crates/vegetation-gpu/tests/baseline_records.rs` | `phase-1-<device>.json`, `ceiling`, `class_from_file_name` |
 
 ## Related
 
 - [Cargo workspace and crate model](../cargo-workspace/) — what `cargo build --workspace` builds
 - [Shader compilation](../shader-compilation/) — what `cargo run -p xtask -- shaders` does with the resolved `slangc`
 - [Dependencies](../dependencies/) — the pins the toolbox `cargo` resolves
+- [Performance telemetry](../../frame-and-render-graph/performance-telemetry/) — the counters and distributions a baseline record samples

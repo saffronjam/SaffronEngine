@@ -71,6 +71,7 @@ flowchart TD
     Physics --> Animation
     Physics --> PhysicsSys
     Physics --> Spatial
+    Physics --> Wind
     Rendering --> Window
     Rendering --> Geometry
     Rendering --> Wind

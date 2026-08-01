@@ -6,7 +6,7 @@ math = false
 
 # Control commands
 
-The control plane exposes 253 typed commands over its local Unix socket. This table follows the frozen order in `saffron_protocol::COMMANDS`; the generated OpenRPC methods use the same names, parameter DTOs, and result DTOs.
+The control plane exposes 256 typed commands over its local Unix socket. This table follows the frozen order in `saffron_protocol::COMMANDS`; the generated OpenRPC methods use the same names, parameter DTOs, and result DTOs.
 
 `register_builtin_commands` installs `ping`, the reflective `help` command, and the render, scene, animation, physics, and asset handlers. The host adds `get-script-schema` because its handler depends on the script crate. A registry test compares the registered names with `COMMANDS` as sets, with that host-owned command accounted for explicitly.
 
@@ -42,7 +42,7 @@ sa -o json set-transform --entity 42 --translation '{"x":0,"y":1,"z":0}'
 | `ping` | `PingParams` | `PingResult` | liveness + engine info |
 | `render-stats` | `EmptyParams` | `RenderStatsDto` | last frame draw counters + the `vsm` shadow-page activity block |
 | `gpu-scene-stats` | `EmptyParams` | `GpuSceneMirrorStatsDto` | persistent GPU-scene mirror population and rebuild counters |
-| `vegetation-mutate` | `VegetationMutateParams` | `VegetationMutateResult` | apply typed vegetation mutations (tombstone/override/anchor/…) through the reducer |
+| `vegetation-mutate` | `VegetationMutateParams` | `VegetationMutateResult` | apply one gesture of typed vegetation mutations through the reducer, replying with its inverse |
 | `vegetation-render-stats` | `EmptyParams` | `VegetationRenderStatsDto` | per-family and per-cell vegetation render population plus page faults |
 | `profiler.set-mode` | `ProfilerSetModeParams` | `ProfilerModeResult` | set the GPU profiler mode |
 | `pass-timings` | `EmptyParams` | `RenderPassTimingsDto` | last frame per-pass GPU timings |
@@ -116,6 +116,7 @@ sa -o json set-transform --entity 42 --translation '{"x":0,"y":1,"z":0}'
 | `set-wind` | `SetWindParams` | `EnvironmentDto` | set shared global wind settings |
 | `sample-wind` | `SampleWindParams` | `SampleWindResult` | the composed wind velocity at a world position {positionM, timeS?} |
 | `emit-interaction-impulse` | `EmitInteractionImpulseParams` | `EmitInteractionImpulseResult` | push the world interaction field {positionM, radiusM, strength, direction?, depress?} |
+| `wind-interaction-field` | `WindInteractionFieldParams` | `WindInteractionFieldResult` | one whole cascade of the world interaction field, reduced to a grid {cascade?, resolution?} |
 | `set-time-of-day` | `SetTimeOfDayParams` | `EnvironmentDto` | set calendar-driven time-of-day settings |
 | `get-selection` | `EmptyParams` | `SelectionResult` | get current selection |
 | `deselect` | `EmptyParams` | `DeselectResult` | clear selection |
@@ -202,6 +203,7 @@ sa -o json set-transform --entity 42 --translation '{"x":0,"y":1,"z":0}'
 | `vegetation-promote` | `VegetationRuntimePlantParams` | `VegetationPromotionResult` | promote one macro plant to a transient entity view at the next synchronization point |
 | `vegetation-fell` | `VegetationRuntimePlantParams` | `VegetationPromotionResult` | fell one plant: the rooted plant becomes a stump and a separate product entity spawns |
 | `vegetation-demote` | `VegetationRuntimePlantParams` | `VegetationPromotionResult` | demote one promoted plant, writing its state back through the reducer |
+| `vegetation-plant-vitals` | `VegetationPlantVitalsParams` | `VegetationPlantVitalsResult` | read a promoted plant's live biology, replacing the fields that are present |
 | `vegetation-state-export` | `EmptyParams` | `VegetationStateSnapshotDto` | export the canonical strict runtime vegetation state snapshot |
 | `vegetation-state-import` | `VegetationStateImportParams` | `VegetationStateSnapshotDto` | verify and atomically import one exact runtime vegetation state snapshot |
 | `vegetation-advance-ecology` | `VegetationAdvanceEcologyParams` | `VegetationEcologyReportDto` | advance biological time and catch dependency regions up to it |
@@ -214,6 +216,8 @@ sa -o json set-transform --entity 42 --translation '{"x":0,"y":1,"z":0}'
 | `vegetation-verify-artifacts` | `VegetationVerifyParams` | `VegetationVerifyResult` | rehash every artifact the current generations name, optionally removing corrupt ones |
 | `vegetation-state-baseline` | `EmptyParams` | `VegetationStateBaselineResult` | publish the current runtime vegetation state as the generation's starting state |
 | `vegetation-telemetry` | `EmptyParams` | `VegetationTelemetryResult` | compact vegetation runtime telemetry: stage times, work counters, resident bytes |
+| `vegetation-network-interest` | `VegetationNetworkInterestParams` | `VegetationNetworkSessionResult` | declare the cells and facets this world is seated with in a network session |
+| `vegetation-network-checkpoint` | `EmptyParams` | `VegetationNetworkSessionResult` | fingerprint the seated scope at the highest agreed transport sequence |
 | `vegetation-import-points` | `VegetationImportPointsParams` | `VegetationImportPointsResult` | import instanced points from a content-creation tool into an authored map layer |
 | `vegetation-export-points` | `VegetationExportPointsParams` | `VegetationExportPointsResult` | export one authored layer's anchors for a content-creation round trip |
 | `plant-create` | `PlantCreateParams` | `PlantCreateResult` | create a native plant family from the starter botanical graph |
@@ -221,7 +225,7 @@ sa -o json set-transform --entity 42 --translation '{"x":0,"y":1,"z":0}'
 | `plant-graph-set` | `PlantGraphSetParams` | `PlantGraphResult` | replace one native plant family's botanical graph and regrow it |
 | `plant-growth` | `PlantGrowthParams` | `BotanicalGrowthDto` | what one plant family's botanical graph grows |
 | `plant-proxies` | `PlantProxiesParams` | `PlantProxiesResult` | plant-proxies {plant} — the collision and navigation proxies a family derived |
-| `plant-season-phenotype` | `PlantSeasonPhenotypeParams` | `PlantSeasonPhenotypeResult` | plant-season-phenotype {plant, seasonMille, lifecycle?} — the appearance a family renders then |
+| `plant-season-phenotype` | `PlantSeasonPhenotypeParams` | `PlantSeasonPhenotypeResult` | plant-season-phenotype {plant, seasonMille, lifecycle?, healthMille?, moistureMille?} — the appearance a family renders then, with every phenotype's weight |
 | `plant-hierarchy` | `PlantHierarchyParams` | `PlantHierarchyResult` | plant-hierarchy {plant} — the cooked cut: each node's representation, page, and declared error |
 | `plant-atlas` | `PlantAtlasParams` | `PlantAtlasResult` | plant-atlas {plant, level?} — one cooked family's packed coverage atlas as a PNG |
 | `plant-phenotypes` | `PlantPhenotypesParams` | `PlantPhenotypesResult` | plant-phenotypes {plant, phenotypes?} — read or replace one family's authored appearances |
