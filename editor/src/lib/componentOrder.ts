@@ -1,7 +1,8 @@
+import type { ComponentName } from "../protocol";
+
 /// Canonical component order + hidden set, shared by the Inspector sections and the hierarchy's
 /// component subrows so the tree leaves and the Inspector stay in lockstep (the `Components` schema
-/// key order). Ordering only — never a per-component render switch. A regenerated schema with new
-/// components extends COMPONENT_ORDER.
+/// key order). Ordering only — never a per-component render switch.
 
 export const COMPONENT_ORDER = [
   "Name",
@@ -12,8 +13,6 @@ export const COMPONENT_ORDER = [
   "Morph",
   "AnimationPlayer",
   "Camera",
-  "MaterialAsset",
-  "Material",
   "MaterialSet",
   "Script",
   "DirectionalLight",
@@ -21,18 +20,29 @@ export const COMPONENT_ORDER = [
   "SpotLight",
   "ReflectionProbe",
   "FogVolume",
+  "WindSource",
+  "VegetationField",
   "Rigidbody",
   "Collider",
   "CharacterController",
   "KinematicBones",
   "BonePhysics",
   "FootIk",
-] as const;
+] as const satisfies readonly ComponentName[];
 
 /// Components the Inspector/tree never render: Relationship carries the hierarchy's durable parent
 /// uuid (edited through the tree / `set-parent`, never as a raw field); Bone is an empty joint tag
 /// (bone-ness shows in the outliner, not as a section).
-export const HIDDEN_COMPONENTS = new Set<string>(["Relationship", "Bone"]);
+const HIDDEN_COMPONENT_NAMES = ["Relationship", "Bone"] as const satisfies readonly ComponentName[];
+
+export const HIDDEN_COMPONENTS: ReadonlySet<string> = new Set<string>(HIDDEN_COMPONENT_NAMES);
+
+/// Every registered component is either ordered or hidden. A registry addition that reaches
+/// `ComponentName` without a slot here fails the typecheck instead of landing in the unordered tail
+/// and disappearing from the Add-component menu.
+type AssertNever<T extends never> = T;
+type PlacedComponent = (typeof COMPONENT_ORDER)[number] | (typeof HIDDEN_COMPONENT_NAMES)[number];
+type _EveryComponentIsPlaced = AssertNever<Exclude<ComponentName, PlacedComponent>>;
 
 export function canonicalComponentNames(components: Record<string, unknown>): string[] {
   const present = Object.keys(components).filter((c) => !HIDDEN_COMPONENTS.has(c));

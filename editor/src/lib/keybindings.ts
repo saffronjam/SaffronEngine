@@ -50,6 +50,8 @@ export type CommandId =
   | "vegetation.tool.promote"
   | "vegetation.brushGrow"
   | "vegetation.brushShrink"
+  | "vegetation.shapeCommit"
+  | "vegetation.shapeCancel"
   | "vegetation.delete";
 
 export interface CommandDef {
@@ -329,8 +331,24 @@ export const COMMANDS: readonly CommandDef[] = [
     scope: "vegetation",
   },
   {
+    id: "vegetation.shapeCommit",
+    label: "Commit spline points",
+    category: "Vegetation",
+    kind: "press",
+    default: "enter",
+    scope: "vegetation",
+  },
+  {
+    id: "vegetation.shapeCancel",
+    label: "Drop spline points",
+    category: "Vegetation",
+    kind: "press",
+    default: "escape",
+    scope: "vegetation",
+  },
+  {
     id: "vegetation.delete",
-    label: "Delete selected plant",
+    label: "Delete selected plants",
     category: "Vegetation",
     kind: "press",
     default: "delete",

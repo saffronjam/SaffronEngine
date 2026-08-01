@@ -1,5 +1,6 @@
-/// Vegetation mode keyboard shortcuts: digit keys select the viewport tool and the
-/// bracket keys grow/shrink the brush. The scope is the open vegetation dock panel —
+/// Vegetation mode keyboard shortcuts: digit keys select the viewport tool, the
+/// bracket keys grow/shrink the brush, and Enter/Escape close or drop the Spline
+/// tool's in-progress control polyline. The scope is the open vegetation dock panel —
 /// with the panel closed the digits pass through untouched, so the mode never steals
 /// keys from ordinary editing. Bindings resolve through lib/keybindings, so rebinds
 /// in settings take effect immediately.
@@ -10,56 +11,34 @@ import { matchesBinding } from "../lib/keybindings";
 import { findPanelLeaf } from "../state/dockLayout";
 import { useEditorStore } from "../state/store";
 import { VEGETATION_TOOLS, isBrushTool } from "../panels/vegetationTools";
-import type { VegetationMutationDto, VegetationMutationRecordDto } from "../protocol";
+import { splineCommit } from "../panels/ViewportPanel/viewportVegetation";
+import { applyVegetationGesture, pushVegetationGesture } from "../panels/vegetationGesture";
+import { mutationRecord } from "../panels/vegetationPlanting";
+import type { VegetationMutationRecordDto } from "../protocol";
 import { isTextEntryFocused } from "./useGizmoShortcuts";
 
-/// A fresh 32-hex vegetation GUID (transaction/idempotency keys).
-function freshGuid(): string {
-  return crypto.randomUUID().replaceAll("-", "");
-}
-
-/// The editor's stable mutation authority id.
-const EDITOR_AUTHORITY = "0000000000000000000000000000e017";
-
-/// Tombstones the selected plant as one undoable edit: the runtime row supplies the
-/// Regrow preimage (lifecycle/phenotype/tick), so undo restores the same stable
-/// identity through the reducer — never by rewriting cooked bytes.
-async function deleteSelectedPlant(plant: string): Promise<void> {
+/// Tombstones every selected plant as ONE undoable edit. Undo restores each plant's exact
+/// persistent delta through the reducer — never by rewriting cooked bytes.
+async function deleteSelectedPlants(plants: readonly string[]): Promise<void> {
   const store = useEditorStore.getState();
-  const inspected = await client.vegetationRuntimeInspect(plant);
-  const resident = inspected.resident;
-  if (!resident) {
-    store.setVegetationSelectedPlant(null);
+  const tombstones: VegetationMutationRecordDto[] = [];
+  for (const plant of plants) {
+    const resident = (await client.vegetationRuntimeInspect(plant)).resident;
+    if (!resident) {
+      continue;
+    }
+    tombstones.push(mutationRecord(resident.cell, { kind: "tombstone", plant }));
+  }
+  if (tombstones.length === 0) {
+    store.setVegetationSelectedPlants([]);
     return;
   }
-  const record = (mutation: VegetationMutationDto): VegetationMutationRecordDto => ({
-    header: {
-      cell: resident.cell,
-      transaction: freshGuid(),
-      authority: EDITOR_AUTHORITY,
-      logicalTick: String(Date.now()),
-      idempotencyKey: freshGuid(),
-    },
-    mutation,
-  });
-  const tombstone = () => client.vegetationMutate([record({ kind: "tombstone", plant })]);
-  const regrow = () =>
-    client.vegetationMutate([
-      record({
-        kind: "regrow",
-        plant,
-        lifecycle: resident.lifecycle,
-        phenotype: resident.phenotype,
-        ecologyTick: String(BigInt(resident.ecologyTick) + 1n),
-      }),
-    ]);
-  await tombstone();
-  store.setVegetationSelectedPlant(null);
-  store.pushEdit({
-    label: "Delete plant",
-    undo: regrow,
-    redo: tombstone,
-  });
+  const inverse = await applyVegetationGesture(tombstones);
+  store.setVegetationSelectedPlants([]);
+  pushVegetationGesture(
+    tombstones.length === 1 ? "Delete plant" : `Delete ${tombstones.length} plants`,
+    inverse,
+  );
 }
 
 export function useVegetationShortcuts(): void {
@@ -69,7 +48,7 @@ export function useVegetationShortcuts(): void {
         return;
       }
       const store = useEditorStore.getState();
-      if (store.settingsOpen || store.playState !== "edit") {
+      if (store.settingsOpen) {
         return;
       }
       // The scope: the vegetation panel is open in the scene dock.
@@ -84,12 +63,26 @@ export function useVegetationShortcuts(): void {
           return;
         }
       }
+      // Everything below authors, so it stands down while the world plays.
+      if (store.playState !== "edit") {
+        return;
+      }
+      if (matchesBinding(event, "vegetation.shapeCommit", overrides)) {
+        event.preventDefault();
+        void splineCommit();
+        return;
+      }
+      if (matchesBinding(event, "vegetation.shapeCancel", overrides)) {
+        event.preventDefault();
+        store.clearVegetationShapePoints();
+        return;
+      }
       if (
-        store.vegetationSelectedPlant !== null &&
+        store.vegetationSelectedPlants.size > 0 &&
         matchesBinding(event, "vegetation.delete", overrides)
       ) {
         event.preventDefault();
-        void deleteSelectedPlant(store.vegetationSelectedPlant).catch((err: unknown) =>
+        void deleteSelectedPlants([...store.vegetationSelectedPlants]).catch((err: unknown) =>
           notifyError(errorText(err)),
         );
         return;

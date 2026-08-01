@@ -12,6 +12,7 @@ export type DockSpaceKind = "scene" | "assetEditor";
 export const SCENE_PANEL_IDS = [
   "inspector",
   "environment",
+  "windDebug",
   "render",
   "postProcess",
   "stats",
@@ -865,6 +866,7 @@ export function defaultDockLayouts(): Record<DockSpaceKind, DockLayout> {
 export const DEFAULT_LEAF: Record<DockPanelId, DockNodeId> = {
   inspector: "leaf:leftBottom",
   environment: "leaf:right",
+  windDebug: "leaf:right",
   render: "leaf:right",
   postProcess: "leaf:right",
   stats: "leaf:right",

@@ -24,6 +24,7 @@ import type {
   RenderStats,
   ScriptLogDto,
   UpscaleDto,
+  VegetationLayerOperatorDto,
   WorldBoundsDto,
 } from "../../protocol";
 import type { StoreKind, StoreResult } from "../../storefront/types";
@@ -80,24 +81,36 @@ export type VegetationTool =
 
 /// Vegetation brush parameters (metres for radius/spacing; falloff 0..1). `projection` picks how a
 /// stroke sample lands on the world: the camera ray's hit, or a straight-down cast above it.
-/// `maxSlopeDeg` drops samples whose surface tilts past the limit (90 = no filter).
+/// `maxSlopeDeg` drops samples whose surface tilts past the limit (90 = no filter). `density` is the
+/// 0..1 level the Density and Fill tools drive texels toward, and the Volume/Exclude shapes' weight.
 export interface VegetationBrush {
   radius: number;
   falloff: number;
   spacing: number;
   projection: "view" | "down";
   maxSlopeDeg: number;
+  density: number;
 }
+
+/// Which chunk payload slot an authored layer's tiles live in: ordinary fields, or the signed
+/// blocker set the Exclude tool writes.
+export type VegetationPaintSlot = "field" | "blocker";
 
 /// The authored layer a vegetation brush stroke targets. `channel` is the layer operator's field
 /// channel for paintable layers; null means the layer is selectable but takes no strokes.
 export interface VegetationPaintTarget {
   map: string;
   layer: string;
+  /// The layer operator's kind, which decides the gestures the layer accepts.
+  operator: VegetationLayerOperatorDto["kind"];
   channel: FieldChannelDto | null;
+  slot: VegetationPaintSlot;
   chunkLevel: number;
   locked: boolean;
 }
+
+/// One picked world position in metres, the unit every vegetation gesture samples in.
+export type VegetationPoint = [number, number, number];
 
 export type ViewTab =
   | { id: "scene"; kind: "scene"; title: "Scene"; closable: false }
@@ -468,21 +481,26 @@ export interface VegetationSlice {
   vegetationSpecies: Set<string>;
   /// Per-species paint weight (0..1; absent means 1).
   vegetationWeights: Record<string, number>;
-  /// The viewport-picked macro plant (stable PlantId hex).
-  vegetationSelectedPlant: string | null;
+  /// The viewport-picked macro plants (stable PlantId hex). A pick holds one; the Lasso tool holds
+  /// every plant its polygon enclosed.
+  vegetationSelectedPlants: ReadonlySet<string>;
   vegetationActiveLayer: VegetationPaintTarget | null;
   vegetationCookJob: string | null;
   /// World bounds of the last committed brush stroke — the region the panel's Estimate preflights.
   vegetationLastStroke: WorldBoundsDto | null;
+  /// Control points the Spline tool has picked but not yet committed, base first.
+  vegetationShapePoints: VegetationPoint[];
 
   setVegetationTool(tool: VegetationTool): void;
   setVegetationBrush(patch: Partial<VegetationBrush>): void;
   toggleVegetationSpecies(id: string, additive: boolean): void;
   setVegetationWeight(id: string, weight: number): void;
-  setVegetationSelectedPlant(plant: string | null): void;
+  setVegetationSelectedPlants(plants: Iterable<string>): void;
   setVegetationActiveLayer(target: VegetationPaintTarget | null): void;
   setVegetationCookJob(job: string | null): void;
   setVegetationLastStroke(bounds: WorldBoundsDto | null): void;
+  addVegetationShapePoint(point: VegetationPoint): void;
+  clearVegetationShapePoints(): void;
 }
 
 /// The Asset Store browse session, persisted across a grid remount.

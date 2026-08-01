@@ -39,6 +39,7 @@ export type PickerAssetKind =
   | "material"
   | "model"
   | "animation"
+  | "plant"
   | "vegetation-map";
 
 /// The native built-in primitive meshes, mirroring the engine's `BuiltinMesh` reserved

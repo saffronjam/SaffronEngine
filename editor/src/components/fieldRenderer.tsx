@@ -71,7 +71,6 @@ export const FIELD_HINTS: Record<string, FieldHint> = {
 
   "Mesh.mesh": { kind: "uuid", asset: "mesh" },
   "VegetationField.map": { kind: "uuid", asset: "vegetation-map" },
-  "MaterialAsset.material": { kind: "uuid", asset: "material" },
 
   "Camera.fov": { kind: "number", min: 1, max: 179, step: 0.5 },
   "Camera.near": { kind: "number", min: 0.001, step: 0.01 },
@@ -181,6 +180,8 @@ export const FIELD_HINTS: Record<string, FieldHint> = {
   "Rigidbody.linearDamping": { kind: "slider", min: 0, max: 1, step: 0.01 },
   "Rigidbody.angularDamping": { kind: "slider", min: 0, max: 1, step: 0.01 },
   "Rigidbody.gravityFactor": { kind: "number", min: 0, max: 2, step: 0.05 },
+  // Scales the collider's cross-section into the wind drag; 0 leaves the body inert to wind.
+  "Rigidbody.windFactor": { kind: "number", min: 0, max: 8, step: 0.05 },
   "Rigidbody.lockPosition": { kind: "lockAxes" },
   "Rigidbody.lockRotation": { kind: "lockAxes" },
   // The moving-slot the body lives in (resolveObjectLayer: 0=Moving, 1=Character, 2=Debris).
