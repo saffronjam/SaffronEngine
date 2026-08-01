@@ -2,8 +2,9 @@
 
 **Status:** COMPLETED (audit of 2026-07-29)
 
-Every box in every phase file is ticked and every phase header says COMPLETED. This file records
-what an independent read of the code found instead. Nine auditors took the phase files apart
+When this audit ran, every box in every phase file was ticked and every phase header said
+COMPLETED. This file records what an independent read of the code found instead, and the ledger at
+the end records which of those findings the planset has since been corrected for. Nine auditors took the phase files apart
 claim by claim and looked for the symbol, test, control command, schema field or docs page that
 proves each one; a tenth checked the cross-cutting README claims. Only problems are listed. A
 confirmed box appears nowhere below.
@@ -446,7 +447,7 @@ the pass/fail claim itself is unverified; the file count is verifiably stale.
 
 **phase-13-ecology-catchup** — (same box) `EcologyClock` ... `ticks_to` refuses a target behind the clock and `complete` accepts only the exact successor
 
-Neither symbol exists. `EcologyClock` exposes `at`, `tick`, `ticks_from`, and `advance_to`;
+Neither symbol exists. `EcologyClock` exposes `at`, `tick`, and `advance_to`;
 there is no `ticks_to` and no `complete`. The guarantee itself holds, but through different
 code: `advance_to` refuses a backwards target and `EcologyState::publish_region_tick` enforces
 the exact-successor rule. The box cites named evidence that is not in the tree.
@@ -1341,10 +1342,12 @@ owner's call, not the auditor's.
 Done, in the planset prose:
 
 1. The superseded strata are gone. Every box that carried an older paragraph beneath a newer one
-   now states one answer: phase 3's acceptance and progress notes, phase 11's GI/reflection
-   culling, RT telemetry and opacity-micromap boxes, phase 12's suite-state clause, phase 14's
-   generator box, and phase 15's work-item-manifest, GPU-telemetry, image-comparison and
-   platform-tier boxes.
+   now states one answer: phases 1 and 3's conformance records, phase 3's progress note, phase 10's
+   history-invalidation and modal-aggregation notes, phase 11's GI/reflection culling, RT telemetry
+   and opacity-micromap boxes (the last of which said attachment was unbuilt above the paragraphs
+   proving it on device), phase 12's suite-state clause, phase 14's preview, season and hierarchy-cut
+   notes, and phase 15's work-item-manifest, GPU-telemetry, image-comparison and platform-tier boxes.
+   No box refers to another note of its own as earlier, superseded, or wrong.
 2. No box quotes a test total. Each claim names the gate recipe or the test that carries it —
    `load_query_unload_and_reload_preserve_persistent_tombstones` for the snapshot round-trip,
    `mesh-executor-parity` for executor agreement, `the_depth_prepass_rasterizes_every_cooked_representation`
@@ -1355,53 +1358,134 @@ Done, in the planset prose:
    and no `complete`); the command is `list-active-alarms`; phase 8 cites the device test that
    exists; the depth family covers the `vsm-pages` shadow pass rather than a point-shadow raster
    pass that was retired; phase 2 lists `saffron-material` among the vegetation crate's
-   dependencies; phase 10 names `gpuSceneWindDeform`.
+   dependencies; phase 10 names `gpuSceneWindDeform`. Every cited benchmark record exists: phases 1
+   and 3 name the NVIDIA conformance record alone, since the MoltenVK one no longer binds the
+   current corpus and was removed from the tree.
 4. Claims the code contradicts are corrected: the mesh executor is opt-in through
-   `SAFFRON_MESH_EXECUTOR=1` on a device whose `Capabilities::mesh_shader` holds, and the optional
+   `SAFFRON_MESH_EXECUTOR=1` on a device whose `Capabilities::mesh_shader` holds, the optional
    `VK_NV_cluster_acceleration_structure` tier is built (`rt_cluster.rs`, `vk_nv_cluster.rs`,
-   `clusterAsSupported`/`clusterBlasCount`/`clasCount`) rather than absent.
+   `clusterAsSupported`/`clusterBlasCount`/`clasCount`) rather than absent, shadows are the one
+   `vsm-pages` pass with directional, spot and point lights as page allocations inside it, and
+   `README.md`'s seam table names files and symbols that exist — no `gather_static_draw_list`,
+   `DrawItem`, `DrawBatch`, `SceneDrawList`, `meshlet_raster.rs` or `meshlet.slang`, and no path the
+   module splits turned into a directory. AMD is out of scope in the milestone rule and in phase
+   10's status line as it already was everywhere else.
 5. `READMESUMMARY.md` is a map again — phase table, platform coverage, the opt-in switches and
    their harnesses, how to verify, and the one open defect — instead of a chronological log whose
-   later sections contradicted its header.
+   later sections contradicted its header. Its switch table carries every switch a harness toggles,
+   its carve-out list matches the phases' own `Status` lines, and it no longer reports which files
+   happen to be staged.
+6. Phase 15's platform box no longer reports the schema contract run as green next to the terminal
+   box recording it as intermittently device-lost, and the software-tier box states the rule (a red
+   on llvmpipe is reproduced on the discrete adapter before it is attributed to the software tier)
+   rather than a stale pair of suite outcomes.
+7. Two clauses that survived the first prose pass are corrected against the tree. Phase 7's
+   checkpoint described displaced instances as drawing through a tessellation seam — a traversal
+   that skips `GPU_MATERIAL_TABLE_FLAG_TESSELLATED` records under a `tess_seam` push, `TessSceneDraw`
+   rows, and vertex-input PSOs for the seam alone, none of which exist. Displaced instances draw
+   through the same binned cut: the traversal emits a `GPU_REPRESENTATION_DISPLACED_MICRO` record,
+   `DisplacedRow` carries the arena row and the cull's local-amplitude slack, and the scatter aims
+   that record's indirect draw at the amplification arena through `gpuSceneDisplacedDraw`. Phase 11's
+   BLAS-sharing box said the geometry stays `OPAQUE` while opacity rides a per-instance force flag,
+   which its own opacity-micromap box contradicts: opacity comes from `cooked_submesh_opacity` per
+   material-homogeneous submesh, and `instance_opacity_flags` speaks only for an instance whose
+   runtime material contradicts the cooked class. Four more names in phase 11 are the tree's:
+   `mesh_blas_build_flags` (not `MESH_BLAS_BUILD_FLAGS`), `displaced_records: 0` as what the shadow-page
+   traversal sets (not a `tess_seam` push), `MeshAssembly::prototype_slices` carrying an
+   `AssemblyPrototypeSlice`, and `GpuSceneMirror::ray_instances`. A checker over every identifier the
+   phase files cite resolves them all against `engine/`, `editor/src`, `tests/e2e`, `tools`, `schemas`
+   and `docs/content` — with the planset itself excluded from the search, since a symbol invented in
+   the planset otherwise resolves against the planset.
+8. Phase 13's acceptance box names its determinism tests instead of counting them, and drops the
+   aside about another agent's in-flight shader test. Phase 9's UI-placement rule points at
+   `EnvironmentPanel/`, which the module split made a directory. `READMESUMMARY.md`'s switch table
+   says what each harness actually proves: five compare two hosts differing in one variable, and the
+   micro-field harness runs one host and asserts `microCandidates` is zero.
+
+9. Phase 15's three box-less sections carry boxes now, and only what the tree answers is ticked.
+   The networking section became eight boxes: interest keys and facets, the base-manifest handshake
+   and its typed rejection, canonical scoped snapshots with sequenced idempotent tails, the
+   transaction/precondition/authority/tick header with reorder-safe reduction, the promotion
+   handoff, and periodic checkpoint hashes are ticked against `engine/crates/vegetation/src/network/`
+   and `runtime_world/network.rs`; a late-join fixture corpus and a proof that a receiver
+   reconstructs wind and micro bend locally are not. The determinism matrix became ten boxes, four
+   ticked (worker/order/rebasing/negative/unrelated-edit invariance, the snapshot-compaction and
+   late-join family, continuous-versus-catch-up ecology with exact-once transitions, and
+   pathological inputs that reject rather than reduce fidelity); each of the six unticked boxes names
+   the exact missing leg rather than discarding the line. Performance closure became two boxes: the
+   stress fixtures and camera/simulation paths are ticked, the twelve-axis budget set is not — six
+   budgets exist in one record and nothing asserts against them.
+10. Three boxes that claimed more than the tree supports are unticked, each keeping its evidence.
+   Phase 15's AMD box stays struck through and DESCOPED but is no longer counted as done, since its
+   own body says no AMD validation was performed. Phase 15's terminal gate box is unticked and states
+   in one sentence what remains unproven: no full-gate run has finished clean end to end while
+   `just schema` loses the device on roughly half its runs. Phase 1's baseline box is unticked and
+   separates its measured legs (scene-gather, draws, `InstanceData` traffic, shadow submission,
+   retained CPU mesh memory) from its unmeasured ones (RT, GPU memory).
 
 Done outside the planset, where the same claims sat in code comments and docs pages:
 
-6. `record_executor_depth_family`'s doc comment (`rendering/src/scene_pass.rs`) names the
+11. `record_executor_depth_family`'s doc comment (`rendering/src/scene_pass.rs`) names the
    `vsm-pages` shadow pass instead of the retired point-shadow raster pass, and the per-bucket
    index stream `bucket_index_buffer` selects instead of the pages arena alone.
-7. `hierarchical-visibility.md`'s mesh-executor section states the real selection —
+12. `hierarchical-visibility.md`'s mesh-executor section states the real selection —
    `SAFFRON_MESH_EXECUTOR=1` plus a device that offers a mesh stage, which MoltenVK does not — and
    the page's code-pointer row names `mesh.slang`, `meshMainExecutor`, `PsoKey::mesh_shader` and
    `SAFFRON_MESH_EXECUTOR`.
+13. No renderer doc comment names a "draw-list batcher" any more — `instancing.rs` describes the
+   per-frame instance set and the deformation wiring, `skinning/` the compute pre-pass, and a
+   repo-wide grep for the phrase returns nothing.
+14. The dead `gpuSceneWindSway` citation is gone: `wind-field.md`, `persistent-gpu-scene.md` and
+   `raytracing-foundation.md` all name `gpuSceneWindDeform`, and a grep for the old spelling over
+   `docs/content` returns nothing.
 
-Still open, and none of it is prose:
+Still open:
 
 1. `vegetation-state-export` / `vegetation-state-import` have no harness. Both carry a manifest
    `skip`, no `tests/e2e` file dispatches them, and the control crate's own tests round-trip only
    the hex helper. The world-level `export_state_snapshot`/`import_state_snapshot` pair is covered;
    the command layer over it is not.
-2. `tools/check-control-schema/check.ts` pushes a skipped command onto its `checked` list, so the
-   run's own count overstates what it dispatched — every `vegetation-*` and `plant-*` command is
-   skipped.
-3. Capability-gated e2e tests return early instead of skipping, so a green run does not distinguish
-   "verified" from "not attempted". Twelve files carry the shape, and the planset cites eleven of
-   them as hardware-tier evidence: `cross-adapter-parity`, `mesh-executor-parity`, `rt-telemetry`,
-   `vegetation-rt`, `vegetation-atlas-micromap`, `vegetation-canopy`, `rt-anyhit`, `rt-blas`,
-   `rt-ptlas`, `skinned-rt`, `perf`, `toggles`. None uses `test.skipIf`; each gates inside the test
-   body and returns. On MoltenVK, where most of the planset's seals were taken, every one of those
-   bodies passes having asserted nothing. The fix has two halves: declare the comparison with
-   `test.skipIf(capability)` so the runner reports it skipped, and add a test that always runs and
-   asserts the capability gate itself — for `mesh-executor-parity`, that booting with
-   `SAFFRON_MESH_EXECUTOR=1` on a device without a mesh stage leaves `meshExecutor` false and still
-   draws.
-4. Two dead symbols still cited by docs pages. `software-ray-trace.md`'s occluder-pressure row
-   points at `set_sdf_scene` and `MAX_SDF_INSTANCES`, both deleted with the CPU occluder upload
-   (`sdf_instances_dropped` is what survives). `wind-field.md` and `persistent-gpu-scene.md` name
-   `gpuSceneWindSway`, which is `gpuSceneWindDeform`.
-5. Phase 15's three box-less sections (networking contract, determinism and failure matrix,
-   performance closure) carry requirements with nothing to tick against.
-6. `just schema` intermittently loses the NVIDIA device in the thumbnail render path. Phase 15's
-   terminal box carries the bisection.
+2. `tools/check-control-schema/check.ts` still pushes a skipped command onto its `checked` list. The
+   entry now reads `<name> skipped (<reason>)`, so a reader of the log can see it, but the closing
+   line still reports `all ${checked.length} manifest-driven control checks passed` — a count that
+   includes every skipped `vegetation-*` and `plant-*` command.
+3. Capability-gated e2e tests mostly still return early instead of skipping, so a green run does not
+   distinguish "verified" from "not attempted". `cross-adapter-parity` now declares its comparison
+   with `test.skipIf(!softwareIcdPresent)`; the other eleven files the planset cites as hardware-tier
+   evidence do not — `mesh-executor-parity`, `rt-telemetry`, `vegetation-rt`,
+   `vegetation-atlas-micromap`, `vegetation-canopy`, `rt-anyhit`, `rt-blas`, `rt-ptlas`,
+   `skinned-rt`, `perf`, `toggles` each gate inside the test body and return. On MoltenVK, where most
+   of the planset's seals were taken, those bodies pass having asserted nothing. The fix has two
+   halves: declare the comparison with `test.skipIf(capability)` so the runner reports it skipped,
+   and add a test that always runs and asserts the capability gate itself — for
+   `mesh-executor-parity`, that booting with `SAFFRON_MESH_EXECUTOR=1` on a device without a mesh
+   stage leaves `meshExecutor` false and still draws.
+4. `just schema` intermittently loses the NVIDIA device in the thumbnail render path. Phase 15's
+   terminal box carries the bisection and is unticked for it.
+5. MoltenVK has no current Rust/Slang conformance record. Phases 1 and 3 ask for byte-equivalence on
+   NVIDIA *and* MoltenVK, and are met on NVIDIA alone until `just compute-conformance` runs on an
+   Apple device; `every_conformance_record_binds_the_current_corpus_and_abi` is what refuses a record
+   that no longer describes the corpus.
+6. No Phase-1 performance baseline exists on NVIDIA, and no baseline on any device carries a
+   GPU-memory figure: `Renderer`'s `vram_usage_bytes` is initialised to zero and never assigned, so
+   `vramUsageBytes`/`vramBudgetBytes` are structurally 0 in every record `tools/bench-foliage-phase1/measure.ts`
+   writes. The RT leg is unmeasured for the same reason in reverse — the only record is from a device
+   that reports `rtSupported: false`.
+7. Nothing asserts a performance budget. `measure.ts` derives six budgets from a run's own p95 and
+   writes them into the record; no gate recipe, e2e file, or test ever reads one back. The other nine
+   axes Phase 15 names — editor stroke latency, incremental cook, cell publication, source
+   travel/prefetch, GPU visibility/deformation/main/VSM/GI/RT, memory/residency, promotion/Jolt,
+   simulation/catch-up, export — have no budget at all.
+8. The determinism matrix's remaining gaps, each now an unticked box in Phase 15 rather than
+   unwritten scope: a disk-full write, a cache-deletion recook under authored overrides and runtime
+   tombstones, a multi-cell halo and cross-hierarchy-level evaluation, a save or unload racing a live
+   promotion plus Jolt churn and contacts on a promoted body, arena growth and rapid phenotype churn
+   and TAA history across a vegetation cut, and vegetation coverage in a reflection view.
+9. Networking's two unbuilt legs, likewise now boxes: a checked-in deterministic late-join fixture
+   corpus (the only late-join world is in-code, and no `tests/e2e` file drives a join), and a proof
+   that a receiver reconstructs wind and micro bend from the immutable base plus received state. The
+   second holds structurally — `saffron-vegetation` does not depend on `saffron-wind`, so no wind
+   value can reach a transmitted byte — but nothing measures the reconstruction.
 
 ## Already acted on
 

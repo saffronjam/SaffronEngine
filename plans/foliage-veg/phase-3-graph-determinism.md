@@ -103,15 +103,17 @@ evaluator calls shared with the future editor, not a second debug interpreter.
 - [x] Every dual-domain node passes Rust/Slang equivalence on **NVIDIA and MoltenVK** before it can
   carry `EquivalentGpu`.
   *(`just compute-conformance` writes a bound record per adapter under `benchmarks/foliage-veg/`.
-  Both records — `compute-conformance-nvidia-rtx-3070-ti.json` (`NVIDIA GeForce RTX 3070 Ti`) and
-  `compute-conformance-apple-m4-moltenvk.json` (`Apple M4` through MoltenVK) — report
-  `rustReferenceSha256 == slangSha256` for the 32-word spatial corpus and the resident graph corpus
-  with `newIssues: 0`, and the two adapters' digests are byte-identical to each other rather than each
-  merely matching its own reference. The qualification corpus covers every declared operator with a
+  `compute-conformance-nvidia-rtx-3070-ti.json` (`NVIDIA GeForce RTX 3070 Ti`) reports
+  `rustReferenceSha256 == slangSha256` for the 32-word spatial corpus and the seven-program resident
+  graph corpus, with `newIssues: 0`. The qualification corpus covers every declared operator with a
   resident program, the ABI and corpus hashes are pinned, branching and terminal masks preserve exact
-  semantics, and only complete program/profile/artifact evidence is admitted. AMD is out of scope by
-  the project owner's decision (2026-07-26): no such adapter exists for this project, so nothing here
-  is verified or claimed on AMD.)*
+  semantics, and only complete program/profile/artifact evidence is admitted;
+  `every_conformance_record_binds_the_current_corpus_and_abi` (`saffron-vegetation-gpu`) fails as soon
+  as a record's corpus, ABI, reference, or operator set drifts from the tree, so a record that no
+  longer describes the corpus cannot sit in the tree unnoticed. MoltenVK carries no current record —
+  the recipe has to run on an Apple device to write one — so this box is met on NVIDIA only. AMD is
+  out of scope by the project owner's decision (2026-07-26): no such adapter exists for this project,
+  so nothing here is verified or claimed on AMD.)*
 - [x] The compiler rejects cosmetic-to-authoritative dependencies, unbounded local influence, cycles,
   and NaN/overflow inputs with typed diagnostics.
 - [x] Concrete-job preflight exposes retained/generated inputs and admission/execution peaks, defines
@@ -129,13 +131,11 @@ point formats.
 
 ## Platform conformance
 
-- MoltenVK on Apple M4: the 32-word spatial corpus and the resident graph corpus pass on the physical
-  GPU with identical Rust/Slang hashes and zero validation issues. The bound record is
-  `benchmarks/foliage-veg/compute-conformance-apple-m4-moltenvk.json`.
 - NVIDIA GeForce RTX 3070 Ti (driver 610.43.03, api 1.4.341): the 32-word spatial corpus and the
   resident graph corpus pass on the physical GPU with identical Rust/Slang hashes and zero validation
-  issues. The bound record is `benchmarks/foliage-veg/compute-conformance-nvidia-rtx-3070-ti.json`,
-  and both digests match the MoltenVK record byte for byte.
+  issues. The bound record is `benchmarks/foliage-veg/compute-conformance-nvidia-rtx-3070-ti.json`.
+- MoltenVK on Apple M4: no current record. `just compute-conformance` on an Apple device writes one;
+  until it does, nothing about Rust/Slang equivalence is claimed there.
 - AMD: descoped by the project owner (2026-07-26) — no such adapter exists for this project. Never
   verified; not claimed.
 

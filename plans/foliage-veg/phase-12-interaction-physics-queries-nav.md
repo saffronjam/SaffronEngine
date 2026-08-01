@@ -192,17 +192,24 @@ obstacle while promoted.
   labels. `tests/e2e/physics-query.test.ts`, `physics-triggers.test.ts` and
   `physics-falling-box.test.ts` cover the tagged shapes end to end.)
 - [x] Promotion stress proves exactly one render/collision/simulation owner at every synchronization
-  point, including save/unload/recook during transition. (e2e: promoting a plant DROPS the bulk
-  `residentBodies` and flips its nav contribution to `DynamicObstacle` in the same pass the entity
-  view appears; demoting restores the exact prior body count. Unload/republication cannot lose or
-  duplicate the suppression because it is keyed by `PlantId` on the world rather than held in an
-  immutable generation; a recook (manifest identity change) calls `abandon`; a save flushes through
-  the reducer without demoting.)
+  point, including save/unload/recook during transition. (`tests/e2e/vegetation-interaction.test.ts`
+  counts owners across render, collision and navigation at each synchronization point and requires
+  bulk plus views to equal the macro row count on every system; it holds that count across a save
+  barrier, a republication under a live view, and a cell that leaves and re-enters residency. A cook
+  committed under a different generation identity while a plant stands promoted abandons the view —
+  the entity, its body and its suppression go together, the owner counts return to exactly what they
+  were before the promotion, and nothing is written back;
+  `abandoning_views_drops_them_whole_and_writes_no_state_back` pins the same contract on the
+  authority directly.)
 - [x] Demotion writes state back and reload preserves it; cache recook cannot resurrect removed plants.
-  (e2e asserts a persistent promotion-origin entry after demotion. The write-back is a reducer
-  transaction, so it lives in the persistent state a reload restores, and a tombstone/stump delta
-  outlives any recook of the disposable cell artifact — the base is immutable and deltas layer over
-  it, so a recook cannot resurrect a removed plant.)
+  (e2e demotes, rebinds the field so the durable state is re-read from disk, deletes
+  `cache/vegetation/cells`, cooks again, confirms the regenerated base still carries every plant the
+  first cook placed, and asserts the removed plant is still gone and the written-back health still
+  there. That holds on two properties the cooker owes it: a cook that accepts an authored source
+  observation reproduces its own generation identity
+  (`a_cook_that_accepts_a_source_observation_reproduces_its_own_generation`), and persistent state
+  rebases onto a generation whose identity did move rather than being dropped
+  (`persistent_state_rebases_onto_a_new_base_and_still_removes_what_it_removed`).)
 - [x] Grass has no body/nav-object explosion; macro nav contributions update only affected regions.
   (Micro fields carry no identity and never reach the collision or navigation rows; `Decorative`
   macro rows produce neither a body nor a contribution. The nav seam marks only the bounds of the

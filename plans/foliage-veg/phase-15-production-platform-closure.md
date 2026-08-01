@@ -13,11 +13,11 @@ pass.
 
 - [x] Extend project/export cooking to build exact plant/biome/map dependency DAGs, platform-profiled
   `.splantc`, sectioned `.svegcell`, manifests, initial persistent-state baseline, shaders/PSOs,
-  textures/materials, collision/nav contributions, and license attribution. (The cooker already builds
+  textures/materials, collision/nav contributions, and license attribution. (The cooker builds
   the dependency DAG (`CookGraph`, `cook_graph_hash`, `CookDependency` on every manifest cell), the
   platform-profiled `.splantc`, the sectioned `.svegcell` including its `CollisionInputs` and
   `NavigationContributions` facets, and the manifest; `export-app` copies the shaders and the
-  textures/materials. Added here: the INITIAL PERSISTENT-STATE BASELINE — a `Baseline` artifact kind
+  textures/materials. THE INITIAL PERSISTENT-STATE BASELINE is a `Baseline` artifact kind
   keyed by the manifest it belongs to (a generation has exactly one starting state), published by
   `vegetation-state-baseline` behind the same promoted-state flush a save takes, carried by the export
   closure, and imported by the runtime when it binds that generation, so a package boots into the world
@@ -28,10 +28,10 @@ pass.
 - [x] Package only required content-addressed roots/pages/cells plus dependency closure. Runtime never
   scans authored source directories or source-format files. (`vegetation_export_closure` walks the
   manifest — generation root, manifest, every named `.splantc` and `.svegcell` — and `export-app`
-  copies exactly that into the package's store, which it previously omitted ENTIRELY: the store lives
-  beside `assets/` and the asset copy never saw it, so an exported player bound no manifest and came up
-  bare. The closure is computed from the manifest rather than a directory scan, so a superseded
-  artifact stays out. The authored `.splant`/`.sbiome`/`.svegmap` files and their sidecar packages are
+  copies exactly that into the package's store. THE STORE IS NOT UNDER `assets/` — it sits beside it —
+  so a package built by copying assets alone binds no manifest and comes up bare. The closure is
+  computed from the manifest rather than a directory scan, so a superseded artifact stays out. The
+  authored `.splant`/`.sbiome`/`.svegmap` files and their sidecar packages are
   excluded from the packaged `assets/` by `is_authored_vegetation`; that is safe because the project
   loader treats the filesystem as the source of truth and drops a catalog row whose file is absent,
   and because vegetation binds by identity through the artifact store rather than through the catalog.)
@@ -66,12 +66,12 @@ pass.
   Proven: unit tests for the wire round-trips, the key-domain separation, claim exclusivity,
   sweep-vs-completion precedence, and four claimants racing 64 items without sharing one; the
   vegetation e2e suites (graph/ecology/stress/export) cook real worlds through the claims path.
-  A remote claimant binary stays deferred as the plan records — transport and a project-mount
-  contract, changing nothing about the format.
+  A remote claimant binary is out of scope here: it needs transport and a project-mount contract, and
+  changes nothing about the format.
   ATOMIC PUBLISH: every artifact
   and every generation root writes through `AtomicWriteFile` and is re-read and rehashed before the
   publication is reported. CANCELLATION: `GraphCancellationToken` plus the cook queue's
-  cancel/supersede transitions, now counted. RESUME: content addressing gives it by construction — a
+  cancel/supersede transitions, each counted. RESUME: content addressing gives it by construction — a
   re-run of an interrupted cook hits the cache for every node that published and re-does only the rest,
   which the cook statistics report as hits against misses. CACHE SHARING: the store is
   content-addressed and lock-guarded, so two cooks over one project share every hit.
@@ -111,13 +111,71 @@ pass.
 
 Networking itself remains owned by its planset. Provide and test the vegetation inputs it will use:
 
-- cell-interest keys/facets and exact base-manifest handshake/rejection;
-- canonical cell state snapshots plus sequenced/idempotent mutation tails;
-- transaction/precondition/authority/tick fields and duplicate/reorder-safe reduction;
-- promoted-entity `PlantOrigin` handoff and snapshot during promotion;
-- deterministic late-join state fixtures and periodic checkpoint hashes; and
-- local reconstruction of wind/micro bend while only persistent macro/disturbance/ecology state is
-  transmitted.
+- [x] Cell-interest keys and facets. (`CellInterestKey` is the exact cell/facet pair in
+  `network/interest.rs` — a 26-byte canonical encoding plus a `routing_word` that is documented as a
+  routing hint and never an identity, because a truncated name that collided would ship one peer
+  another peer's cell. `CellInterestSet` is the per-cell facet mask in canonical cell order, with an
+  empty mask refused so a withdrawal encodes exactly one way. Proven by
+  `interest_declaration_round_trips_and_rejects_an_empty_mask`,
+  `a_declaration_out_of_canonical_cell_order_is_rejected`, and
+  `interest_keys_enumerate_in_canonical_cell_then_facet_order`.)
+- [x] Exact base-manifest handshake and rejection. (`BaseManifestOffer` carries the protocol version,
+  the `VegetationStateBinding` — generation, cook graph, `CookVersionSet`, seed namespaces — and the
+  25-column point-schema identity; `PeerBaseIdentity::accept` matches all six exactly and returns the
+  first dimension that differs as a typed `ManifestHandshakeRejection`. There is no negotiation and
+  no partial acceptance: two peers reducing the same operation under different contracts diverge
+  silently instead of failing. Proven by `a_handshake_names_the_first_dimension_that_differs`, which
+  perturbs each dimension in turn.)
+- [x] Canonical cell state snapshots plus sequenced/idempotent mutation tails.
+  (`VegetationState::scope_to_interest` projects the authoritative state onto one declaration —
+  a cell's delta crosses under any facet, an ecology summary only under `Simulation`, and
+  applied-transaction signatures never cross because a scoped peer recomputing one would reject a
+  legitimate replay. `NetworkMutationEnvelope` carries a monotonic sequence, the manifest identity,
+  the sequenced operations, and an optional authoritative snapshot;
+  `VegetationWorld::receive_network_envelope` drops a retransmission at the sequence gate, refuses an
+  operation outside the seated declaration, and rebases from a carried snapshot before its operations
+  reduce. Proven by `scoping_drops_an_undeclared_cell_and_a_summary_no_facet_asked_for`,
+  `a_network_envelope_advances_once_per_sequence_and_corrects_from_a_snapshot`, and
+  `snapshot_compaction_and_duplicate_tail_replay_are_equivalent`.)
+- [x] Transaction/precondition/authority/tick fields and duplicate/reorder-safe reduction.
+  (`MutationHeader` carries `cell`, `transaction`, `authority`, `logical_tick`, `idempotency_key`,
+  and the optional `base_revision` precondition. `shuffled_transactions_and_exact_replays_reduce_identically`
+  is the reorder and duplicate proof: two reductions of the same records in different orders, with
+  exact replays interleaved, produce identical `canonical_bytes()`.)
+- [x] Promoted-entity `PlantOrigin` handoff and snapshot during promotion. (`PlantOrigin` is the
+  immutable scene component a promoted entity carries — `remove_component` panics with "PlantOrigin
+  is immutable; demote the plant instead" — and the felled product deliberately carries none.
+  `VegetationMutation::PromotionOriginState` is the return leg: pose plus linear and angular velocity
+  in Q15.16, reduced into the cell delta's `promotion_origin` and lifted back into the published
+  generation by `CellPersistentOverlay::from_state`. Ownership is the network-facing half:
+  `plant_simulation_authority` and `authority_epoch` record who last claimed the plant, neither is
+  persisted, and both are cleared by `replace_persistent_state` — which is how a save load, a
+  snapshot import, and a network join are all noticed by one path. Proven by
+  `momentum_round_trips_between_the_live_body_and_the_reducer`,
+  `a_re_promoted_plant_continues_the_motion_its_view_ended_with`,
+  `a_foreign_claim_releases_the_view_and_the_authority_s_own_claim_keeps_it`, and
+  `promotion_origin_velocity_survives_into_the_next_snapshot`.)
+- [x] Periodic checkpoint hashes. (`VegetationCheckpoint` fingerprints the scoped state at a
+  sequence — sequence, ecology tick, manifest identity, interest identity, state identity — and
+  `reconcile` returns a typed `CheckpointReconciliation`: `InSync`, `Diverged`, `Behind`, `Ahead`,
+  `InterestMismatch`, or `ManifestMismatch`, with `requires_snapshot` saying which of those
+  operations cannot repair. Both sides fingerprint the *same* scope, so a peer holding a subset
+  reconciles against the authority's projection of that subset rather than a world-wide digest it
+  could never reproduce. Proven by
+  `a_checkpoint_over_the_same_scope_agrees_and_over_a_different_one_does_not`.)
+- [ ] Deterministic late-join state fixtures. The seating path is built —
+  `LateJoinRequest`/`LateJoinGrant` in `network/session.rs`, `issue_late_join`/`accept_late_join` in
+  `runtime_world/network.rs`, with the snapshot travelling *inside* an envelope so a joiner and a
+  peer being corrected take the identical receive path, and the joiner proving it landed where the
+  authority said by reproducing the granted checkpoint. `a_late_joiner_reproduces_the_authority_checkpoint_for_its_declared_scope`
+  covers it. What does not exist is a fixture corpus: the only late-join world is that test's
+  in-code one, and no `tests/e2e` file drives a join.
+- [ ] Local reconstruction of wind/micro bend while only persistent macro/disturbance/ecology state
+  is transmitted. It holds structurally — `VegetationState` is a manifest identity, cell deltas,
+  applied-transaction signatures and ecology state, with no wind, bend or micro field anywhere in it,
+  and `saffron-vegetation` does not depend on `saffron-wind` at all, so no wind value can reach a
+  transmitted byte — but nothing asserts the other half: no test reconstructs bend
+  on a receiver from the immutable base plus a received state and compares it against the authority's.
 
 Do not implement transport, connection authority, retransmission, or general replication here.
 
@@ -239,8 +297,8 @@ Do not implement transport, connection authority, retransmission, or general rep
 - [x] No diagnostic reads back per-instance data every frame; instrumentation uses compact counters
   and explicit capture modes. (Holds for the CPU vegetation path: every counter is incremented where
   the work happens, the stage timing is five durations, and per-plant detail is an explicit request
-  through `vegetation-runtime-inspect`/`-query`/`vegetation-cell-inspect`. AND NOW FOR THE GPU PATH TOO, which is
-  what this box was waiting on, since it is a claim about EVERY diagnostic.
+  through `vegetation-runtime-inspect`/`-query`/`vegetation-cell-inspect`. AND FOR THE GPU PATH, which
+  the box's word EVERY reaches too.
   AUDITED ACROSS THE RENDERER: every per-frame host read of GPU-produced data is one of three things,
   and none is per-instance diagnostics. The 24-word visibility block is a single fence-gated copy.
   The page-fault and VSM demand rings are FUNCTIONAL STREAMING rather than instrumentation — they
@@ -262,20 +320,99 @@ Do not implement transport, connection authority, retransmission, or general rep
 
 Automate named tests for:
 
-- different worker counts, job/input/cell/source order, origin rebasing, negative coordinates, and
-  unrelated graph edits;
-- cell faces/corners, large halos, hierarchy levels, cross-cell transactions and competition;
-- cancellation/supersession, atomic publication, corrupt/truncated/unknown artifacts, disk-full and
-  interrupted writes;
-- cache deletion/recook under authored overrides and runtime tombstones;
-- snapshot/compaction, duplicate/reordered mutation envelopes, manifest mismatch, and late join;
-- promotion ownership/save/unload/recook races, Jolt batch churn, contacts, nav dirtying, and products;
-- continuous versus unload/catch-up ecology and exact-once transitions;
-- page loss/eviction/arena growth, camera cut/teleport/resize, rapid wind/interaction/phenotype,
-  triangle↔voxel transition, HZB/VSM history, and TAA;
-- depth/main/VSM/GI/reflection/RT coverage and thin-sheet response parity; and
-- pathological graph density/cardinality/memory inputs that must reject/cancel rather than silently
-  reduce fidelity.
+- [x] Different worker counts, job/input/cell/source order, origin rebasing, negative coordinates,
+  and unrelated graph edits. (`worker_counts_and_cell_request_order_are_byte_identical` and
+  `catch_up_is_identical_across_worker_counts` for the worker dimension;
+  `graph_bytes_ignore_input_and_dependency_order`, `source_order_cannot_change_resolved_bytes`,
+  `manifest_identity_is_schedule_and_input_order_independent` and
+  `shuffled_snapshots_reach_one_admission_order` for order; `origin_rebasing_preserves_identity`,
+  `render_origin_rebasing_does_not_change_plant_identity` and
+  `surface_hit_is_identical_after_render_origin_rebase` for rebasing;
+  `negative_parent_uses_floor_division` and
+  `covering_cells_are_exact_for_negative_half_open_bounds_and_limits` for negative coordinates; and
+  `unrelated_node_revision_does_not_change_retained_node_identity`, which is the one that matters
+  most — a content hash may invalidate cache but must never reshuffle a node it did not touch.)
+- [ ] Cell faces/corners, large halos, hierarchy levels, cross-cell transactions and competition.
+  Faces and corners are covered (`cell_faces_have_one_half_open_owner`,
+  `halo_faces_and_corners_publish_every_owned_point_exactly_once`), as are cross-cell transactions
+  (`cross_cell_transaction_is_atomic`) and competition (`root_competition_takes_its_share_of_the_water`,
+  `propagating_operators_require_global_policy_but_competition_is_partitionable`). Two legs have no
+  named determinism test: a halo spanning several cells at once, and evaluation at more than one
+  hierarchy level — `every_level_boundary_key_round_trips_and_orders_big_endian` pins the key
+  encoding at every level, which is not the same as pinning published bytes across levels.
+- [ ] Cancellation/supersession, atomic publication, corrupt/truncated/unknown artifacts, disk-full
+  and interrupted writes. Everything here is covered except disk-full: cancellation and supersession
+  by `cancellation_and_deadline_abort_deterministically_at_every_publication_phase`,
+  `canceled_generation_never_publishes`, `cancelled_staged_cook_never_advances_the_generation_root`,
+  `newer_same_map_job_supersedes_the_running_job` and
+  `poll_ready_finalizes_a_superseded_worker_as_superseded`; atomic publication by
+  `publication_is_content_addressed_atomic_and_idempotent` and
+  `late_generation_is_rejected_under_concurrent_publication`; corrupt, truncated and unknown bytes by
+  `corrupt_and_truncated_manifest_are_typed_failures`,
+  `zstd_checksum_corruption_and_truncation_are_typed_failures`,
+  `toc_rejects_unknown_duplicate_and_unsupported_entries` and
+  `corrupt_artifact_never_reaches_publication`; and an interrupted write by
+  `interrupted_frames_are_rejected_at_every_boundary`, which truncates a state container at every
+  offset and requires each prefix to be refused. A full disk is not simulated anywhere.
+- [ ] Cache deletion/recook under authored overrides and runtime tombstones. The persistence half is
+  covered — `load_query_unload_and_reload_preserve_persistent_tombstones` and
+  `persistent_state_rebases_onto_a_new_base_and_still_removes_what_it_removed`, which is the recook
+  rebase — and `a_flipped_byte_is_found_and_repaired` covers repair of a corrupt artifact. What no
+  test drives is the whole loop: delete `<project>/cache/vegetation/`, recook, and require the
+  authored overrides and runtime tombstones to land on the republished base unchanged.
+- [x] Snapshot/compaction, duplicate/reordered mutation envelopes, manifest mismatch, and late join.
+  (`snapshot_tail_compaction_matches_full_reduction` and
+  `complete_reduced_snapshot_round_trips_every_delta_family` for the containers;
+  `shuffled_transactions_and_exact_replays_reduce_identically` and
+  `snapshot_compaction_and_duplicate_tail_replay_are_equivalent` for duplicates and reordering;
+  `state_rejects_a_different_manifest` and `every_header_binding_mismatch_is_rejected` for the
+  mismatch, plus the envelope's own `ManifestMismatch` arm in
+  `a_network_envelope_advances_once_per_sequence_and_corrects_from_a_snapshot`; and
+  `a_late_joiner_reproduces_the_authority_checkpoint_for_its_declared_scope` for late join.)
+- [ ] Promotion ownership/save/unload/recook races, Jolt batch churn, contacts, nav dirtying, and
+  products. Ownership is covered by
+  `a_foreign_claim_releases_the_view_and_the_authority_s_own_claim_keeps_it` (a recook restore, an
+  editor undo, or a network snapshot takes the view down without a write-back) and
+  `demotion_of_a_live_view_is_cancelled_by_a_new_promotion`; products by
+  `felling_requests_queue_once_and_products_carry_no_plant_identity`; nav dirtying by
+  `one_promotion_dirties_only_that_plant` and `dirty_regions_coalesce_and_drain_once`. Not covered:
+  a save or an unload racing a live promotion, Jolt body churn under repeated
+  promote/demote cycles, and contact events on a promoted body.
+- [x] Continuous versus unload/catch-up ecology and exact-once transitions.
+  (`catch_up_equals_continuous_simulation` is the equivalence itself;
+  `a_catch_up_budget_delays_readiness_without_changing_results` and
+  `catch_up_is_identical_across_worker_counts` hold it under a budget and a worker count;
+  `a_tick_is_reproducible_and_neighbour_order_independent` and
+  `disjoint_regions_commit_the_same_state_in_either_order` hold it under region order;
+  `committed_records_emit_one_typed_transition_and_replays_emit_none` is exact-once; and
+  `tests/e2e/vegetation-ecology.test.ts`'s "a cell mid-catch-up publishes for no facet" and
+  "biological time advances, regions catch up under a budget, and the route does not matter" drive
+  the unload/catch-up route through the real host.)
+- [ ] Page loss/eviction/arena growth, camera cut/teleport/resize, rapid wind/interaction/phenotype,
+  triangle↔voxel transition, HZB/VSM history, and TAA. Most of this is covered:
+  `tests/e2e/gpu-scene-residency.test.ts`'s "rapid camera cuts and teleports keep the cut hole-free"
+  and "a resize storm rebuilds the pyramids without dropping the cut"; `tests/e2e/vsm-churn.test.ts`'s
+  "a starved page budget still reconverges to the reference image" for page loss and eviction and
+  "the atlas converges back to its settled image after wind and camera churn" for VSM history under
+  wind; `tests/e2e/vegetation-churn.test.ts`'s "trampling the canopy and releasing it leaves the
+  frame where it started" for interaction; and `triangle_to_voxel_error_covers_thin_sheet_appearance`
+  with `tests/e2e/vegetation-representation-parity.test.ts` for the triangle↔voxel crossing. Three
+  legs have no named test: arena growth under load, rapid phenotype churn, and TAA history across
+  a vegetation cut.
+- [ ] Depth/main/VSM/GI/reflection/RT coverage and thin-sheet response parity. Depth is
+  `the_depth_prepass_rasterizes_every_cooked_representation`; main and VSM are `tests/e2e/vsm.test.ts`
+  with the vegetation matrix; GI is `tests/e2e/vegetation-micro-gi.test.ts`; RT is
+  `tests/e2e/vegetation-rt.test.ts` and `tests/e2e/vegetation-canopy.test.ts`; thin-sheet response is
+  `thin_sheet_surface_is_the_authority_for_coverage_and_optics` and
+  `triangle_to_voxel_error_covers_thin_sheet_appearance`. The reflection view is the gap — no test
+  asserts vegetation coverage in a reflection pass.
+- [x] Pathological graph density/cardinality/memory inputs that must reject/cancel rather than
+  silently reduce fidelity. (`memory_peak_boundary_is_exact_and_rejects_before_gpu_dispatch` refuses
+  before dispatch rather than after allocating; `source_claim_budget_rejects_unbounded_materialization`
+  bounds cardinality at the residency claim; `the_cook_budget_can_never_truncate` is the fidelity
+  rule itself, in the botanical grower; `check_budget_cancels_the_final_tail_without_timing` cancels
+  deterministically rather than on a clock; and `compiler_rejects_numeric_overflow_as_a_typed_error`
+  refuses at the typed path instead of saturating.)
 
 ## Platform quality parity
 
@@ -284,10 +421,11 @@ Automate named tests for:
   driver 610.43.03, api 1.4.341, advertising `VK_KHR_acceleration_structure`, `VK_KHR_ray_query`,
   `VK_EXT_mesh_shader`, `VK_EXT_opacity_micromap` (`micromap = true`, subdivision level 12) and
   `VK_NV_cluster_acceleration_structure`. VALIDATED: the REQUIRED tier — `just engine`,
-  `just prepare-for-commit`, `just schema`, `just test` and `just e2e` all EXIT=0 on this adapter,
-  validation-clean throughout, every render-touching e2e file asserting `validationErrors()` empty —
-  and the KHR RT tier: acceleration structures build, compact, and are traced by ray-query shadows
-  without a validation message.
+  `just prepare-for-commit`, `just test` and `just e2e` run on this adapter validation-clean, every
+  render-touching e2e file asserting `validationErrors()` empty. `just schema` answers every contract
+  check on this adapter and then meets the intermittent device loss the terminal box of this phase
+  records, so that arm is qualified there rather than closed. And the KHR RT tier: acceleration
+  structures build, compact, and are traced by ray-query shadows without a validation message.
   THE MESH TIER IS VALIDATED. The übershader's `meshMainExecutor` serves the shaded scene pass over the
   same binned records, and `mesh-executor-parity` boots two hosts differing only in
   `SAFFRON_MESH_EXECUTOR`, reads back which executor each actually used rather than assuming, and
@@ -305,7 +443,7 @@ Automate named tests for:
   capability and the zero case, and `vegetation-canopy`'s "on a cluster-AS device the family's
   structures compose from its cooked clusters" requires at least one composed structure with at least
   one CLAS where the extension is present and none where it is not.)
-- [x] ~~Validate AMD Vulkan required+mesh where present+KHR RT, including subgroup/workgroup
+- [ ] ~~Validate AMD Vulkan required+mesh where present+KHR RT, including subgroup/workgroup
   variation.~~ **DESCOPED BY THE PROJECT OWNER (2026-07-26)** — no AMD adapter exists for this project
   and none can be obtained, so this is closed as out of scope, not as done. **No AMD validation was
   performed and none is claimed.** The platform matrix the project actually targets is NVIDIA
@@ -333,9 +471,8 @@ Automate named tests for:
   fails because the engine **correctly refuses** GPU graph evaluation there (`vegetation graph
   qualification requires a physical GPU, found cpu`) — `VulkanGraphComputeExecutor::new`'s fail-closed
   contract working, not a correctness defect. A red elsewhere on llvmpipe is not automatically
-  software-specific — `vsm`'s page-atlas leg and `vegetation-export` have each failed identically on
-  the discrete adapter — so a failure is reproduced on both tiers before it is attributed to the
-  software one. NO PERFORMANCE CLAIM: a software
+  software-specific, so a failure is reproduced on the discrete adapter before it is attributed to the
+  software tier. NO PERFORMANCE CLAIM: a software
   run takes roughly 2.5x the wall clock of the discrete one on this machine, which says nothing about
   representative performance either way.)*
 - [x] Query and record individual feature bits/limits; extension names and vendor IDs do not select
@@ -373,12 +510,33 @@ Automate named tests for:
 
 ## Performance closure
 
-Use the Phase-1 baselines to set project-owned budgets for editor stroke latency, incremental cook,
-cell publication, source travel/prefetch, frame CPU, GPU visibility/deformation/main/VSM/GI/RT,
-memory/residency, promotion/Jolt, simulation/catch-up, and export. Check in representative stress
-worlds and camera/simulation paths. If a budget fails, optimize data/algorithms/scheduling; do not
-lower default vegetation density, disable distant motion, remove shadows/GI/RT, or introduce a
-lower-quality content path.
+- [ ] Use the Phase-1 baselines to set project-owned budgets for editor stroke latency, incremental
+  cook, cell publication, source travel/prefetch, frame CPU, GPU
+  visibility/deformation/main/VSM/GI/RT, memory/residency, promotion/Jolt, simulation/catch-up, and
+  export. Six budgets exist and they reach three of those axes:
+  `tools/bench-foliage-phase1/measure.ts` derives `sceneGatherP95Ms`, `cpuFrameP95Ms`,
+  `gpuFrameP95Ms`, `drawCallsMax`, `instanceUploadBytesMax` and `retainedMeshCpuBytesMax` from the
+  run's own steady-state p95 and writes them into the record. That is frame CPU, one aggregate GPU
+  frame time rather than the per-stage visibility/deformation/main/VSM/GI/RT split, and the CPU half
+  of memory/residency; `benchmarks/foliage-veg/phase-1-apple-m4-moltenvk.json` is the only record in
+  the tree carrying them. Nothing compares a later run against a record: `measure.ts` writes a budget
+  block and never reads one, and no gate recipe or e2e file asserts against a baseline. The other
+  nine axes have no budget at all. `vegetation-budgets` is a different thing and does not close this
+  box: it sets three *capacity* bounds — plants per cell, instances per family, a family's cooked
+  blade-candidate bound — which raise owned alarms when a population overruns them, not time or
+  memory budgets derived from a baseline.
+- [x] Check in representative stress worlds and camera/simulation paths. (Seven checked-in fixtures
+  under `tests/e2e/fixtures/`: `vegetation-stress-meadow.json` (micro density),
+  `-woodland` (multi-cell with negative cells), `-scale` (extreme scale), `-traversal` (rapid cell
+  traversal), and the three leaf-content rows `-broadleaf`, `-serration`, `-needles`.
+  `tests/e2e/vegetation-stress.test.ts` imports, cooks, streams and renders each with no overflow and
+  a validation-clean log, every row on its own host so one fixture's residency is never reported as
+  another's. The camera paths are the traversal fixture plus
+  `tests/e2e/gpu-scene-residency.test.ts`'s cut, teleport and resize storms; the simulation path is
+  `tests/e2e/vegetation-ecology.test.ts`'s budgeted catch-up route.)
+
+If a budget fails, optimize data/algorithms/scheduling; do not lower default vegetation density,
+disable distant motion, remove shadows/GI/RT, or introduce a lower-quality content path.
 
 ## Final repository closure
 
@@ -429,17 +587,19 @@ lower-quality content path.
   `docs/content` — the last of which enforces the timeless-present rule, so a stale status claim in any
   of these pages fails it.)
 - [x] Remove stale pending-plan claims and verify no superseded foliage/wind/renderer/shadow path or
-  documentation survives. (One real instance found and fixed: the `xtask`
-  `geometry_passes_use_the_canonical_coverage_module` test still listed `point_shadow.slang`, deleted by
-  the committed refactor that retired the meshlet and point-shadow RASTER paths — so `just test` had
-  been failing on a reference to a file the tree no longer has. The list now names the three geometry
-  passes that exist. The docs style checker enforces the no-stale-claims rule on prose.
+  documentation survives. (The `xtask`
+  `geometry_passes_use_the_canonical_coverage_module` test names the three geometry passes that exist —
+  `mesh.slang`, `gbuffer.slang`, `motion.slang` — and shadows are the one `vsm-pages` pass, so there is
+  no separate point-shadow raster pass for it to cover. The docs style checker enforces the
+  no-stale-claims rule on prose.
   THE SWEEP FOUND NOTHING SUPERSEDED LEFT ALIVE. The two top-level forms and the two
   bottom-level forms that landed last are capability branches, not surviving old paths: a device
   takes exactly one of each, chosen where the descriptor layout and the upload path resolve it, and
   the unused arm is unreachable rather than merely unused. `Placement` and `RtBlas` exist precisely
   so neither form re-derives what the other already decided.)
-- [x] Mark every phase and this README `COMPLETED` only after the integrated destination is green.
+- [ ] Mark every phase and this README `COMPLETED` only after the integrated destination is green.
+  WHAT REMAINS UNPROVEN: `just schema` completes its contract checks and then loses the device on
+  roughly half of its runs, so no run of the full gate has finished clean end to end.
   (ONE DEFECT IS OPEN AND NOT ATTRIBUTABLE TO THIS WORK, and this box exists to say so rather than to
   hide it: the control-schema contract run hangs
   the GPU about half the time. The signature is stable — `GPU submission 'frame 167' has been in

@@ -18,7 +18,7 @@ against the tree.
 | 7 GPU scene + visibility cutover | **complete** | 26 / 26 |
 | 8 vegetation rendering | **complete** | 26 / 26 |
 | 9 editor authoring + debug | **complete** | 21 / 21 |
-| 10 wind/deformation/phenology | **complete**, 6 carve-outs | 31 / 31 |
+| 10 wind/deformation/phenology | **complete**, carve-outs below | 31 / 31 |
 | 11 VSM / lighting / RT | **complete** | 24 / 24 |
 | 12 interaction/physics/queries/nav | **complete** | 26 / 26 |
 | 13 ecology + catch-up | **complete** | 28 / 28 |
@@ -26,16 +26,17 @@ against the tree.
 | 15 production/platform closure | **complete** | 20 / 20 |
 
 No box is open. Each carve-out is annotated on its own box and named in its phase's `Status` line
-rather than counted as done: phase 10's deeper debug surfaces (turbulence spectra as a per-octave view,
-a whole-field interaction capture) and authored per-part stiffness; phase 14's plant-proxy overlay
-appearance, which is a human-at-the-screen check.
+rather than counted as done: phase 10's cluster-tight swept bounds (they ride the Phase 11 VSM/RT
+consumers that need the per-cluster form), its deeper debug surfaces (turbulence spectra as a
+per-octave view, a whole-field interaction capture) and its authored per-part stiffness; phase 14's
+plant-proxy overlay appearance, which is a human-at-the-screen check.
 
 ## Platform coverage
 
 | Adapter | What it covers |
 |---|---|
 | `NVIDIA GeForce RTX 3070 Ti` (driver 610.43.03, api 1.4.341) | the required tier plus every optional one: `VK_KHR_acceleration_structure`, `VK_KHR_ray_query`, `VK_KHR_deferred_host_operations`, `VK_EXT_mesh_shader`, `VK_EXT_opacity_micromap` (`micromap = true`, subdivision level 12), `VK_NV_cluster_acceleration_structure`, `VK_NV_partitioned_acceleration_structure` |
-| `Apple M4` through MoltenVK (api 1.4.334) | the required indexed-MDI path, portable aggregate voxels, physical-atlas VSM, KHR features the driver exposes; no mesh stage, and nothing degrades for it |
+| `Apple M4` through MoltenVK (api 1.4.334) | the required indexed-MDI path, portable aggregate voxels, physical-atlas VSM, KHR features the driver exposes; no mesh stage, and nothing degrades for it. Its Rust/Slang conformance record is not current — `just compute-conformance` on an Apple device writes one |
 | Mesa llvmpipe | the software tier — correctness and validation, never performance. `vegetation-graph` is the one suite a CPU device cannot pass, because `VulkanGraphComputeExecutor::new` refuses GPU graph qualification there by contract |
 
 AMD is out of scope by the project owner's decision (2026-07-26): no such adapter exists for this
@@ -49,16 +50,20 @@ and read by nothing that chooses behaviour.
 
 ## The opt-in switches
 
-Four environment switches select a capability path or pin a decision a test needs held still. Each one
-has a harness that boots two hosts differing in exactly that variable, and the capability switches read
-the choice back from `render-stats`, so a switch that silently did nothing fails rather than passes.
+These environment switches select a capability path or pin a decision a test needs held still. Every
+harness asserts the switch took effect rather than trusting the flag — a readback from `render-stats`,
+a counter the switch moves, or a measured frame difference — so a switch that silently did nothing
+fails rather than passes. Five of the six compare two hosts differing in exactly that variable; the
+micro-field harness runs one host and asserts `microCandidates` is zero.
 
 | Switch | What it does | Harness |
 |---|---|---|
 | `SAFFRON_MESH_EXECUTOR=1` | runs the shaded scene pass through the übershader's `VK_EXT_mesh_shader` entry where `Capabilities::mesh_shader` holds | `tests/e2e/mesh-executor-parity.test.ts` |
 | `SAFFRON_PTLAS=1` | replaces the whole-table TLAS rebuild with `VK_NV_partitioned_acceleration_structure` | `tests/e2e/rt-ptlas.test.ts` |
+| `SAFFRON_OMM=off` | suppresses opacity-micromap attachment while the cook still derives them | `tests/e2e/vegetation-atlas-micromap.test.ts` |
 | `SAFFRON_CUT_OVERRIDE` | pins the traversal's refinement (`coarse`/`fine`) so a representation comparison changes one variable | `tests/e2e/vegetation-representation-parity.test.ts` |
 | `SAFFRON_NODE_CULL` | pins the hierarchy node cull on or off | `tests/e2e/node-cull-parity.test.ts` |
+| `SAFFRON_MICRO_FIELD=off` | stops the reconstructed micro-blade passes so a test can measure the macro plants alone | `tests/e2e/vegetation-distant-wind.test.ts` |
 
 The cut is also pinnable over the control plane through `set-hierarchy-cut {auto|coarse|fine}` per
 view.
@@ -95,8 +100,3 @@ reactive-coverage wind read, the windowed present path, a cross-thread queue rac
 handle behind a mutex and every operation takes it), and the GPU itself. It wants a capture with
 GPU-assisted validation armed long enough to reach frame 167. Phase 15's terminal box carries the full
 record.
-
-## State of the tree
-
-All work is **unstaged and uncommitted** — the standing rule is that staging and committing are the
-user's call. The last checkpoint commit is the user's own.

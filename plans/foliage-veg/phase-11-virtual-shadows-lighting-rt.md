@@ -36,8 +36,9 @@ map path.
   raster replays the executor stream through `vertexMainExecutor` + `depthPrepassFragment` — the
   same wind/deform vertex path and `sampleCanonicalCoverage` fragment as the depth prepass; each
   page group runs the same cull → traversal → binning chain over the same hierarchy. Displaced
-  (tess-seam) casters shadow from their base geometry: the page traversal runs `tess_seam: 0`, so
-  displacement detail is a camera-pass refinement, not a shadow term.)*
+  casters shadow from their base geometry: the page traversal runs `displaced_records: 0`, so every
+  instance walks its base pages and displacement detail is a camera-pass refinement rather than a
+  shadow term.)*
 - [x] Wind and interaction never disable at distance to save page invalidation. Reduced far modes and
   tight bounds provide the scalability mechanism. *(no distance gate exists in `gpuSceneWindDeform`;
   scalability comes from the S4 dynamic-dirty level cap — levels 6–7 whose 0.5 m+ texels cannot
@@ -128,16 +129,17 @@ map path.
   march against pages that had never been demanded, a hole in the gather rather than a missing
   pixel. `gi_reachable_pages_outrank_pages_nothing_reads` pins the ordering as an inequality rather
   than as three magic constants, so retuning the weights cannot silently invert it.
-  BOTH SETS ARE CUT AGAINST ONE WINDOW. `rt_instances` is
-  gated against the same cascade window as `sdf_instances`, and so are the vegetation ray instances
-  the mirror splices in — a resident cell reaches far past what any ray does, and splicing its
-  plants in wholesale was the last ungated half. Reported as `rtInstancesCulled`, named apart from
+  BOTH SETS ARE CUT AGAINST ONE WINDOW. The ray instances and the SDF occluders are gated against
+  the same coarsest-cascade window — the occluders by the reach visibility view's device cull plus
+  the per-field test in `gi_occluder_scatter.slang`, the ray instances by `window_intersects`
+  (`gpu_scene_mirror/facts.rs`) — and a resident cell reaches far past what any ray does, so the
+  mirror's plants are gated by it too. Reported as `rtInstancesCulled`, named apart from
   a drop for the same reason `sdfInstancesCulled` is: culling is a claim about REACH and is sound,
   while an instance lost to capacity is geometry silently missing from reflections.
-  ONE PREDICATE, NOT TWO. `window_intersects` (`gpu_scene_mirror/facts.rs`) is shared by both cuts
-  rather than each repeating
-  the comparison, so they cannot drift into disagreeing about what reachable means — which would
-  surface as a reflection and a cone trace gathering from different sets of occluders.
+  ONE WINDOW, NOT TWO. `gi_occluder_bounds` is the only definition of reach, pushed to the reach
+  cull and read by the mirror's cut, so the two cannot drift into disagreeing about what reachable
+  means — which would surface as a reflection and a cone trace gathering from different sets of
+  occluders.
   `the_ray_cut_keeps_what_a_ray_can_reach_and_drops_what_it_cannot` pins the cases that matter: an
   occluder DIRECTLY BEHIND THE EYE survives (the one a frustum cull gets backwards), one outside
   the coarsest cascade drops, a straddling one is kept because the cut may only drop what it can
@@ -147,7 +149,7 @@ map path.
   `tests/e2e/rt-telemetry.test.ts`.
   VEGETATION REACHES BOTH SETS. It never enters the ECS — the mirror syncs it straight into the
   persistent GPU scene and micro-field blades are reconstructed GPU-side in `add_micro_field_passes` —
-  so it takes its own route. `GpuSceneMirror::vegetation_ray_instances` derives ray instances from the
+  so it takes its own route. `GpuSceneMirror::ray_instances` derives a plant's ray instances from the
   RETAINED plant state, not the sync delta, which would have published a plant once and then lost it
   on the next unchanged frame; a multi-prototype family expands into one TLAS instance per use over
   per-prototype structures. `tests/e2e/vegetation-rt.test.ts` asserts resident plants move
@@ -249,9 +251,11 @@ map path.
   frame's TLAS rather than a dead "built ever" counter that never had a caller. e2e `rt-blas`: four
   added cube instances move `rtInstances` by exactly 4 and `blasCount` by at most 1, and the frame is
   validation-clean. TRANSFORMS AND MATERIAL CLASSIFICATION PERMIT IT BY CONSTRUCTION: the transform is
-  per-`VkAccelerationStructureInstanceKHR`, and the opacity class rides the per-instance
-  `FORCE_OPAQUE`/`FORCE_NO_OPAQUE` flag while the BLAS geometry stays `OPAQUE`, so two instances that
-  classify differently still share one structure. COMPACTED: `MESH_BLAS_BUILD_FLAGS` adds
+  per-`VkAccelerationStructureInstanceKHR`, and a geometry's opacity comes from the cooked material
+  class of its material-homogeneous submesh (`cooked_submesh_opacity`), so an instance whose runtime
+  material contradicts that class expresses the disagreement through `instance_opacity_flags` —
+  `FORCE_OPAQUE`/`FORCE_NO_OPAQUE` plus `DISABLE_OPACITY_MICROMAPS_EXT` — rather than through a second
+  structure. COMPACTED: `mesh_blas_build_flags` adds
   `ALLOW_COMPACTION`, and `Uploader::compact_mesh_blas` reads the
   `ACCELERATION_STRUCTURE_COMPACTED_SIZE_KHR` query and copies through
   `record_blas_compaction` (`CopyAccelerationStructureModeKHR::COMPACT`) into an exactly-sized
@@ -262,21 +266,20 @@ map path.
   supports nested micro-instance parts inside one plant BLAS.
   (THE WARNING IN THE BOX IS THE DESIGN. KHR structures cannot nest micro-instance parts, so a
   family is **one structure per prototype plus one TLAS instance per placed use** — never a merged
-  plant BLAS. `MeshAssembly::prototype_index_ranges` records each prototype's slice of the flattened
-  index stream (derived from the uploaded submesh table, the authoritative layout),
+  plant BLAS. `MeshAssembly::prototype_slices` records each prototype's `AssemblyPrototypeSlice` of the
+  flattened index stream (derived from the uploaded submesh table, the authoritative layout),
   `record_mesh_blas_build` takes a `MeshBlasGeometry` carrying that range, and `GpuMesh` holds the
   per-prototype set in `assembly_blas`. `Rt::prepare_tlas_build` expands an assembly input into one
   instance per use its combination leaves active, composing the use's family-local matrix with the
   instance's world transform.
   A PARTIAL SET IS REFUSED: if any prototype's structure fails to build, the whole set is dropped
   rather than placed. Half a canopy casting is worse than none casting, because it looks correct.
-  PLANTS REACH THE TLAS AT ALL FOR THE FIRST TIME. Vegetation never enters the ECS, so the CPU scan
-  that builds `rt_instances` could not see it and no plant had ever been in the TLAS.
-  `GpuSceneMirror::vegetation_ray_instances()` derives inputs from RETAINED plant state, not from a
-  sync delta — the first attempt accumulated during the delta walk and published an empty set on
-  any steady frame, which silently removed every plant from the TLAS. It also places
-  single-prototype families, which are cooked as plain meshes; requiring the assembly form dropped
-  them, and the fixture happens to be exactly that shape.
+  PLANTS REACH THE TLAS THROUGH RETAINED MIRROR STATE. Vegetation never enters the ECS, so nothing
+  that walks entities can see it. `GpuSceneMirror::ray_instances()` derives a plant's inputs from
+  RETAINED plant state rather than from a sync delta: accumulating during the
+  delta walk publishes an empty set on any steady frame, which silently removes every plant from the
+  TLAS. It also places single-prototype families, which are cooked as plain meshes — requiring the
+  assembly form drops them, and the fixture is exactly that shape.
   Measured by `tests/e2e/vegetation-rt.test.ts`: a resident cell moves `rtInstances` 1 → **5**
   and `blasCount` 1 → **2**, with `blasBytes` rising and validation clean.)
   (HARDWARE NOW PRESENT — this box needs code, not a machine. The RTX 3070 Ti advertises
@@ -430,22 +433,21 @@ map path.
   built and `rtInstances`/`blasCount` non-zero. The patch is not guessed: it was located by diffing a
   normal frame against a build that rejects every candidate, so the pixels sampled are exactly the
   candidate-driven ray shadow. Whole-frame comparison cannot show this — the change is ~2620 px in
-  1.44M and sits under that metric's noise floor, which is what made several earlier readings of this
-  box wrong.
+  1.44M and sits under that metric's noise floor, so a frame mean reads as no change at all.
   CHAIN PARITY separately: `ray_candidate_classification_matches_the_cpu_classifier`
   (`gpu_scene_upload.rs`) drives the same resolve-and-classify chain on the GPU and compares every
   resolved word against `classify_canonical_coverage` byte-exactly, green on this hardware.)*
 - [x] Derive optional `VK_KHR_opacity_micromap` data from the exact coverage texture/mip/classification
   source and validate conservative/unknown states. OMM removes cost, never correctness.
-  (**THE BOX TITLE IS NOT WRONG; AN EARLIER NOTE HERE WAS.** That note claimed no `VK_KHR_` micromap
-  extension exists. It does — `VK_KHR_opacity_micromap`, last modified 2026-05-08 — and it differs
+  (**THE BOX NAMES THE KHR EXTENSION; THE TREE TARGETS EXT.** `VK_KHR_opacity_micromap` exists (last
+  modified 2026-05-08) and differs
   architecturally from EXT: KHR creates micromaps *as* `VkAccelerationStructureKHR` and builds, copies
   and queries them with the acceleration-structure commands, rather than owning a separate
   `VkMicromapEXT` object and `vkCmdBuildMicromapsEXT`.
-  **We target EXT anyway, for two measured reasons**: driver 610.43.03 on the RTX 3070 Ti advertises
-  `VK_EXT_opacity_micromap` rev 2 and no KHR variant, and `ash` is pinned `=0.38` (Vulkan 1.3.281),
-  whose only micromap module is `ext::opacity_micromap`. Revisit if either changes. Everything below
-  uses the EXT name because that is what is callable, not because KHR is fictional.
+  **EXT is what is callable here, for two measured reasons**: driver 610.43.03 on the RTX 3070 Ti
+  advertises `VK_EXT_opacity_micromap` rev 2 and no KHR variant, and `ash` is pinned `=0.38`
+  (Vulkan 1.3.281), whose only micromap module is `ext::opacity_micromap`. Revisit if either changes;
+  everything below uses the EXT name.
   THE CAPABILITY LAYER IS BUILT: `device.rs` probes the extension behind the RT gate — a micromap is
   only meaningful attached to an AS build — queries
   `PhysicalDeviceOpacityMicromapFeaturesEXT::micromap`, enables extension *and* feature at device
@@ -455,7 +457,7 @@ map path.
   coming up validation-clean, asserted by `tests/e2e/rt-telemetry.test.ts` — which does not
   assert the capability's *value* (it is device-dependent) but does assert it is reported, that it
   never claims true without ray tracing, and that enabling it raised no validation message.
-  **THE DERIVATION IS NOW BUILT AND PROVEN; ATTACHMENT IS NOT.**
+  THE DERIVATION IS BUILT AND PROVEN.
   `geometry/src/opacity_micromap.rs` derives conservatively: a micro-triangle is called opaque or
   transparent only where a min/max alpha pyramid proves every point of its UV footprint classifies
   that way, and anything else is UNKNOWN — which traversal treats as non-opaque, so the classifier
@@ -463,8 +465,9 @@ map path.
   tested at levels 0..=4. Subdivision follows texel density (4 texels per micro-triangle, the
   bilinear support), which bounds total work by the *texture* rather than the mesh. Uniform
   triangles emit special indices and no block.
-  THE KEYSTONE, and it is mutation-checked: `settled_micro_triangles_agree_with_the_classifier_
-  under_every_hash` samples inside every settled micro-triangle and runs the real
+  THE KEYSTONE, and it is mutation-checked:
+  `settled_micro_triangles_agree_with_the_classifier_under_every_hash`
+  samples inside every settled micro-triangle and runs the real
   `classify_canonical_coverage` across many salts, anchors and temporal phases, asserting agreement.
   The first version of that test used a soft-edged card and **passed even with a deliberately
   non-conservative rule** — the ramp was too narrow for the error to land in a settled block. A
@@ -473,32 +476,20 @@ map path.
   `record_micromap_build`, proven by `a_derived_micromap_builds_validation_clean`. That test caught
   a real defect — micromap build inputs must be **256-byte aligned**, and unaligned ones are invalid
   rather than merely slow.
-  WHY ATTACHMENT IS STILL OPEN, with evidence rather than assertion. Per spec an instance-level
-  `FORCE_OPAQUE`/`FORCE_NO_OPAQUE` overrides a micromap outright, and this engine expresses opacity
-  per instance, so a micromap attached today is inert. Moving opacity onto the geometry was tried
-  using the cooked `PortableRayTracingRecord::material_class` — and `tests/e2e/rt-anyhit.test.ts`
-  failed, because it assigns a thin-sheet material **at runtime** to a built-in cube whose cooked
-  class is Opaque. That is a direct proof of the design's claim: **the BLAS must be keyed by
-  (geometry x material)**, since one mesh is instanced with materials chosen at runtime and
-  cook-time class cannot express it. The change was reverted rather than left as a regression.
-  What remains: a BLAS cache keyed by that pair, built lazily where materials are known, plus the
-  cook stage that emits the derivation into the `RayTracing` section.
-  THE OLD NOTE BELOW IS SUPERSEDED and kept only for the plumbing it names. **A previous note here named the wrong blocker**, claiming the upload
-  path does not retain decoded image data. It does: `texture_pixels_by_uuid` (`assets/src/lib.rs:333`)
-  caches decoded RGBA8 behind `load_texture_pixels`, and the plant cooker *already* decodes coverage
-  textures and runs a per-texel algorithm over them (`resolve_material_coverage_image` →
-  `contour_alpha_card`), with reads hash-guarded through `CookAssetAccess::read_source`. A cook-time
-  stage is still the right shape — but because that is where the per-texel work belongs, not because
-  the data is unavailable.
-  THE REMAINING GAP IS NARROWER THAN THE LINES ABOVE SAY, and two of their claims are now false.
-  `triangle_geometry` no longer returns `<'static>` and no longer hardcodes
-  `GeometryFlagsKHR::OPAQUE`: `MeshBlasGeometry` carries an `opaque` field and a
-  `micromap: Option<&Micromap>` slot. And the
-  `VkAccelerationStructureTrianglesOpacityMicromapEXT` chain is not absent — it is built and pushed
-  onto the triangles geometry. The *policy* half exists end to end too:
+  OPACITY LIVES ON THE GEOMETRY, WHICH IS WHAT LETS A MICROMAP MEAN ANYTHING. Per spec an
+  instance-level `FORCE_OPAQUE`/`FORCE_NO_OPAQUE` overrides a micromap outright, so an engine that
+  forced opacity per instance would render every micromap inert. `MeshBlasGeometry` carries `opaque`
+  and `micromap: Option<&Micromap>` per geometry, one geometry per material-homogeneous submesh
+  (`cooked_submesh_opacity` resolving the cooked `material_class`, non-opaque where a submesh has no
+  cluster to answer for it), and `VkAccelerationStructureTrianglesOpacityMicromapEXT` is pushed onto
+  the triangles geometry. `instance_opacity_flags` forces opacity only for an instance whose runtime
+  material contradicts the cooked class, and that case also sets `DISABLE_OPACITY_MICROMAPS_EXT`,
+  because a micromap derived for the cooked material describes coverage this instance does not have.
+  `tests/e2e/rt-anyhit.test.ts` is exactly that case: it assigns a thin-sheet material at runtime to a
+  built-in cube whose cooked class is Opaque. The *policy* half exists end to end too:
   `OpacityMicromapDerivation` (enable, subdivision cap, transparent/opaque thresholds) is packed into
   `omm_policy`/`omm_thresholds` in `global_gpu_data.rs`.
-  CLOSED, AND THE CLAIM IS MEASURED RATHER THAN ARGUED.
+  THE CLAIM IS MEASURED RATHER THAN ARGUED.
   `vegetation-atlas-micromap` builds a thin-sheet family whose coverage is a diagonal cutout, then
   boots a SECOND host differing in exactly `SAFFRON_OMM=off` and compares settled frames.
   `meanAbsoluteDifference` is **0** — exactly, not within a tolerance, because a micromap that
@@ -515,7 +506,7 @@ map path.
   sets `AlphaMode::Mask` — so an OBJ-sourced family cannot express a masked material at all, and no
   existing fixture could ever have exercised this. `plant-create` binds catalog materials directly,
   which is the one path where a test can author the coverage it wants to see.
-  EVERY ONE OF THE FIVE ABSENCES BELOW IS NOW CLOSED. `derive_family_micromaps` runs as a cook
+  THE COOK-TO-DEVICE CHAIN IS WHOLE. `derive_family_micromaps` runs as a cook
   stage over the atlas alpha plane and emits into the `RayTracing` section (domain `/v2`, hierarchy
   format 4); `build_cooked_micromaps` rebuilds them at upload and feeds
   `MeshBlasGeometry.micromap`, retained on `GpuMesh` so they outlive every structure referencing
@@ -666,9 +657,9 @@ map path.
   and validation clean — a shadow left at a stale caster position does not fit in that budget. The
   test proves its own metric discriminates: a frame from one of the churn poses must score above
   5× the tolerance, so the assertion cannot pass on a blind metric.
-  PAGE CHURN UNDER PRESSURE IS NOW COVERED, which the note below recorded as unreachable. The
-  render budget was a compile-time 64 and the atlas holds 1024 tiles, so no scene a test can build
-  ever starved it. `vsm-page-budget` makes the throttle settable: at ONE page a frame the dirty set
+  PAGE CHURN UNDER PRESSURE IS COVERED. A compile-time
+  render budget of 64 against an atlas of 1024 tiles cannot be starved by any scene a test can
+  build. `vsm-page-budget` makes the throttle settable: at ONE page a frame the dirty set
   outruns the refresh, which is the backlog the reconvergence path exists to survive.
   `a starved page budget still reconverges to the reference image` asserts the pressure was REAL
   before trusting the recovery — peak dirtied above zero and peak rendered at most one, sampled

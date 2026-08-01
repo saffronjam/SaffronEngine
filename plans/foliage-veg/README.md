@@ -45,9 +45,13 @@ When the planset is complete:
   and future sequenced network envelopes without conflating their different retention semantics;
 - the persistent GPU Scene is a derived render mirror updated by deltas, never the scene or
   vegetation authority;
-- all geometry passes consume one semantic visible-cluster stream. Portable compute plus indexed
-  multi-draw-indirect is required; mesh shaders, opacity micromaps, and vendor RT structures are
-  capability executors over identical content;
+- raster, virtual shadow maps, and the GI occluder feed consume one semantic visible-cluster
+  stream, produced on device by the visibility hierarchy. Ray tracing places the same mirrored
+  instances through a host-built instance stream: an acceleration-structure build is host-recorded,
+  the partitioned top level diffs against host-stable instance slots, and the wind materialization
+  budget is planned against the same list. Portable compute plus indexed multi-draw-indirect is
+  required; mesh shaders, opacity micromaps, and vendor RT structures are capability executors over
+  identical content;
 - wind is structured deformation driven by the shared Environment wind field, with current and
   previous state reused by depth, shading, motion, shadows, GI, and ray tracing;
 - a physical-atlas virtual shadow-map system replaces fixed foliage-hostile shadow maps; and
@@ -68,7 +72,8 @@ flowchart TD
     F --> Q[queries / physics / nav contributions / simulation]
     F --> G[GPU Scene render mirror]
     G --> H[visibility hierarchy and page requests]
-    H --> I[raster / VSM / GI / RT]
+    H --> I[raster / VSM / GI]
+    G --> J[host-built ray instance stream]
     F --> P[promoted hecs + Jolt entity]
     P --> M
 ```
@@ -157,7 +162,7 @@ portable.
 | 12 | [`phase-12-interaction-physics-queries-nav.md`](phase-12-interaction-physics-queries-nav.md) | Add facet-resident Jolt proxies, atomic promotion/demotion, complete `WorldHitTarget` cutover, script/control queries, persistent disturbance, products, and navigation contribution seams. | 5, 8, 10 |
 | 13 | [`phase-13-ecology-catchup.md`](phase-13-ecology-catchup.md) | Add fixed-tick lifecycle/ecological rule simulation, cross-cell competition, succession, propagation, checkpoints, deterministic catch-up, and fire/weather ownership hooks. | 3, 5, 12 |
 | 14 | [`phase-14-botanical-authoring-interchange.md`](phase-14-botanical-authoring-interchange.md) | Add native procedural/manual botanical authoring and normalize glTF/USD/Houdini/SpeedTree-originated standard exports into the same `.splant` and point contracts. | 2, 6, 9–10 |
-| 15 | [`phase-15-production-platform-closure.md`](phase-15-production-platform-closure.md) | Close export cooking, incremental distributed work, future networking codecs, multi-source residency, telemetry, pathological tests, NVIDIA/AMD/MoltenVK quality parity, docs, and integrated scale budgets. | 1–14 |
+| 15 | [`phase-15-production-platform-closure.md`](phase-15-production-platform-closure.md) | Close export cooking, incremental distributed work, future networking codecs, multi-source residency, telemetry, pathological tests, NVIDIA/MoltenVK/software-tier quality parity, docs, and integrated scale budgets. | 1–14 |
 
 Phases 1–5 deliberately establish identity, deterministic evaluation, mutation semantics, and
 persistence before plants become broadly editable. Phases 6–7 establish the final renderer before
@@ -165,25 +170,26 @@ vegetation rendering; no disposable CPU foliage renderer is ever introduced. Pha
 cutover: the old static gather, transparent sorting, shadow-only gathers, and opt-in per-instance
 mesh-task loop are deleted in the same phase that every responsibility moves to the GPU Scene.
 
-## Current-code grounding
+## Where each seam lives
 
-| Concern | Current files and symbols | Consequence for the plan |
+| Concern | Files and symbols | The rule it carries |
 |---|---|---|
-| CPU scene gather | `engine/crates/assets/src/render_scene.rs` — `DrawListBuild`, `gather_static_draw_list`, `gather_skinned_draw_list`, `SceneRenderer::submit_draw_list` | Phase 7 must move every consumer and delete this gather, not add vegetation beside it. |
-| CPU frame batching | `engine/crates/rendering/src/instancing.rs`; `draw_list.rs` — `DrawItem`, `DrawBatch`, `SceneDrawList` | The 256-byte per-frame `InstanceData` and CPU buckets cannot scale to vegetation. |
-| Opt-in meshlet path | `engine/crates/rendering/src/meshlet_raster.rs`; `engine/assets/shaders/meshlet.slang` | It emits one mesh-task draw per instance/submesh and only frustum-culls spheres; Phase 7 retires it. |
-| Existing Vulkan capabilities | `engine/crates/rendering/src/device.rs` — `Capabilities`, `draw_indirect_count`, `mesh_shader_supported` | Query individual feature bits/limits; portable indexed MDI is required on MoltenVK. |
-| Render graph | `engine/crates/rendering/src/render_graph.rs`, `transient.rs` | Phase 6 adds persistent/transient buffers and indirect access/barrier declarations before culling. |
-| Virtual hierarchy | `engine/crates/geometry/src/virtual_hierarchy.rs`; `engine/crates/rendering/src/upload.rs` | One portable appearance-error hierarchy feeds artifact codecs and execution packing. |
-| Material schema | `engine/crates/assets/src/material.rs` — `MaterialAsset`; `render_material.rs`; `lighting.slang` — `SurfaceData` | Thin-sheet and coverage contracts land before plant hierarchy baking. |
-| Asset catalog | `engine/crates/scene/src/environment.rs` — `AssetType`; `engine/crates/assets/src/scan.rs`, `names.rs`, `manage.rs` | Add Plant/Biome/VegetationMap through every frozen map and scan/rename/delete route. |
+| Scene → raster path | `engine/crates/rendering/src/visibility/`; `engine/assets/shaders/scene_bin_count.slang`, `scene_bin_scatter.slang` | One semantic visible-cluster stream per view, binned on the GPU. No CPU gather composes a draw list for anything, vegetation included. |
+| GPU Scene mirror | `engine/crates/assets/src/gpu_scene_mirror/`; `engine/crates/rendering/src/gpu_scene_upload/`, `persistent_gpu_scene/` | A derived render mirror updated by journal deltas; it never assigns plant or entity identity. |
+| Per-frame instance set | `engine/crates/rendering/src/instancing.rs` — `Instancing`, `gather_instance_deformation` | Set 2 carries the joint palette, the material-parameter arena, the address block, and the record stream — not a per-frame batch of per-object bytes. |
+| Executor selection | `engine/assets/shaders/mesh.slang` — `vertexMainExecutor`, `meshMainExecutor`; `engine/crates/rendering/src/pipelines/` — `PsoKey` | Both entries read one binned stream. A capability executor varies command mechanics, never content. |
+| Vulkan capabilities | `engine/crates/rendering/src/device/` — `Capabilities`, `draw_indirect_count`, `mesh_shader` | Behaviour keys on individual feature bits and limits; portable indexed MDI is the required path and is what MoltenVK takes. |
+| Render graph | `engine/crates/rendering/src/render_graph/`, `transient.rs` | A pass declares its resource usage; the graph derives every barrier and layout transition. |
+| Virtual hierarchy | `engine/crates/geometry/src/virtual_hierarchy/`; `engine/crates/rendering/src/upload/` | One portable appearance-error hierarchy feeds artifact codecs and execution packing. |
+| Material schema | `engine/crates/assets/src/material/` — `MaterialAsset`; `render_material.rs`; `engine/assets/shaders/lighting.slang` — `SurfaceData` | Thin-sheet and coverage parameters live in the one material vocabulary. |
+| Asset catalog | `engine/crates/scene/src/environment.rs` — `AssetType`; `engine/crates/assets/src/scan/`, `names.rs`, `manage/` | Plant, Biome, and VegetationMap route through every frozen map and every scan/rename/delete path. |
 | Scene component registry | `engine/crates/scene/src/registry.rs` — `register_builtin_components`, `BUILTIN_COMPONENT_NAMES`; `engine/crates/protocol/src/scene_dto.rs` — `COMPONENT_NAMES` | `VegetationField` is one fully registered serialized component with generated DTOs. |
-| Surface picking | `engine/crates/assets/src/render_scene.rs` — `SceneSurfaceHit`, `pick_scene_surface` | Replace the entity/point-only shape with the shared provider hit including normal, tangent, tags, identity, and revision. |
-| Shared wind/calendar | `engine/crates/scene/src/environment.rs` — `WindSettings`, `TimeOfDaySettings`, `SceneEnvironment` | Extend this single source; never add foliage-private wind or calendar state. |
-| ECS mutation seam | `engine/crates/scene/src/scene.rs` — `add_component`, `remove_component`, `with_component_mut`, `for_each` | Phase 7 adds a tracked delta journal and world-transform dirtiness so rendering scales with changes. |
-| Physics hit identity | `engine/crates/physics/src/types.rs` — `RayHit`; `world.rs` — `BodyEntry`, `map_ray_hit` | Phase 12 makes the breaking tagged-target cutover through Rust, protocol, `sa`, Luau, contacts, and tests. |
-| Editor docking | `editor/src/state/dockLayout.ts`; `components/dock/panelRegistry.tsx`; `panels/AssetEditorWorkspace.tsx` | Vegetation gets its own closable scene tool/panel and asset workspaces; Environment remains focused. |
-| Generated protocol | `engine/crates/protocol/src/{dto,scene_dto,command,codegen}.rs`; `engine/xtask/src/protocol/` | Rust DTOs remain the only source; regenerate `editor/src/protocol/sa-types.ts`, never hand-edit it. |
+| ECS mutation seam | `engine/crates/scene/src/scene.rs` — `add_component`, `with_component_mut`; `journal.rs` | Every mutable path reports the affected entity, type, and revision, so rendering scales with changes rather than with instance count. |
+| Surface picking | `engine/crates/assets/src/render_scene/pick.rs` — `pick_scene_surface`; `render_scene/mod.rs` — `SceneSurfaceHit` | One shared provider hit carrying the surface result and the provider's capabilities at the sampled revision. |
+| Shared wind/calendar | `engine/crates/scene/src/environment.rs` — `WindSettings`, `TimeOfDaySettings`, `SceneEnvironment` | The single source. No foliage-private wind or calendar state. |
+| Hit identity | `engine/crates/physics/src/types.rs` — `RayHit`, `WorldHitTarget`; `world/` — `BodyEntry` | One tagged target through Rust, protocol, `sa`, Luau, contacts, and tests; no UUID sentinel or truncated id. |
+| Editor docking | `editor/src/state/dockLayout.ts`; `components/dock/panelRegistry.tsx`; `panels/AssetEditorWorkspace.tsx` | Vegetation owns closable scene panels and asset workspaces; Environment keeps the shared controls only. |
+| Generated protocol | `engine/crates/protocol/src/dto/`, `command/`, `scene_dto.rs`, `codegen.rs`; `engine/xtask/src/protocol/` | Rust DTOs are the only source; `editor/src/protocol/sa-types.ts` is regenerated, never hand-edited. |
 
 ## Non-negotiable invariants
 
@@ -241,8 +247,9 @@ just test
 just e2e
 ```
 
-GPU phases also run validation-clean representative and stress scenes on NVIDIA, AMD, and Apple through
-MoltenVK. Use the repository's standard headless/run recipes and GPU-driver macro. The plan never treats
+GPU phases also run validation-clean representative and stress scenes on NVIDIA and on Apple through
+MoltenVK. AMD is out of scope by the project owner's decision (2026-07-26): no such adapter exists for
+this project, so nothing is verified or claimed there. Use the repository's standard headless/run recipes and GPU-driver macro. The plan never treats
 Epic/NVIDIA timing or compression figures as Anima acceptance thresholds; Phase 1 records Anima's own
 quality and performance budgets before implementation.
 

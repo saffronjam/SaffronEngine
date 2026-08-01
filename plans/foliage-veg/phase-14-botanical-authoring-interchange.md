@@ -191,24 +191,39 @@ second editable plant source, and no native-only renderer path exists.
 
 - [x] Add structure tree/graph, 3D preview, semantic selection, parameter inspector, family variation
   browser, wind/interaction preview, lifecycle/season timeline, materials/atlas view, collision/nav,
-  hierarchy/voxel/error, and validation/cook-stat panels to the Plant workspace. (`PlantGraphPanel`
-  (the `plantGraph` asset-editor dock panel) carries the STRUCTURE readout (axes, elements, shells,
-  grafts, vertices, triangles, parts, height, applied edits, graph identity), the FAMILY VARIATION
-  BROWSER with per-variation age editing, the addressable ELEMENT list — which is also the semantic
-  selection surface, since an edit targets one of those identities — the orphaned-edit list, and the
-  VALIDATION/COOK-STAT readout from `plant-validate`.
-  THE 3D PREVIEW EXISTS — an earlier note here listed it as missing and was wrong. `enter_plant_preview`
+  hierarchy/voxel/error, and validation/cook-stat panels to the Plant workspace.
+  (`PlantGraphPanel/` (the `plantGraph` asset-editor dock panel) puts the BOTANICAL GRAPH on the
+  shared node canvas — the same `GraphCanvas` the material and biome graphs use — with the
+  document's operators as nodes wired through typed pins. Every canvas gesture (add, delete,
+  connect, disconnect) is one semantic document edit through the panel's single write path, never a
+  local model saved later; the document carries no layout, so columns come from each node's longest
+  path from a source.
+  THREE TABS SIT UNDER THE CANVAS. NODE is the typed PARAMETER INSPECTOR for the selected
+  operator — trunk length/taper/segments, branch length and radius ratios, declination and jitter,
+  phyllotaxis pattern and divergence, tropism stimulus and plane, prune rule and threshold, roots,
+  shells, instances, module calls. STRUCTURE is the STRUCTURE TREE of what the graph grew: axes nest
+  under the axis they grew from and a placement hangs under the axis carrying its frame. Picking a
+  row there is the SEMANTIC SELECTION every manual edit addresses — an edit names *that* element's
+  identity, derived from ancestry, so it survives a parameter change — and Transform, Trim, Remove,
+  and Graft are authored on the selected row. FAMILY carries the VARIATION BROWSER with
+  per-variation age editing, the MODULE CALL bindings, the growth readout (axes, elements, shells,
+  grafts, vertices, triangles, parts, height, applied edits, graph identity), the orphaned-edit
+  list, and the VALIDATION/COOK-STAT readout from `plant-validate`.
+  A MODULE CALL AND ITS BINDING MOVE TOGETHER, because the family validator refuses either half
+  alone: adding one mints the call GUID, the node, and the reference in a single document edit, so
+  the canvas add palette does not offer a bare `module-call`.
+  A PARAMETER SCRUB IS ONE EDIT, not one per keystroke. Field changes edit a local document and
+  write once the typing settles; a structural gesture landing mid-burst folds the burst into itself
+  rather than recording a second entry, and writes queue on one promise chain so a later reply can
+  never publish an older document.
+  THE 3D PREVIEW EXISTS. `enter_plant_preview`
   builds a real preview scene and returns `plant_combinations`, and a `.splant` subject drives the
   `assetPreview` subsurface: `AssetEditorWorkspace` short-circuits to a summary for biome and
-  vegetation-map subjects only, so a plant falls through to the live surface. A stale comment in
-  `assetEditorPanels.tsx` still says vegetation subjects have no 3D preview surface and is
-  contradicted by the code three lines below it; deleting that comment belongs with this box.
-  THAT GAP IS CLOSED. The capability effect now opens `plantGraph` for a plant subject, AFTER the
+  vegetation-map subjects only, so a plant falls through to the live surface. The capability effect
+  opens `plantGraph` for a plant subject, AFTER the
   rig branch closes `skeleton` — the two share a dock leaf, and a plant grown from a botanical graph
-  is rigless, so opening first would put the panel in a leaf that then collapses. The stale comment
-  is deleted; the accurate statement is that only biome and vegetation-map subjects short-circuit to
-  a summary, because neither has a single renderable form to show.
-  THE WIND/INTERACTION PREVIEW IS NOW BUILT. `PlantWindPanel` (the `plantWind` asset-editor dock
+  is rigless, so opening first would put the panel in a leaf that then collapses.
+  THE WIND/INTERACTION PREVIEW IS BUILT. `PlantWindPanel` (the `plantWind` asset-editor dock
   panel, opened for a plant subject beside `plantGraph` and closed for every other) drives the REAL
   wind field and the REAL interaction field rather than a model of them, so the previewed plant is
   the plant. That is what makes it a surface rather than a readout: a table of stiffness and drag
@@ -219,17 +234,14 @@ second editable plant source, and no native-only renderer path exists.
   radially outward from its own centre and therefore cancels AT the centre, so a push aimed at the
   subject would move nothing and look exactly like a broken control. That cost most of a day
   elsewhere in this planset and is written into the panel so it cannot be rediscovered.
-  THE LIFECYCLE/VARIATION SCRUB WAS ALREADY THERE and this box's earlier note undercounted it:
+  THE LIFECYCLE/VARIATION SCRUB IS THERE:
   `AssetEditorWorkspace` reads `plantCombinations` from `enter-asset-preview` and drives
   `set-asset-preview-options {variation, phenotype}`, so scrubbing a combination changes what the
-  live preview renders. What is missing from that clause is the SEASON axis specifically — the
-  rendered phenotype resolves from typed lifecycle plus season, and no preview control moves the
-  calendar.
-  PHENOTYPES ARE NOW AUTHORABLE. `plant-phenotypes` reads and replaces a family's appearance list
-  over the control plane, which nothing could do before — `plant-create` scaffolds exactly one and
-  there was no way to add a second. That is the authoring half of the lifecycle clause; the panel
-  over it and the season scrub are what remain.
-  THE MATERIALS/ATLAS VIEW IS NOW BUILT. `plant-atlas {plant, level?}` returns one level of the
+  live preview renders; the season axis of the same clause is `PlantSeasonPanel`, below.
+  PHENOTYPES ARE AUTHORABLE. `plant-phenotypes` reads and replaces a family's appearance list
+  over the control plane; `plant-create` scaffolds exactly one, and this is how a family gains a
+  second.
+  THE MATERIALS/ATLAS VIEW IS BUILT. `plant-atlas {plant, level?}` returns one level of the
   packed coverage atlas as a PNG with its placements, and `PlantAtlasPanel` shows it over a checker
   so the gutter and the cut-out alpha read as transparent rather than as black — which is the whole
   reason to look at an atlas.
@@ -245,15 +257,15 @@ second editable plant source, and no native-only renderer path exists.
   genuinely smaller, and that a level past the chain is an error rather than a silent clamp.
   A family whose slots resolve to catalog materials cooks no atlas; the panel says so in place
   rather than raising a toast on every plant an author opens.
-  THE HIERARCHY/VOXEL/ERROR VIEW IS NOW BUILT, and it is two halves that only mean something
+  THE HIERARCHY/VOXEL/ERROR VIEW IS BUILT, and it is two halves that only mean something
   together. `plant-hierarchy` returns the published cut node by node — representation, primitive
   count, page, depth, and the five-component declared error — and `set-hierarchy-cut` pins what the
   preview beside it actually draws.
-  PINNING THE CUT IS THE HALF THAT WAS MISSING. A representation comparison needs the cut to move
+  PINNING THE CUT OVER THE CONTROL PLANE IS THE HALF THAT MAKES IT A VIEW. A representation
+  comparison needs the cut to move
   while the CAMERA HOLDS STILL: flying out to reach the aggregate shrinks the subject at the same
-  time, so any difference conflates the two changes. It used to be boot-time `SAFFRON_CUT_OVERRIDE`
-  env, which is no way to compare anything — the env stays as the initial value a test needs before
-  the first frame, not as a second mechanism.
+  time, so any difference conflates the two changes. `SAFFRON_CUT_OVERRIDE` remains the initial value
+  a test needs before the first frame, not a second mechanism.
   THE ERROR COLUMN IS THE NUMBER THE SELECTOR READS, shown in local units rather than as a raw
   Q15.16 word, and it says `saturated` where it saturates. That is the surprising case worth seeing:
   a comb of thin blades calibrates to an error so wide the aggregate is never selected while
@@ -264,7 +276,7 @@ second editable plant source, and no native-only renderer path exists.
   aggregate nodes exist (a hierarchy of triangles alone would leave the cut control nothing to move
   between), exactly one root, every parent a real node, and every total at least its own silhouette
   component — a total below a component would misreport which node gets picked.
-  THE LIFECYCLE/SEASON TIMELINE IS NOW BUILT. `plant-season-phenotype {plant, seasonMille,
+  THE LIFECYCLE/SEASON TIMELINE IS BUILT. `plant-season-phenotype {plant, seasonMille,
   lifecycle?}` answers which appearance the family renders at a point in the year, and
   `PlantSeasonPanel` scrubs the year and binds the answer to the live preview — the plant through
   the year rather than a picker over phenotype ids.
@@ -280,7 +292,7 @@ second editable plant source, and no native-only renderer path exists.
   of the seasonal window (a resolver stuck on either answer passes one of them), that a dead plant
   in autumn falls back to the cooked appearance rather than taking the seasonal match — the part a
   season-first resolver gets wrong — and that an out-of-range season is refused rather than wrapped.
-  THE COLLISION/NAV VIEW IS NOW BUILT, and it is an overlay rather than a table. `plant-proxies`
+  THE COLLISION/NAV VIEW IS BUILT, and it is an overlay rather than a table. `plant-proxies`
   reports the derived capsules and footprints IN METRES, and `build_plant_proxy_overlays` draws them
   over the preview through the same overlay path the scene uses for physics colliders — with the
   same two toggles, applied to whatever surface is in front of you.
@@ -296,7 +308,7 @@ second editable plant source, and no native-only renderer path exists.
   overlay reads those arrays directly, and a missing one draws nothing while looking fine) and that
   dimensions arrive in metres — a raw Q15.16 word would draw a capsule sixty-five thousand times too
   big and read as a broken overlay rather than as a unit mistake.
-  ALL ELEVEN SURFACES THE BOX NAMES NOW EXIST: structure tree, 3D preview, semantic selection,
+  ALL ELEVEN SURFACES THE BOX NAMES EXIST: structure tree, 3D preview, semantic selection,
   parameter inspector, variation browser, wind/interaction, lifecycle/season, materials/atlas,
   collision/nav, hierarchy/voxel/error, and validation/cook-stats.
   ONE HONEST CARVE-OUT, the same one Phase 8's acceptance box carries: the proxy overlay's
@@ -321,8 +333,10 @@ second editable plant source, and no native-only renderer path exists.
 - [x] Make every graph/manual edit transactional and undoable at semantic-operation granularity.
   (Transactional at the seam: `plant-graph-set` replaces the whole document in one call and revalidates
   the regrown family before it saves, so a refused edit changes nothing. Undoable through the editor's
-  existing `pushEdit`: `PlantGraphPanel.apply` records ONE edit per artist-level operation — "Add
-  variation", "Set variation age" — whose inverse is the PREVIOUS GRAPH DOCUMENT replayed through the
+  existing `pushEdit`: the plant graph panel's one `commit` records ONE edit per artist-level
+  operation — adding or deleting a node, wiring or unwiring an edge, a settled parameter scrub, a
+  manual Transform/Trim/Remove/Graft on the selected element, a module call, a variation — whose
+  inverse is the PREVIOUS GRAPH DOCUMENT replayed through the
   same one write path. That is what keeps undo honest for a derived model: nothing reconstructs the old
   parts, dimensions, spines, or proxies by hand, because regrowing the old graph produces them. Never
   keystroke granularity, and never a second write path for the inverse.)
@@ -504,11 +518,13 @@ second editable plant source, and no native-only renderer path exists.
   snapshot that tries to stand in for grown geometry — a native family's generated geometry never
   becomes a second editable source.)
 - [x] Standard gate, asset-editor E2E, source-license fixtures, and botanical/interchange docs are
-  green. (`just prepare-for-commit` EXIT=0; `vegetation-botanical` 6/6, `vegetation-interchange` 1/1,
-  `vegetation-interaction` 1/1, `vegetation-ecology` 2/2, all validation-clean; the source-license
+  green. (`just prepare-for-commit` is the gate arm; the e2e legs are
+  `tests/e2e/vegetation-botanical.test.ts` and `vegetation-interchange.test.ts` for the authoring and
+  interchange halves, with `vegetation-interaction` and `vegetation-ecology` covering the runtime side,
+  each asserting `validationErrors()` empty. The source-license
   fixture is `geometry/tests/fixtures/two-materials.gltf`, which states a generator and a copyright
-  requiring attribution; `botanical-graph.md` and `point-interchange.md` pass hugo, the link check, and
-  the style check at 0/0.)
+  requiring attribution. `botanical-graph.md` and `point-interchange.md` pass hugo, the link check, and
+  the style check.)
 
 ## NO-LEGACY gate
 

@@ -49,9 +49,9 @@ section in the Environment panel. The default scene layout remains uncluttered.
   `vegetation-map-layer-commit` transaction over `commitLayersPatch` (patches computed over rows
   re-read at commit time, each touched row upserted complete with revision + 1 under the re-read
   expected generation) with `pushEdit` inverses: solo mutes every other layer in one multi-row
-  transaction (solo again unmutes all), reorder swaps `order` with the neighbor in a two-row
-  transaction (its own inverse — up/down buttons drive the same wire a drag gesture would); e2e
-  drives mute → generation bump → restore. Dirty/cook state: the summary's engine-computed
+  transaction (solo again unmutes all), reorder moves a row to an index and renumbers the run it
+  passed through, with the captured prior order set as its inverse — a row drag with a drop
+  indicator and the up/down buttons both call it; e2e drives mute → generation bump → restore. Dirty/cook state: the summary's engine-computed
   `dirtyLayers` as an amber dot per row; e2e drives chunk-commit → dirty → recook → clean.
   Blend/operator/coordinate-space/provenance/bounds detail renders in the map workspace's
   Ordered-layers section (operator badge, space, order, revision, dependencies) beside the map
@@ -122,8 +122,7 @@ section in the Environment panel. The default scene layout remains uncluttered.
   (unregistered, like `PreviewGhost`) the GPU-scene mirror resolves to an assembly combination
   exactly like a cooked point; the workspace toolbar offers the combination select when the
   family authors more than one. E2e enters, frames, scrubs, renders validation-clean, exits.
-  Open: season/wind scrubs ride phase 10 (they scrub systems that phase builds);
-  representation-error/coverage/proxies/conflict scrubs ride the diagnostics overlays.)*
+  Representation-error, coverage, proxy, and conflict scrubs ride the diagnostics overlays.)*
 
 ## Transactional editing and undo
 
@@ -183,7 +182,7 @@ authored/evaluated results.
 
 ## UI placement rule
 
-`EnvironmentPanel.tsx` retains shared wind/calendar/environment controls. Species, density, brush,
+`EnvironmentPanel/` retains shared wind/calendar/environment controls. Species, density, brush,
 biome, lifecycle, and plant deformation response never land there. Plant-specific response belongs
 in the Plant workspace; world placement belongs in Vegetation mode.
 

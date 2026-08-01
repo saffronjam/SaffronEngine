@@ -135,8 +135,11 @@ phenotype the source of lifecycle truth.
 - [x] Nav/physics/render facets observe committed tick generations only. (Every facet reads a
   published `VegetationCellGeneration`, which is only replaced by `publish_state_rebuilds` after a
   reduction commits. A tick's mutations and its boundary summaries land in that same commit, and
-  `EcologyState::is_caught_up` tells a reader whether a cell's simulation facet stands at world time
-  — a region mid-catch-up publishes nothing for a facet to see.)
+  `VegetationWorld::simulation_facet_is_settled` tells a reader whether a cell's biology is settled —
+  a cell whose resident region is behind world time publishes nothing for a facet to see, which
+  `VegetationCollisionResidency::advance` and `VegetationNavigationSeam::advance` both gate on.
+  `a_stalled_region_publishes_its_last_committed_generation` pins the other half: a region that
+  cannot run keeps publishing, because no tick is coming for it.)
 
 ## Debug and control
 
@@ -173,15 +176,19 @@ advance a bounded fixture and dump canonical cell/checkpoint hashes.
   the unload leg: time advances while nothing is loaded, and the reload catches up to the same
   bytes a resident-throughout world holds.)
 - [x] Results are identical across worker counts, shuffled plant/cell order, different residency paths,
-  and origin rebasing. (`catch_up_is_identical_across_worker_counts` runs a four-region world at one
-  worker and at four and compares `canonical_bytes()`: `compute_region_ticks` spreads the pure
-  per-region rules across `EcologyCatchUpBudget::workers` and commits in canonical region order.
-  `disjoint_regions_commit_the_same_state_in_either_order` covers region order,
-  `a_tick_is_reproducible_and_neighbour_order_independent` covers neighbour order,
+  and origin rebasing. (`catch_up_is_identical_across_worker_counts` runs an eight-region world at one
+  worker and at three and compares `canonical_bytes()`: `compute_region_ticks` spreads the pure
+  per-region rules across `EcologyCatchUpBudget::workers` and commits in canonical region order, and
+  the test also asserts `EcologyCatchUpReport::workers` so a call that quietly ran serial cannot pass
+  a bytes-only comparison. `disjoint_regions_commit_the_same_state_in_either_order` covers region
+  order, `a_tick_is_reproducible_and_neighbour_order_independent` covers neighbour order,
   `unordered_plants_are_refused` plus the sort in `region_state` pins plant order, and
   `a_region_awaiting_residency_owes_its_ticks` covers the residency path. Origin rebasing is a
-  render-space transform: every ecology input is a quantized world tick or a `UnitInterval`, and no
-  rule reads a camera-relative value.)
+  render-space transform and no ecology input is expressed in it — every one is a quantized world
+  tick or a `UnitInterval` — so what there is to pin is that the world coordinate itself does not
+  reach a rule: `the_deterministic_tick_is_translation_invariant` advances the same forest at the
+  origin and a million cells away and requires the same health, moisture, fuel, and boundary summary,
+  excluding the stochastic channels whose random domain carries the owner cell by design.)
 - [x] Cross-cell shade/competition/propagation seam fixtures have no double update or border artifact.
   (`the_shade_seam_updates_each_plant_once` puts a clearing inside a ring of dense canopy: the
   neighbours' shade reaches across every border and costs the plant health, while every plant in the
@@ -210,13 +217,16 @@ advance a bounded fixture and dump canonical cell/checkpoint hashes.
   render references, or render bounds, and holds one `EcologyPlantState` row per macro plant plus one
   `EcologyCellSummary` per cell. A region that is not resident costs a residency check.)
 - [x] Standard gate, determinism/property tests, and lifecycle/ecology docs are green.
-  (`just prepare-for-commit` EXIT=0; `cargo test --workspace` green apart from one `xtask` shader
-  test another agent's in-flight change owns. Determinism/property coverage: 20 ecology tests in
-  `saffron-vegetation` plus the three catch-up acceptance tests over a live `VegetationWorld`.
-  `tests/e2e/vegetation-ecology.test.ts` drives the same claims through the real host — 2 files, 30
-  assertions, validation-clean. Docs: the new `explanations/scene-and-ecs/ecology-catchup.md` plus
-  its hub row and the reworked `vegetation-state.md` sections; `hugo --gc` EXIT=0, links none broken,
-  style 0 errors 0 warnings.)
+  (`just prepare-for-commit` and `cargo test --workspace` are the gate arms. What carries the
+  determinism claims, by name: `catch_up_equals_continuous_simulation`,
+  `catch_up_is_identical_across_worker_counts`,
+  `disjoint_regions_commit_the_same_state_in_either_order`,
+  `a_tick_is_reproducible_and_neighbour_order_independent`, `unordered_plants_are_refused`, and
+  `the_deterministic_tick_is_translation_invariant`, all in `saffron-vegetation`.
+  `tests/e2e/vegetation-ecology.test.ts` drives the same claims through the real host, asserting
+  `validationErrors()` empty. Docs: `explanations/scene-and-ecs/ecology-catchup.md` plus its hub row
+  and the `vegetation-state.md` sections, checked by the docs-page skill's `hugo --gc` +
+  `check_links.py` + `check_style.py`.)
 
 ## NO-LEGACY gate
 

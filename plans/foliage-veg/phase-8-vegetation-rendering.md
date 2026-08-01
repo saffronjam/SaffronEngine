@@ -135,16 +135,17 @@ coverage, visibility, page, picking, and diagnostic infrastructure as ordinary g
 
 - [x] Add a GPU selection-ID path returning tagged `Vegetation(PlantId)` for macro plants and an
   explicit nonpersistent micro hit for paint feedback. Editor selection resolves through the CPU cell
-  snapshot/provenance, not GPU slot indices. *(Macro: `pick` returns `kind: vegetation` + the stable
-  `PlantId`, resolved via `VegetationWorld::query_ray` over the CPU cell snapshots — never a GPU
-  slot. Micro: `VegetationWorld::query_micro_ray` intersects the resident cells' floor planes and
-  requires a nonzero-density texel; `pick` returns `kind: micro-vegetation` + the world `position`
-  (no identity — paint feedback only), losing ties to entity surfaces and macro plants. Both
-  e2e-asserted; a GPU ID buffer exists for no content type — selection is the engine's one CPU
-  viewport ray.)*
+  snapshot/provenance, not GPU slot indices. *(`Renderer::pick_selection_id` replays the frame's
+  binned cut through the selection PSO (`selectionIdFragment`) into one-texel identity/position/normal
+  targets and reads them back; `GpuSceneMirror::identify_instance_slot` translates the record's
+  GPU-scene slot into an entity, a `(cell, PlantId)`, or a micro field, so no slot reaches the wire.
+  `pick` returns `kind: vegetation` + the stable `PlantId` for a macro plant and `kind:
+  micro-vegetation` + a world `position` with no identity for a blade. Unit-tested by
+  `pick_translates_every_selection_id_answer`; e2e in `picking.test.ts` and `vegetation-graph`.)*
 - [x] Merge selection with the shared `SurfaceField`/entity picking vocabulary without a second
-  viewport ray implementation. *(`viewport_pick_ray` reuses the one `viewport_ray`; the pick compares
-  the surface hit and the vegetation hit by distance and returns the nearest vocabulary.)*
+  viewport ray implementation. *(There is no picking ray at all now: billboards hit-test in screen
+  space, everything else answers from the one selection readback. `query_scene_surface_ray` remains
+  the surface-field query behind `query-surface-ray` and asset placement.)*
 - [x] Feed visible/error/missing-page, camera prediction, and view demand back to residency.
   *(`gpuSceneRequestPage` appends GPU missing-page requests from the traversal (non-resident node
   or child); the CPU drain feeds `PageResidency` demand; `page_demand_view` carries the live
@@ -168,12 +169,15 @@ extreme scale, negative cells, rapid camera traversal, and asset-preview views. 
 content and camera paths, not vendor-derived performance numbers.
 
 *(Checked in: `xtask gen-vegetation-e2e-fixture` emits the canonical package plus the stress matrix
-— `vegetation-stress-{meadow,woodland,scale,traversal}.json` (meadow 16×16 micro density; woodland
-mixed multi-cell across four cells including negative coordinates, with a seasonal second
-variation/phenotype pair; extreme 40 m scale; a three-cell rapid-traversal run) — and
+— `vegetation-stress-{meadow,woodland,scale,traversal,broadleaf,serration,needles}.json` (meadow
+16×16 micro density; woodland mixed multi-cell across four cells including negative coordinates,
+with a seasonal second variation/phenotype pair; extreme 40 m scale; a three-cell rapid-traversal
+run; twelve modelled broad blades; the same blades with the serrated edge carried by an
+`alphaMode: MASK` cutout texture; and two shared-vertex strips of 58 needle slivers) — and
 `vegetation-stress.test.ts` drives each through import → cook → residency → records with zero
-overflow, validation-clean. The leaf-content rows (geometry-first broad leaves, masked serrations,
-conifer needles) require authored botanical assets and land with the phase-14 interchange content.)*
+overflow, validation-clean. The three leaf rows additionally render their family alone through
+`enter-asset-preview`, and read the cooked coverage atlas back through `plant-atlas`: the masked
+row packs one, the geometry-first rows pack none.)*
 
 ## Acceptance
 

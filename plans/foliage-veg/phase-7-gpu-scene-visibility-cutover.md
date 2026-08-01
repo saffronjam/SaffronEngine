@@ -79,10 +79,11 @@ streams for translucency, the reactive-coverage mask over the blend buckets, the
 executor-only wireframe overlay), the survivor chain runs end to end (snapshot →
 HZB#1 → retest → survivor traversal/binning → survivor raster with loaded
 attachments and MSAA re-resolve → full re-bin → HZB rebuild over the same imported
-pyramid), displaced instances draw through the tessellation seam (the traversal
-skips `GPU_MATERIAL_TABLE_FLAG_TESSELLATED` records under the `tess_seam` push;
-`TessSceneDraw` rows carry the mirror's material-parameter index; the vertex-input
-pass PSOs exist for the seam alone), the scene driver submits
+pyramid), displaced instances draw through the same binned cut (the traversal emits a
+`GPU_REPRESENTATION_DISPLACED_MICRO` record per displaced instance, `DisplacedRow`
+carries its amplification-arena row plus the local-amplitude slack the cull adds to
+the cooked bounds, and the scatter points that record's indirect draw at the arena's
+index stream through `gpuSceneDisplacedDraw`), the scene driver submits
 `DeformationWork` + joints through `submit_gpu_scene_deformations` (no draw list),
 the editor-camera gizmo is a `PreviewGhost` child entity over the reserved
 `EDITOR_CAMERA_MESH_ID`, set-2 binding 2 is the global material-parameter arena,
@@ -221,9 +222,11 @@ Indexed-MDI and mesh-task executors derive their own command layouts from the sa
   shadow pages, gbuffer, motion) stays indexed. The box asks for execution that "cannot unlock unique
   content"; the shaded pass demonstrates it, and leaving the depth family indexed unlocks nothing.)
 - [x] Schedule count/scan/scatter so capacities are proven; expose every pressure/overflow flag.
-- [x] Drive depth, main, motion, current fixed directional/spot/point shadows, G-buffer, transparent,
-  wire/debug, selection ID, and thumbnail/preview passes from this data. (Selection/picking is the
-  CPU BVH query — no ID pass exists to drive.)
+- [x] Drive depth, main, motion, every shadow view, G-buffer, transparent, wire/debug, selection ID,
+  and thumbnail/preview passes from this data. (Shadows are the one `vsm-pages` pass — directional,
+  spot, and point lights are page allocations inside it, not passes of their own — and it records the
+  executor draws like every other raster pass. Selection/picking is the CPU BVH query, so there is no
+  ID pass to drive.)
 
 ## Rehome every current responsibility
 

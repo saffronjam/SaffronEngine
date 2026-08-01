@@ -4,7 +4,7 @@
 its box: cluster-tight swept bounds ride the Phase 11 VSM/RT consumers that need the
 per-cluster form; the deeper debug surfaces (turbulence spectra as a per-octave view,
 a whole-field interaction capture) and authored per-part stiffness are refinements on
-landed mechanisms; the NVIDIA/AMD platform legs need hardware this machine lacks)
+landed mechanisms)
 
 **Depends on:** Phases 2, 5, and 8
 
@@ -258,10 +258,9 @@ bounds.
   continuously and disabled temporal accumulation outright — `vegetation-wind-visual` caught it as a
   canopy that never settled. Pinned by `the_wind_clock_is_not_an_edit` and
   `only_a_wind_edit_counts_as_a_discontinuity`.
-  THE `GpuSceneHistoryInvalidation` VOCABULARY IS NOW LIVE, which reverses the note that used to
-  sit here. That note was right at the time — the enum wrote state nothing read, so a producer
-  would have been inert — and the fix was to give it a reader rather than to keep avoiding it.
-  `reset_view_temporal` now takes a reason and drives BOTH the renderer's temporal state and the
+  THE `GpuSceneHistoryInvalidation` VOCABULARY IS LIVE, reader included — an enum whose state
+  nothing reads makes every producer inert.
+  `reset_view_temporal` takes a reason and drives BOTH the renderer's temporal state and the
   persistent scene's per-view history generation. Those were two parallel truths: resetting one
   while leaving the other meant a view whose reprojection was blanked still advertised a valid
   history to the GPU.
@@ -270,14 +269,12 @@ bounds.
   boolean cannot answer the question actually asked when accumulation misbehaves — which of them
   did it. Proven by `a wind edit invalidates history under its own name`, mutation-checked:
   emitting `NewView` instead fails it with the two names side by side.
-  ONE VARIANT WAS ADDED AND ONE WAS REMOVED AGAIN. `WindDiscontinuity` has a producer.
-  `InteractionFieldReset` was written and then deleted in the same change once it was clear nothing
-  emits it — a variant reserved for future work is the "additive for now, retire later" shape this
-  repo forbids, and leaving it would have made the enum look more finished than it is.
-  THE PER-INSTANCE REACTIVE PATH NOW EXISTS, which is what the last clause was waiting on and what
-  the note below used to record as missing. The field re-centres on sub-metre camera motion, so a
-  whole-frame history reset would fire nearly every frame and blank accumulation for a scene where
-  almost nothing jumped; the right unit is the instance.
+  EVERY VARIANT HAS A PRODUCER, `WindDiscontinuity` included. A variant reserved for future work is
+  the "additive for now, retire later" shape this repo forbids, and it would make the enum look more
+  finished than it is.
+  THE PER-INSTANCE REACTIVE PATH IS WHAT THE LAST CLAUSE ASKS FOR. The field re-centres on sub-metre
+  camera motion, so a whole-frame history reset would fire nearly every frame and blank accumulation
+  for a scene where almost nothing jumped; the right unit is the instance.
   THE TEST IS THE CASCADE, NOT THE TEXEL. Texels are addressed by ABSOLUTE world coordinate, so a
   standing plant keeps its texel as the window scrolls and reads a continuous value — the reset only
   bites when the plant changes which CASCADE covers it, because cascade 1's state is separate and
@@ -396,7 +393,7 @@ bounds.
   pixels, `visible`/`records` still count it, and every frame-difference reads 0. Confirming that
   the TRIANGLE cut was equally frozen is what showed the fault was the harness rather than the
   aggregate branch.
-  THE MODAL AGGREGATION IS NOW BOUNDED, which is the clause the note above left open.
+  THE MODAL AGGREGATION IS BOUNDED, which is the last clause of this box.
   WHAT AGGREGATING TAKES AWAY IS THE POINT, not what it gets wrong standing still. A triangle cut
   swings each assembly use about its pivot and shimmers the leaf parts; an aggregate brick has no
   parts and applies neither, keeping only the whole-plant sway both representations share. That is
@@ -455,18 +452,27 @@ bounds.
   blades deform from the composed field, and `sample-wind`/the vector overlay serve the same
   composition on the CPU seam.)*
 - [x] Standard gate, platform validation/visual tests, and wind/phenology docs are green.
-  *(The standard gate (build + shaders + clippy + suites + e2e validation-clean + docs 3×) is green
+  *(The standard gate (build + shaders + clippy + suites + e2e validation-clean + docs 3x) is green
   at every slice seal on MoltenVK; wind-field/plant-rendering/persistent-gpu-scene/cloud docs are
-  current. THE NVIDIA LEG IS GREEN TOO (`NVIDIA GeForce RTX 3070 Ti`): `just engine`,
-  `just prepare-for-commit`, `just schema`, `just test`, and `just e2e` all EXIT=0, with every
-  render-touching e2e file asserting `validationErrors()` empty.
+  current. THE NVIDIA LEG (`NVIDIA GeForce RTX 3070 Ti`) runs the same arms — `just engine`,
+  `just prepare-for-commit`, `just test`, `just e2e` — with every
+  render-touching e2e file asserting `validationErrors()` empty; the schema contract run there meets
+  the intermittent device loss Phase 15's terminal box records.
   THE VISUAL TEST IS BUILT: `tests/e2e/vegetation-wind-visual.test.ts` cooks a real cell,
   waits for residency, and measures MOTION OVER TIME rather than calm-versus-gale — each wind state
   is sampled twice across the same settle and compared to itself, so the calm pair is the control.
-  Measured: a still field gives **0.0001** mean absolute per-channel difference between consecutive
-  frames, a gale gives **0.408** — a ratio near 3,500x. A third assertion returns the field to calm
-  and requires stillness again, which is what would catch a deformation that latched at its last
-  displacement. Two traps are recorded in the test: wind displaces only instances carrying
+  THE SCORE IS THE STEP ONE CHANNEL TAKES, not the frame's mean. A resident micro field is matter in
+  the global distance field, and the occlusion marches that read it rotate their sample set per
+  frame, so the canopy's shading keeps stepping by one 8-bit level for as long as the frame runs
+  while the prepass records zero sway (the same scene with `SAFFRON_MICRO_FIELD=off`, and a scene
+  with no cooked cell, hold a byte-identical frame indefinitely). Pooled into a mean that residue
+  scores 0.02-0.04, which is what a gale window scores when it samples the sway near a phase return,
+  so the two states are not separable that way. Measured per channel: a still window peaks at **1**
+  level with **zero** channels stepping 8 or more; a gale window peaks at **80-84** and puts **178
+  to 11,973** channels past 8 depending on where it samples the sway cycle, the worst of the two
+  windows never under **5,862**. A third assertion returns the field to calm and requires stillness
+  again, which is what would catch a deformation that latched at its last displacement. Two traps are
+  recorded in the test: wind displaces only instances carrying
   `GPU_SCENE_INSTANCE_FLAG_WIND` (vegetation points alone, so a cooked cell is required), and the
   test must NOT enter play mode — play renders the scene's primary camera, so `set-camera` is
   ignored and every frame becomes the same picture of nothing.
