@@ -232,6 +232,58 @@ impl Pipelines {
         }
     }
 
+    /// The ray-geometry materialization PSO (the visibility set layout for its address block, a
+    /// [`crate::RtDeformPush`]-sized push naming one placed use's slice).
+    pub fn request_rt_deform(&mut self, layout: vk::DescriptorSetLayout) -> Option<Arc<Pipeline>> {
+        if let Some(pipeline) = &self.rt_deform {
+            return Some(Arc::clone(pipeline));
+        }
+        match self.build_compute(
+            "shaders/rt_deform.spv",
+            layout,
+            size_of::<crate::RtDeformPush>() as u32,
+        ) {
+            Ok(pipeline) => {
+                let pipeline = Arc::new(pipeline);
+                self.rt_deform = Some(Arc::clone(&pipeline));
+                self.pipelines_created += 1;
+                Some(pipeline)
+            }
+            Err(err) => {
+                tracing::error!("request_rt_deform: {err}");
+                None
+            }
+        }
+    }
+
+    /// The micro-blade ray-geometry materialization PSO: the micro-field pass family's set layout
+    /// (the address block it resolves the tile directory through), a
+    /// [`crate::MICRO_RT_DEFORM_PUSH_SIZE`]-byte push.
+    pub fn request_micro_rt_deform(
+        &mut self,
+        layout: vk::DescriptorSetLayout,
+    ) -> Option<Arc<Pipeline>> {
+        if let Some(pipeline) = &self.micro_rt_deform {
+            return Some(Arc::clone(pipeline));
+        }
+        match self.build_compute(
+            "shaders/micro_rt_deform.spv",
+            layout,
+            crate::MICRO_RT_DEFORM_PUSH_SIZE,
+        ) {
+            Ok(pipeline) => {
+                let pipeline = Arc::new(pipeline);
+                self.micro_rt_deform = Some(Arc::clone(&pipeline));
+                self.pipelines_created += 1;
+                Some(pipeline)
+            }
+            Err(err) => {
+                tracing::error!("request_micro_rt_deform: {err}");
+                None
+            }
+        }
+    }
+
     /// The interaction-field step PSO (BDA-only, a
     /// [`crate::WIND_INTERACT_PUSH_SIZE`]-byte push of addresses, centres, and dt).
     pub fn request_wind_interact(

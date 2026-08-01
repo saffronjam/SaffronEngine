@@ -1148,3 +1148,61 @@ impl RgPass {
         }
     }
 }
+
+/// A pass index names a position in the graph that produced it. Carried into the next frame's
+/// graph it points at whatever pass happens to sit at that index, which can be a *later* one —
+/// and a batch that waits on a later batch is a cycle the submit cannot satisfy. The write-back
+/// therefore drops it, leaving the queue/family to carry ownership across the frame exactly as it
+/// does for an image.
+#[test]
+fn external_buffer_state_carries_ownership_without_a_pass_index() {
+    let mut graph = RenderGraph::new();
+    let slot =
+        graph.alloc_external_buffer_state(owned_buffer_state(RgQueueAssignment::AsyncCompute, 5));
+    let buffer = graph.import_buffer(vk::Buffer::from_raw(7), Some(slot));
+    let whole = RgBufferRange::new(0, 256).unwrap();
+    graph.add_pass(RgPass::compute("warm-up"));
+    graph.add_pass(async_compute("build").access_buffer(
+        buffer,
+        whole,
+        RgUsage::StorageWriteCompute,
+    ));
+    let families = RgQueueFamilies {
+        graphics: 2,
+        async_compute: Some(5),
+    };
+    let (_, exit, _) = graph.compile_barriers(families);
+    graph.resources = exit;
+    graph.write_external_states();
+    let carried = graph.external_buffer_state(slot);
+    assert_eq!(carried.accesses.len(), 1);
+    assert_eq!(carried.accesses[0].queue, RgQueueAssignment::AsyncCompute);
+    assert_eq!(carried.accesses[0].queue_family, 5);
+    assert_eq!(carried.accesses[0].last_pass, None);
+
+    // The next frame declares the same buffer's build first and a graphics reader after it. The
+    // build must wait on nothing, and the reader on the build — never the other way round.
+    let mut next = RenderGraph::new();
+    let next_slot = next.alloc_external_buffer_state(carried);
+    let next_buffer = next.import_buffer(vk::Buffer::from_raw(7), Some(next_slot));
+    next.add_pass(async_compute("build").access_buffer(
+        next_buffer,
+        whole,
+        RgUsage::StorageWriteCompute,
+    ));
+    next.add_pass(RgPass::compute("consume").access_buffer(
+        next_buffer,
+        whole,
+        RgUsage::StorageReadCompute,
+    ));
+    let plan = next.submission_plan(families);
+    assert_eq!(plan.compute_batch_count(), 1);
+    for (index, batch) in plan.batches.iter().enumerate() {
+        for &source in &batch.wait_for_batches {
+            assert!(
+                source < index,
+                "batch {index} waits on batch {source}, which the submit has not reached"
+            );
+        }
+    }
+}

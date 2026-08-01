@@ -315,6 +315,126 @@ impl Pipelines {
         Ok(Pipeline::from_parts(&self.resources, pipeline, layout))
     }
 
+    /// Builds the selection PSO from `mesh.spv` (`vertexMainExecutor` + `selectionIdFragment`):
+    /// no vertex input (record-driven pulling), three color attachments (the uint identity, then
+    /// world position and world normal), depth `LESS` + write into a private pick depth, dynamic
+    /// cull, sets 0/1/2 + the viewProj push.
+    ///
+    /// Always single-sampled: the pick renders its own one-texel targets, never the view's.
+    pub(super) fn build_selection_id(&self) -> Result<Pipeline> {
+        let raw = self.resources.device();
+        let module = self.load_shader_module("shaders/mesh.spv")?;
+        let result = self.build_selection_id_with_module(raw, module);
+        // SAFETY: the ash seam. The module is consumed by pipeline creation; freeing it after
+        // creation is valid and required.
+        unsafe { raw.destroy_shader_module(module, None) };
+        result
+    }
+
+    fn build_selection_id_with_module(
+        &self,
+        raw: &ash::Device,
+        module: vk::ShaderModule,
+    ) -> Result<Pipeline> {
+        let stages = [
+            vk::PipelineShaderStageCreateInfo::default()
+                .stage(vk::ShaderStageFlags::VERTEX)
+                .module(module)
+                .name(c"vertexMainExecutor"),
+            vk::PipelineShaderStageCreateInfo::default()
+                .stage(vk::ShaderStageFlags::FRAGMENT)
+                .module(module)
+                .name(c"selectionIdFragment"),
+        ];
+
+        // Record-driven vertex pulling: no vertex input bindings exist.
+        let vertex_input = vk::PipelineVertexInputStateCreateInfo::default();
+
+        let input_assembly = vk::PipelineInputAssemblyStateCreateInfo::default()
+            .topology(vk::PrimitiveTopology::TRIANGLE_LIST);
+        let viewport_state = vk::PipelineViewportStateCreateInfo::default()
+            .viewport_count(1)
+            .scissor_count(1);
+        let raster = vk::PipelineRasterizationStateCreateInfo::default()
+            .polygon_mode(vk::PolygonMode::FILL)
+            .cull_mode(vk::CullModeFlags::NONE)
+            .front_face(vk::FrontFace::COUNTER_CLOCKWISE)
+            .line_width(1.0);
+        let multisample = vk::PipelineMultisampleStateCreateInfo::default()
+            .rasterization_samples(vk::SampleCountFlags::TYPE_1);
+        let depth_stencil = vk::PipelineDepthStencilStateCreateInfo::default()
+            .depth_test_enable(true)
+            .depth_write_enable(true)
+            .depth_compare_op(vk::CompareOp::LESS);
+        let blend_attachments = [vk::PipelineColorBlendAttachmentState::default()
+            .color_write_mask(vk::ColorComponentFlags::RGBA)
+            .blend_enable(false); 3];
+        let color_blend =
+            vk::PipelineColorBlendStateCreateInfo::default().attachments(&blend_attachments);
+        let dynamic_states = [
+            vk::DynamicState::VIEWPORT,
+            vk::DynamicState::SCISSOR,
+            vk::DynamicState::CULL_MODE,
+        ];
+        let dynamic = vk::PipelineDynamicStateCreateInfo::default().dynamic_states(&dynamic_states);
+
+        let color_formats = [
+            crate::SELECTION_ID_FORMAT,
+            crate::SELECTION_SURFACE_FORMAT,
+            crate::SELECTION_SURFACE_FORMAT,
+        ];
+        let mut rendering_info = vk::PipelineRenderingCreateInfo::default()
+            .color_attachment_formats(&color_formats)
+            .depth_attachment_format(DEPTH_FORMAT);
+
+        let push_constant = [vk::PushConstantRange::default()
+            .stage_flags(vk::ShaderStageFlags::VERTEX)
+            .offset(0)
+            .size(crate::MESH_EXECUTOR_PUSH_SIZE)];
+        // Same set prefix as the mesh layout (0 bindless, 1 light, 2 instance); the selection
+        // pass binds sets 0 + 2 and the viewProj push, matching the depth prepass.
+        let set_layouts = &self.set_layouts[..3];
+        let layout_info = vk::PipelineLayoutCreateInfo::default()
+            .set_layouts(set_layouts)
+            .push_constant_ranges(&push_constant);
+        // SAFETY: the ash seam. The set layouts outlive the call; the layout is owned by the
+        // returned `Pipeline`.
+        let layout = checked(
+            unsafe { raw.create_pipeline_layout(&layout_info, None) },
+            "create_pipeline_layout (selection)",
+        )?;
+
+        let pipeline_info = vk::GraphicsPipelineCreateInfo::default()
+            .push_next(&mut rendering_info)
+            .stages(&stages)
+            .vertex_input_state(&vertex_input)
+            .input_assembly_state(&input_assembly)
+            .viewport_state(&viewport_state)
+            .rasterization_state(&raster)
+            .multisample_state(&multisample)
+            .depth_stencil_state(&depth_stencil)
+            .color_blend_state(&color_blend)
+            .dynamic_state(&dynamic)
+            .layout(layout);
+        // SAFETY: the ash seam. The create-info chain outlives the call; on failure the layout is
+        // freed exactly once.
+        let created = unsafe {
+            raw.create_graphics_pipelines(vk::PipelineCache::null(), &[pipeline_info], None)
+        };
+        let pipeline = match created {
+            Ok(pipelines) => pipelines[0],
+            Err((_, result)) => {
+                // SAFETY: the ash seam. The layout was created above; freed once here.
+                unsafe { raw.destroy_pipeline_layout(layout, None) };
+                return Err(Error::Vk {
+                    context: "create_graphics_pipelines (selection)",
+                    result,
+                });
+            }
+        };
+        Ok(Pipeline::from_parts(&self.resources, pipeline, layout))
+    }
+
     /// Builds the TAA reactive-coverage PSO from `mesh.spv` (`vertex_entry` +
     /// `reactiveCoverageFragment`): no vertex input (record-driven pulling), one `R8_UNORM` color
     /// the constant-1.0 fragment writes, depth `LESS_OR_EQUAL` **read-only** (test against the

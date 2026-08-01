@@ -186,6 +186,26 @@ impl Pipelines {
         }
     }
 
+    /// The selection graphics PSO: writes the emitting draw record's identity and surface point
+    /// into the one-texel pick targets.
+    pub fn request_selection_id(&mut self) -> Option<Arc<Pipeline>> {
+        if let Some(pipeline) = &self.selection_id {
+            return Some(Arc::clone(pipeline));
+        }
+        match self.build_selection_id() {
+            Ok(pipeline) => {
+                let pipeline = Arc::new(pipeline);
+                self.selection_id = Some(Arc::clone(&pipeline));
+                self.pipelines_created += 1;
+                Some(pipeline)
+            }
+            Err(err) => {
+                tracing::error!("request_selection_id: {err}");
+                None
+            }
+        }
+    }
+
     /// The analytic ground-grid graphics PSO: fullscreen triangle, depth-tested without writing,
     /// alpha-blended, a 2×mat4 push, single-sampled onto the 1× resolved color after tonemap.
     pub fn request_grid(&mut self) -> Option<Arc<Pipeline>> {

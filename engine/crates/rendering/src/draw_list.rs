@@ -249,7 +249,7 @@ pub struct MorphDispatch {
 /// of the tessellation chain — not the fine buffers the raster passes draw. The coarse mesh is still
 /// Phong-smoothed, displaced, and watertight; the smaller worst case makes the per-frame BLAS build
 /// far cheaper for shadow / GI / reflection rays.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct TessRtSlice {
     /// The transient VB holding this frame's amplified micro-vertices (48 B stride).
     pub vertex_buffer: vk::Buffer,
@@ -265,8 +265,8 @@ pub struct TessRtSlice {
     pub worst_case_prims: u32,
 }
 
-/// One deforming mesh-instance (skinned, morph, or tessellated) the TLAS references via its own
-/// per-frame BLAS. The geometry is the post-deform vertex slice; `world_transform` places it in
+/// One deforming mesh-instance (skinned, morph, wind, or tessellated) the TLAS references via its
+/// own per-frame BLAS. The geometry is the post-deform vertex slice; `world_transform` places it in
 /// the TLAS.
 #[derive(Clone)]
 pub struct DeformedRtInstance {
@@ -274,13 +274,33 @@ pub struct DeformedRtInstance {
     pub entity: u64,
     /// The instance's base vertex in the frame's deformed buffer.
     pub deformed_offset: u32,
+    /// The first vertex of the mesh's own stream this slice mirrors.
+    ///
+    /// Zero whenever the slice covers the whole mesh. An assembly prototype's slice covers only
+    /// that prototype's run, while the index stream addresses the family's vertices absolutely, so
+    /// the build's vertex base is rebased by this — which is why a slice is never placed below its
+    /// own base.
+    pub vertex_base: u32,
     /// The deformed vertex count.
     pub vertex_count: u32,
-    /// The index count (the BLAS geometry's triangle source).
+    /// The index count (the tessellated path's triangle source; the refit path uses the submesh
+    /// run below).
     pub index_count: u32,
+    /// First submesh of the run this structure covers.
+    pub first_submesh: u32,
+    /// Submeshes in the run — one BLAS geometry each, carrying its own cooked opacity, exactly as
+    /// the static build lays them out. A single-geometry structure would hold one opacity class
+    /// for the whole instance and resolve every candidate to the run's first submesh.
+    pub submesh_count: u32,
+    /// The GPU-scene instance slot a traced candidate resolves against, or
+    /// [`crate::RT_UNMIRRORED_INSTANCE`].
+    pub instance_slot: u32,
+    /// Opacity this instance forces over its geometry's cooked classes; see
+    /// [`crate::RtInstanceInput::opacity_override`].
+    pub opacity_override: Option<bool>,
     /// The mesh supplying the index stream for the BLAS geometry.
     pub mesh: Arc<GpuMesh>,
-    /// The TLAS placement: identity for a skinned / skin+morph instance (already
+    /// The TLAS placement: identity for a skinned / skin+morph / wind instance (already
     /// world-space), the node world matrix for an unskinned-morph / tessellated instance.
     pub world_transform: Mat4,
     /// When set the instance is tessellated: its BLAS is a full per-frame `MODE_BUILD` over the
@@ -373,4 +393,8 @@ pub struct RenderStats {
     pub retained_mesh_cpu_bytes: u64,
     /// Actual indexed draw invocations recorded across directional, spot, and point shadows.
     pub shadow_draw_calls: u32,
+    /// Command buffers this frame's render graph submitted on the independent compute queue.
+    /// Zero where no pass asked for the async lane, and zero on a device with no independent
+    /// compute family (the same passes then execute on graphics).
+    pub async_compute_batches: u32,
 }

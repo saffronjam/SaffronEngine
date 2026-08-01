@@ -479,10 +479,13 @@ impl ViewTarget {
         for &set in &self.gi_resolve_sets {
             plan.push(Binding::sampled(set, 0, nearest, g_normal));
             plan.push(Binding::storage(set, 1, gi_indirect));
-            // b4 = the spatially-denoised DFAO (available in the screen-space chain where gi-resolve
-            // runs), linear-sampled for the half-res upsample. (Temporal `dfao_resolved` is only final
-            // after the later accum pass; the spatial result matches it on a converged static frame.)
-            plan.push(Binding::sampled(set, 4, linear, dfao_denoised));
+            // b4 = the temporally accumulated DFAO, linear-sampled for the half-res upsample. The
+            // trace rotates its cone ring every frame, so the spatial result carries that rotation
+            // variance indefinitely and only the EMA converges; gi-resolve rides the sky-visibility
+            // at full weight wherever DDGI is absent, which would put the variance straight into
+            // the indirect diffuse. The accum pass runs earlier in the same frame, so this is this
+            // frame's result, not last frame's.
+            plan.push(Binding::sampled(set, 4, linear, dfao_resolved));
         }
         // b2: each slot binds its own mapped GiParams UBO (a buffer write, its own update call).
         for (i, set) in self.gi_resolve_sets.iter().enumerate() {

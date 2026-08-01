@@ -323,15 +323,38 @@ pub struct TessBucket {
     pub edge_length_target: f32,
 }
 
-/// One (instance slot, arena row) pair in the frame's displaced-row table, sorted by slot so
-/// the traversal's lookup is a binary search.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, bytemuck::Pod, bytemuck::Zeroable)]
+/// One displaced instance's entry in the frame's displaced-row table, sorted by slot so the
+/// traversal's and the cull's lookup is a binary search.
+#[derive(Clone, Copy, Debug, Default, PartialEq, bytemuck::Pod, bytemuck::Zeroable)]
 #[repr(C)]
 pub struct DisplacedRow {
     /// The instance's slot in the persistent GPU scene's instance table.
     pub slot: u32,
     /// The instance's row in the frame's displacement arena.
     pub row: u32,
+    /// Upper bound of the relief's local-space displacement, in the instance's local units —
+    /// the slack the visibility cull adds to the instance's cooked bounds sphere, which
+    /// describes the undisplaced surface. Without it, relief poking outside the base AABB is
+    /// frustum-culled or HZB-occluded at the screen edge.
+    pub local_amplitude: f32,
+    /// Reserved ABI word, holding the record at 16 bytes so its stride is the same under
+    /// every block-layout rule the shaders may be compiled with.
+    pub reserved: u32,
+}
+
+const _: () = assert!(size_of::<DisplacedRow>() == 16);
+
+/// The conservative local-space displacement bound of a scalar or vector relief at
+/// `height_scale`. A scalar height sample is `[0, 1]` along the normal; a vector sample is
+/// `[-1, 1]` per tangent-frame axis, so its magnitude reaches `sqrt(3)`.
+#[must_use]
+pub fn displaced_local_amplitude(height_scale: f32, vector_index: u32) -> f32 {
+    let axes = if vector_index != 0 {
+        3.0_f32.sqrt()
+    } else {
+        1.0
+    };
+    height_scale.abs() * axes
 }
 
 /// Buffer device addresses of the frame's displacement arena, published in the GPU-scene
@@ -940,6 +963,21 @@ mod tests {
         assert_eq!(size_of::<TessScanPush>(), 32);
         assert_eq!(size_of::<TessFinalizePush>(), 32);
         assert_eq!(size_of::<TessEmitPush>(), 64);
+    }
+
+    /// The cull slack a displaced instance gets is an UPPER bound on what
+    /// `tessellate.slang::displacedPosition` can move a vertex, or relief pokes out of the sphere
+    /// the cull tests and vanishes at the screen edge. A scalar height rides one axis in `[0, 1]`;
+    /// a vector sample rides three in `[-1, 1]`, so its reach is the cube's half-diagonal.
+    #[test]
+    fn the_displacement_bound_covers_both_relief_forms() {
+        assert!((displaced_local_amplitude(0.25, 0) - 0.25).abs() < 1e-6);
+        assert!((displaced_local_amplitude(0.25, 7) - 0.25 * 3.0_f32.sqrt()).abs() < 1e-6);
+        // A vector relief must never be bounded by the scalar reach.
+        assert!(displaced_local_amplitude(0.25, 7) > displaced_local_amplitude(0.25, 0));
+        // A negative authored amplitude displaces inward by the same magnitude.
+        assert!((displaced_local_amplitude(-0.5, 0) - 0.5).abs() < 1e-6);
+        assert_eq!(displaced_local_amplitude(0.0, 7), 0.0);
     }
 
     /// Worst-case reservation is the closed form of the dice contract at `L = factor_cap`.

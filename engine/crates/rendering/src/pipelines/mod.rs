@@ -135,6 +135,7 @@ pub struct Pipelines {
     gdf_cull: Option<Arc<Pipeline>>,
     gdf_composite: Option<Arc<Pipeline>>,
     gi_occluder_scatter: Option<Arc<Pipeline>>,
+    gi_occluder_micro: Option<Arc<Pipeline>>,
 
     /// The three ReSTIR DI compute PSOs. RT-only, since the resolve needs ray-query.
     restir_initial: Option<Arc<Pipeline>>,
@@ -143,6 +144,8 @@ pub struct Pipelines {
     hzb_copy: Option<Arc<Pipeline>>,
     scene_visibility: Option<Arc<Pipeline>>,
     wind_deform: Option<Arc<Pipeline>>,
+    rt_deform: Option<Arc<Pipeline>>,
+    micro_rt_deform: Option<Arc<Pipeline>>,
     wind_interact: Option<Arc<Pipeline>>,
     vsm_demand: Option<Arc<Pipeline>>,
     vsm_demand_compact: Option<Arc<Pipeline>>,
@@ -214,6 +217,9 @@ pub struct Pipelines {
     /// to mark the reactive mask.
     reactive_coverage: Option<Arc<Pipeline>>,
     reactive_transition: Option<Arc<Pipeline>>,
+    /// The selection graphics PSO: mesh vertex + a fragment writing the emitting draw record's
+    /// identity and surface point into the pick targets, depth-tested and depth-writing.
+    selection_id: Option<Arc<Pipeline>>,
     /// The analytic ground-grid graphics PSO (fullscreen, depth-tested, alpha-blended, 2×mat4 push).
     grid: Option<Arc<Pipeline>>,
     /// The always-on-top editor-overlay graphics PSO over the [`crate::OverlayVertex`] stream.
@@ -302,6 +308,7 @@ impl Pipelines {
             specocc: None,
             gdf_cull: None,
             gi_occluder_scatter: None,
+            gi_occluder_micro: None,
             gdf_composite: None,
             restir_initial: None,
             restir_reuse: None,
@@ -309,6 +316,8 @@ impl Pipelines {
             hzb_copy: None,
             scene_visibility: None,
             wind_deform: None,
+            rt_deform: None,
+            micro_rt_deform: None,
             wind_interact: None,
             vsm_demand: None,
             vsm_demand_compact: None,
@@ -350,6 +359,7 @@ impl Pipelines {
             depth_upscale: None,
             reactive_coverage: None,
             reactive_transition: None,
+            selection_id: None,
             grid: None,
             overlay: None,
             overlay_depth: None,

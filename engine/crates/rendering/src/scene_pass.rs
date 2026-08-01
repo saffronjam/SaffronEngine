@@ -244,9 +244,9 @@ pub fn record_executor_transparent_stream(
     sets: MeshPassSets,
     inputs: crate::ExecutorDrawInputs,
     page_index_buffer: vk::Buffer,
-    transparent_commands: vk::Buffer,
     draw_indirect_count: bool,
     draws: &[(crate::ExecutorBucket, bool, std::sync::Arc<crate::Pipeline>)],
+    mesh_dispatch: Option<&ash::ext::mesh_shader::Device>,
 ) -> u32 {
     let blend: Vec<_> = draws.iter().filter(|(_, blend, _)| *blend).collect();
     let Some((_, _, first)) = blend.first() else {
@@ -257,7 +257,11 @@ pub fn record_executor_transparent_stream(
         cmd,
         first.layout(),
         view_proj,
-        vk::ShaderStageFlags::VERTEX,
+        if mesh_dispatch.is_some() {
+            vk::ShaderStageFlags::MESH_EXT
+        } else {
+            vk::ShaderStageFlags::VERTEX
+        },
         sets.bindless,
         sets.light,
         sets.instance,
@@ -269,9 +273,9 @@ pub fn record_executor_transparent_stream(
     );
     // The slice stride stays the full record capacity — that is how the reorder pass addresses
     // each bucket's stream — while the draw count follows the records that exist.
-    let draws = inputs.draw_bound.min(inputs.record_capacity);
+    let draw_count = inputs.draw_bound.min(inputs.record_capacity);
     for (group_slot, (bucket, _, pso)) in blend.iter().enumerate() {
-        let offset = group_slot as u64 * u64::from(inputs.record_capacity) * 20;
+        let slice_base = crate::transparent_slice_base(inputs.record_capacity, group_slot as u32);
         // SAFETY: the ash seam. The sorted streams + their count were built this frame; each
         // bucket binds the index stream its representation reads.
         unsafe {
@@ -283,18 +287,61 @@ pub fn record_executor_transparent_stream(
                 0,
                 vk::IndexType::UINT32,
             );
-            if draw_indirect_count {
-                raw.cmd_draw_indexed_indirect_count(
+        }
+        let count_offset = (crate::SCENE_VISIBILITY_COUNTER_TRANSPARENT * 4) as u64;
+        if let Some(dispatch) = mesh_dispatch {
+            // `SV_DrawIndex` counts from zero within this slice, so the mesh entry needs the
+            // slice's arena base to reach its own command — the sorted counterpart of the
+            // per-bucket base the opaque scope pushes.
+            // SAFETY: the ash seam. The range was declared to cover this offset; the sorted
+            // mesh-task slice was written by the reorder pass this frame.
+            unsafe {
+                raw.cmd_push_constants(
                     cmd,
-                    transparent_commands,
-                    offset,
-                    inputs.counters,
-                    (crate::SCENE_VISIBILITY_COUNTER_TRANSPARENT * 4) as u64,
-                    draws,
-                    20,
+                    pso.layout(),
+                    vk::ShaderStageFlags::MESH_EXT,
+                    size_of::<Mat4>() as u32,
+                    &slice_base.to_ne_bytes(),
                 );
-            } else {
-                raw.cmd_draw_indexed_indirect(cmd, transparent_commands, offset, draws, 20);
+                let offset = u64::from(slice_base) * crate::MESH_TASK_COMMAND_STRIDE;
+                let stride = crate::MESH_TASK_COMMAND_STRIDE as u32;
+                if draw_indirect_count {
+                    dispatch.cmd_draw_mesh_tasks_indirect_count(
+                        cmd,
+                        inputs.mesh_args,
+                        offset,
+                        inputs.counters,
+                        count_offset,
+                        draw_count,
+                        stride,
+                    );
+                } else {
+                    dispatch.cmd_draw_mesh_tasks_indirect(
+                        cmd,
+                        inputs.mesh_args,
+                        offset,
+                        draw_count,
+                        stride,
+                    );
+                }
+            }
+        } else {
+            let offset = u64::from(slice_base) * 20;
+            // SAFETY: the ash seam, as above.
+            unsafe {
+                if draw_indirect_count {
+                    raw.cmd_draw_indexed_indirect_count(
+                        cmd,
+                        inputs.commands,
+                        offset,
+                        inputs.counters,
+                        count_offset,
+                        draw_count,
+                        20,
+                    );
+                } else {
+                    raw.cmd_draw_indexed_indirect(cmd, inputs.commands, offset, draw_count, 20);
+                }
             }
         }
     }

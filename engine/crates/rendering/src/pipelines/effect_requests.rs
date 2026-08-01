@@ -240,6 +240,33 @@ impl Pipelines {
         }
     }
 
+    /// The micro-field slab-occluder compute PSO: the same `scatter_layout` set the instance
+    /// scatter writes through, so both append into one occluder region.
+    pub fn request_gi_occluder_micro(
+        &mut self,
+        scatter_layout: vk::DescriptorSetLayout,
+    ) -> Option<Arc<Pipeline>> {
+        if let Some(pipeline) = &self.gi_occluder_micro {
+            return Some(Arc::clone(pipeline));
+        }
+        let set_layouts = [scatter_layout];
+        match self.build_compute_multi(
+            "shaders/gi_occluder_micro.spv",
+            &set_layouts,
+            crate::GI_OCCLUDER_MICRO_PUSH_SIZE,
+        ) {
+            Ok(pipeline) => {
+                let pipeline = Arc::new(pipeline);
+                self.gi_occluder_micro = Some(Arc::clone(&pipeline));
+                Some(pipeline)
+            }
+            Err(err) => {
+                tracing::error!("request_gi_occluder_micro: {err}");
+                None
+            }
+        }
+    }
+
     /// The Global-SDF composite compute PSO: set 0 = the bindless brick array (the `sampleMdfBrick`
     /// taps), set 1 = `gdf_layout` (instances + cull list + cascade storage images), a 48-byte push.
     pub fn request_gdf_composite(

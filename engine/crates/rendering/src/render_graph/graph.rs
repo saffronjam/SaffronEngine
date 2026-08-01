@@ -787,8 +787,20 @@ impl RenderGraph {
                 };
             }
             if let Some(slot) = r.external_buffer_state {
+                // A pass index names a position in the graph that produced it and means nothing
+                // in the next one. Carrying it across would make an acquire wait on whatever pass
+                // happens to sit at that index, which can point forward and close a batch cycle.
+                // Ownership still crosses the frame through the queue/family, as it does for
+                // images — the entry-release path is what answers a foreign owner.
                 self.external_buffer_states[slot] = RgExternalBufferState {
-                    accesses: r.buffer_accesses.clone(),
+                    accesses: r
+                        .buffer_accesses
+                        .iter()
+                        .map(|access| RgBufferAccessState {
+                            last_pass: None,
+                            ..*access
+                        })
+                        .collect(),
                 };
             }
         }
