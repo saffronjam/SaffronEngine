@@ -5,6 +5,7 @@
 // coordinates — camera travel changes residency, never established placement.
 
 import global_gpu_data;
+import wind;
 
 // One resident micro field tile's header in the fields arena; `sampleCount` u16 density samples
 // (padded to four bytes) follow, then `attributeCount` typed channels. `cell` packs the signed
@@ -106,6 +107,15 @@ public static const uint SCENE_MICRO_SCRATCH_HEADER = 4u;
 public static const uint SCENE_MICRO_BASE_SKIPPED = 0xffffffffu;
 public static const uint SCENE_TRAVERSAL_OVERFLOW_RECORDS = 4u;
 public static const float BASE_CELL_EDGE_METERS = 64.0;
+// The blade height envelope: a reconstructed blade stands between these two heights above its
+// root. The aggregate slab occluder spans the tile's rooting grid plus the upper bound, so the
+// volume the distance field marks porous is the volume blades can occupy.
+public static const float MICRO_BLADE_MIN_HEIGHT = 0.25;
+public static const float MICRO_BLADE_MAX_HEIGHT = 0.6;
+// The one-sided leaf-area index of fully vegetated ground, which is what a tile whose density
+// samples all saturate stands for. The slab's occupancy is this optical depth spread over the
+// slab's own height, so a shorter grass field is denser matter for the same leaf area.
+public static const float MICRO_FIELD_FULL_LEAF_AREA = 2.0;
 
 public struct MicroFieldPush
 {
@@ -172,6 +182,43 @@ public uint microTileDensity(GpuSceneAddressBlock addresses, uint tileOffset, ui
     return (sample & 1u) != 0u ? (word >> 16u) : (word & 0xffffu);
 }
 
+// The tile's per-texel world footprint: the grid spans its owner cell's bounds.
+public float3 microTileTexelSize(GpuFieldTileRecord tile)
+{
+    return float3(
+        BASE_CELL_EDGE_METERS / float(tile.dims[0]),
+        BASE_CELL_EDGE_METERS / float(tile.dims[1]),
+        BASE_CELL_EDGE_METERS / float(tile.dims[2]));
+}
+
+// The owner cell's world origin in metres. `cell` packs the signed level-zero coordinates as
+// lo/hi word pairs, so each axis reassembles before it scales.
+public float3 microTileCellBase(GpuFieldTileRecord tile)
+{
+    return float3(
+        float(int64_t((uint64_t(tile.cell[1]) << 32) | uint64_t(tile.cell[0])))
+            * BASE_CELL_EDGE_METERS,
+        float(int64_t((uint64_t(tile.cell[3]) << 32) | uint64_t(tile.cell[2])))
+            * BASE_CELL_EDGE_METERS,
+        float(int64_t((uint64_t(tile.cell[5]) << 32) | uint64_t(tile.cell[4])))
+            * BASE_CELL_EDGE_METERS);
+}
+
+// The world box the tile's reconstructed blades occupy: its owner cell's horizontal footprint,
+// and vertically the texel grid's own rooting span plus the blade height envelope. The
+// aggregate occluder the distance field marches through is this box.
+public void microTileSlab(
+    GpuFieldTileRecord tile, out float3 slabMin, out float3 slabMax)
+{
+    float3 texelSize = microTileTexelSize(tile);
+    slabMin = microTileCellBase(tile);
+    slabMax = slabMin
+        + float3(
+            BASE_CELL_EDGE_METERS,
+            float(tile.dims[1] - 1u) * texelSize.y + MICRO_BLADE_MAX_HEIGHT,
+            BASE_CELL_EDGE_METERS);
+}
+
 // One texel's reconstruction inputs, shared verbatim by count and scatter so both
 // passes derive the identical blade set.
 public struct MicroTexel
@@ -202,22 +249,14 @@ public MicroTexel microTexel(
         return result;
     }
 
-    // The texel's world footprint: the tile grid spans its owner cell's bounds.
-    uint x = texel % tile.dims[0];
-    uint y = (texel / tile.dims[0]) % tile.dims[1];
-    uint z = texel / (tile.dims[0] * tile.dims[1]);
-    result.texelSize = float3(
-        BASE_CELL_EDGE_METERS / float(tile.dims[0]),
-        BASE_CELL_EDGE_METERS / float(tile.dims[1]),
-        BASE_CELL_EDGE_METERS / float(tile.dims[2]));
-    float3 cellBase = float3(
-        float(int64_t((uint64_t(tile.cell[1]) << 32) | uint64_t(tile.cell[0])))
-            * BASE_CELL_EDGE_METERS,
-        float(int64_t((uint64_t(tile.cell[3]) << 32) | uint64_t(tile.cell[2])))
-            * BASE_CELL_EDGE_METERS,
-        float(int64_t((uint64_t(tile.cell[5]) << 32) | uint64_t(tile.cell[4])))
-            * BASE_CELL_EDGE_METERS);
-    result.texelBase = cellBase + float3(x, y, z) * result.texelSize;
+    // The cooked density grid linearizes as `(x * dims[1] + y) * dims[2] + z`, so Z runs
+    // fastest and X slowest. Square dimensions hide a transposed decode; non-square ones
+    // scatter every blade.
+    uint z = texel % tile.dims[2];
+    uint y = (texel / tile.dims[2]) % tile.dims[1];
+    uint x = texel / (tile.dims[2] * tile.dims[1]);
+    result.texelSize = microTileTexelSize(tile);
+    result.texelBase = microTileCellBase(tile) + float3(x, y, z) * result.texelSize;
 
     // Distance gate on the texel center: micro reconstruction is near-field.
     float3 texelCenter = result.texelBase + result.texelSize * 0.5;
@@ -232,15 +271,17 @@ public MicroTexel microTexel(
     return result;
 }
 
-// The deterministic blade for one (texel, blade) pair plus its frustum verdict.
-public bool microBlade(
-    MicroTexel texel, uint blade, float4x4 viewProj, out GpuMicroCandidate candidate)
+// The deterministic blade for one (texel, blade) pair, frustum verdict aside — ray traversal
+// keeps blades the camera cannot see, because they still cast and reflect.
+public void microBladePlacement(MicroTexel texel, uint blade, out GpuMicroCandidate candidate)
 {
     uint hash = microHashCombine(texel.seed, blade);
     float jitterX = microHashUnit(microHashCombine(hash, 1u));
     float jitterZ = microHashUnit(microHashCombine(hash, 2u));
     candidate.position = texel.texelBase + float3(jitterX, 0.0, jitterZ) * texel.texelSize;
-    candidate.height = 0.25 + 0.35 * microHashUnit(microHashCombine(hash, 3u));
+    candidate.height = MICRO_BLADE_MIN_HEIGHT
+        + (MICRO_BLADE_MAX_HEIGHT - MICRO_BLADE_MIN_HEIGHT)
+            * microHashUnit(microHashCombine(hash, 3u));
     candidate.yaw = 6.2831853 * microHashUnit(microHashCombine(hash, 4u));
     candidate.width = 0.02 + 0.02 * microHashUnit(microHashCombine(hash, 5u));
     candidate.phenotype = 0u;
@@ -249,6 +290,72 @@ public bool microBlade(
     // survivor count stay bend-independent so count and scatter agree exactly.
     candidate.windBend = float2(0.0, 0.0);
     candidate.windBendPrevious = float2(0.0, 0.0);
+}
+
+// The horizontal bend words of one sway sample, magnitude-capped so grass bends
+// without flattening.
+float2 microBladeBend(float3 sway, float cap)
+{
+    float2 bend = float2(sway.x, sway.z);
+    float magnitude = length(bend);
+    return magnitude > cap ? bend * (cap / magnitude) : bend;
+}
+
+// Bakes a blade's analytic wind bend: the shared field's sway at the root for the current and
+// previous frame times, horizontal and capped by blade height, plus the interaction push sampled
+// once at the root. One implementation, because a raster pixel and a ray must see one pose —
+// the raster passes read these words from the candidate, and the ray materialization applies
+// them to the vertices it writes.
+public void microBladeBakeBend(
+    uint64_t interactionField,
+    float4 dirSpeedGust,
+    float4 windParams,
+    uint octaves,
+    uint seed,
+    float timeCurrent,
+    float timePrevious,
+    uint64_t sources,
+    uint sourceCount,
+    inout GpuMicroCandidate candidate)
+{
+    uint bladeHash = windInstanceHash(candidate.position);
+    float bendCap = candidate.height * 0.6;
+    // Blades regenerate each frame, so the interaction push (sampled once at the root) rides both
+    // bend words; only the wind term differs per frame.
+    float3 interaction = gpuSceneInteractionSample(interactionField, candidate.position.xz);
+    candidate.windBend = microBladeBend(
+        windSwayOffset(
+            candidate.position,
+            timeCurrent,
+            bladeHash,
+            dirSpeedGust,
+            windParams,
+            octaves,
+            seed,
+            sources,
+            sourceCount)
+            + interaction,
+        bendCap);
+    candidate.windBendPrevious = microBladeBend(
+        windSwayOffset(
+            candidate.position,
+            timePrevious,
+            bladeHash,
+            dirSpeedGust,
+            windParams,
+            octaves,
+            seed,
+            sources,
+            sourceCount)
+            + interaction,
+        bendCap);
+}
+
+// The same blade plus its frustum verdict, for the raster reconstruction.
+public bool microBlade(
+    MicroTexel texel, uint blade, float4x4 viewProj, out GpuMicroCandidate candidate)
+{
+    microBladePlacement(texel, blade, candidate);
 
     // Frustum test the blade's bounding point (root + height).
     float4 clip = mul(viewProj, float4(candidate.position, 1.0));

@@ -5,7 +5,6 @@
 
 import global_gpu_data;
 import scene_micro_common;
-import wind;
 
 [[vk::binding(0, 0)]] RWStructuredBuffer<uint> counters;
 [[vk::binding(1, 0)]] RWStructuredBuffer<GpuDrawRecord> records;
@@ -16,15 +15,6 @@ import wind;
 
 groupshared uint prefixes[64];
 groupshared uint chunkBase;
-
-// The horizontal bend words of one sway sample, magnitude-capped so grass bends
-// without flattening.
-float2 microBladeBend(float3 sway, float cap)
-{
-    float2 bend = float2(sway.x, sway.z);
-    float magnitude = length(bend);
-    return magnitude > cap ? bend * (cap / magnitude) : bend;
-}
 
 [shader("compute")]
 [numthreads(64, 1, 1)]
@@ -97,42 +87,19 @@ void computeMain(uint3 tid : SV_DispatchThreadID, uint3 group : SV_GroupID)
             {
                 continue;
             }
-            // The survivor's analytic wind bend, baked once per frame: the shared
-            // field's sway at the root for the current and previous frame times,
-            // horizontal and capped by blade height so grass bends without
-            // flattening. Every raster pass reads the stored words.
-            uint bladeHash = windInstanceHash(candidate.position);
-            float bendCap = candidate.height * 0.6;
-            // Blades regenerate each frame, so the interaction push (sampled once at
-            // the root) rides both bend words; only the wind term differs per frame.
-            float3 interaction = gpuSceneInteractionSample(
-                addresses.interactionField, candidate.position.xz);
-            candidate.windBend = microBladeBend(
-                windSwayOffset(
-                    candidate.position,
-                    pc.windTimeCurrent,
-                    bladeHash,
-                    pc.windDirSpeedGust,
-                    pc.windParams,
-                    pc.windOctaves,
-                    pc.windSeed,
-                    pc.windSources,
-                    pc.windSourceCount)
-                    + interaction,
-                bendCap);
-            candidate.windBendPrevious = microBladeBend(
-                windSwayOffset(
-                    candidate.position,
-                    pc.windTimePrevious,
-                    bladeHash,
-                    pc.windDirSpeedGust,
-                    pc.windParams,
-                    pc.windOctaves,
-                    pc.windSeed,
-                    pc.windSources,
-                    pc.windSourceCount)
-                    + interaction,
-                bendCap);
+            // The survivor's analytic wind bend, baked once per frame; every raster pass
+            // reads the stored words.
+            microBladeBakeBend(
+                addresses.interactionField,
+                pc.windDirSpeedGust,
+                pc.windParams,
+                pc.windOctaves,
+                pc.windSeed,
+                pc.windTimeCurrent,
+                pc.windTimePrevious,
+                pc.windSources,
+                pc.windSourceCount,
+                candidate);
             uint candidateIndex = pc.frameBase + slot;
             GpuMicroCandidate* out = (GpuMicroCandidate*)(
                 addresses.candidates
