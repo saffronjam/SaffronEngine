@@ -395,6 +395,61 @@ impl VsmDirectionalSpace {
         }
     }
 
+    /// The inclusive `(x0, y0, x1, y1)` page rectangle a world-space box covers in `level`, or
+    /// `None` when the box misses the level's window entirely.
+    ///
+    /// The box's eight corners are projected into the light plane and their extent taken, rather
+    /// than a bounding sphere through the box: a sphere over a box is up to √3 wider on every
+    /// axis, and each extra page in that margin is re-rasterized for geometry that never enters
+    /// it. A caster's aspect decides the cost — an edge-on plank covers a strip, not a disc.
+    #[must_use]
+    pub fn directional_page_span(
+        &self,
+        level: u32,
+        min: [f32; 3],
+        max: [f32; 3],
+    ) -> Option<(u32, u32, u32, u32)> {
+        let window = self.levels.get(level as usize)?;
+        if window.extent_m <= 0.0 {
+            return None;
+        }
+        let mut light_min = [f32::INFINITY; 2];
+        let mut light_max = [f32::NEG_INFINITY; 2];
+        for corner in 0..8_usize {
+            let point = self.basis.transform_point3(Vec3::new(
+                if corner & 1 == 0 { min[0] } else { max[0] },
+                if corner & 2 == 0 { min[1] } else { max[1] },
+                if corner & 4 == 0 { min[2] } else { max[2] },
+            ));
+            light_min[0] = light_min[0].min(point.x);
+            light_min[1] = light_min[1].min(point.y);
+            light_max[0] = light_max[0].max(point.x);
+            light_max[1] = light_max[1].max(point.y);
+        }
+        let page_m = window.extent_m / VSM_LEVEL_PAGES as f32;
+        let lo = [
+            (light_min[0] - window.origin_light[0]) / page_m,
+            (light_min[1] - window.origin_light[1]) / page_m,
+        ];
+        let hi = [
+            (light_max[0] - window.origin_light[0]) / page_m,
+            (light_max[1] - window.origin_light[1]) / page_m,
+        ];
+        if hi[0] < 0.0
+            || hi[1] < 0.0
+            || lo[0] >= VSM_LEVEL_PAGES as f32
+            || lo[1] >= VSM_LEVEL_PAGES as f32
+        {
+            return None;
+        }
+        Some((
+            lo[0].max(0.0) as u32,
+            lo[1].max(0.0) as u32,
+            hi[0].min(VSM_LEVEL_PAGES as f32 - 1.0) as u32,
+            hi[1].min(VSM_LEVEL_PAGES as f32 - 1.0) as u32,
+        ))
+    }
+
     /// The [0,1] depth of a light-space forward coordinate — the EXACT mapping the
     /// page matrices rasterize, shared with the shader sampler.
     pub fn depth01(&self, forward: f32) -> f32 {
@@ -955,6 +1010,73 @@ pub fn vsm_table_entry(tile: Option<u32>) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The dirty page rectangle is the box's own light-plane extent, so a caster's aspect decides
+    /// how many pages re-rasterize.
+    ///
+    /// The plank and the cube here share a bounding sphere to within a page — half-extents
+    /// `(12, 0.3, 0.3)` and `(6.9325, 6.9325, 6.9325)` both have radius ~12 m — so a derivation
+    /// that goes through a sphere, or through the prototype's own bounding radius, answers them
+    /// identically. The third box IS that sphere's box, and it is what the page counts are measured
+    /// against: the plank dirties a 25-page strip and the cube a 196-page square, where the sphere
+    /// dirties 676 for either.
+    #[test]
+    fn a_thin_caster_dirties_a_strip_where_a_cube_dirties_a_square() {
+        // Straight-down light: the light plane's x tracks world −z and its y tracks world x, so a
+        // world-X-long plank lays out as a one-page-wide column (level 0 pages are 1 m).
+        let space = VsmDirectionalSpace::build(Vec3::NEG_Y, Vec3::ZERO);
+        let span = |min: [f32; 3], max: [f32; 3]| {
+            space
+                .directional_page_span(0, min, max)
+                .expect("the box sits inside level 0's window")
+        };
+        let pages = |(x0, y0, x1, y1): (u32, u32, u32, u32)| {
+            u64::from(x1 - x0 + 1) * u64::from(y1 - y0 + 1)
+        };
+        let plank = span([-12.0, -0.3, 0.2], [12.0, 0.3, 0.8]);
+        let cube = span([-6.9325; 3], [6.9325; 3]);
+        let sphere_box = span([-12.0075; 3], [12.0075; 3]);
+        assert_eq!(
+            plank,
+            (15, 4, 15, 28),
+            "the plank covers one column of pages"
+        );
+        assert_eq!(cube, (9, 9, 22, 22), "the cube covers a square");
+        assert_eq!(pages(plank), 25);
+        assert_eq!(pages(cube), 196);
+        assert_eq!(pages(sphere_box), 676);
+        assert!(
+            pages(cube) > pages(plank) * 4,
+            "a sphere-derived span answers these two alike"
+        );
+        assert!(
+            pages(sphere_box) > pages(cube) * 3,
+            "and it costs even the cube more than three times its own footprint"
+        );
+    }
+
+    /// A box outside a level's window dirties nothing there, and one that straddles the edge
+    /// dirties only the part inside — the clamp is what keeps an off-window caster from marking
+    /// the border row of every level it misses.
+    #[test]
+    fn a_box_outside_the_window_dirties_no_pages() {
+        let space = VsmDirectionalSpace::build(Vec3::NEG_Y, Vec3::ZERO);
+        // Level 0 is 32 m across, centred on the camera: its light plane spans [-16, 16).
+        assert!(
+            space
+                .directional_page_span(0, [40.0, -1.0, -1.0], [42.0, 1.0, 1.0])
+                .is_none(),
+            "a caster past the level's window marks nothing in it"
+        );
+        let (_, y0, _, y1) = space
+            .directional_page_span(0, [-40.0, -1.0, -1.0], [-14.5, 1.0, 1.0])
+            .expect("the box reaches into the window");
+        assert_eq!(y0, 0, "the span clamps to the window's first page");
+        assert_eq!(
+            y1, 1,
+            "and covers only the metre and a half that reaches in"
+        );
+    }
 
     #[test]
     fn windows_snap_deterministically_and_shift_by_pages() {

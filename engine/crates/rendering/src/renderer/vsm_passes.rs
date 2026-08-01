@@ -3,53 +3,12 @@ use super::*;
 impl Renderer {
     /// Marks every resident virtual-shadow page a swept world AABB overlaps as dirty, across the
     /// directional levels and the armed spot/point spaces. Marking an absent page is a no-op.
-    ///
-    /// The box's eight corners are projected into each space and their extent taken, rather than a
-    /// bounding sphere through the box: a sphere over a box is up to √3 wider on every axis, and
-    /// each extra page in that margin is re-rasterized for geometry that never enters it.
     fn dirty_vsm_swept_bounds(&mut self, min: [f32; 3], max: [f32; 3]) {
-        use saffron_geometry::glam::Vec3;
-        let corners: [Vec3; 8] = std::array::from_fn(|corner| {
-            Vec3::new(
-                if corner & 1 == 0 { min[0] } else { max[0] },
-                if corner & 2 == 0 { min[1] } else { max[1] },
-                if corner & 4 == 0 { min[2] } else { max[2] },
-            )
-        });
-        let mut light_min = [f32::INFINITY; 2];
-        let mut light_max = [f32::NEG_INFINITY; 2];
-        for corner in corners {
-            let light = self.vsm_space.basis.transform_point3(corner);
-            light_min[0] = light_min[0].min(light.x);
-            light_min[1] = light_min[1].min(light.y);
-            light_max[0] = light_max[0].max(light.x);
-            light_max[1] = light_max[1].max(light.y);
-        }
         for level in 0..crate::VSM_DIRECTIONAL_LEVELS {
-            let window = &self.vsm_space.levels[level as usize];
-            if window.extent_m <= 0.0 {
+            let Some((x0, y0, x1, y1)) = self.vsm_space.directional_page_span(level, min, max)
+            else {
                 continue;
-            }
-            let page_m = window.extent_m / crate::VSM_LEVEL_PAGES as f32;
-            let lo = [
-                (light_min[0] - window.origin_light[0]) / page_m,
-                (light_min[1] - window.origin_light[1]) / page_m,
-            ];
-            let hi = [
-                (light_max[0] - window.origin_light[0]) / page_m,
-                (light_max[1] - window.origin_light[1]) / page_m,
-            ];
-            if hi[0] < 0.0
-                || hi[1] < 0.0
-                || lo[0] >= crate::VSM_LEVEL_PAGES as f32
-                || lo[1] >= crate::VSM_LEVEL_PAGES as f32
-            {
-                continue;
-            }
-            let x0 = lo[0].max(0.0) as u32;
-            let y0 = lo[1].max(0.0) as u32;
-            let x1 = (hi[0].min(crate::VSM_LEVEL_PAGES as f32 - 1.0)) as u32;
-            let y1 = (hi[1].min(crate::VSM_LEVEL_PAGES as f32 - 1.0)) as u32;
+            };
             for y in y0..=y1 {
                 for x in x0..=x1 {
                     self.vsm_residency
@@ -57,6 +16,13 @@ impl Renderer {
                 }
             }
         }
+        let corners: [saffron_geometry::glam::Vec3; 8] = std::array::from_fn(|corner| {
+            saffron_geometry::glam::Vec3::new(
+                if corner & 1 == 0 { min[0] } else { max[0] },
+                if corner & 2 == 0 { min[1] } else { max[1] },
+                if corner & 4 == 0 { min[2] } else { max[2] },
+            )
+        });
         let projective = |matrix: saffron_geometry::glam::Mat4,
                           pages: u32,
                           residency: &mut crate::VsmResidency,

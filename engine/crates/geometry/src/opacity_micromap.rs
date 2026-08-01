@@ -532,7 +532,7 @@ mod tests {
     fn the_curve_round_trips_every_micro_triangle() {
         // The index is derived from barycentrics; the corner search inverts it. If either is
         // wrong the states land in the wrong slots, which no image test would localize.
-        for level in 0..=4 {
+        for level in 0..=6 {
             let count = 1u32 << (2 * level);
             for index in 0..count {
                 let corners = micro_triangle_corners(index, level);

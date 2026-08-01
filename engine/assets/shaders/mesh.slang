@@ -232,7 +232,7 @@ VertexOutput executorVertexOutput(uint recordIndex, uint vertexIndex)
         assembly,
         use,
         record.clusterState);
-    return transformExecutorVertex(
+    VertexOutput output = transformExecutorVertex(
         local,
         localNormal,
         uv,
@@ -240,6 +240,8 @@ VertexOutput executorVertexOutput(uint recordIndex, uint vertexIndex)
         windOffset,
         material.parameterIndex,
         record.transition);
+    output.recordIndex = recordIndex;
+    return output;
 }
 
 // Indexed-MDI executor vertex path: SV_VulkanVertexID is the pulled index value plus the
@@ -343,6 +345,56 @@ float4 depthPrepassFragment(VertexOutput input) : SV_Target
         return float4(0.0, 0.0, 0.0, coverage.alpha);
     }
     return float4(0.0, 0.0, 0.0, 1.0);
+}
+
+/// One selection-pass fragment: the tagged draw-record identity plus the surface point the
+/// picked pixel resolved to.
+struct SelectionOutput
+{
+    /// `x` = representation + 1 (zero is the cleared "nothing here" word), `y` = the GPU-scene
+    /// instance slot, `z` = the record's content index, `w` = the record's assembly use.
+    uint4 id : SV_Target0;
+    float4 position : SV_Target1;
+    float4 normal : SV_Target2;
+};
+
+// Selection fragment: writes the emitting record's identity and surface point. Repeats the
+// depth-prepass coverage test exactly, so a cutout texel of a foliage card answers with whatever
+// stands behind it rather than with the card.
+[shader("fragment")]
+SelectionOutput selectionIdFragment(VertexOutput input)
+{
+    MaterialParams mat = materialParams[input.materialIndex];
+    bool thinSheet = (mat.tex1.w & FEATURE_THIN_SHEET) != 0u;
+    if (thinSheet || (mat.tex1.w & FEATURE_ALPHACLIP) != 0u)
+    {
+        float2 uv = input.uv0 * mat.uv.xy + mat.uv.zw;
+        uint sourceIndex = thinSheet ? mat.coverage.x : mat.tex0.x;
+        CoverageSample coverage = sampleCanonicalCoverage(
+            albedoTextures[NonUniformResourceIndex(sourceIndex)],
+            uv,
+            input.coverageAnchor,
+            thinSheet ? mat.coverage.y : COVERAGE_SOURCE_ALBEDO_ALPHA,
+            thinSheet ? mat.coverage.z : COVERAGE_CLASS_MASKED,
+            mat.baseColor.a,
+            thinSheet ? mat.coverageHash.zw : uint2(1u),
+            thinSheet ? mat.coverageHash.xy : uint2(0u),
+            mat.tex1.z,
+            mat.pbr.w,
+            thinSheet,
+            false);
+        if (!coverage.covered) { discard; }
+    }
+    let record = executorRecords[input.recordIndex];
+    SelectionOutput output;
+    output.id = uint4(
+        record.representation + 1u,
+        record.instance.index,
+        record.contentIndex,
+        record.clusterState);
+    output.position = float4(input.worldPos, 1.0);
+    output.normal = float4(normalize(input.worldNormal), 0.0);
+    return output;
 }
 
 // Reactive-coverage fragment: the TAA reactive mask's producer. The reactive-coverage pass draws

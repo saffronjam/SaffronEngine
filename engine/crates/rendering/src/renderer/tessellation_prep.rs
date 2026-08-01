@@ -315,6 +315,11 @@ impl Renderer {
             .map(|(row, inst)| crate::DisplacedRow {
                 slot: inst.instance_slot,
                 row: row as u32,
+                local_amplitude: crate::displaced_local_amplitude(
+                    inst.height_scale,
+                    inst.vector_index,
+                ),
+                reserved: 0,
             })
             .collect();
         let rows_address = match self
