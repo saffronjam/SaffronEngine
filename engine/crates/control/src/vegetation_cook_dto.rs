@@ -423,7 +423,7 @@ fn vegetation_map_chunk_key_dto(key: VegetationMapChunkKey) -> VegetationMapChun
     }
 }
 
-fn field_channel_dto(channel: FieldChannel) -> FieldChannelDto {
+pub(crate) fn field_channel_dto(channel: FieldChannel) -> FieldChannelDto {
     let (kind, user) = match channel {
         FieldChannel::Altitude => (FieldChannelKindDto::Altitude, None),
         FieldChannel::Slope => (FieldChannelKindDto::Slope, None),

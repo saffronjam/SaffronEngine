@@ -14,6 +14,7 @@ use saffron_scene::{
     SkinnedMesh, TextureRole, Transform,
 };
 use saffron_sceneedit::{PlayState, ProjectLoadRequest, ProjectPhase};
+use saffron_spatial::UnitInterval;
 use saffron_vegetation::PlantCompileLimits;
 use serde_json::{Value, json};
 
@@ -241,24 +242,17 @@ pub(crate) fn preview_budget(
 pub(crate) fn phenotype_dto(
     phenotype: &saffron_vegetation::PlantPhenotype,
 ) -> saffron_protocol::PlantPhenotypeDto {
-    use saffron_vegetation::PhenotypeRole;
     saffron_protocol::PlantPhenotypeDto {
         id: phenotype.id,
-        role: match phenotype.role {
-            PhenotypeRole::Healthy => saffron_protocol::PhenotypeRoleDto::Healthy,
-            PhenotypeRole::Harvested => saffron_protocol::PhenotypeRoleDto::Harvested,
-            PhenotypeRole::Damaged => saffron_protocol::PhenotypeRoleDto::Damaged,
-            PhenotypeRole::Burned => saffron_protocol::PhenotypeRoleDto::Burned,
-            PhenotypeRole::Dead => saffron_protocol::PhenotypeRoleDto::Dead,
-            PhenotypeRole::Flowering => saffron_protocol::PhenotypeRoleDto::Flowering,
-            PhenotypeRole::Fruiting => saffron_protocol::PhenotypeRoleDto::Fruiting,
-            PhenotypeRole::Senescent => saffron_protocol::PhenotypeRoleDto::Senescent,
-            PhenotypeRole::Wet => saffron_protocol::PhenotypeRoleDto::Wet,
-        },
+        role: phenotype_role_dto(phenotype.role),
         variation: phenotype.variation,
         season_window: phenotype
+            .response
             .season_window
             .map(|(start, end)| [u32::from(start), u32::from(end)]),
+        health_band: phenotype.response.health_band.map(unit_band_dto),
+        moisture_band: phenotype.response.moisture_band.map(unit_band_dto),
+        ramp_mille: u32::from(phenotype.response.ramp_mille),
         material_remap: phenotype
             .material_remap
             .iter()
@@ -272,6 +266,46 @@ pub(crate) fn phenotype_dto(
             .map(ToString::to_string)
             .collect(),
     }
+}
+
+/// One phenotype role on the wire.
+pub(crate) fn phenotype_role_dto(
+    role: saffron_vegetation::PhenotypeRole,
+) -> saffron_protocol::PhenotypeRoleDto {
+    use saffron_vegetation::PhenotypeRole;
+    match role {
+        PhenotypeRole::Healthy => saffron_protocol::PhenotypeRoleDto::Healthy,
+        PhenotypeRole::Harvested => saffron_protocol::PhenotypeRoleDto::Harvested,
+        PhenotypeRole::Damaged => saffron_protocol::PhenotypeRoleDto::Damaged,
+        PhenotypeRole::Burned => saffron_protocol::PhenotypeRoleDto::Burned,
+        PhenotypeRole::Dead => saffron_protocol::PhenotypeRoleDto::Dead,
+        PhenotypeRole::Flowering => saffron_protocol::PhenotypeRoleDto::Flowering,
+        PhenotypeRole::Fruiting => saffron_protocol::PhenotypeRoleDto::Fruiting,
+        PhenotypeRole::Senescent => saffron_protocol::PhenotypeRoleDto::Senescent,
+        PhenotypeRole::Wet => saffron_protocol::PhenotypeRoleDto::Wet,
+    }
+}
+
+/// A unit band as per-mille endpoints.
+fn unit_band_dto(band: (UnitInterval, UnitInterval)) -> [u32; 2] {
+    let mille = |unit: UnitInterval| u32::from(unit.bits()) * 1000 / u32::from(u16::MAX);
+    [mille(band.0), mille(band.1)]
+}
+
+/// Per-mille endpoints back to a unit band, rejecting an inverted or out-of-range one.
+fn unit_band_from_dto(band: [u32; 2]) -> Result<(UnitInterval, UnitInterval)> {
+    let unit = |value: u32| {
+        (value <= 1000)
+            .then(|| UnitInterval::from_bits((value * u32::from(u16::MAX) / 1000) as u16))
+            .ok_or_else(|| Error::command("a phenotype band is per-mille (0..=1000)"))
+    };
+    let (low, high) = (unit(band[0])?, unit(band[1])?);
+    if high <= low {
+        return Err(Error::command(
+            "a phenotype band's high must exceed its low",
+        ));
+    }
+    Ok((low, high))
 }
 
 pub(crate) fn phenotype_from_dto(
@@ -292,6 +326,12 @@ pub(crate) fn phenotype_from_dto(
             Result::Ok((narrow(start)?, narrow(end)?))
         })
         .transpose()?;
+    let health_band = dto.health_band.map(unit_band_from_dto).transpose()?;
+    let moisture_band = dto.moisture_band.map(unit_band_from_dto).transpose()?;
+    let ramp_mille = u16::try_from(dto.ramp_mille)
+        .ok()
+        .filter(|value| *value <= 500)
+        .ok_or_else(|| Error::command("rampMille is per-mille of a band (0..=500)"))?;
     Ok(saffron_vegetation::PlantPhenotype {
         id: dto.id,
         role: match dto.role {
@@ -305,7 +345,12 @@ pub(crate) fn phenotype_from_dto(
             saffron_protocol::PhenotypeRoleDto::Senescent => PhenotypeRole::Senescent,
             saffron_protocol::PhenotypeRoleDto::Wet => PhenotypeRole::Wet,
         },
-        season_window,
+        response: saffron_vegetation::PhenotypeResponse {
+            season_window,
+            health_band,
+            moisture_band,
+            ramp_mille,
+        },
         variation: dto.variation,
         material_remap: dto
             .material_remap

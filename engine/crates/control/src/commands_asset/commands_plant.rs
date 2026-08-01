@@ -1,3 +1,5 @@
+use std::collections::BTreeMap;
+
 use saffron_assets::{
     PlantRecookOptions, PlantRecookOutcome, load_plant_family_asset,
     portable_vegetation_platform_profile, recook_plant_family, validate_plant_family_sources,
@@ -106,6 +108,11 @@ pub fn register_plant_commands(reg: &mut CommandRegistry) {
                     .iter()
                     .map(crate::botanical_dto::graft_source_dto)
                     .collect(),
+                modules: plant
+                    .modules
+                    .iter()
+                    .map(crate::botanical_dto::module_reference_dto)
+                    .collect(),
                 growth: plant_growth_dto(
                     ctx.assets,
                     &plant,
@@ -152,12 +159,20 @@ pub fn register_plant_commands(reg: &mut CommandRegistry) {
                 })
                 .collect::<Result<Vec<_>>>()?;
             grafts.sort_by_key(|graft| graft.id);
-            // The family's parts, spines, and dimensions are what the new graph grows, never the
-            // previous graph's leftovers: a native family's structure is a result.
-            // The regrown family inherits the module table it is called with: `plant-graph-set`
-            // replaces the graph, and a graph whose module calls lost their bindings would fail
-            // validation on the way back in.
-            let module_resolver = saffron_assets::PlantModules::for_family(ctx.assets, &existing);
+            // A `moduleCall` node and the binding it names are validated against each other, so the
+            // module table crosses with the graph rather than leaving one of the two behind.
+            let mut modules = params
+                .modules
+                .iter()
+                .map(crate::botanical_dto::module_reference_from_dto)
+                .collect::<Result<Vec<_>>>()?;
+            modules.sort_by_key(|module| module.call_guid);
+            let with_modules = saffron_vegetation::PlantFamilyAsset {
+                modules,
+                ..existing.clone()
+            };
+            let module_resolver =
+                saffron_assets::PlantModules::for_family(ctx.assets, &with_modules);
             let mut updated = saffron_vegetation::native_plant_family(
                 id,
                 &existing.name,
@@ -166,6 +181,7 @@ pub fn register_plant_commands(reg: &mut CommandRegistry) {
                 &module_resolver,
             )
             .map_err(Error::command)?;
+            updated.modules = with_modules.modules.clone();
             if let saffron_vegetation::PlantFamilySource::Native {
                 grafts: declared, ..
             } = &mut updated.source
@@ -175,6 +191,10 @@ pub fn register_plant_commands(reg: &mut CommandRegistry) {
             // Everything the artist authored around the graph survives the regrow. What the graph
             // derives — variations, appearances, proxies, dimensions, spines — is the NEW graph's,
             // never the previous one's leftovers.
+            // A module family stays a module: the role and the depth budget are authored around the
+            // graph, not derived from it, and a regrow that reset them would unbind every caller.
+            updated.role = existing.role;
+            updated.module_recursion_limit = existing.module_recursion_limit;
             updated.tags = existing.tags.clone();
             updated.mechanics = existing.mechanics;
             updated.interaction_policy = existing.interaction_policy;
@@ -193,6 +213,11 @@ pub fn register_plant_commands(reg: &mut CommandRegistry) {
                 grafts: grafts
                     .iter()
                     .map(crate::botanical_dto::graft_source_dto)
+                    .collect(),
+                modules: updated
+                    .modules
+                    .iter()
+                    .map(crate::botanical_dto::module_reference_dto)
                     .collect(),
                 growth: plant_growth_dto(
                     ctx.assets,
@@ -297,31 +322,42 @@ pub fn register_plant_commands(reg: &mut CommandRegistry) {
         saffron_protocol::PlantSeasonPhenotypeResult,
     >(
         "plant-season-phenotype",
-        "plant-season-phenotype {plant, seasonMille, lifecycle?} — the appearance a family renders then",
+        "plant-season-phenotype {plant, seasonMille, lifecycle?, healthMille?, moistureMille?} — the appearance a family renders then, with every phenotype's weight",
         |ctx, params| {
             require_project_loaded(ctx)?;
             if params.season_mille > 999 {
                 return Err(Error::command("seasonMille is per-mille of the year (0..1000)"));
             }
+            let unit = |value: Option<u32>, default: saffron_spatial::UnitInterval| match value {
+                Some(value) if value <= 1000 => Ok(saffron_spatial::UnitInterval::from_bits(
+                    (value * u32::from(u16::MAX) / 1000) as u16,
+                )),
+                Some(_) => Err(Error::command("health and moisture are per-mille (0..=1000)")),
+                None => Ok(default),
+            };
             let id = resolve_asset(ctx, &params.plant)?;
             let plant = load_plant_family_asset(ctx.assets, id)
                 .map_err(Error::command)?;
-            let lifecycle = params.lifecycle.map_or(
-                saffron_vegetation::PlantLifecycle::Mature,
-                crate::commands_vegetation_runtime::lifecycle_from_dto,
-            );
+            let state = saffron_vegetation::PhenologyState {
+                lifecycle: params.lifecycle.map_or(
+                    saffron_vegetation::PlantLifecycle::Mature,
+                    crate::commands_vegetation_runtime::lifecycle_from_dto,
+                ),
+                season_mille: u16::try_from(params.season_mille).unwrap_or(0),
+                health: unit(params.health_mille, saffron_spatial::UnitInterval::ONE)?,
+                moisture: unit(params.moisture_mille, saffron_spatial::UnitInterval::ZERO)?,
+            };
             // The engine's own resolver, not a second reading of the same rules: lifecycle wins
-            // over season (a dead plant does not turn autumnal), and the cooked phenotype is the
-            // fallback throughout. A preview that resolved this differently from the renderer would
-            // be showing an appearance the scene never picks.
+            // over the curves (a dead plant does not turn autumnal), and the cooked phenotype is
+            // the fallback throughout. A preview that resolved this differently from the renderer
+            // would be showing an appearance the scene never picks.
             let phenotype = saffron_vegetation::resolve_rendered_phenotype(
                 plant
                     .phenotypes
                     .iter()
-                    .map(|entry| (entry.id, entry.role, entry.season_window)),
+                    .map(|entry| (entry.id, entry.role, entry.response)),
                 plant.phenotypes.first().map_or(0, |entry| entry.id),
-                lifecycle,
-                u16::try_from(params.season_mille).unwrap_or(0),
+                state,
             );
             let variation = plant
                 .phenotypes
@@ -332,6 +368,20 @@ pub fn register_plant_commands(reg: &mut CommandRegistry) {
                 plant: WireUuid(id.value()),
                 phenotype,
                 variation,
+                weights: plant
+                    .phenotypes
+                    .iter()
+                    .map(|entry| saffron_protocol::PlantPhenotypeWeightDto {
+                        phenotype: entry.id,
+                        role: crate::commands_asset::preview::phenotype_role_dto(entry.role),
+                        weight_mille: saffron_vegetation::phenotype_weight_mille(
+                            entry.role,
+                            entry.response,
+                            state,
+                        )
+                        .map(u32::from),
+                    })
+                    .collect(),
             })
         },
     );
@@ -520,6 +570,23 @@ pub fn register_plant_commands(reg: &mut CommandRegistry) {
                 &saffron_vegetation::BotanicalBudget::COOK,
             )
             .map_err(Error::command)?;
+            let frame_axis: BTreeMap<_, _> = growth
+                .assembly
+                .frames
+                .iter()
+                .map(|frame| (frame.id, frame.axis))
+                .collect();
+            let elements = growth
+                .assembly
+                .elements
+                .iter()
+                .map(|placement| {
+                    let axis = frame_axis.get(&placement.frame).copied().ok_or_else(|| {
+                        Error::command("grown element sits on a frame the growth does not carry")
+                    })?;
+                    Ok(crate::botanical_dto::placement_dto(placement, axis))
+                })
+                .collect::<Result<Vec<_>>>()?;
             Ok(saffron_protocol::PlantElementsResult {
                 plant: WireUuid(id.value()),
                 axes: growth
@@ -528,12 +595,7 @@ pub fn register_plant_commands(reg: &mut CommandRegistry) {
                     .iter()
                     .map(crate::botanical_dto::axis_dto)
                     .collect(),
-                elements: growth
-                    .assembly
-                    .elements
-                    .iter()
-                    .map(crate::botanical_dto::placement_dto)
-                    .collect(),
+                elements,
             })
         },
     );

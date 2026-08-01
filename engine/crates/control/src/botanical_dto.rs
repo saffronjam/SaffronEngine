@@ -140,6 +140,36 @@ pub(crate) fn graft_source_from_dto(
     })
 }
 
+/// The DTO form of one module binding.
+#[must_use]
+pub(crate) fn module_reference_dto(
+    reference: &saffron_vegetation::PlantModuleReference,
+) -> saffron_protocol::PlantModuleReferenceDto {
+    saffron_protocol::PlantModuleReferenceDto {
+        call_guid: VegetationGuid(format!("{:032x}", reference.call_guid)),
+        plant: saffron_protocol::Uuid(reference.plant.value()),
+        variation: reference.variation,
+        scale_bits: reference.scale.bits(),
+    }
+}
+
+/// The module binding one DTO describes.
+///
+/// # Errors
+///
+/// [`Error::command`] when the call-site identity is not 32 hex digits.
+pub(crate) fn module_reference_from_dto(
+    dto: &saffron_protocol::PlantModuleReferenceDto,
+) -> Result<saffron_vegetation::PlantModuleReference> {
+    Ok(saffron_vegetation::PlantModuleReference {
+        plant: saffron_core::Uuid(dto.plant.0),
+        call_guid: u128::from_str_radix(&dto.call_guid.0, 16)
+            .map_err(|_| Error::command("modules.callGuid must be 32 hex digits"))?,
+        variation: dto.variation,
+        scale: DecisionScalar::from_bits(dto.scale_bits),
+    })
+}
+
 fn import_settings_dto(
     settings: &saffron_vegetation::PlantImportSettings,
 ) -> PlantImportSettingsDto {
@@ -284,12 +314,17 @@ pub(crate) fn axis_dto(axis: &BotanicalAxis) -> BotanicalAxisDto {
     }
 }
 
-/// The DTO form of one placed element, as an edit addresses it.
+/// The DTO form of one placed element, as an edit addresses it. `axis` is the axis carrying the
+/// frame the element sits on, which the caller resolves from the same assembly's frame table.
 #[must_use]
-pub(crate) fn placement_dto(placement: &BotanicalPlacement) -> BotanicalPlacementDto {
+pub(crate) fn placement_dto(
+    placement: &BotanicalPlacement,
+    axis: BotanicalElementId,
+) -> BotanicalPlacementDto {
     BotanicalPlacementDto {
         id: placement.id.value().to_string(),
         frame: placement.frame.value().to_string(),
+        axis: axis.value().to_string(),
         element: element_dto(placement.element),
         material_slot: placement.material_slot,
         position_bits: placement.position.map(DecisionScalar::bits),
@@ -459,13 +494,20 @@ fn operator_dto(operator: &BotanicalOperator) -> BotanicalOperatorDto {
             end: end.bits(),
             divergence: divergence.bits(),
         },
-        BotanicalOperator::Tropism { kind, strength } => BotanicalOperatorDto::Tropism {
+        BotanicalOperator::Tropism {
+            kind,
+            strength,
+            stimulus,
+            plane_offset,
+        } => BotanicalOperatorDto::Tropism {
             kind_of: match kind {
                 TropismKind::Phototropism => TropismKindDto::Phototropism,
                 TropismKind::Gravitropism => TropismKindDto::Gravitropism,
                 TropismKind::Thigmotropism => TropismKindDto::Thigmotropism,
             },
             strength: strength.bits(),
+            stimulus_bits: stimulus.map(DecisionScalar::bits),
+            plane_offset_bits: plane_offset.bits(),
         },
         BotanicalOperator::Prune {
             rule,
@@ -582,13 +624,20 @@ fn operator_from_dto(operator: &BotanicalOperatorDto) -> Result<BotanicalOperato
             end: unit(*end),
             divergence: unit(*divergence),
         },
-        BotanicalOperatorDto::Tropism { kind_of, strength } => BotanicalOperator::Tropism {
+        BotanicalOperatorDto::Tropism {
+            kind_of,
+            strength,
+            stimulus_bits,
+            plane_offset_bits,
+        } => BotanicalOperator::Tropism {
             kind: match kind_of {
                 TropismKindDto::Phototropism => TropismKind::Phototropism,
                 TropismKindDto::Gravitropism => TropismKind::Gravitropism,
                 TropismKindDto::Thigmotropism => TropismKind::Thigmotropism,
             },
             strength: unit(*strength),
+            stimulus: stimulus_bits.map(fixed),
+            plane_offset: fixed(*plane_offset_bits),
         },
         BotanicalOperatorDto::Prune {
             rule,

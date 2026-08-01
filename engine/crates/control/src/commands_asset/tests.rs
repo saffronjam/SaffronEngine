@@ -1,7 +1,8 @@
 use std::collections::BTreeMap;
 
 use saffron_assets::{
-    default_material_asset, save_biome_asset, save_material_asset, save_plant_family_asset,
+    default_material_asset, load_plant_family_asset, save_biome_asset, save_material_asset,
+    save_plant_family_asset,
 };
 use saffron_protocol::PlantSourceSelectorDto;
 use saffron_scene::{AssetEntry, AssetType, MaterialSet, Mesh, VegetationField};
@@ -10,8 +11,8 @@ use saffron_spatial::{DecisionScalar, UnitInterval};
 use saffron_vegetation::{
     BIOME_ASSET_VERSION, BiomeAsset, BiomeGraphPolicy, BiomePaletteEntry, BiomeRole,
     BotanicalGraphDocument, InteractionPolicy, MechanicalResponse, PLANT_ASSET_VERSION,
-    PhenotypeRole, PlantDimensions, PlantFamilyAsset, PlantFamilySource, PlantPart,
-    PlantPartSemantic, PlantPhenotype, PlantVariation,
+    PhenotypeResponse, PhenotypeRole, PlantDimensions, PlantFamilyAsset, PlantFamilySource,
+    PlantPart, PlantPartSemantic, PlantPhenotype, PlantVariation,
 };
 use serde_json::json;
 
@@ -105,7 +106,7 @@ fn seed_native_plant(ctx: &mut EngineContext<'_>) -> u64 {
         phenotypes: vec![PlantPhenotype {
             id: 0,
             role: PhenotypeRole::Healthy,
-            season_window: None,
+            response: PhenotypeResponse::default(),
             variation: 0,
             material_remap: Vec::new(),
             active_parts: Vec::new(),
@@ -119,6 +120,111 @@ fn seed_native_plant(ctx: &mut EngineContext<'_>) -> u64 {
     save_plant_family_asset(ctx.assets, plant, "Oak", "plants")
         .expect("save plant")
         .value()
+}
+
+/// Seeds a second native family carrying the module role — the preset a `moduleCall` grows.
+fn seed_plant_module(ctx: &mut EngineContext<'_>, family: u64) -> u64 {
+    let material = save_material_asset(ctx.assets, &default_material_asset(), "Frond", "plants")
+        .expect("save module material");
+    let mut module =
+        load_plant_family_asset(ctx.assets, saffron_core::Uuid(family)).expect("the seeded family");
+    module.name = "Bough".to_owned();
+    module.role = saffron_vegetation::PlantFamilyRole::Module;
+    // Its own sapling graph binds a shell slot and an instance slot, and a family declares a
+    // material for every slot it grows.
+    module.material_slots = vec![
+        material,
+        save_material_asset(ctx.assets, &default_material_asset(), "Twig", "plants")
+            .expect("save module material"),
+    ];
+    module.source = PlantFamilySource::Native {
+        graph: BotanicalGraphDocument::sapling(0x600d),
+        grafts: Vec::new(),
+    };
+    save_plant_family_asset(ctx.assets, module, "Bough", "plants")
+        .expect("save module")
+        .value()
+}
+
+/// The document with `frames` routed into a fresh `module-call` node whose elements replace whatever
+/// fed the family sink, so the grown plant is the module and nothing else.
+fn call_the_module(graph: &serde_json::Value, call_guid: &str) -> serde_json::Value {
+    let mut document = graph.clone();
+    let nodes = document["nodes"].as_array().expect("nodes").clone();
+    let frames_source = nodes
+        .iter()
+        .find(|node| node["operator"]["kind"] == json!("phyllotaxis"))
+        .expect("a phyllotaxis node")["guid"]
+        .as_str()
+        .expect("guid")
+        .to_owned();
+    let sink = nodes
+        .iter()
+        .find(|node| node["operator"]["kind"] == json!("family"))
+        .expect("the family sink")["guid"]
+        .as_str()
+        .expect("guid")
+        .to_owned();
+    let call = nodes
+        .iter()
+        .map(|node| {
+            node["guid"]
+                .as_str()
+                .and_then(|guid| guid.parse::<u128>().ok())
+                .unwrap_or(0)
+        })
+        .max()
+        .unwrap_or(0)
+        + 1;
+    let mut appended = nodes;
+    appended.push(json!({
+        "guid": call.to_string(),
+        "version": 2,
+        "semanticRevision": 1,
+        "operator": { "kind": "module-call", "callGuid": call_guid },
+    }));
+    appended.sort_by_key(|node| {
+        node["guid"]
+            .as_str()
+            .and_then(|guid| guid.parse::<u128>().ok())
+            .unwrap_or(0)
+    });
+    document["nodes"] = json!(appended);
+    let mut edges: Vec<serde_json::Value> = document["edges"]
+        .as_array()
+        .expect("edges")
+        .iter()
+        .filter(|edge| !(edge["toNode"] == json!(sink) && edge["toPin"] == json!("elements")))
+        .cloned()
+        .collect();
+    edges.push(json!({
+        "fromNode": frames_source,
+        "fromPin": "frames",
+        "toNode": call.to_string(),
+        "toPin": "frames",
+    }));
+    edges.push(json!({
+        "fromNode": call.to_string(),
+        "fromPin": "elements",
+        "toNode": sink,
+        "toPin": "elements",
+    }));
+    edges.sort_by_key(|edge| {
+        (
+            edge["fromNode"]
+                .as_str()
+                .and_then(|guid| guid.parse::<u128>().ok())
+                .unwrap_or(0),
+            edge["fromPin"].as_str().unwrap_or("").to_owned(),
+            edge["toNode"]
+                .as_str()
+                .and_then(|guid| guid.parse::<u128>().ok())
+                .unwrap_or(0),
+            edge["toPin"].as_str().unwrap_or("").to_owned(),
+        )
+    });
+    document["edges"] = json!(edges);
+    document
 }
 
 fn seed_biome(ctx: &mut EngineContext<'_>, plant: u64) -> u64 {
@@ -171,6 +277,116 @@ fn list_and_scan_on_empty_project() {
         assert_eq!(scan["ok"], json!(true));
         assert_eq!(scan["result"]["added"], json!(0));
         assert_eq!(scan["result"]["removed"], json!(0));
+    });
+}
+
+/// A module call and the binding it names cross in one write, because the family validator checks
+/// them against each other: a call with no binding is refused, and the graph that carries both grows
+/// the preset. The regrow also leaves the family's own role alone, so a module edited through the
+/// same command does not quietly stop being one.
+#[test]
+fn plant_graph_set_carries_module_bindings_and_keeps_the_family_role() {
+    let reg = registry();
+    let mut renderer = StubRenderer::default();
+    with_stub(&mut renderer, |ctx| {
+        scratch_root(ctx, "plant-modules");
+        ctx.scene_edit.project_phase = ProjectPhase::Ready;
+        let plant = seed_native_plant(ctx);
+        let module = seed_plant_module(ctx, plant);
+        let call_guid = "0000000000000000000000000000002a";
+        // The module's own elements bind a second slot, and a family must declare a material for
+        // every slot anything it grows binds — including what a call site grows inside it.
+        let mut caller = load_plant_family_asset(ctx.assets, saffron_core::Uuid(plant))
+            .expect("the seeded family");
+        caller.material_slots.push(
+            save_material_asset(ctx.assets, &default_material_asset(), "Bark", "plants")
+                .expect("save caller material"),
+        );
+        saffron_assets::update_plant_family_asset(ctx.assets, saffron_core::Uuid(plant), &caller)
+            .expect("declare the second slot");
+
+        let read = reg.dispatch(
+            ctx,
+            &json!({ "cmd": "plant-graph", "params": { "plant": plant.to_string() } }),
+        );
+        assert_eq!(read["ok"], json!(true));
+        assert_eq!(read["result"]["modules"], json!([]));
+        let calling = call_the_module(&read["result"]["graph"], call_guid);
+
+        // The call with no binding names a module reference the family does not carry.
+        let unbound = reg.dispatch(
+            ctx,
+            &json!({
+                "cmd": "plant-graph-set",
+                "params": { "plant": plant.to_string(), "graph": calling, "grafts": [] },
+            }),
+        );
+        assert_eq!(unbound["ok"], json!(false), "{unbound}");
+
+        // With the binding beside it the same document grows, and the reference comes back.
+        let bound = reg.dispatch(
+            ctx,
+            &json!({
+                "cmd": "plant-graph-set",
+                "params": {
+                    "plant": plant.to_string(),
+                    "graph": calling,
+                    "grafts": [],
+                    "modules": [{
+                        "callGuid": call_guid,
+                        "plant": module.to_string(),
+                        "variation": 0,
+                        "scaleBits": 32_768,
+                    }],
+                },
+            }),
+        );
+        assert_eq!(bound["ok"], json!(true), "{bound}");
+        assert_eq!(bound["result"]["modules"][0]["callGuid"], json!(call_guid));
+        assert_eq!(bound["result"]["modules"][0]["scaleBits"], json!(32_768));
+        assert!(bound["result"]["growth"]["elements"].as_u64().unwrap_or(0) > 0);
+
+        // A binding no call names is the other half of the same check.
+        let orphaned = reg.dispatch(
+            ctx,
+            &json!({
+                "cmd": "plant-graph-set",
+                "params": {
+                    "plant": plant.to_string(),
+                    "graph": read["result"]["graph"],
+                    "grafts": [],
+                    "modules": [{
+                        "callGuid": call_guid,
+                        "plant": module.to_string(),
+                        "variation": 0,
+                        "scaleBits": 65_536,
+                    }],
+                },
+            }),
+        );
+        assert_eq!(orphaned["ok"], json!(false), "{orphaned}");
+
+        // Editing the module's own graph leaves it a module, or every caller loses its binding.
+        let module_read = reg.dispatch(
+            ctx,
+            &json!({ "cmd": "plant-graph", "params": { "plant": module.to_string() } }),
+        );
+        assert_eq!(module_read["ok"], json!(true));
+        let rewritten = reg.dispatch(
+            ctx,
+            &json!({
+                "cmd": "plant-graph-set",
+                "params": {
+                    "plant": module.to_string(),
+                    "graph": module_read["result"]["graph"],
+                    "grafts": [],
+                },
+            }),
+        );
+        assert_eq!(rewritten["ok"], json!(true), "{rewritten}");
+        let reloaded = load_plant_family_asset(ctx.assets, saffron_core::Uuid(module))
+            .expect("the module family");
+        assert_eq!(reloaded.role, saffron_vegetation::PlantFamilyRole::Module);
     });
 }
 
