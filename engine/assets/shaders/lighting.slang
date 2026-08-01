@@ -19,6 +19,9 @@ public struct VertexOutput
     public nointerpolation uint materialIndex : TEXCOORD2;
     /// The record's representation-crossfade word (zero outside a transition).
     public nointerpolation uint transition : TEXCOORD3;
+    /// The emitting draw record's index in the frame's semantic record stream. The selection
+    /// pass reads the record back through it; every other fragment entry ignores it.
+    public nointerpolation uint recordIndex : TEXCOORD4;
 };
 
 struct Camera
@@ -245,6 +248,7 @@ public VertexOutput transformExecutorVertex(
     output.coverageAnchor = local;
     output.materialIndex = parameterIndex;
     output.transition = transition;
+    output.recordIndex = 0u;
     return output;
 }
 

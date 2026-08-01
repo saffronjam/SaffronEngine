@@ -237,6 +237,10 @@ mod tests {
     /// every spatial-hash salt, anchor and temporal phase — the hash makes coverage depend on
     /// where the plant stands rather than on alpha alone. Unknown states are not asserted:
     /// they mean the classifier still runs, so whatever it decides is correct.
+    ///
+    /// Both coverage rules are checked. A plain masked surface reconstructs the authored cutoff;
+    /// a thin-sheet surface's alpha *is* a coverage probability, which the classifier compares
+    /// against the spatial hash instead — a different branch, and the one the plant cooker takes.
     #[test]
     fn settled_micro_triangles_agree_with_the_classifier_under_every_hash() {
         use saffron_geometry::{
@@ -245,106 +249,144 @@ mod tests {
         };
         use saffron_material::{AlphaClassification, OpacityMicromapDerivation, SurfaceUnit};
 
+        const EXTENT: u32 = 64;
         // A full-range gradient: micro-triangles tile every alpha level, so a derivation that
         // settles at the wrong threshold has somewhere to be caught.
-        const EXTENT: u32 = 64;
-        let alpha: Vec<u8> = (0..EXTENT * EXTENT)
+        let gradient: Vec<u8> = (0..EXTENT * EXTENT)
             .map(|i| ((i % EXTENT) * 255 / (EXTENT - 1)) as u8)
             .collect();
+        // The authored cutout shape: a hard diagonal, placed to cross the probe triangle so both
+        // verdicts occur, and with no soft ramp for a rounding error to hide in.
+        let cutout: Vec<u8> = (0..EXTENT * EXTENT)
+            .map(|i| {
+                let (x, y) = (i % EXTENT, i / EXTENT);
+                if x + y < EXTENT / 2 { 255 } else { 0 }
+            })
+            .collect();
 
-        let cutoff = 0.5_f32;
-        let policy = OpacityMicromapDerivation {
-            enabled: true,
-            max_subdivision: 4,
-            transparent_threshold: SurfaceUnit::from_bits(0),
-            opaque_threshold: SurfaceUnit::from_bits(u16::MAX),
-        };
         let uvs = [[0.0_f32, 0.0], [1.0, 0.0], [0.0, 1.0]];
-        let rule = CoverageRule::new(AlphaClassification::Masked, false, cutoff);
-        let build = derive_opacity_micromap(
-            &[0, 1, 2],
-            &uvs,
-            CoverageSourcePlane {
-                alpha: &alpha,
-                width: EXTENT,
-                height: EXTENT,
-                rule,
-                base_alpha: 1.0,
-            },
-            &policy,
-        );
+        let cutoff = 0.5_f32;
+        // `(alpha plane, canonical probability, subdivision cap)`. The cap is the cooked one for
+        // the thin-sheet case: the level a full-plane triangle picks there is the finest the
+        // derivation ever runs at, and the bound is tightest exactly there.
+        let cases: [(&[u8], bool, u8); 2] = [(&gradient, false, 4), (&cutout, true, 5)];
 
-        // The derivation must have settled something, or this proves nothing at all.
-        assert!(
-            build.classes.opaque > 0,
-            "no opaque micro-triangles to check"
-        );
-        assert!(
-            build.classes.transparent > 0,
-            "no transparent micro-triangles to check"
-        );
-
-        let sample = |uv: [f32; 2]| -> f32 {
-            let x = (uv[0] * EXTENT as f32).clamp(0.0, EXTENT as f32 - 1.0) as u32;
-            let y = (uv[1] * EXTENT as f32).clamp(0.0, EXTENT as f32 - 1.0) as u32;
-            f32::from(alpha[(y * EXTENT + x) as usize]) / 255.0
-        };
-
-        let block = build.indices[0];
-        assert!(block >= 0, "the soft edge must produce a mixed block");
-        let level = u32::from(build.blocks[block as usize].subdivision_level);
-        let mut checked = 0_u32;
-        for micro in 0..1u32 << (2 * level) {
-            let Some(state) = build.state(block as usize, micro) else {
-                continue;
+        for (alpha, canonical_probability, max_subdivision) in cases {
+            let policy = OpacityMicromapDerivation {
+                enabled: true,
+                max_subdivision,
+                transparent_threshold: SurfaceUnit::from_bits(0),
+                opaque_threshold: SurfaceUnit::from_bits(u16::MAX),
             };
-            if state.is_unknown() {
-                continue;
-            }
-            let corners = micro_triangle_corners(micro, level);
-            for &(b1, b2) in &corners {
-                // Pull each sample toward the centroid so it lands strictly inside.
-                let c = (
-                    (corners[0].0 + corners[1].0 + corners[2].0) / 3.0,
-                    (corners[0].1 + corners[1].1 + corners[2].1) / 3.0,
-                );
-                let (b1, b2) = (b1 * 0.2 + c.0 * 0.8, b2 * 0.2 + c.1 * 0.8);
-                let b0 = 1.0 - b1 - b2;
-                let uv = [
-                    uvs[0][0] * b0 + uvs[1][0] * b1 + uvs[2][0] * b2,
-                    uvs[0][1] * b0 + uvs[1][1] * b1 + uvs[2][1] * b2,
+            let rule =
+                CoverageRule::new(AlphaClassification::Masked, canonical_probability, cutoff);
+            let build = derive_opacity_micromap(
+                &[0, 1, 2],
+                &uvs,
+                CoverageSourcePlane {
+                    alpha,
+                    width: EXTENT,
+                    height: EXTENT,
+                    rule,
+                    base_alpha: 1.0,
+                },
+                &policy,
+            );
+
+            // The derivation must have settled something, or this proves nothing at all.
+            assert!(
+                build.classes.opaque > 0,
+                "no opaque micro-triangles to check (canonical {canonical_probability})"
+            );
+            assert!(
+                build.classes.transparent > 0,
+                "no transparent micro-triangles to check (canonical {canonical_probability})"
+            );
+
+            // Bilinear, clamp-to-edge: what the sampler the ray path binds actually returns, and
+            // the reason the derivation dilates its texel footprint past the tap's own support.
+            let sample = |uv: [f32; 2]| -> f32 {
+                let texel = |v: f32, extent: u32| v * extent as f32 - 0.5;
+                let (tx, ty) = (texel(uv[0], EXTENT), texel(uv[1], EXTENT));
+                let (x0, y0) = (tx.floor(), ty.floor());
+                let (fx, fy) = (tx - x0, ty - y0);
+                let at = |x: f32, y: f32| {
+                    let x = (x as i64).clamp(0, i64::from(EXTENT) - 1) as u32;
+                    let y = (y as i64).clamp(0, i64::from(EXTENT) - 1) as u32;
+                    f32::from(alpha[(y * EXTENT + x) as usize]) / 255.0
+                };
+                let top = at(x0, y0) * (1.0 - fx) + at(x0 + 1.0, y0) * fx;
+                let bottom = at(x0, y0 + 1.0) * (1.0 - fx) + at(x0 + 1.0, y0 + 1.0) * fx;
+                top * (1.0 - fy) + bottom * fy
+            };
+
+            let block = build.indices[0];
+            assert!(block >= 0, "the edge must produce a mixed block");
+            let level = u32::from(build.blocks[block as usize].subdivision_level);
+            let mut checked = 0_u32;
+            for micro in 0..1u32 << (2 * level) {
+                let Some(state) = build.state(block as usize, micro) else {
+                    continue;
+                };
+                if state.is_unknown() {
+                    continue;
+                }
+                let corners = micro_triangle_corners(micro, level);
+                // Corners, edge midpoints and the centroid: a ray hits anywhere in the
+                // micro-triangle including its boundary, and the boundary is where the bound is
+                // tightest — sampling only the interior would never test the dilation.
+                let mid = |a: (f32, f32), b: (f32, f32)| ((a.0 + b.0) * 0.5, (a.1 + b.1) * 0.5);
+                let probes = [
+                    corners[0],
+                    corners[1],
+                    corners[2],
+                    mid(corners[0], corners[1]),
+                    mid(corners[1], corners[2]),
+                    mid(corners[2], corners[0]),
+                    (
+                        (corners[0].0 + corners[1].0 + corners[2].0) / 3.0,
+                        (corners[0].1 + corners[1].1 + corners[2].1) / 3.0,
+                    ),
                 ];
-                for salt in [0_u64, 7, 0x1122_3344_5566_7788, u64::MAX] {
-                    for phase in [0_u32, 3, 91] {
-                        for anchor in [[0.0_f32; 3], [12.5, -3.25, 400.0], [-1e3, 7.0, 1e3]] {
-                            let verdict = classify_canonical_coverage(
-                                sample(uv),
-                                uv,
-                                anchor,
-                                CoverageSourceKind::Texture,
-                                AlphaClassification::Masked,
-                                1.0,
-                                [EXTENT, EXTENT],
-                                salt,
-                                phase,
-                                cutoff,
-                                0.0,
-                                false,
-                                false,
-                            );
-                            assert_eq!(
-                                verdict.covered,
-                                state == MicroState::Opaque,
-                                "micro {micro} declared {state:?} but the classifier disagreed \
-                                 (salt {salt}, phase {phase}, anchor {anchor:?})"
-                            );
-                            checked += 1;
+                for (b1, b2) in probes {
+                    let b0 = 1.0 - b1 - b2;
+                    let uv = [
+                        uvs[0][0] * b0 + uvs[1][0] * b1 + uvs[2][0] * b2,
+                        uvs[0][1] * b0 + uvs[1][1] * b1 + uvs[2][1] * b2,
+                    ];
+                    for salt in [0_u64, 7, 0x1122_3344_5566_7788, u64::MAX] {
+                        for phase in [0_u32, 3, 91] {
+                            for anchor in [[0.0_f32; 3], [12.5, -3.25, 400.0], [-1e3, 7.0, 1e3]] {
+                                let verdict = classify_canonical_coverage(
+                                    sample(uv),
+                                    uv,
+                                    anchor,
+                                    CoverageSourceKind::Texture,
+                                    AlphaClassification::Masked,
+                                    1.0,
+                                    [EXTENT, EXTENT],
+                                    salt,
+                                    phase,
+                                    cutoff,
+                                    0.0,
+                                    canonical_probability,
+                                    false,
+                                );
+                                assert_eq!(
+                                    verdict.covered,
+                                    state == MicroState::Opaque,
+                                    "micro {micro} declared {state:?} but the classifier \
+                                     disagreed (canonical {canonical_probability}, salt {salt}, \
+                                     phase {phase}, anchor {anchor:?})"
+                                );
+                                checked += 1;
+                            }
                         }
                     }
                 }
             }
+            assert!(checked > 0, "no settled micro-triangle was sampled");
         }
-        assert!(checked > 0, "no settled micro-triangle was sampled");
     }
 
     #[test]

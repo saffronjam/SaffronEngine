@@ -315,4 +315,87 @@ impl Uploader {
         );
         Ok(field)
     }
+
+    /// Uploads the unit-box field every aggregate slab occluder is backed by: one occupied
+    /// brick over `[-0.5, 0.5]³` holding the signed distance to the box surface.
+    ///
+    /// A slab occluder has no cooked field of its own — the matter it stands for is
+    /// reconstructed on device — but the distance-field consumers read every occluder through
+    /// [`crate::SdfInstance`] and one brick tap, so the slab arrives as a real field whose
+    /// `worldToLocal` maps its world box onto this one. Every sample inside the box reads a
+    /// negative distance, which is what makes the composite splat the slab's occupancy across
+    /// its whole volume.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Vk`]/[`Error::ZeroSizedImage`] for a failing Vulkan/VMA call during
+    /// the SDF upload.
+    pub fn upload_unit_box_sdf(&self, descriptors: &Descriptors) -> Result<Arc<GpuSdf>> {
+        let grid = GridDesc {
+            dims: [8, 8, 8],
+            bounds_min: Vec3::splat(-0.5),
+            bounds_max: Vec3::splat(0.5),
+            max_dist: 0.5,
+        };
+        self.upload_sdf(
+            descriptors,
+            &Sdf::from_dense_field(&grid, &unit_box_field(&grid)),
+        )
+    }
+}
+
+/// The dense signed field of the unit box: per fine voxel, the distance to the nearest face
+/// of the `[-0.5, 0.5]³` box, negative inside, `R16_SNORM`-encoded against `grid.max_dist`.
+///
+/// Every voxel centre of the grid lies inside the box, so no voxel saturates to `+max` and the
+/// single brick is never classified empty.
+fn unit_box_field(grid: &GridDesc) -> Vec<i16> {
+    let [nx, ny, nz] = grid.dims;
+    let half = (grid.bounds_max - grid.bounds_min) * 0.5;
+    let mut dense = Vec::with_capacity((nx * ny * nz) as usize);
+    for z in 0..nz {
+        for y in 0..ny {
+            for x in 0..nx {
+                let p = grid.voxel_center(x, y, z).abs();
+                let inner = (half - p).min_element();
+                let encoded = (-inner / grid.max_dist).clamp(-1.0, 1.0) * f32::from(i16::MAX);
+                dense.push(encoded as i16);
+            }
+        }
+    }
+    dense
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use saffron_geometry::SDF_EMPTY_BRICK;
+
+    #[test]
+    fn the_unit_box_field_is_one_occupied_brick_negative_throughout() {
+        let grid = GridDesc {
+            dims: [8, 8, 8],
+            bounds_min: Vec3::splat(-0.5),
+            bounds_max: Vec3::splat(0.5),
+            max_dist: 0.5,
+        };
+        let dense = unit_box_field(&grid);
+        assert_eq!(dense.len(), 8 * 8 * 8);
+        // A positive voxel would make the brick sample read "outside" somewhere inside the
+        // slab, and the composite would stop splatting occupancy there.
+        assert!(
+            dense.iter().all(|&v| v < 0),
+            "every voxel is inside the box"
+        );
+        let sdf = Sdf::from_dense_field(&grid, &dense);
+        assert_eq!(sdf.header.occupied_bricks, 1);
+        assert_eq!(sdf.header.indirection_dims, [1, 1, 1]);
+        assert!(sdf.indirection.iter().all(|&b| b != SDF_EMPTY_BRICK));
+        // The centre is the deepest point: half the box span, normalized by the encode clamp.
+        let centre = sdf.sample_voxel(4, 4, 4);
+        assert!(
+            centre < -0.4,
+            "centre depth {centre} reaches the box interior"
+        );
+    }
 }

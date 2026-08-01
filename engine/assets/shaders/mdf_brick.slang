@@ -21,6 +21,16 @@ module mdf_brick;
 [[vk::binding(2, 0)]] Texture3D<uint> sdfIndirection[256];
 [[vk::binding(3, 0)]] Sampler3D sdfCoverage[256];
 
+// The Beer-Lambert extinction coefficient every aggregate march applies, in reciprocal
+// metres: fully dense porous matter transmits about 5% of the light entering one metre of it.
+// Must equal `saffron_material::AGGREGATE_EXTINCTION_PER_METER`, or brightness shifts at the
+// triangle-to-aggregate transition.
+public static const float AGGREGATE_EXTINCTION_PER_METER = 3.0;
+
+// The largest occupancy an aggregate may carry and still be marched through. `1.0` means solid
+// matter, which hardens the distance field instead; a porous aggregate stays strictly below it.
+public static const float AGGREGATE_MAX_OCCUPANCY = 0.9375;
+
 // Voxels per brick axis and the unique-voxel stride (the 8th voxel is the shared border).
 static const uint kBrickSize = 8u;
 static const float kBrickUseful = 7.0;

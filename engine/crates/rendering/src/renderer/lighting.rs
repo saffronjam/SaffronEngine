@@ -285,6 +285,150 @@ impl Renderer {
             unsafe { std::ptr::read(staging.mapped_ptr().cast::<crate::GpuWindInstanceRecord>()) };
         Ok(Some(record))
     }
+
+    /// Captures one whole cascade of the world interaction field, reduced to a `resolution²`
+    /// grid of block means plus the cascade's placement and its extremes.
+    ///
+    /// The reduction happens here rather than on the caller because the cascade is a quarter of
+    /// a million texels: a grid is the shape a person can read, and shipping the texels to reduce
+    /// them elsewhere would move two megabytes to produce a few hundred numbers.
+    ///
+    /// One-shot, never per frame — the field is device-local and this idles the queue. Returns
+    /// `None` before the first frame has created the field.
+    pub fn capture_interaction_field(
+        &self,
+        cascade: u32,
+        resolution: u32,
+    ) -> crate::Result<Option<InteractionFieldCapture>> {
+        let world = self.active_view.gpu_scene_world();
+        let Some(field) = self.interaction_fields.get(&world.0) else {
+            return Ok(None);
+        };
+        if cascade >= crate::GPU_INTERACTION_CASCADES || resolution == 0 {
+            return Ok(None);
+        }
+        let resolution = resolution.min(crate::GPU_INTERACTION_TEXELS);
+        let staging = crate::Buffer::new(
+            self.device.resources(),
+            crate::GPU_INTERACTION_FIELD_BYTES,
+            vk::BufferUsageFlags::TRANSFER_DST,
+            &vk_mem::AllocationCreateInfo {
+                usage: vk_mem::MemoryUsage::AutoPreferHost,
+                flags: vk_mem::AllocationCreateFlags::HOST_ACCESS_RANDOM
+                    | vk_mem::AllocationCreateFlags::MAPPED,
+                ..Default::default()
+            },
+        )?;
+        let source = field.handle();
+        let destination = staging.handle();
+        self.device.one_shot_transfer(|raw, cmd| {
+            // SAFETY: the ash seam. Both buffers outlive the submit this records into,
+            // and the copy spans exactly the field's allocated size.
+            unsafe {
+                raw.cmd_copy_buffer(
+                    cmd,
+                    source,
+                    destination,
+                    &[vk::BufferCopy {
+                        src_offset: 0,
+                        dst_offset: 0,
+                        size: crate::GPU_INTERACTION_FIELD_BYTES,
+                    }],
+                );
+            }
+        })?;
+        // SAFETY: HOST_VISIBLE + MAPPED, the field's full length, and the transfer's fence was
+        // waited before this returns.
+        let bytes = unsafe {
+            std::slice::from_raw_parts(
+                staging.mapped_ptr().cast::<u8>(),
+                crate::GPU_INTERACTION_FIELD_BYTES as usize,
+            )
+        };
+        let header: crate::GpuInteractionHeader =
+            *bytemuck::from_bytes(&bytes[..size_of::<crate::GpuInteractionHeader>()]);
+        let side = crate::GPU_INTERACTION_TEXELS as usize;
+        let cascade_start = crate::GPU_INTERACTION_HEADER_SIZE as usize
+            + cascade as usize * side * side * crate::GPU_INTERACTION_TEXEL_SIZE as usize;
+        let texels: &[crate::GpuInteractionTexel] = bytemuck::cast_slice(
+            &bytes[cascade_start
+                ..cascade_start + side * side * crate::GPU_INTERACTION_TEXEL_SIZE as usize],
+        );
+        let center = header.center_texel[cascade as usize];
+        let half = side as i32 / 2;
+        let block = side.div_ceil(resolution as usize);
+        let mut cells = vec![[0.0_f32; 3]; (resolution * resolution) as usize];
+        let mut counts = vec![0_u32; cells.len()];
+        let mut capture = InteractionFieldCapture {
+            cascade,
+            texel_meters: 0.25 * (1 << (2 * cascade)) as f32,
+            center_texel: center,
+            generation: header.generation,
+            resolution,
+            cells: Vec::new(),
+            live_texels: 0,
+            peak_displacement_m: 0.0,
+            peak_velocity_mps: 0.0,
+        };
+        for y in 0..side {
+            for x in 0..side {
+                let texel = texels[y * side + x];
+                // A slot whose stored coordinate is not the one it addresses scrolled out from
+                // under its state and reads as rest, exactly as the sampler treats it.
+                let expected = [center[0] + x as i32 - half, center[1] + y as i32 - half];
+                if texel.world_coord != expected {
+                    continue;
+                }
+                let displacement =
+                    (texel.displacement[0].powi(2) + texel.displacement[1].powi(2)).sqrt();
+                let velocity = (texel.velocity[0].powi(2) + texel.velocity[1].powi(2)).sqrt();
+                if displacement > 0.0 || velocity > 0.0 || texel.depress != 0.0 {
+                    capture.live_texels += 1;
+                }
+                capture.peak_displacement_m = capture.peak_displacement_m.max(displacement);
+                capture.peak_velocity_mps = capture.peak_velocity_mps.max(velocity);
+                let cell = (y / block).min(resolution as usize - 1) * resolution as usize
+                    + (x / block).min(resolution as usize - 1);
+                cells[cell][0] += texel.displacement[0];
+                cells[cell][1] += texel.displacement[1];
+                cells[cell][2] += texel.depress;
+                counts[cell] += 1;
+            }
+        }
+        for (cell, count) in cells.iter_mut().zip(&counts) {
+            if *count > 0 {
+                let inverse = 1.0 / *count as f32;
+                cell[0] *= inverse;
+                cell[1] *= inverse;
+                cell[2] *= inverse;
+            }
+        }
+        capture.cells = cells;
+        Ok(Some(capture))
+    }
+}
+
+/// One whole cascade of the world interaction field, reduced for inspection.
+#[derive(Clone, Debug, PartialEq)]
+pub struct InteractionFieldCapture {
+    /// Which cascade this reduces.
+    pub cascade: u32,
+    /// Metres per texel of that cascade.
+    pub texel_meters: f32,
+    /// The cascade's centre in absolute world texel coordinates.
+    pub center_texel: [i32; 2],
+    /// The field's monotonic generation.
+    pub generation: u32,
+    /// Side length of the reduced grid.
+    pub resolution: u32,
+    /// Row-major block means of `(displacement.x, displacement.z, depress)`, in metres.
+    pub cells: Vec<[f32; 3]>,
+    /// Texels whose stored state is current and nonzero — what the cascade is holding.
+    pub live_texels: u32,
+    /// The largest horizontal displacement in the cascade, in metres.
+    pub peak_displacement_m: f32,
+    /// The largest horizontal recovery velocity in the cascade, in metres per second.
+    pub peak_velocity_mps: f32,
 }
 
 fn chromatic_light(radiance: Vec3, trim: f32) -> (Vec3, f32) {

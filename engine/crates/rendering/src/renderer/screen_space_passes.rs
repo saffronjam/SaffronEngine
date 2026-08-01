@@ -371,13 +371,13 @@ impl Renderer {
 
         // DFAO diffuse sky-visibility: the reduced-resolution GDF cone trace (Wright 2015),
         // mirroring the SSGI chain — a half-res trace, a bilateral upsample (reusing the ssgi-blur
-        // PSO), then temporal accumulation through the motion vectors (the ssgi-accum PSO). The
-        // trace is a three-set pass like the DDGI trace: it taps the GDF cascade clipmap via the
-        // light set, so it declares SampledRead on the cascades. The mesh samples set 4 binding 5.
-        // The gi-resolve pass (added after this block) samples the spatial DFAO as its sky-visibility
-        // input when sky occlusion ran; `None` when it did not, and gi-resolve's skyVis flag is 0.
-        let mut dfao_denoised_res: Option<RgResource> = None;
-        if let Some(dfao) = &pipelines.dfao {
+        // PSO), then temporal accumulation through the motion vectors. The trace is a three-set
+        // pass like the DDGI trace: it taps the GDF cascade clipmap via the light set, so it
+        // declares SampledRead on the cascades. The chain's product is the accumulated map, which
+        // the gi-resolve pass (added after this block) samples as its sky-visibility input; `None`
+        // when the chain did not run, and gi-resolve's skyVis flag is 0.
+        let mut dfao_sky_vis: Option<RgResource> = None;
+        if let (Some(dfao), Some(motion)) = (&pipelines.dfao, motion) {
             let bindless_set = self.descriptors.bindless_set();
             let dfao_raw = graph.import_image(
                 view.dfao_raw.as_ref().expect("dfao_raw built").handle(),
@@ -405,7 +405,7 @@ impl Renderer {
 
             // 1. Trace: reconstruct world pos/normal from the G-buffer, cone-trace the GDF sky
             //    visibility into the half-res raw map. Records its three sets directly.
-            let trace = Arc::clone(dfao);
+            let trace = Arc::clone(&dfao.trace);
             let trace_handle = trace.handle();
             let trace_layout = trace.layout();
             let trace_set = view.dfao_set;
@@ -456,92 +456,83 @@ impl Renderer {
             graph.add_pass(trace_pass);
 
             // 2. Bilateral upsample: dfao_raw (half-res) + g_normal → dfao_denoised (full-res).
-            if let Some(dfao_blur) = &pipelines.dfao_blur {
-                self.add_compute_pass(
-                    graph,
-                    "dfao-blur",
-                    dfao_blur,
-                    view.dfao_blur_set,
-                    &[
-                        (dfao_raw, RgUsage::SampledReadCompute),
-                        (g_normal, RgUsage::SampledReadCompute),
-                        (dfao_denoised, RgUsage::StorageImageRwCompute),
-                    ],
-                    None,
-                    groups(extent.width),
-                    groups(extent.height),
-                    1,
-                );
-            }
+            self.add_compute_pass(
+                graph,
+                "dfao-blur",
+                &dfao.blur,
+                view.dfao_blur_set,
+                &[
+                    (dfao_raw, RgUsage::SampledReadCompute),
+                    (g_normal, RgUsage::SampledReadCompute),
+                    (dfao_denoised, RgUsage::StorageImageRwCompute),
+                ],
+                None,
+                groups(extent.width),
+                groups(extent.height),
+                1,
+            );
 
-            // Expose dfao_denoised to the gi-resolve pass (added after this block so it runs whenever
-            // the screen chain does, not only when sky-occlusion is on): its skyVis input, when present.
-            dfao_denoised_res = Some(dfao_denoised);
-
-            // 3. Temporal accumulation (when motion ran): reproject the DFAO history through
-            //    motion, neighborhood-clamp, EMA into the stable dfao_resolved the mesh samples.
-            if let (Some(accum), Some(motion)) = (&pipelines.dfao_accum, motion) {
-                let p = view.history_index;
-                let dfao_resolved_slot = graph.alloc_external_state(
-                    view.dfao_resolved
-                        .as_ref()
-                        .expect("dfao_resolved built")
-                        .graph_state(),
-                );
-                let dfao_resolved = graph.import_image(
-                    view.dfao_resolved
-                        .as_ref()
-                        .expect("dfao_resolved built")
-                        .handle(),
-                    view.dfao_resolved
-                        .as_ref()
-                        .expect("dfao_resolved built")
-                        .view(),
-                    vk::ImageAspectFlags::COLOR,
-                    view.dfao_resolved
-                        .as_ref()
-                        .expect("dfao_resolved built")
-                        .layout,
-                    Some(dfao_resolved_slot),
-                );
-                let (read_slot, read) = import_ssgi_history(graph, &view.dfao_history[1 - p]);
-                let (write_slot, write) = import_ssgi_history(graph, &view.dfao_history[p]);
-                let push = crate::SsgiAccumPush {
-                    params: saffron_geometry::glam::Vec4::new(
-                        crate::SSGI_HISTORY_WEIGHT,
-                        if view.history_valid { 1.0 } else { 0.0 },
-                        0.0,
-                        0.0,
-                    ),
-                };
-                self.add_compute_pass(
-                    graph,
-                    "dfao-accum",
-                    accum,
-                    view.dfao_accum_sets[p],
-                    &[
-                        (dfao_denoised, RgUsage::SampledReadCompute),
-                        (read, RgUsage::SampledReadCompute),
-                        (motion, RgUsage::SampledReadCompute),
-                        (dfao_resolved, RgUsage::StorageImageRwCompute),
-                        (write, RgUsage::StorageImageRwCompute),
-                    ],
-                    Some(bytemuck::bytes_of(&push).to_vec()),
-                    groups(extent.width),
-                    groups(extent.height),
-                    1,
-                );
-                result.scene_sampled.push(dfao_resolved);
-                result.dfao_resolved_slot = Some(dfao_resolved_slot);
-                result.dfao_history_slots = Some(TaaHistorySlots {
-                    read: (1 - p, read_slot),
-                    write: (p, write_slot),
-                });
-            } else {
-                // No motion this frame (practically unreachable — DFAO forces motion on): the
-                // scene samples the spatially denoised map instead of the resolved one.
-                result.scene_sampled.push(dfao_denoised);
-            }
+            // 3. Temporal accumulation: reproject the DFAO history through motion and EMA it into
+            //    dfao_resolved — the stable map every consumer of the term samples.
+            let p = view.history_index;
+            let dfao_resolved_slot = graph.alloc_external_state(
+                view.dfao_resolved
+                    .as_ref()
+                    .expect("dfao_resolved built")
+                    .graph_state(),
+            );
+            let dfao_resolved = graph.import_image(
+                view.dfao_resolved
+                    .as_ref()
+                    .expect("dfao_resolved built")
+                    .handle(),
+                view.dfao_resolved
+                    .as_ref()
+                    .expect("dfao_resolved built")
+                    .view(),
+                vk::ImageAspectFlags::COLOR,
+                view.dfao_resolved
+                    .as_ref()
+                    .expect("dfao_resolved built")
+                    .layout,
+                Some(dfao_resolved_slot),
+            );
+            let (read_slot, read) = import_ssgi_history(graph, &view.dfao_history[1 - p]);
+            let (write_slot, write) = import_ssgi_history(graph, &view.dfao_history[p]);
+            let push = crate::SsgiAccumPush {
+                params: saffron_geometry::glam::Vec4::new(
+                    crate::SSGI_HISTORY_WEIGHT,
+                    if view.history_valid { 1.0 } else { 0.0 },
+                    0.0,
+                    0.0,
+                ),
+            };
+            self.add_compute_pass(
+                graph,
+                "dfao-accum",
+                &dfao.accum,
+                view.dfao_accum_sets[p],
+                &[
+                    (dfao_denoised, RgUsage::SampledReadCompute),
+                    (read, RgUsage::SampledReadCompute),
+                    (motion, RgUsage::SampledReadCompute),
+                    (dfao_resolved, RgUsage::StorageImageRwCompute),
+                    (write, RgUsage::StorageImageRwCompute),
+                ],
+                Some(bytemuck::bytes_of(&push).to_vec()),
+                groups(extent.width),
+                groups(extent.height),
+                1,
+            );
+            result.scene_sampled.push(dfao_resolved);
+            result.dfao_resolved_slot = Some(dfao_resolved_slot);
+            result.dfao_history_slots = Some(TaaHistorySlots {
+                read: (1 - p, read_slot),
+                write: (p, write_slot),
+            });
+            // The accumulated map is what gi-resolve samples (its set binds `dfao_resolved`), so
+            // the pass added after this block declares its read on the resource written here.
+            dfao_sky_vis = Some(dfao_resolved);
         }
 
         // Screen-space indirect-diffuse resolve: reconstruct worldPos/n from the G-buffer, integrate
@@ -571,7 +562,7 @@ impl Renderer {
                 (gi_indirect, RgUsage::StorageImageRwCompute),
                 (sky_sh, RgUsage::StorageReadCompute),
             ];
-            if let Some(dfao_res) = dfao_denoised_res {
+            if let Some(dfao_res) = dfao_sky_vis {
                 accesses.push((dfao_res, RgUsage::SampledReadCompute));
             }
             self.add_compute_pass(

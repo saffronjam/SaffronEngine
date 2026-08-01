@@ -249,6 +249,10 @@ fn merge_regions(mut regions: Vec<GdfRegion>) -> Vec<GdfRegion> {
 /// in [`crate::Lighting`]).
 struct FrameGdf {
     cull_buffer: Buffer,
+    /// Cross-frame queue-family ownership and access state of `cull_buffer`. The build runs on
+    /// the async-compute lane, and the graph only places a pass there when it can derive the
+    /// ownership transfer for every buffer it touches — which needs this to carry across frames.
+    cull_state: crate::RgExternalBufferState,
     params_ubo: Buffer,
     cull_set: vk::DescriptorSet,
     composite_set: vk::DescriptorSet,
@@ -649,6 +653,16 @@ impl GlobalSdf {
     /// Frame slot `frame`'s cull-list SSBO handle (for the graph import + barrier tracking).
     pub fn cull_buffer(&self, frame: usize) -> vk::Buffer {
         self.frames[frame].cull_buffer.handle()
+    }
+
+    /// This frame slot's cull-list buffer state, seeding the graph's external slot.
+    pub fn cull_buffer_state(&self, frame: usize) -> crate::RgExternalBufferState {
+        self.frames[frame].cull_state.clone()
+    }
+
+    /// Stores the cull-list buffer state the executed graph resolved for this frame slot.
+    pub fn set_cull_buffer_state(&mut self, frame: usize, state: crate::RgExternalBufferState) {
+        self.frames[frame].cull_state = state;
     }
 
     /// The number of `u32` header words to clear at the start of the cull pass (the per-cascade

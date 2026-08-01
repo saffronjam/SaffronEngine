@@ -161,11 +161,11 @@ public float gdfOccupancyAt(float3 wp)
 }
 
 // The shared Beer-Lambert extinction step every march applies through porous matter:
-// full density transmits ~5% per metre (kappa = 3 / m), scaling linearly with the
-// occupancy density.
+// full density transmits ~5% per metre, scaling linearly with the occupancy density.
 public float sdfExtinctionStep(float occupancy, float stepLength)
 {
-    return exp(-3.0 * max(occupancy, 0.0) * max(stepLength, 0.0));
+    return exp(
+        -AGGREGATE_EXTINCTION_PER_METER * max(occupancy, 0.0) * max(stepLength, 0.0));
 }
 
 // The unified near/far field sample for a march: the full-resolution per-mesh MDF for the near

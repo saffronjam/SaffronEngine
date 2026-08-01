@@ -28,6 +28,7 @@ pub(super) fn build_frame(
     let scatter_set = descriptors.allocate_set(layouts.2)?;
     Ok(FrameGdf {
         cull_buffer,
+        cull_state: crate::RgExternalBufferState::default(),
         params_ubo,
         cull_set,
         composite_set,

@@ -1,6 +1,46 @@
 use super::*;
 
+/// Queue the global-distance-field build runs on.
+///
+/// The cascade volumes are consumed much later in the frame — the far-field tap in `ddgi-trace`
+/// and the lit gather — so the build overlaps the depth and gbuffer raster instead of stalling in
+/// front of it. Every buffer and volume it touches is a declared access, which is what lets the
+/// graph derive the release/acquire pair and the cross-queue timeline; a device with no
+/// independent compute family runs the identical passes on graphics.
+const GDF_BUILD_QUEUE: crate::RgQueuePreference = crate::RgQueuePreference::AsyncCompute;
+
 impl Renderer {
+    /// The micro-field slab-occluder push for this frame: the reach window, the unit-box brick
+    /// every slab is backed by, and the resident-tile directory to walk.
+    pub(super) fn gi_occluder_micro_push(
+        &self,
+        reach: (Vec3, Vec3),
+        directory_offset: u32,
+        directory_count: u32,
+    ) -> crate::GiOccluderMicroPush {
+        let field = &self.slab_sdf;
+        let dims = |d: [u32; 3]| [d[0], d[1], d[2], 0];
+        crate::GiOccluderMicroPush {
+            reach_min: reach.0.extend(0.0).to_array(),
+            reach_max: reach.1.extend(0.0).to_array(),
+            local_min: field.bounds_min.extend(0.0).to_array(),
+            local_max: field.bounds_max.extend(0.0).to_array(),
+            voxel_dims: dims(field.voxel_dims),
+            indirection_dims: dims(field.indirection_dims),
+            atlas_bricks: dims(field.atlas_bricks),
+            field: [
+                field.bindless_index() as f32,
+                field.max_dist,
+                field.mip_count as f32,
+                0.0,
+            ],
+            capacity: MAX_SDF_INSTANCES,
+            directory_offset,
+            directory_count,
+            reserved: 0,
+        }
+    }
+
     /// Builds the four DDGI compute passes into `graph` when the chain runs this frame (DDGI on +
     /// ready + all four PSOs resolved): `ddgi-trace` (the GDF/MDF sphere-march → ray storage),
     /// `ddgi-blend-irr` (ray sampler → irradiance storage), `ddgi-blend-dist` (ray sampler →
@@ -226,7 +266,10 @@ impl Renderer {
         // Import this frame slot's cull-list buffer (the cull writes it, the composite reads it) +
         // each cascade volume (the composite writes them, the downstream consumers sample them). The
         // cull list is per-frame-in-flight so frame N+1's clear/rebuild never races frame N's reads.
-        let cull_res = graph.import_buffer(self.global_sdf.cull_buffer(frame), None);
+        let cull_state_slot =
+            graph.alloc_external_buffer_state(self.global_sdf.cull_buffer_state(frame));
+        let cull_res =
+            graph.import_buffer(self.global_sdf.cull_buffer(frame), Some(cull_state_slot));
         // The occluder region + meta the scatter wrote earlier this frame: declared on
         // the cull (and the composite, which reads instances through the cull list) so
         // the graph orders both after the scatter's write.
@@ -269,6 +312,7 @@ impl Renderer {
             let raw_body = raw.clone();
             graph.add_pass(
                 RgPass::compute("gdf-cull")
+                    .queue(GDF_BUILD_QUEUE)
                     .access(sdf_instances_res, RgUsage::StorageReadCompute)
                     .access(sdf_meta_res, RgUsage::StorageReadCompute)
                     .access(cull_res, RgUsage::StorageWriteCompute)
@@ -343,6 +387,7 @@ impl Renderer {
             }
         }
         let mut composite_pass = RgPass::compute("gdf-composite")
+            .queue(GDF_BUILD_QUEUE)
             .access(cull_res, RgUsage::StorageReadCompute)
             .access(sdf_instances_res, RgUsage::StorageReadCompute);
         for cascade in cascade_res {
@@ -388,6 +433,10 @@ impl Renderer {
             occupancy_slots,
             albedo: Some(albedo_res),
             albedo_slot: Some(albedo_slot),
+            cull_state: Some(GdfCullState {
+                slot: cull_state_slot,
+                frame,
+            }),
         }
     }
 
