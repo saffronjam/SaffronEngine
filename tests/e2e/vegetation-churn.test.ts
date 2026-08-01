@@ -14,19 +14,16 @@
 // discriminating: the push moves the frame by ~0.97 and it settles back to ~0.21.
 
 import { afterAll, beforeAll, expect, test } from "bun:test";
-import type {
-  RenderStatsDto,
-  VegetationRuntimeQueryResult,
-} from "@saffron/protocol";
 import type { Engine } from "./harness.ts";
 import { Cleaner, bootEngine, captureViewport, prepareScene } from "./test-utils.ts";
 import { decodeRgb8Png, meanAbsoluteDifference } from "./image.ts";
 import {
-  WIDE_BOUNDS,
   bindVegetationField,
   cookCells,
   importVegetationPackage,
   loadFixture,
+  queryPlants,
+  WIDE_BOUNDS,
 } from "./vegetation-utils.ts";
 
 // The framing the stress suite established for a woodland cell: cells are 64 m apart and this
@@ -47,7 +44,7 @@ beforeAll(async () => {
 
   const fixture = loadFixture("vegetation-stress-woodland");
   await importVegetationPackage(engine, cleaner, fixture, "churn");
-  const world = await bindVegetationField(engine, cleaner, fixture, "Churn vegetation");
+  await bindVegetationField(engine, cleaner, fixture, "Churn vegetation");
   await cookCells(engine, fixture.map);
 
   // After the cook: residency is camera-driven, so the view has to be in place before the cell can
@@ -57,9 +54,7 @@ beforeAll(async () => {
 
   const deadline = Date.now() + 40_000;
   for (;;) {
-    const hits = await engine.call<VegetationRuntimeQueryResult>("vegetation-runtime-query", {
-      query: { kind: "bounds", bounds: WIDE_BOUNDS },
-    });
+    const hits = await queryPlants(engine, WIDE_BOUNDS);
     if (hits.hits.length > 0) {
       plants = hits.hits.map((hit) => hit.plant.plant);
       break;
@@ -93,10 +88,11 @@ test("trampling the canopy and releasing it leaves the frame where it started", 
   // its own centre and therefore cancels AT the centre, so a push aimed at the canopy would move
   // nothing and look exactly like a broken interaction path.
   const trample = async () => {
-    for (const direction of [
+    const directions: [number, number][] = [
       [1, 0],
       [0, 1],
-    ]) {
+    ];
+    for (const direction of directions) {
       await engine.call("emit-interaction-impulse", {
         positionM: [32, 32],
         radiusM: 64,
@@ -126,7 +122,7 @@ test("trampling the canopy and releasing it leaves the frame where it started", 
   const settled = decodeRgb8Png(await captureViewport(engine, cleaner, "churn-trample-settled"));
   expect(meanAbsoluteDifference(reference, settled)).toBeLessThan(CONVERGENCE_TOLERANCE);
 
-  const stats = await engine.call<RenderStatsDto>("render-stats");
+  const stats = await engine.call("render-stats");
   expect(stats.vsm.overflow).toBe(0);
   expect(engine.validationErrors()).toEqual([]);
 }, 180_000);

@@ -17,15 +17,15 @@
 // brightness, with a control showing the frames really are two different pictures.
 
 import { afterAll, beforeAll, expect, test } from "bun:test";
-import type { VegetationRuntimeQueryResult } from "@saffron/protocol";
 import { Engine } from "./harness.ts";
 import { Cleaner, captureViewport, prepareScene } from "./test-utils.ts";
 import {
-  BOUNDS,
   bindVegetationField,
+  BOUNDS,
   cookCells,
   importVegetationPackage,
   loadFixture,
+  queryPlants,
 } from "./vegetation-utils.ts";
 import { decodeRgb8Png, meanAbsoluteDifference, regionMean } from "./image.ts";
 
@@ -49,7 +49,7 @@ async function captureWithCut(cut: "coarse" | "fine"): Promise<Buffer> {
 
   const fixture = loadFixture("vegetation-phase3");
   await importVegetationPackage(engine, cleaner, fixture, `repr-${cut}`);
-  const world = await bindVegetationField(engine, cleaner, fixture, `Representation ${cut}`);
+  await bindVegetationField(engine, cleaner, fixture, `Representation ${cut}`);
   await cookCells(engine, fixture.map);
 
   await engine.call("set-camera", CAMERA);
@@ -58,9 +58,7 @@ async function captureWithCut(cut: "coarse" | "fine"): Promise<Buffer> {
 
   const deadline = Date.now() + 30_000;
   for (;;) {
-    const hits = await engine.call<VegetationRuntimeQueryResult>("vegetation-runtime-query", {
-      query: { kind: "bounds", bounds: BOUNDS },
-    });
+    const hits = await queryPlants(engine, BOUNDS);
     if (hits.hits.length > 0) {
       break;
     }

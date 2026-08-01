@@ -14,12 +14,7 @@
 // buffer is device-local and reading it idles the queue.
 
 import { afterAll, beforeAll, expect, test } from "bun:test";
-import type {
-  EntityRef,
-  VegetationRuntimeQueryResult,
-  VegetationWindRecordResult,
-} from "@saffron/protocol";
-import type { ActiveAlarmsDto, DrainAlarmsResult, GpuSceneMirrorStatsDto } from "@saffron/protocol";
+import type { GpuSceneMirrorStatsDto, VegetationWindRecordResult } from "@saffron/protocol";
 import type { Engine } from "./harness.ts";
 import { Cleaner, bootEngine, prepareScene } from "./test-utils.ts";
 import {
@@ -28,6 +23,7 @@ import {
   cookCells,
   importVegetationPackage,
   loadFixture,
+  queryPlants,
 } from "./vegetation-utils.ts";
 
 const cleaner = new Cleaner();
@@ -49,7 +45,7 @@ beforeAll(async () => {
 
   const fixture = loadFixture("vegetation-phase3");
   await importVegetationPackage(engine, cleaner, fixture, "mechanics");
-  const world = await engine.call<EntityRef>("create-entity", { name: "Mechanics vegetation" });
+  const world = await engine.call("create-entity", { name: "Mechanics vegetation" });
   await engine.call("add-component", { entity: world.id, component: "VegetationField" });
   await engine.call("set-component", {
     entity: world.id,
@@ -60,9 +56,7 @@ beforeAll(async () => {
 
   const deadline = Date.now() + 30_000;
   for (;;) {
-    const hits = await engine.call<VegetationRuntimeQueryResult>("vegetation-runtime-query", {
-      query: { kind: "bounds", bounds: BOUNDS },
-    });
+    const hits = await queryPlants(engine, BOUNDS);
     const first = hits.hits[0];
     if (first) {
       plant = { plant: first.plant.plant, cell: CELL };
@@ -77,12 +71,12 @@ beforeAll(async () => {
 
   await engine.call("set-wind", { speed: 12, gust: 0.6 });
   await engine.settle(600);
-  record = await engine.call<VegetationWindRecordResult>("vegetation-wind-record", plant);
-  stats = await engine.call<GpuSceneMirrorStatsDto>("gpu-scene-stats");
+  record = await engine.call("vegetation-wind-record", plant);
+  stats = await engine.call("gpu-scene-stats");
 
   await engine.call("set-wind", { speed: 0, gust: 0 });
   await engine.settle(600);
-  stillRecord = await engine.call<VegetationWindRecordResult>("vegetation-wind-record", plant);
+  stillRecord = await engine.call("vegetation-wind-record", plant);
 }, 180_000);
 
 afterAll(async () => {
@@ -170,17 +164,14 @@ test("a camera jump across a cascade edge marks the plants reactive; standing st
   // The counter is a running total on purpose. A reset is an event lasting one frame, and no
   // caller can time a stats query to the frame the camera crossed an edge.
   const resets = async () =>
-    (await engine.call<GpuSceneMirrorStatsDto>("gpu-scene-stats")).visibility.interactionResets;
+    (await engine.call("gpu-scene-stats")).visibility.interactionResets;
 
   const idle = await resets();
   await engine.settle(500);
   // The control, and the half that fails if the flag were simply always set: a still camera
   // holds the cascade centres still, so no instance changes cascade and nothing is flagged.
   expect(await resets()).toBe(idle);
-  const stillCapture = await engine.call<VegetationWindRecordResult>(
-    "vegetation-wind-record",
-    plant!,
-  );
+  const stillCapture = await engine.call("vegetation-wind-record", plant!);
   expect(stillCapture.interactionReset).toBe(false);
 
   // Cascade 0 is 256 texels of 0.25 m: a 64 m window centred on the eye. The plants sit near
@@ -205,7 +196,7 @@ test("a tightened budget alarms on the cell and the family that broke it", async
   // invisible from there and is exactly what an author needs to go and fix. The breach is computed
   // where the population is known and handed to the alarm machinery with its owner attached.
   const vegetationAlarms = async () =>
-    (await engine.call<ActiveAlarmsDto>("list-active-alarms")).alarms.filter((alarm) =>
+    (await engine.call("list-active-alarms")).alarms.filter((alarm) =>
       alarm.metric.startsWith("vegetation-"),
     );
 
@@ -227,7 +218,7 @@ test("a tightened budget alarms on the cell and the family that broke it", async
   expect(cell!.value).toBeGreaterThan(cell!.threshold);
 
   // And the events carry it too, so a listener that never polls the active set still learns who.
-  const drained = await engine.call<DrainAlarmsResult>("drain-alarms", { since: 0 });
+  const drained = await engine.call("drain-alarms", { since: 0 });
   expect(
     drained.events.some(
       (event) => event.metric === "vegetation-cell-plants" && event.owner === cell!.owner,

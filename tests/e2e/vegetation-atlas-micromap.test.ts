@@ -18,10 +18,10 @@ import { afterAll, beforeAll, expect, test } from "bun:test";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import type { RenderStatsDto } from "@saffron/protocol";
+import type { MaterialSurfaceDto, RenderStatsDto } from "@saffron/protocol";
 import { Engine } from "./harness.ts";
 import { Cleaner, bootEngine, captureViewport, prepareScene } from "./test-utils.ts";
-import { decodeRgb8Png, encodeRgba8Png, meanAbsoluteDifference } from "./image.ts";
+import { decodeRgb8Png, encodeRgba8Png } from "./image.ts";
 
 const cleaner = new Cleaner();
 let engine: Engine;
@@ -40,7 +40,7 @@ function cutoutPng(edge: number): Buffer {
 }
 
 // A thin-sheet foliage surface whose coverage comes from the albedo alpha, with OMM enabled.
-function thinSheetSurface() {
+function thinSheetSurface(): MaterialSurfaceDto {
   return {
     model: "thin-sheet-foliage",
     parameters: {
@@ -92,13 +92,13 @@ async function buildFamily(host: Engine): Promise<string> {
   cleaner.defer(() => rmSync(scratch, { recursive: true, force: true }));
   const texturePath = join(scratch, "leaf.png");
   writeFileSync(texturePath, cutoutPng(64));
-  const texture = await host.call<{ texture: string }>("import-texture", {
+  const texture = await host.call("import-texture", {
     path: texturePath,
     role: "albedo",
   });
 
-  const bark = await host.call<{ id: string }>("material-create", { name: "Atlas bark" });
-  const leaf = await host.call<{ id: string }>("material-create", { name: "Atlas leaf" });
+  const bark = await host.call("material-create", { name: "Atlas bark" });
+  const leaf = await host.call("material-create", { name: "Atlas leaf" });
   // Both slots carry the cutout, so the atlas has two rectangles to pack rather than one — a
   // single-slot atlas would pass a packing assertion that says nothing about placement.
   for (const material of [bark.id, leaf.id]) {
@@ -109,8 +109,10 @@ async function buildFamily(host: Engine): Promise<string> {
     await host.call("material-update", { material, albedoTexture: texture.texture });
   }
 
-  const created = await host.call<{ plant: string }>("plant-create", {
+  const created = await host.call("plant-create", {
     name: "Atlas family",
+    folder: "",
+    seed: "0",
     materials: [bark.id, leaf.id],
   });
   // Creating the family only authors it. The preview builds a real scene from its compiled
@@ -134,7 +136,7 @@ async function buildFamily(host: Engine): Promise<string> {
 beforeAll(async () => {
   engine = await bootEngine(cleaner, { SAFFRON_SCRATCH_PROJECT: "1" });
   plant = await buildFamily(engine);
-  stats = await engine.call<RenderStatsDto>("render-stats");
+  stats = await engine.call("render-stats");
   frames.on = await captureViewport(engine, cleaner, "omm-on");
 
   // A second host identical but for `SAFFRON_OMM=off`. Building the same family twice rather than
@@ -143,7 +145,7 @@ beforeAll(async () => {
   const off = await Engine.boot({ SAFFRON_SCRATCH_PROJECT: "1", SAFFRON_OMM: "off" });
   cleaner.defer(() => off.shutdown());
   await buildFamily(off);
-  offStats = await off.call<RenderStatsDto>("render-stats");
+  offStats = await off.call("render-stats");
   frames.off = await captureViewport(off, cleaner, "omm-off");
   expect(off.validationErrors()).toEqual([]);
 }, 300_000);
@@ -153,7 +155,7 @@ afterAll(async () => {
 });
 
 test("the family cooks and validates with its coverage texture bound", async () => {
-  const validation = await engine.call<{ diagnostics?: unknown[] }>("plant-validate", {
+  const validation = await engine.call("plant-validate", {
     plant,
   });
   // A family that failed to resolve its materials would still return a result, so the check is
@@ -172,24 +174,41 @@ test("the cooked family reports a structure count consistent with its slots", ()
   expect(stats.blasCount).toBeGreaterThanOrEqual(0);
 });
 
-test("opacity micromaps reach the GPU and settle real micro-triangles", () => {
-  if (!stats.rtSupported || !stats.ommSupported) {
-    console.warn(
-      `opacity micromaps unavailable (rt=${stats.rtSupported}, omm=${stats.ommSupported})`,
-    );
-    return;
-  }
-  const opaque = Number(stats.ommOpaque);
-  const transparent = Number(stats.ommTransparent);
-  const unknown = Number(stats.ommUnknown);
-  // The load-bearing assertion. Zero micromaps is what a derivation that silently produced nothing
-  // looks like, and every "is it correct" check passes vacuously in that state.
-  expect(stats.ommMicromaps).toBeGreaterThan(0);
+test("the derivation settles both states from the coverage texture on every target", () => {
+  // The derived counters are read off the cooked hierarchy before any device gate, so this is the
+  // assertion that holds wherever the suite runs — a target with no `VK_EXT_opacity_micromap` can
+  // attach nothing, but its cook must still produce the same micromaps.
+  const opaque = Number(stats.ommDerivedOpaque);
+  const transparent = Number(stats.ommDerivedTransparent);
+  const unknown = Number(stats.ommDerivedUnknown);
+  // Zero micromaps is what a derivation that silently produced nothing looks like, and every
+  // "is it correct" check passes vacuously in that state.
+  expect(stats.ommDerivedMicromaps).toBeGreaterThan(0);
   expect(opaque + transparent + unknown).toBeGreaterThan(0);
   // A cutout has interior on both sides of its edge, so a conservative derivation must settle some
   // of each. All-unknown would mean micromaps exist and remove no classifier work at all.
   expect(opaque).toBeGreaterThan(0);
   expect(transparent).toBeGreaterThan(0);
+});
+
+test("opacity micromaps reach the GPU and settle real micro-triangles", () => {
+  if (!stats.rtSupported || !stats.ommSupported) {
+    // The derivation is asserted above and is device-independent; what this device cannot do is
+    // attach the result. That must read as zero rather than as a count of structures nothing
+    // built.
+    expect(stats.ommMicromaps).toBe(0);
+    return;
+  }
+  const opaque = Number(stats.ommOpaque);
+  const transparent = Number(stats.ommTransparent);
+  const unknown = Number(stats.ommUnknown);
+  expect(stats.ommMicromaps).toBeGreaterThan(0);
+  expect(opaque + transparent + unknown).toBeGreaterThan(0);
+  expect(opaque).toBeGreaterThan(0);
+  expect(transparent).toBeGreaterThan(0);
+  // What the device attached is what the cook derived — nothing is dropped or invented between
+  // the two, except by the device's own subdivision cap, which can only reject whole micromaps.
+  expect(stats.ommMicromaps).toBeLessThanOrEqual(stats.ommDerivedMicromaps);
 });
 
 test("attaching micromaps raises no validation error", () => {
@@ -199,27 +218,65 @@ test("attaching micromaps raises no validation error", () => {
 });
 
 test("the two hosts really differ in whether micromaps were attached", () => {
+  // `SAFFRON_OMM=off` suppresses attachment, never derivation: both hosts cook the same
+  // micromaps, and only one hands them to the device.
+  expect(offStats.ommDerivedMicromaps).toBe(stats.ommDerivedMicromaps);
+  expect(offStats.ommMicromaps).toBe(0);
   if (!stats.rtSupported || !stats.ommSupported) {
     return;
   }
   // Without this the frame comparison below would pass for the wrong reason: two hosts that both
   // attached micromaps agree trivially and prove nothing about what a micromap changes.
   expect(stats.ommMicromaps).toBeGreaterThan(0);
-  expect(offStats.ommMicromaps).toBe(0);
 });
 
-test("a micromap removes classifier work without changing a pixel", () => {
-  if (!stats.rtSupported || !stats.ommSupported) {
-    return;
-  }
-  // A micromap settles a micro-triangle only where the derivation PROVED every point of its
-  // footprint classifies that way, so traversal reaches the same verdict with less work. Exactly
-  // equal, not within a tolerance: a micromap that shifted a pixel would mean the proof was wrong.
+test("a micromap removes classifier work without changing coverage", () => {
+  // This measures the ATTACHMENT. What the derivation settles is proved against the classifier
+  // itself, by the `settled_micro_triangles_agree_with_the_classifier_under_every_hash` unit
+  // test; a frame is far too blunt for that, because a shadow ray that terminates one leaf early
+  // lands on a pixel the same leaf already darkened.
+  //
+  // Unconditional: where the device attaches nothing the two hosts render the same inputs and the
+  // pair is bit-identical, so a disagreement there is a nondeterministic frame — which would mask
+  // this comparison on the devices that do attach.
+  //
+  // Where it does attach, the disagreement is isolated pixels on the cutout's staircase: the
+  // intersector resolves an exactly-on-edge candidate differently once the micromap path is live.
+  // That tie is the traversal's rather than the data's — widening the derivation's own bound until
+  // it settles a thirtieth as many micro-triangles leaves the very same pixels — so the assertion
+  // is on the SHAPE of the disagreement. A structure attached to the wrong geometry, or a block
+  // stream read at the wrong offset, moves contiguous blocks of pixels instead.
   const on = decodeRgb8Png(frames.on);
   const off = decodeRgb8Png(frames.off);
   expect(on.width).toBe(off.width);
   expect(on.height).toBe(off.height);
-  expect(meanAbsoluteDifference(on, off)).toBe(0);
+  const differs = (x: number, y: number): boolean => {
+    if (x < 0 || y < 0 || x >= on.width || y >= on.height) {
+      return false;
+    }
+    const base = (y * on.width + x) * 3;
+    return [0, 1, 2].some((channel) => on.pixels[base + channel] !== off.pixels[base + channel]);
+  };
+  const flipped: [number, number][] = [];
+  for (let y = 0; y < on.height; y += 1) {
+    for (let x = 0; x < on.width; x += 1) {
+      if (differs(x, y)) {
+        flipped.push([x, y]);
+      }
+    }
+  }
+  for (const [x, y] of flipped) {
+    expect({
+      pixel: [x, y],
+      neighbours: [
+        differs(x - 1, y),
+        differs(x + 1, y),
+        differs(x, y - 1),
+        differs(x, y + 1),
+      ],
+    }).toEqual({ pixel: [x, y], neighbours: [false, false, false, false] });
+  }
+  expect(flipped.length).toBeLessThanOrEqual(8);
 });
 
 test("a wind edit invalidates history under its own name", async () => {
@@ -228,7 +285,7 @@ test("a wind edit invalidates history under its own name", async () => {
   // — which is the question that actually gets asked when temporal accumulation misbehaves.
   await engine.call("set-wind", { speed: 11, gust: 0.7 });
   await engine.settle(200);
-  const afterWind = await engine.call<{ historyInvalidation: string }>("gpu-scene-stats");
+  const afterWind = await engine.call("gpu-scene-stats");
   expect(afterWind.historyInvalidation).toBe("wind-discontinuity");
 });
 
@@ -238,10 +295,7 @@ test("vegetation stages appear as spans in a capture", async () => {
   await engine.call("profiler.set-mode", { mode: "timestamps" });
   await engine.call("profiler.capture-start", { mode: "single" });
   await engine.settle(900);
-  const stopped = await engine.call<{ chromeTrace: string; inlined: boolean }>(
-    "profiler.capture-stop",
-    {},
-  );
+  const stopped = await engine.call("profiler.capture-stop", {});
   await engine.call("profiler.set-mode", { mode: "off" });
 
   // A single-frame capture carries its Chrome trace inline, so the span names are readable right

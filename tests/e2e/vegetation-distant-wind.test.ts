@@ -12,11 +12,7 @@
 // the counters below assert the separation happened rather than trusting the flag.
 
 import { afterAll, beforeAll, expect, test } from "bun:test";
-import type {
-  EntityRef,
-  GpuSceneMirrorStatsDto,
-  VegetationRuntimeQueryResult,
-} from "@saffron/protocol";
+import type { GpuSceneMirrorStatsDto } from "@saffron/protocol";
 import type { Engine } from "./harness.ts";
 import { Cleaner, bootEngine, captureViewport, prepareScene } from "./test-utils.ts";
 import { decodeRgb8Png, meanAbsoluteDifference } from "./image.ts";
@@ -25,6 +21,7 @@ import {
   cookCells,
   importVegetationPackage,
   loadFixture,
+  queryPlants,
 } from "./vegetation-utils.ts";
 
 const cleaner = new Cleaner();
@@ -47,7 +44,7 @@ beforeAll(async () => {
 
   const fixture = loadFixture("vegetation-phase3");
   await importVegetationPackage(engine, cleaner, fixture, "distant-wind");
-  const world = await engine.call<EntityRef>("create-entity", { name: "Distant vegetation" });
+  const world = await engine.call("create-entity", { name: "Distant vegetation" });
   await engine.call("add-component", { entity: world.id, component: "VegetationField" });
   await engine.call("set-component", {
     entity: world.id,
@@ -66,9 +63,7 @@ beforeAll(async () => {
 
   const deadline = Date.now() + 30_000;
   for (;;) {
-    const hits = await engine.call<VegetationRuntimeQueryResult>("vegetation-runtime-query", {
-      query: { kind: "bounds", bounds: BOUNDS },
-    });
+    const hits = await queryPlants(engine, BOUNDS);
     if (hits.hits[0]) {
       break;
     }
@@ -78,7 +73,7 @@ beforeAll(async () => {
     await engine.settle(50);
   }
   await engine.settle(800);
-  stats = await engine.call<GpuSceneMirrorStatsDto>("gpu-scene-stats");
+  stats = await engine.call("gpu-scene-stats");
 
   await engine.call("set-wind", { speed: 14, gust: 0.8 });
   await engine.settle(500);
