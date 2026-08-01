@@ -316,10 +316,48 @@ pub struct VegetationPromotionResult {
     pub state: PlantPromotionStateDto,
 }
 
+/// Reads a promoted plant's live biology, replacing the fields that are present.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema, TS)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[ts(export)]
+pub struct VegetationPlantVitalsParams {
+    pub plant: PlantId,
+    /// Replacement lifecycle stage.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lifecycle: Option<PlantLifecycleDto>,
+    /// Replacement health, in unit-interval bits.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub health: Option<u16>,
+    /// Replacement moisture, in unit-interval bits.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub moisture: Option<u16>,
+    /// Replacement combustible fuel, in unit-interval bits.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fuel: Option<u16>,
+    /// Replacement biological age.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ecology_tick: Option<String>,
+}
+
+/// A promoted plant's live biology, as its entity view now carries it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema, TS)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[ts(export)]
+pub struct VegetationPlantVitalsResult {
+    pub plant: PlantId,
+    /// The entity view carrying the biology.
+    pub entity: Uuid,
+    pub lifecycle: PlantLifecycleDto,
+    pub health: u16,
+    pub moisture: u16,
+    pub fuel: u16,
+    pub ecology_tick: String,
+}
+
 /// What one plant contributes to navigation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema, TS)]
 #[serde(rename_all = "kebab-case", deny_unknown_fields)]
-#[ts(export)]
+#[ts(export, rename_all = "kebab-case")]
 pub enum NavigationContributionKindDto {
     /// Passable, at a traversal-cost multiplier.
     Cost,

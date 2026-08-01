@@ -157,6 +157,19 @@ pub struct PlantPhenotypeDto {
     /// derives the role's default window.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub season_window: Option<[u32; 2]>,
+    /// Health band `[low, high]` in per-mille the appearance expresses in. Absent derives the
+    /// role's default; damage is what low health selects.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub health_band: Option<[u32; 2]>,
+    /// Moisture band `[low, high]` in per-mille the appearance expresses in. Absent derives the
+    /// role's default; wetness is what high moisture selects.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub moisture_band: Option<[u32; 2]>,
+    /// Edge ramp in per-mille of each band's own domain, so the appearance fades in and out
+    /// rather than switching on a day. Zero derives the role's default ramp.
+    #[serde(default)]
+    #[schemars(range(min = 0, max = 500))]
+    pub ramp_mille: u32,
     /// Material slot remaps as `[from, to]` pairs. This is how one variation renders differently
     /// in two phenotypes without growing a second set of geometry.
     #[serde(default)]
@@ -327,10 +340,18 @@ pub struct PlantSeasonPhenotypeParams {
     /// not turn autumnal.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub lifecycle: Option<PlantLifecycleDto>,
+    /// Persistent plant health in per-mille; full health by default.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schemars(range(min = 0, max = 1000))]
+    pub health_mille: Option<u32>,
+    /// Persistent plant moisture in per-mille; dry by default.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schemars(range(min = 0, max = 1000))]
+    pub moisture_mille: Option<u32>,
 }
 
 /// Reply of `plant-season-phenotype`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema, TS)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema, TS)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 #[ts(export)]
 pub struct PlantSeasonPhenotypeResult {
@@ -340,6 +361,25 @@ pub struct PlantSeasonPhenotypeResult {
     pub phenotype: u32,
     /// The variation that phenotype draws, which is what a preview binds alongside it.
     pub variation: u32,
+    /// Every phenotype's expression weight under those conditions, in authoring order. The
+    /// selected one is the strongest above the activation threshold; a weight explains why a
+    /// resolution went the way it did, which the resolved id alone cannot.
+    pub weights: Vec<PlantPhenotypeWeightDto>,
+}
+
+/// One phenotype's expression weight under a set of phenology inputs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema, TS)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[ts(export)]
+pub struct PlantPhenotypeWeightDto {
+    /// Stable family-local phenotype identity.
+    pub phenotype: u32,
+    /// What the appearance means.
+    pub role: PhenotypeRoleDto,
+    /// Expression weight in per-mille, or absent when the phenotype declares no curve to derive
+    /// one from — those appearances are reached by lifecycle or as the cooked default.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub weight_mille: Option<u32>,
 }
 
 /// One derived collision proxy a family carries.

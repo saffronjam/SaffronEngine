@@ -30,7 +30,49 @@ pub struct PlantTransformDto {
     pub scale_bits: [i32; 3],
 }
 
-/// One typed mutation understood by the editor journal, save state, and future network envelopes.
+/// Exact state a promoted simulation representation returned to the macro plant.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema, TS)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[ts(export)]
+pub struct PlantPromotionOriginDto {
+    pub transform: PlantTransformDto,
+    /// Linear velocity in Q15.16 metres per tick.
+    pub linear_velocity_bits: [i32; 3],
+    /// Angular velocity in Q15.16 turns per tick.
+    pub angular_velocity_bits: [i32; 3],
+}
+
+/// The whole persistent delta layered over one plant.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema, TS)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[ts(export)]
+pub struct PlantDeltaDto {
+    /// Added authored or runtime point; absent for a delta over a cooked plant.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub addition: Option<PlantPointDto>,
+    pub tombstoned: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub transform: Option<PlantTransformDto>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub lifecycle: Option<PlantLifecycleDto>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub phenotype: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ecology_tick: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub health: Option<u16>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub moisture: Option<u16>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fuel: Option<u16>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub interaction_policy: Option<InteractionPolicyDto>,
+    pub ignited: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub promotion_origin: Option<PlantPromotionOriginDto>,
+}
+
+/// One typed mutation understood by the editor journal, the save state, and the network envelope.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema, TS)]
 #[serde(
     tag = "kind",
@@ -108,14 +150,26 @@ pub enum VegetationMutationDto {
     },
     PromotionOriginState {
         plant: PlantId,
-        transform: PlantTransformDto,
-        linear_velocity_bits: [i32; 3],
-        angular_velocity_bits: [i32; 3],
+        origin: PlantPromotionOriginDto,
     },
     DisturbanceMask {
         categories: u32,
         tile: VegetationGuid,
         values: Vec<i16>,
+    },
+    PlantDeltaRestore {
+        plant: PlantId,
+        /// The delta to install; absent removes the plant's delta from the cell.
+        delta: Option<Box<PlantDeltaDto>>,
+    },
+    FieldTileClear {
+        layer: VegetationGuid,
+        channel: FieldChannelDto,
+        tile: VegetationGuid,
+    },
+    DisturbanceMaskClear {
+        categories: u32,
+        tile: VegetationGuid,
     },
 }
 
@@ -333,17 +387,22 @@ pub struct VegetationMapLayerCommitResult {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 #[ts(export)]
 pub struct VegetationMutateParams {
+    /// The gesture these records belong to, grouping them into one journal entry.
+    pub gesture: VegetationGuid,
     /// The ordered mutation records; the batch applies atomically per record order.
     pub records: Vec<VegetationMutationRecordDto>,
 }
 
 /// Result of applying a vegetation mutation batch.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema, TS)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema, TS)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 #[ts(export)]
 pub struct VegetationMutateResult {
     /// Records applied.
     pub applied: u32,
+    /// The records that undo this gesture exactly, captured from the preimage the batch replaced.
+    /// Applying them yields the records that redo it, so a caller toggles one list.
+    pub inverse: Vec<VegetationMutationRecordDto>,
 }
 
 /// A vegetation mutation with common deterministic metadata.

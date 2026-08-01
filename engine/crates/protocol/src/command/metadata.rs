@@ -30,6 +30,7 @@ pub static COMMAND_FIXTURES: &[(&str, &str)] = &[
     ("set-tonemap", "tonemap"),
     ("set-rt-shadows", "toggle-off"),
     ("set-hierarchy-cut", "empty"),
+    ("set-mesh-executor", "empty"),
     ("vsm-page-budget", "empty"),
     ("page-request-budget", "empty"),
     ("set-restir", "toggle-off"),
@@ -75,6 +76,7 @@ pub static COMMAND_FIXTURES: &[(&str, &str)] = &[
     ("set-wind", "wind-calm"),
     ("sample-wind", "wind-sample-origin"),
     ("emit-interaction-impulse", "interaction-impulse"),
+    ("wind-interaction-field", "interaction-field-coarse"),
     ("set-time-of-day", "time-of-day-noon"),
     ("get-selection", "empty"),
     ("deselect", "empty"),
@@ -248,6 +250,10 @@ pub static COMMAND_SKIPS: &[(&str, &str)] = &[
         "requires a live play world and a resident macro plant",
     ),
     (
+        "vegetation-plant-vitals",
+        "requires a live play world and a promoted macro plant",
+    ),
+    (
         "vegetation-state-export",
         "requires an exact bound vegetation runtime generation",
     ),
@@ -269,6 +275,14 @@ pub static COMMAND_SKIPS: &[(&str, &str)] = &[
     ),
     (
         "vegetation-combustion",
+        "requires an exact bound vegetation runtime generation",
+    ),
+    (
+        "vegetation-network-interest",
+        "requires an exact bound vegetation runtime generation",
+    ),
+    (
+        "vegetation-network-checkpoint",
         "requires an exact bound vegetation runtime generation",
     ),
     ("vegetation-usd-skeletons", "requires a USD stage on disk"),

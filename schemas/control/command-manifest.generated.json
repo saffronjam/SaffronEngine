@@ -212,6 +212,13 @@
       "fixture": "empty"
     },
     {
+      "name": "set-mesh-executor",
+      "params": "SetMeshExecutorParams",
+      "result": "MeshExecutorResult",
+      "status": "typed",
+      "fixture": "empty"
+    },
+    {
       "name": "vsm-page-budget",
       "params": "VsmPageBudgetParams",
       "result": "VsmPageBudgetResult",
@@ -539,6 +546,13 @@
       "result": "EmitInteractionImpulseResult",
       "status": "typed",
       "fixture": "interaction-impulse"
+    },
+    {
+      "name": "wind-interaction-field",
+      "params": "WindInteractionFieldParams",
+      "result": "WindInteractionFieldResult",
+      "status": "typed",
+      "fixture": "interaction-field-coarse"
     },
     {
       "name": "set-time-of-day",
@@ -1143,6 +1157,13 @@
       "skip": "requires a live play world and a promoted macro plant"
     },
     {
+      "name": "vegetation-plant-vitals",
+      "params": "VegetationPlantVitalsParams",
+      "result": "VegetationPlantVitalsResult",
+      "status": "typed",
+      "skip": "requires a live play world and a promoted macro plant"
+    },
+    {
       "name": "vegetation-state-export",
       "params": "EmptyParams",
       "result": "VegetationStateSnapshotDto",
@@ -1225,6 +1246,20 @@
       "result": "VegetationTelemetryResult",
       "status": "typed",
       "skip": "requires a bound vegetation runtime"
+    },
+    {
+      "name": "vegetation-network-interest",
+      "params": "VegetationNetworkInterestParams",
+      "result": "VegetationNetworkSessionResult",
+      "status": "typed",
+      "skip": "requires an exact bound vegetation runtime generation"
+    },
+    {
+      "name": "vegetation-network-checkpoint",
+      "params": "EmptyParams",
+      "result": "VegetationNetworkSessionResult",
+      "status": "typed",
+      "skip": "requires an exact bound vegetation runtime generation"
     },
     {
       "name": "vegetation-import-points",

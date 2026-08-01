@@ -178,6 +178,12 @@ pub static COMMANDS: &[CommandSpec] = &[
         "HierarchyCutResult",
     ),
     CommandSpec::new(
+        "set-mesh-executor",
+        "set-mesh-executor [true|false] — route the shaded executor through the mesh stage (omit to read)",
+        "SetMeshExecutorParams",
+        "MeshExecutorResult",
+    ),
+    CommandSpec::new(
         "vsm-page-budget",
         "read or set the shadow pages a frame may render",
         "VsmPageBudgetParams",
@@ -438,6 +444,12 @@ pub static COMMANDS: &[CommandSpec] = &[
         "emit-interaction-impulse {positionM, radiusM, strength, direction?, depress?} — push the world interaction field",
         "EmitInteractionImpulseParams",
         "EmitInteractionImpulseResult",
+    ),
+    CommandSpec::new(
+        "wind-interaction-field",
+        "wind-interaction-field {cascade?, resolution?} — one whole cascade of the world interaction field, reduced to a grid",
+        "WindInteractionFieldParams",
+        "WindInteractionFieldResult",
     ),
     CommandSpec::new(
         "set-time-of-day",
@@ -941,6 +953,12 @@ pub static COMMANDS: &[CommandSpec] = &[
         "VegetationPromotionResult",
     ),
     CommandSpec::new(
+        "vegetation-plant-vitals",
+        "read a promoted plant's live biology, replacing the fields that are present",
+        "VegetationPlantVitalsParams",
+        "VegetationPlantVitalsResult",
+    ),
+    CommandSpec::new(
         "vegetation-state-export",
         "export the canonical strict runtime vegetation state snapshot",
         "EmptyParams",
@@ -1013,6 +1031,18 @@ pub static COMMANDS: &[CommandSpec] = &[
         "VegetationTelemetryResult",
     ),
     CommandSpec::new(
+        "vegetation-network-interest",
+        "declare the cells and facets this world is seated with in a network session",
+        "VegetationNetworkInterestParams",
+        "VegetationNetworkSessionResult",
+    ),
+    CommandSpec::new(
+        "vegetation-network-checkpoint",
+        "fingerprint the seated scope at the highest agreed transport sequence",
+        "EmptyParams",
+        "VegetationNetworkSessionResult",
+    ),
+    CommandSpec::new(
         "vegetation-import-points",
         "import instanced points from a content-creation tool into an authored map layer",
         "VegetationImportPointsParams",
@@ -1056,7 +1086,7 @@ pub static COMMANDS: &[CommandSpec] = &[
     ),
     CommandSpec::new(
         "plant-season-phenotype",
-        "plant-season-phenotype {plant, seasonMille, lifecycle?} — the appearance a family renders then",
+        "plant-season-phenotype {plant, seasonMille, lifecycle?, healthMille?, moistureMille?} — the appearance a family renders then, with every phenotype's weight",
         "PlantSeasonPhenotypeParams",
         "PlantSeasonPhenotypeResult",
     ),

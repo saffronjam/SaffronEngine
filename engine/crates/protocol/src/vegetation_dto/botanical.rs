@@ -121,6 +121,12 @@ pub enum BotanicalOperatorDto {
     Tropism {
         kind_of: TropismKindDto,
         strength: u16,
+        /// Light direction for `phototropism` and the obstacle plane's outward normal for
+        /// `thigmotropism`, in family-local metres as Q15.16 bits. `gravitropism` ignores it.
+        stimulus_bits: [i32; 3],
+        /// Signed distance from the family origin to the obstacle plane along `stimulusBits`, as
+        /// Q15.16 metres. Only `thigmotropism` reads it.
+        plane_offset_bits: i32,
     },
     Prune {
         rule: PruneRuleDto,
@@ -279,6 +285,25 @@ pub struct PlantGraphSetParams {
     /// External hero meshes the graph's grafts name, in canonical identity order.
     #[serde(default)]
     pub grafts: Vec<PlantGraftSourceDto>,
+    /// The `.splant` module each `moduleCall` node binds to. A call and its binding are validated
+    /// together, so they cross in one write.
+    #[serde(default)]
+    pub modules: Vec<PlantModuleReferenceDto>,
+}
+
+/// One call site's binding of a `.splant` module — the preset a `moduleCall` node grows.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema, TS)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[ts(export)]
+pub struct PlantModuleReferenceDto {
+    /// Call-site GUID the graph's `moduleCall` node names.
+    pub call_guid: VegetationGuid,
+    /// The `.splant` this call site grows, which must carry the module family role.
+    pub plant: Uuid,
+    /// Which of the module's variations to grow.
+    pub variation: u32,
+    /// Uniform placement scale as Q15.16 metres, where one is the module's authored size.
+    pub scale_bits: i32,
 }
 
 /// The graph a plant family carries, and what it grows.
@@ -290,6 +315,8 @@ pub struct PlantGraphResult {
     pub graph: BotanicalGraphDto,
     /// External hero meshes the graph's grafts name.
     pub grafts: Vec<PlantGraftSourceDto>,
+    /// The `.splant` modules the graph's `moduleCall` nodes bind to.
+    pub modules: Vec<PlantModuleReferenceDto>,
     pub growth: BotanicalGrowthDto,
 }
 
@@ -369,6 +396,9 @@ pub struct BotanicalPlacementDto {
     pub id: String,
     /// Frame it sits on, as a decimal `u128`.
     pub frame: String,
+    /// The axis carrying that frame, as a decimal `u128`. It is always present in the same report's
+    /// axis list, so the structure it hangs under never has to be inferred.
+    pub axis: String,
     pub element: BotanicalElementDto,
     pub material_slot: u32,
     /// Position in family-local metres, as Q15.16 bits.

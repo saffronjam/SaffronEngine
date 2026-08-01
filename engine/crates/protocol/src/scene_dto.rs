@@ -371,6 +371,7 @@ pub struct Rigidbody {
     pub linear_damping: f32,
     pub angular_damping: f32,
     pub gravity_factor: f32,
+    pub wind_factor: f32,
     pub lock_position: BVec3,
     pub lock_rotation: BVec3,
     pub collision_layer: i32,

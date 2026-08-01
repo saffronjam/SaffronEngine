@@ -560,3 +560,25 @@ pub struct HierarchyCutResult {
     /// The cut that view now draws.
     pub cut: HierarchyCutDto,
 }
+
+/// Params of `set-mesh-executor`: route the shaded executor through the mesh stage.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema, TS)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[ts(export)]
+pub struct SetMeshExecutorParams {
+    /// Whether to run the mesh executor. Omit to read which executor is in force.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub enabled: Option<bool>,
+}
+
+/// Reply of `set-mesh-executor`: which executor draws, and whether the device qualifies.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema, TS)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[ts(export)]
+pub struct MeshExecutorResult {
+    /// Whether the shaded executor now draws through the mesh stage.
+    pub enabled: bool,
+    /// Whether this device's mesh feature bits and output limits qualify at all. A request to
+    /// enable the mesh executor on a device that does not qualify leaves `mesh` false.
+    pub supported: bool,
+}

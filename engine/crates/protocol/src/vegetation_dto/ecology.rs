@@ -1,6 +1,7 @@
 use crate::{
-    InteractionPolicyDto, PlantId, PlantLifecycleDto, PlantPromotionStateDto,
-    VegetationRuntimePlantDto, VegetationRuntimeQueryFilterDto, WorldBoundsDto, WorldCellDto,
+    InteractionPolicyDto, PlantId, PlantLifecycleDto, PlantPromotionOriginDto,
+    PlantPromotionStateDto, VegetationRuntimePlantDto, VegetationRuntimeQueryFilterDto,
+    WorldBoundsDto, WorldCellDto,
 };
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -260,6 +261,8 @@ pub struct VegetationPromotionReportDto {
     pub felled_total: String,
     pub failed_total: String,
     pub flushed_total: String,
+    /// Views dropped without a write-back because another authority took the plant over.
+    pub released_total: String,
 }
 
 /// Persistent overlay for one plant, independent of current facet residency.
@@ -279,7 +282,10 @@ pub struct VegetationRuntimePlantStateDto {
     pub moisture: Option<u16>,
     pub fuel: Option<u16>,
     pub interaction_policy: Option<InteractionPolicyDto>,
-    pub promoted: bool,
+    /// The exact state the plant's last promoted simulation returned, including the momentum a
+    /// re-promotion hands back to its entity view. Absent for a plant no promotion ever wrote.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub promotion_origin: Option<PlantPromotionOriginDto>,
 }
 
 /// Resident effective row plus any persistent overlay and editor provenance.

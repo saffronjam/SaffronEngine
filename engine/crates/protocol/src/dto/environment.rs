@@ -357,6 +357,86 @@ pub struct SampleWindResult {
     pub velocity_mps: [f32; 3],
     pub gust_front: f32,
     pub time_s: f64,
+    /// The mean advection term, including its gust-front boost.
+    pub mean_mps: [f32; 3],
+    /// The turbulence term the octaves below sum to.
+    pub turbulence_mps: [f32; 3],
+    /// The turbulence spectrum: one entry per evaluated octave, coarsest first.
+    pub octaves: Vec<WindOctaveDto>,
+    /// What each enabled local source contributed here, in scene order.
+    pub sources: Vec<WindSourceInfluenceDto>,
+}
+
+/// One turbulence octave's own share of a wind sample.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct WindOctaveDto {
+    /// Octave index, zero being the coarsest.
+    pub octave: u32,
+    /// The octave's spatial wavelength in metres; each is half the one before.
+    pub wavelength_m: f32,
+    /// The velocity this octave alone contributes.
+    pub velocity_mps: [f32; 3],
+}
+
+/// Params of `wind-interaction-field`: one whole cascade of the world interaction field.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, JsonSchema, TS)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[ts(export)]
+pub struct WindInteractionFieldParams {
+    /// Which cascade to read; zero is the fine one.
+    #[serde(default)]
+    #[schemars(range(min = 0, max = 1))]
+    pub cascade: u32,
+    /// Side length of the reduced grid; 32 when absent, 256 at most.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schemars(range(min = 1, max = 256))]
+    pub resolution: Option<u32>,
+}
+
+/// Reply of `wind-interaction-field`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema, TS)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[ts(export)]
+pub struct WindInteractionFieldResult {
+    /// The cascade this reduces.
+    pub cascade: u32,
+    /// Metres per texel of that cascade.
+    pub texel_meters: f32,
+    /// The cascade's centre in absolute world texel coordinates.
+    pub center_texel: [i32; 2],
+    /// The field's monotonic generation.
+    pub generation: u32,
+    /// Side length of the reduced grid.
+    pub resolution: u32,
+    /// Row-major block means of `[displacementX, displacementZ, depress]` in metres.
+    pub cells: Vec<[f32; 3]>,
+    /// Texels holding current, nonzero state — what the cascade is carrying right now.
+    pub live_texels: u32,
+    /// The largest horizontal displacement in the cascade, in metres.
+    pub peak_displacement_m: f32,
+    /// The largest horizontal recovery velocity in the cascade, in metres per second.
+    pub peak_velocity_mps: f32,
+}
+
+/// One local wind source's contribution at a sampled position.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct WindSourceInfluenceDto {
+    /// The source entity.
+    pub entity: String,
+    /// `directional`, `point`, `vortex`, `wake`, or `volume`.
+    pub kind: String,
+    /// Distance from the sample to the source in metres.
+    pub distance_m: f32,
+    /// The source's 0..1 edge weight at that distance; zero is out of range.
+    pub weight: f32,
+    /// The velocity this source adds. Zero for a volume source, which scales instead.
+    pub added_mps: [f32; 3],
+    /// The factor a volume source scales the global term by; one for every other kind.
+    pub global_scale: f32,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, JsonSchema, TS)]

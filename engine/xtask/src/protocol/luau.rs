@@ -331,13 +331,22 @@ pub fn emit_api_defs() -> String {
     let ragdoll_state = "---@class sa.RagdollState\n---@field present boolean\n---@field active \
                          boolean\n---@field body_weight number\n---@field bones integer";
 
+    let vegetation_event = "---@class sa.VegetationEvent\n---@field seq number\n---@field kind \
+                            string\n---@field plant string?\n---@field cell { x: number, y: \
+                            number, z: number, level: number }\n---@field lifecycle \
+                            string?\n---@field previous_lifecycle string?\n---@field phenotype \
+                            number?\n---@field amount number?\n---@field health number?\n---@field \
+                            moisture number?\n---@field fuel number?\n---@field categories number?";
+
     let script_self = "---@class sa.ScriptSelf\n---@field entity sa.Entity\nlocal ScriptSelf = \
                        {}\nfunction ScriptSelf:on_create() end\nfunction ScriptSelf:on_update(dt) \
                        end ---@param dt number\nfunction ScriptSelf:on_destroy() end\nfunction \
                        ScriptSelf:on_trigger_enter(other) end ---@param other sa.Entity\nfunction \
                        ScriptSelf:on_trigger_exit(other) end ---@param other sa.Entity\nfunction \
                        ScriptSelf:on_contact(other, point, normal) end ---@param other sa.Entity \
-                       @param point sa.Vec3 @param normal sa.Vec3";
+                       @param point sa.Vec3 @param normal sa.Vec3\nfunction \
+                       ScriptSelf:on_vegetation_event(event) end ---@param event \
+                       sa.VegetationEvent";
 
     [
         header.to_owned(),
@@ -345,6 +354,7 @@ pub fn emit_api_defs() -> String {
         ray_hit.to_owned(),
         plant_hit.to_owned(),
         ragdoll_state.to_owned(),
+        vegetation_event.to_owned(),
         emit_component_name_alias(),
         emit_entity_class(),
         script_self.to_owned(),
@@ -552,6 +562,8 @@ mod tests {
         assert!(defs.contains("---@field entity sa.Entity?"));
         assert!(defs.contains("---@class sa.RagdollState\n---@field present boolean"));
         assert!(defs.contains("---@field body_weight number"));
+        assert!(defs.contains("---@class sa.VegetationEvent\n---@field seq number"));
+        assert!(defs.contains("---@field previous_lifecycle string?"));
         assert!(defs.contains("---@class sa.ScriptSelf\n---@field entity sa.Entity"));
         for handler in [
             "function ScriptSelf:on_create() end",
@@ -561,6 +573,7 @@ mod tests {
             "function ScriptSelf:on_trigger_exit(other) end ---@param other sa.Entity",
             "function ScriptSelf:on_contact(other, point, normal) end ---@param other sa.Entity \
              @param point sa.Vec3 @param normal sa.Vec3",
+            "function ScriptSelf:on_vegetation_event(event) end ---@param event sa.VegetationEvent",
         ] {
             assert!(
                 defs.contains(handler),

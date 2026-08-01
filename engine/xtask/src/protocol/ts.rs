@@ -24,11 +24,27 @@ pub fn emit_sa_types(decls: &DtoDecls) -> String {
 
     format!(
         "/**\n * GENERATED - do not edit.\n *\n * Produced by cargo run -p xtask -- \
-         gen-protocol.\n */\n\nexport type WireUuid = string;\n\n{}\n\nexport \
+         gen-protocol.\n */\n\nexport type WireUuid = string;\n\n{}\n\n{}\n\nexport \
          interface CommandParamsMap {{\n{}\n}}\n\nexport interface CommandResultMap \
          {{\n{}\n}}\n",
-        interfaces, params_map, result_map,
+        emit_component_names(),
+        interfaces,
+        params_map,
+        result_map,
     )
+}
+
+/// The `ComponentName` union over the registered scene components, in registry order. The editor's
+/// canonical ordering and hidden sets are checked exhaustively against it, so a component added to
+/// the registry without an editor slot is a typecheck failure rather than a silently unreachable
+/// Add-component entry.
+fn emit_component_names() -> String {
+    let union = saffron_protocol::COMPONENT_NAMES
+        .iter()
+        .map(|name| format!("  | {name:?}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    format!("export type ComponentName =\n{union};")
 }
 
 /// The declaration emission order, matching the complete Rust DTO inventory.

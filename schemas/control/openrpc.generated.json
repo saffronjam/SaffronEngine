@@ -546,6 +546,24 @@
       }
     },
     {
+      "name": "set-mesh-executor",
+      "summary": "set-mesh-executor [true|false] — route the shaded executor through the mesh stage (omit to read)",
+      "params": [
+        {
+          "name": "params",
+          "schema": {
+            "$ref": "#/components/schemas/SetMeshExecutorParams"
+          }
+        }
+      ],
+      "result": {
+        "name": "result",
+        "schema": {
+          "$ref": "#/components/schemas/MeshExecutorResult"
+        }
+      }
+    },
+    {
       "name": "vsm-page-budget",
       "summary": "read or set the shadow pages a frame may render",
       "params": [
@@ -1388,6 +1406,24 @@
         "name": "result",
         "schema": {
           "$ref": "#/components/schemas/EmitInteractionImpulseResult"
+        }
+      }
+    },
+    {
+      "name": "wind-interaction-field",
+      "summary": "wind-interaction-field {cascade?, resolution?} — one whole cascade of the world interaction field, reduced to a grid",
+      "params": [
+        {
+          "name": "params",
+          "schema": {
+            "$ref": "#/components/schemas/WindInteractionFieldParams"
+          }
+        }
+      ],
+      "result": {
+        "name": "result",
+        "schema": {
+          "$ref": "#/components/schemas/WindInteractionFieldResult"
         }
       }
     },
@@ -2940,6 +2976,24 @@
       }
     },
     {
+      "name": "vegetation-plant-vitals",
+      "summary": "read a promoted plant's live biology, replacing the fields that are present",
+      "params": [
+        {
+          "name": "params",
+          "schema": {
+            "$ref": "#/components/schemas/VegetationPlantVitalsParams"
+          }
+        }
+      ],
+      "result": {
+        "name": "result",
+        "schema": {
+          "$ref": "#/components/schemas/VegetationPlantVitalsResult"
+        }
+      }
+    },
+    {
       "name": "vegetation-state-export",
       "summary": "export the canonical strict runtime vegetation state snapshot",
       "params": [
@@ -3156,6 +3210,42 @@
       }
     },
     {
+      "name": "vegetation-network-interest",
+      "summary": "declare the cells and facets this world is seated with in a network session",
+      "params": [
+        {
+          "name": "params",
+          "schema": {
+            "$ref": "#/components/schemas/VegetationNetworkInterestParams"
+          }
+        }
+      ],
+      "result": {
+        "name": "result",
+        "schema": {
+          "$ref": "#/components/schemas/VegetationNetworkSessionResult"
+        }
+      }
+    },
+    {
+      "name": "vegetation-network-checkpoint",
+      "summary": "fingerprint the seated scope at the highest agreed transport sequence",
+      "params": [
+        {
+          "name": "params",
+          "schema": {
+            "$ref": "#/components/schemas/EmptyParams"
+          }
+        }
+      ],
+      "result": {
+        "name": "result",
+        "schema": {
+          "$ref": "#/components/schemas/VegetationNetworkSessionResult"
+        }
+      }
+    },
+    {
       "name": "vegetation-import-points",
       "summary": "import instanced points from a content-creation tool into an authored map layer",
       "params": [
@@ -3283,7 +3373,7 @@
     },
     {
       "name": "plant-season-phenotype",
-      "summary": "plant-season-phenotype {plant, seasonMille, lifecycle?} — the appearance a family renders then",
+      "summary": "plant-season-phenotype {plant, seasonMille, lifecycle?, healthMille?, moistureMille?} — the appearance a family renders then, with every phenotype's weight",
       "params": [
         {
           "name": "params",
@@ -6679,6 +6769,17 @@
                 "minimum": 0,
                 "maximum": 65535
               },
+              "stimulusBits": {
+                "type": "array",
+                "items": {
+                  "type": "integer"
+                },
+                "minItems": 3,
+                "maxItems": 3
+              },
+              "planeOffsetBits": {
+                "type": "integer"
+              },
               "kind": {
                 "type": "string",
                 "const": "tropism"
@@ -6688,7 +6789,9 @@
             "required": [
               "kind",
               "kindOf",
-              "strength"
+              "strength",
+              "stimulusBits",
+              "planeOffsetBits"
             ]
           },
           {
@@ -6867,6 +6970,9 @@
           "frame": {
             "type": "string"
           },
+          "axis": {
+            "type": "string"
+          },
           "element": {
             "type": "string",
             "enum": [
@@ -6909,6 +7015,7 @@
         "required": [
           "id",
           "frame",
+          "axis",
           "element",
           "materialSlot",
           "positionBits",
@@ -10605,6 +10712,22 @@
           "mesh"
         ]
       },
+      "MeshExecutorResult": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "enabled": {
+            "type": "boolean"
+          },
+          "supported": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "enabled",
+          "supported"
+        ]
+      },
       "ModelInfoParams": {
         "type": "object",
         "additionalProperties": false,
@@ -11759,6 +11882,75 @@
           "growth"
         ]
       },
+      "PlantDeltaDto": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "addition": {
+            "$ref": "#/components/schemas/PlantPointDto"
+          },
+          "tombstoned": {
+            "type": "boolean"
+          },
+          "transform": {
+            "$ref": "#/components/schemas/PlantTransformDto"
+          },
+          "lifecycle": {
+            "type": "string",
+            "enum": [
+              "seed",
+              "sprout",
+              "juvenile",
+              "mature",
+              "senescent",
+              "dead",
+              "stump",
+              "removed"
+            ]
+          },
+          "phenotype": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "ecologyTick": {
+            "type": "string"
+          },
+          "health": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 65535
+          },
+          "moisture": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 65535
+          },
+          "fuel": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 65535
+          },
+          "interactionPolicy": {
+            "type": "string",
+            "enum": [
+              "decorative",
+              "interactive",
+              "harvestable",
+              "structural"
+            ]
+          },
+          "ignited": {
+            "type": "boolean"
+          },
+          "promotionOrigin": {
+            "$ref": "#/components/schemas/PlantPromotionOriginDto"
+          }
+        },
+        "required": [
+          "tombstoned",
+          "ignited"
+        ]
+      },
       "PlantElementsResult": {
         "type": "object",
         "additionalProperties": false,
@@ -11830,6 +12022,12 @@
               "$ref": "#/components/schemas/PlantGraftSourceDto"
             }
           },
+          "modules": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/PlantModuleReferenceDto"
+            }
+          },
           "growth": {
             "$ref": "#/components/schemas/BotanicalGrowthDto"
           }
@@ -11838,6 +12036,7 @@
           "plant",
           "graph",
           "grafts",
+          "modules",
           "growth"
         ]
       },
@@ -11855,6 +12054,13 @@
             "type": "array",
             "items": {
               "$ref": "#/components/schemas/PlantGraftSourceDto"
+            },
+            "default": []
+          },
+          "modules": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/PlantModuleReferenceDto"
             },
             "default": []
           }
@@ -12092,6 +12298,34 @@
           "removed"
         ]
       },
+      "PlantModuleReferenceDto": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "callGuid": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{32}$",
+            "minLength": 32,
+            "maxLength": 32
+          },
+          "plant": {
+            "type": "string"
+          },
+          "variation": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "scaleBits": {
+            "type": "integer"
+          }
+        },
+        "required": [
+          "callGuid",
+          "plant",
+          "variation",
+          "scaleBits"
+        ]
+      },
       "PlantNavigationProxyDto": {
         "type": "object",
         "additionalProperties": false,
@@ -12144,6 +12378,30 @@
             "minItems": 2,
             "maxItems": 2
           },
+          "healthBand": {
+            "type": "array",
+            "items": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "minItems": 2,
+            "maxItems": 2
+          },
+          "moistureBand": {
+            "type": "array",
+            "items": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "minItems": 2,
+            "maxItems": 2
+          },
+          "rampMille": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 500,
+            "default": 0
+          },
           "materialRemap": {
             "type": "array",
             "items": {
@@ -12169,6 +12427,27 @@
           "id",
           "role",
           "variation"
+        ]
+      },
+      "PlantPhenotypeWeightDto": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "phenotype": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "role": {
+            "$ref": "#/components/schemas/PhenotypeRoleDto"
+          },
+          "weightMille": {
+            "type": "integer",
+            "minimum": 0
+          }
+        },
+        "required": [
+          "phenotype",
+          "role"
         ]
       },
       "PlantPhenotypesParams": {
@@ -12449,6 +12728,36 @@
           "surfaceProjectionBits"
         ]
       },
+      "PlantPromotionOriginDto": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "transform": {
+            "$ref": "#/components/schemas/PlantTransformDto"
+          },
+          "linearVelocityBits": {
+            "type": "array",
+            "items": {
+              "type": "integer"
+            },
+            "minItems": 3,
+            "maxItems": 3
+          },
+          "angularVelocityBits": {
+            "type": "array",
+            "items": {
+              "type": "integer"
+            },
+            "minItems": 3,
+            "maxItems": 3
+          }
+        },
+        "required": [
+          "transform",
+          "linearVelocityBits",
+          "angularVelocityBits"
+        ]
+      },
       "PlantPromotionStateDto": {
         "oneOf": [
           {
@@ -12657,6 +12966,16 @@
               "stump",
               "removed"
             ]
+          },
+          "healthMille": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 1000
+          },
+          "moistureMille": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 1000
           }
         },
         "required": [
@@ -12678,12 +12997,19 @@
           "variation": {
             "type": "integer",
             "minimum": 0
+          },
+          "weights": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/PlantPhenotypeWeightDto"
+            }
           }
         },
         "required": [
           "plant",
           "phenotype",
-          "variation"
+          "variation",
+          "weights"
         ]
       },
       "PlantSemanticDestinationDto": {
@@ -14208,6 +14534,13 @@
           "shadowDrawCalls": {
             "type": "integer"
           },
+          "asyncComputeQueue": {
+            "type": "boolean"
+          },
+          "asyncComputeBatches": {
+            "type": "integer",
+            "minimum": 0
+          },
           "vsm": {
             "$ref": "#/components/schemas/VsmStatsDto"
           },
@@ -14215,6 +14548,9 @@
             "type": "integer"
           },
           "rtAggregateInstances": {
+            "type": "integer"
+          },
+          "rtResolvableInstances": {
             "type": "integer"
           },
           "frameMs": {
@@ -14365,6 +14701,9 @@
           "tessellatedBlasCount": {
             "type": "integer"
           },
+          "windDeformedInstances": {
+            "type": "integer"
+          },
           "clusterAsSupported": {
             "type": "boolean"
           },
@@ -14399,6 +14738,18 @@
             "type": "string"
           },
           "ommUnknown": {
+            "type": "string"
+          },
+          "ommDerivedMicromaps": {
+            "type": "integer"
+          },
+          "ommDerivedOpaque": {
+            "type": "string"
+          },
+          "ommDerivedTransparent": {
+            "type": "string"
+          },
+          "ommDerivedUnknown": {
             "type": "string"
           },
           "blasBytes": {
@@ -14528,9 +14879,12 @@
           "instanceUploadBytes",
           "retainedMeshCpuBytes",
           "shadowDrawCalls",
+          "asyncComputeQueue",
+          "asyncComputeBatches",
           "vsm",
           "rtInstances",
           "rtAggregateInstances",
+          "rtResolvableInstances",
           "frameMs",
           "fps",
           "gpuMs",
@@ -14577,6 +14931,7 @@
           "blasCount",
           "skinnedBlasCount",
           "tessellatedBlasCount",
+          "windDeformedInstances",
           "clusterAsSupported",
           "clusterBlasCount",
           "clasCount",
@@ -14589,6 +14944,10 @@
           "ommOpaque",
           "ommTransparent",
           "ommUnknown",
+          "ommDerivedMicromaps",
+          "ommDerivedOpaque",
+          "ommDerivedTransparent",
+          "ommDerivedUnknown",
           "blasBytes",
           "blasBuiltBytes",
           "tlasBytes",
@@ -14686,6 +15045,9 @@
           "gravityFactor": {
             "type": "number"
           },
+          "windFactor": {
+            "type": "number"
+          },
           "lockPosition": {
             "$ref": "#/components/schemas/BVec3"
           },
@@ -14702,6 +15064,7 @@
           "linearDamping",
           "angularDamping",
           "gravityFactor",
+          "windFactor",
           "lockPosition",
           "lockRotation",
           "collisionLayer"
@@ -14744,12 +15107,44 @@
           },
           "timeS": {
             "type": "number"
+          },
+          "meanMps": {
+            "type": "array",
+            "items": {
+              "type": "number"
+            },
+            "minItems": 3,
+            "maxItems": 3
+          },
+          "turbulenceMps": {
+            "type": "array",
+            "items": {
+              "type": "number"
+            },
+            "minItems": 3,
+            "maxItems": 3
+          },
+          "octaves": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/WindOctaveDto"
+            }
+          },
+          "sources": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/WindSourceInfluenceDto"
+            }
           }
         },
         "required": [
           "velocityMps",
           "gustFront",
-          "timeS"
+          "timeS",
+          "meanMps",
+          "turbulenceMps",
+          "octaves",
+          "sources"
         ]
       },
       "SaveEnvironmentProfileParams": {
@@ -14855,6 +15250,10 @@
             "type": "integer",
             "minimum": 0
           },
+          "culledClusters": {
+            "type": "integer",
+            "minimum": 0
+          },
           "giReachVisible": {
             "type": "integer",
             "minimum": 0
@@ -14890,6 +15289,7 @@
           "interactionResets",
           "coveredSamples",
           "culledNodes",
+          "culledClusters",
           "giReachVisible",
           "giReachCulled",
           "overflowFlags",
@@ -16218,6 +16618,16 @@
           },
           "ambient": {
             "type": "number"
+          }
+        },
+        "required": []
+      },
+      "SetMeshExecutorParams": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "enabled": {
+            "type": "boolean"
           }
         },
         "required": []
@@ -22452,6 +22862,12 @@
         "type": "object",
         "additionalProperties": false,
         "properties": {
+          "gesture": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{32}$",
+            "minLength": 32,
+            "maxLength": 32
+          },
           "records": {
             "type": "array",
             "items": {
@@ -22460,6 +22876,7 @@
           }
         },
         "required": [
+          "gesture",
           "records"
         ]
       },
@@ -22470,10 +22887,17 @@
           "applied": {
             "type": "integer",
             "minimum": 0
+          },
+          "inverse": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/VegetationMutationRecordDto"
+            }
           }
         },
         "required": [
-          "applied"
+          "applied",
+          "inverse"
         ]
       },
       "VegetationMutationDto": {
@@ -22916,24 +23340,8 @@
                 "minLength": 32,
                 "maxLength": 32
               },
-              "transform": {
-                "$ref": "#/components/schemas/PlantTransformDto"
-              },
-              "linearVelocityBits": {
-                "type": "array",
-                "items": {
-                  "type": "integer"
-                },
-                "minItems": 3,
-                "maxItems": 3
-              },
-              "angularVelocityBits": {
-                "type": "array",
-                "items": {
-                  "type": "integer"
-                },
-                "minItems": 3,
-                "maxItems": 3
+              "origin": {
+                "$ref": "#/components/schemas/PlantPromotionOriginDto"
               },
               "kind": {
                 "type": "string",
@@ -22943,9 +23351,7 @@
             "required": [
               "kind",
               "plant",
-              "transform",
-              "linearVelocityBits",
-              "angularVelocityBits"
+              "origin"
             ]
           },
           {
@@ -22979,6 +23385,82 @@
               "categories",
               "tile",
               "values"
+            ]
+          },
+          {
+            "type": "object",
+            "properties": {
+              "plant": {
+                "type": "string",
+                "pattern": "^[0-9a-f]{32}$",
+                "minLength": 32,
+                "maxLength": 32
+              },
+              "delta": {
+                "$ref": "#/components/schemas/PlantDeltaDto"
+              },
+              "kind": {
+                "type": "string",
+                "const": "plant-delta-restore"
+              }
+            },
+            "required": [
+              "kind",
+              "plant"
+            ]
+          },
+          {
+            "type": "object",
+            "properties": {
+              "layer": {
+                "type": "string",
+                "pattern": "^[0-9a-f]{32}$",
+                "minLength": 32,
+                "maxLength": 32
+              },
+              "channel": {
+                "$ref": "#/components/schemas/FieldChannelDto"
+              },
+              "tile": {
+                "type": "string",
+                "pattern": "^[0-9a-f]{32}$",
+                "minLength": 32,
+                "maxLength": 32
+              },
+              "kind": {
+                "type": "string",
+                "const": "field-tile-clear"
+              }
+            },
+            "required": [
+              "kind",
+              "layer",
+              "channel",
+              "tile"
+            ]
+          },
+          {
+            "type": "object",
+            "properties": {
+              "categories": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "tile": {
+                "type": "string",
+                "pattern": "^[0-9a-f]{32}$",
+                "minLength": 32,
+                "maxLength": 32
+              },
+              "kind": {
+                "type": "string",
+                "const": "disturbance-mask-clear"
+              }
+            },
+            "required": [
+              "kind",
+              "categories",
+              "tile"
             ]
           }
         ]
@@ -23186,6 +23668,89 @@
           "obstacles",
           "dynamicObstacles",
           "drained"
+        ]
+      },
+      "VegetationNetworkInterestCellDto": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "cell": {
+            "$ref": "#/components/schemas/WorldCellDto"
+          },
+          "facets": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "enum": [
+                "render",
+                "physics",
+                "simulation",
+                "editing",
+                "navigation",
+                "network"
+              ]
+            }
+          }
+        },
+        "required": [
+          "cell",
+          "facets"
+        ]
+      },
+      "VegetationNetworkInterestParams": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "cells": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/VegetationNetworkInterestCellDto"
+            },
+            "default": []
+          }
+        },
+        "required": []
+      },
+      "VegetationNetworkSessionResult": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "seated": {
+            "type": "boolean"
+          },
+          "protocolVersion": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "sequence": {
+            "type": "string"
+          },
+          "interest": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/VegetationNetworkInterestCellDto"
+            }
+          },
+          "interestIdentity": {
+            "type": "string"
+          },
+          "stateIdentity": {
+            "type": "string"
+          },
+          "manifestIdentity": {
+            "type": "string"
+          },
+          "ecologyTick": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "seated",
+          "protocolVersion",
+          "sequence",
+          "interest",
+          "manifestIdentity",
+          "ecologyTick"
         ]
       },
       "VegetationNodeEvaluationDiagnosticDto": {
@@ -23456,6 +24021,107 @@
           "layer"
         ]
       },
+      "VegetationPlantVitalsParams": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "plant": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{32}$",
+            "minLength": 32,
+            "maxLength": 32
+          },
+          "lifecycle": {
+            "type": "string",
+            "enum": [
+              "seed",
+              "sprout",
+              "juvenile",
+              "mature",
+              "senescent",
+              "dead",
+              "stump",
+              "removed"
+            ]
+          },
+          "health": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 65535
+          },
+          "moisture": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 65535
+          },
+          "fuel": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 65535
+          },
+          "ecologyTick": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "plant"
+        ]
+      },
+      "VegetationPlantVitalsResult": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "plant": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{32}$",
+            "minLength": 32,
+            "maxLength": 32
+          },
+          "entity": {
+            "type": "string"
+          },
+          "lifecycle": {
+            "type": "string",
+            "enum": [
+              "seed",
+              "sprout",
+              "juvenile",
+              "mature",
+              "senescent",
+              "dead",
+              "stump",
+              "removed"
+            ]
+          },
+          "health": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 65535
+          },
+          "moisture": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 65535
+          },
+          "fuel": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 65535
+          },
+          "ecologyTick": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "plant",
+          "entity",
+          "lifecycle",
+          "health",
+          "moisture",
+          "fuel",
+          "ecologyTick"
+        ]
+      },
       "VegetationPointColumnTypeDto": {
         "type": "string",
         "enum": [
@@ -23554,6 +24220,9 @@
           },
           "flushedTotal": {
             "type": "string"
+          },
+          "releasedTotal": {
+            "type": "string"
           }
         },
         "required": [
@@ -23564,7 +24233,8 @@
           "demotedTotal",
           "felledTotal",
           "failedTotal",
-          "flushedTotal"
+          "flushedTotal",
+          "releasedTotal"
         ]
       },
       "VegetationPromotionResult": {
@@ -24139,16 +24809,15 @@
               "structural"
             ]
           },
-          "promoted": {
-            "type": "boolean"
+          "promotionOrigin": {
+            "$ref": "#/components/schemas/PlantPromotionOriginDto"
           }
         },
         "required": [
           "cell",
           "cellRevision",
           "added",
-          "tombstoned",
-          "promoted"
+          "tombstoned"
         ]
       },
       "VegetationRuntimeQueryDto": {
@@ -25279,6 +25948,15 @@
           "queryHits": {
             "type": "string"
           },
+          "queryGenerationsVisited": {
+            "type": "string"
+          },
+          "queryNodesVisited": {
+            "type": "string"
+          },
+          "queryRowsTested": {
+            "type": "string"
+          },
           "mutations": {
             "type": "string"
           },
@@ -25299,6 +25977,9 @@
           "synchronizations",
           "queries",
           "queryHits",
+          "queryGenerationsVisited",
+          "queryNodesVisited",
+          "queryRowsTested",
           "mutations",
           "mutationBytes",
           "snapshots",
@@ -25490,6 +26171,111 @@
           "overflow"
         ]
       },
+      "WindInteractionFieldParams": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "cascade": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 1,
+            "default": 0
+          },
+          "resolution": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 256
+          }
+        },
+        "required": []
+      },
+      "WindInteractionFieldResult": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "cascade": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "texelMeters": {
+            "type": "number"
+          },
+          "centerTexel": {
+            "type": "array",
+            "items": {
+              "type": "integer"
+            },
+            "minItems": 2,
+            "maxItems": 2
+          },
+          "generation": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "resolution": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "cells": {
+            "type": "array",
+            "items": {
+              "type": "array",
+              "items": {
+                "type": "number"
+              },
+              "minItems": 3,
+              "maxItems": 3
+            }
+          },
+          "liveTexels": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "peakDisplacementM": {
+            "type": "number"
+          },
+          "peakVelocityMps": {
+            "type": "number"
+          }
+        },
+        "required": [
+          "cascade",
+          "texelMeters",
+          "centerTexel",
+          "generation",
+          "resolution",
+          "cells",
+          "liveTexels",
+          "peakDisplacementM",
+          "peakVelocityMps"
+        ]
+      },
+      "WindOctaveDto": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "octave": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "wavelengthM": {
+            "type": "number"
+          },
+          "velocityMps": {
+            "type": "array",
+            "items": {
+              "type": "number"
+            },
+            "minItems": 3,
+            "maxItems": 3
+          }
+        },
+        "required": [
+          "octave",
+          "wavelengthM",
+          "velocityMps"
+        ]
+      },
       "WindSettingsDto": {
         "type": "object",
         "additionalProperties": false,
@@ -25577,6 +26363,43 @@
           "radius",
           "falloff",
           "enabled"
+        ]
+      },
+      "WindSourceInfluenceDto": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "entity": {
+            "type": "string"
+          },
+          "kind": {
+            "type": "string"
+          },
+          "distanceM": {
+            "type": "number"
+          },
+          "weight": {
+            "type": "number"
+          },
+          "addedMps": {
+            "type": "array",
+            "items": {
+              "type": "number"
+            },
+            "minItems": 3,
+            "maxItems": 3
+          },
+          "globalScale": {
+            "type": "number"
+          }
+        },
+        "required": [
+          "entity",
+          "kind",
+          "distanceM",
+          "weight",
+          "addedMps",
+          "globalScale"
         ]
       },
       "WindSourceKindDto": {

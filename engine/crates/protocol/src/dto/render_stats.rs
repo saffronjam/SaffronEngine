@@ -45,6 +45,12 @@ pub struct RenderStatsDto {
     pub retained_mesh_cpu_bytes: u64,
     /// Indirect draw invocations recorded across the frame's virtual-shadow pages.
     pub shadow_draw_calls: i32,
+    /// Whether the device exposes an independent compute queue family, which is what lets a
+    /// pass that prefers the async lane actually take it.
+    pub async_compute_queue: bool,
+    /// Command buffers the frame's render graph submitted on that independent compute queue.
+    /// Zero where the device has no such family — the same passes then run on graphics.
+    pub async_compute_batches: u32,
     /// Virtual-shadow residency activity (requests, allocations, evictions, …).
     pub vsm: VsmStatsDto,
     /// Instances published into the active frame TLAS.
@@ -52,6 +58,10 @@ pub struct RenderStatsDto {
     /// TLAS instances placed through the aggregate-representation structure — a family
     /// packed as one coarse instance instead of its per-use expansion.
     pub rt_aggregate_instances: i32,
+    /// TLAS instances whose identity record names a live GPU-scene slot, so a non-opaque
+    /// candidate on them runs through the canonical coverage classifier. The rest commit
+    /// unconditionally — conservative, but not coverage agreement.
+    pub rt_resolvable_instances: i32,
     pub frame_ms: f32,
     pub fps: f32,
     pub gpu_ms: f32,
@@ -104,7 +114,7 @@ pub struct RenderStatsDto {
     pub rt_reflections: bool,
     /// Whether `VK_EXT_mesh_shader` is enabled, making the mesh executor reachable on this device.
     pub mesh_shader: bool,
-    /// Whether the shaded executor is running through the mesh stage (`SAFFRON_MESH_EXECUTOR`).
+    /// Whether the shaded executor is running through the mesh stage.
     pub mesh_executor: bool,
     /// Occluders dropped from this frame's SDF list for want of capacity; nonzero means the
     /// global-illumination inputs are incomplete.
@@ -120,6 +130,10 @@ pub struct RenderStatsDto {
     pub skinned_blas_count: i32,
     /// Tessellated structures active this frame; variable topology forbids an in-place refit.
     pub tessellated_blas_count: i32,
+    /// Placed uses whose wind-deformed geometry this frame materialized into the deformed arena
+    /// for their bottom-level structures, so ray shadows and reflections show the pose every
+    /// raster pass draws instead of the rest pose.
+    pub wind_deformed_instances: i32,
     /// Whether `VK_NV_cluster_acceleration_structure` is enabled: an assembly prototype's
     /// bottom-level structure then composes from its cooked triangle clusters.
     pub cluster_as_supported: bool,
@@ -150,6 +164,16 @@ pub struct RenderStatsDto {
     pub omm_transparent: String,
     /// Micro-triangles left unresolved, where the coverage classifier still runs.
     pub omm_unknown: String,
+    /// Cooked opacity micromaps uploaded meshes carried this session, counted from the cooked
+    /// hierarchy before any device gate — so it reports what the derivation produced even where
+    /// the extension is absent and nothing can be attached.
+    pub omm_derived_micromaps: i32,
+    /// Micro-triangles that derivation proved wholly covered.
+    pub omm_derived_opaque: String,
+    /// Micro-triangles that derivation proved wholly cut out.
+    pub omm_derived_transparent: String,
+    /// Micro-triangles that derivation left unresolved.
+    pub omm_derived_unknown: String,
     /// AS-storage bytes the distinct bottom-level structures occupy, deduplicated by device
     /// address so shared structures are charged once.
     pub blas_bytes: String,
@@ -270,6 +294,9 @@ pub struct SceneVisibilityStatsDto {
     pub covered_samples: u32,
     /// Hierarchy nodes rejected on their swept world bounds, each dropping the subtree beneath it.
     pub culled_nodes: u32,
+    /// Triangle clusters on a surviving node rejected on their own swept world bounds — the
+    /// per-part granularity beneath `culledNodes`.
+    pub culled_clusters: u32,
     /// Instances the global-illumination reach view kept: those a march or reflection ray can
     /// read, whether or not the camera sees them. Zero while the distance field is off.
     pub gi_reach_visible: u32,
