@@ -179,6 +179,7 @@ impl From<saffron_vegetation::Error> for Error {
             | VegetationError::DuplicatePlantId(_)
             | VegetationError::PointSchema(_)
             | VegetationError::Mutation(_)
+            | VegetationError::Network(_)
             | VegetationError::ManifestMismatch
             | VegetationError::UnknownRuntimeCell { .. }
             | VegetationError::PlantNotResident { .. }

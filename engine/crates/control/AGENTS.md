@@ -7,7 +7,7 @@ runtime, no worker thread. One request is one newline-delimited compact-JSON lin
 the request `id` and carries `ok` plus exactly one of `result` / `error`.
 
 The wire contract is DTO-first and generated — read `schemas/control/AGENTS.md` before adding or
-changing a command payload. Vegetation is the largest single domain here: 47 of the manifest's
+changing a command payload. Vegetation is the largest single domain here: 49 of the manifest's
 commands, plus the job machinery behind them.
 
 ## Layout
@@ -34,7 +34,7 @@ Adding a command to the wrong one is easy and the split is by concern, not by na
 |---|---:|---|
 | `commands_asset/` | 14 | Authoring and catalog: `import-vegetation-asset` and the `vegetation-map-*` commands in `commands_map.rs`, all seven `plant-*` in `commands_plant.rs`, the two `*-points` interchange commands in `commands_interchange.rs` |
 | `commands_vegetation.rs` | 14 | Evaluation and cooking: `vegetation-cook`, `vegetation-start-evaluation`, `vegetation-compile-biome`, `vegetation-manifest`, `vegetation-explain-point`, the cancel/status pairs |
-| `commands_vegetation_runtime/` | 18 | Runtime and persistent state: `state.rs` (residency, query, telemetry), `plants.rs` (inspection, promotion), `convert.rs` (state export/import, mutation, ecology) |
+| `commands_vegetation_runtime/` | 20 | Runtime and persistent state: `state.rs` (residency, query, telemetry), `plants.rs` (inspection, promotion), `convert.rs` (state export/import, mutation, ecology), `network.rs` (session scope and checkpoint) |
 | `commands_render/` | 1 | `vegetation-render-stats` — it reports renderer counters, so it registers with the render commands (`stats.rs`) |
 
 ## Rules that are easy to break
@@ -61,6 +61,8 @@ Adding a command to the wrong one is easy and the split is by concern, not by na
   that moved has entries in two cells, so reading only the first silently hides one of them.
 - **Every mutating command needs an inverse the editor can record.** Undo is reconstructed in the
   editor from paired control calls (`editor/AGENTS.md`), so a command with no expressible inverse is
-  a command the user cannot undo.
+  a command the user cannot undo. `vegetation-mutate` is the one command that hands the editor its
+  inverse rather than expecting one to be composed: it names a gesture, captures the preimage of
+  every address the batch touches before the reducer runs, and returns the records that restore it.
 - **A feature that adds engine state worth driving or inspecting gets a command here.** That is the
   repo-wide "Keep current" rule: one registration, so the running editor stays scriptable from `sa`.

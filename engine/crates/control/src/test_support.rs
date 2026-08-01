@@ -102,6 +102,10 @@ pub struct StubRenderer {
     pub restir: bool,
     pub ssr: bool,
     pub rt_reflections: bool,
+    /// Whether the shaded executor runs through the mesh stage.
+    pub mesh_executor: bool,
+    /// What the GPU selection readback answers with.
+    pub selection_pick: Option<crate::SelectionPick>,
     pub view_mode: ViewMode,
     pub aa_samples: u32,
     pub aa_fxaa: bool,
@@ -178,6 +182,8 @@ impl Default for StubRenderer {
             restir: false,
             ssr: false,
             rt_reflections: false,
+            mesh_executor: false,
+            selection_pick: None,
             view_mode: ViewMode::Lit,
             aa_samples: 1,
             aa_fxaa: false,
@@ -285,6 +291,14 @@ impl ControlRenderer for StubRenderer {
         _cell: saffron_spatial::WorldCellKey,
         _plant: saffron_vegetation::PlantId,
     ) -> std::result::Result<Option<crate::registry::PlantWindRecord>, String> {
+        Ok(None)
+    }
+
+    fn capture_interaction_field(
+        &self,
+        _cascade: u32,
+        _resolution: u32,
+    ) -> std::result::Result<Option<saffron_rendering::InteractionFieldCapture>, String> {
         Ok(None)
     }
 
@@ -476,7 +490,24 @@ impl ControlRenderer for StubRenderer {
         false
     }
     fn mesh_executor_active(&self) -> bool {
+        self.mesh_executor
+    }
+    fn mesh_executor_supported(&self) -> bool {
+        true
+    }
+    fn set_mesh_executor(&mut self, mesh: bool) -> bool {
+        self.mesh_executor = mesh;
+        mesh
+    }
+    fn async_compute_queue_supported(&self) -> bool {
         false
+    }
+    fn pick_selection_id(
+        &mut self,
+        _u: f32,
+        _v: f32,
+    ) -> std::result::Result<Option<crate::SelectionPick>, String> {
+        Ok(self.selection_pick)
     }
     fn sdf_instances_dropped(&self) -> u32 {
         0
@@ -497,6 +528,9 @@ impl ControlRenderer for StubRenderer {
         0
     }
     fn rt_tessellated_blas_count(&self) -> u32 {
+        0
+    }
+    fn rt_wind_deformed(&self) -> u32 {
         0
     }
     fn cluster_as_supported(&self) -> bool {
@@ -543,6 +577,9 @@ impl ControlRenderer for StubRenderer {
     }
     fn rt_omm_classes(&self) -> (u64, u64, u64) {
         (0, 0, 0)
+    }
+    fn rt_omm_derived(&self) -> (u64, u64, u64, u64) {
+        (0, 0, 0, 0)
     }
     fn rt_blas_bytes(&self) -> u64 {
         0
@@ -883,6 +920,15 @@ pub fn with_stub<T>(
     renderer: &mut StubRenderer,
     body: impl FnOnce(&mut EngineContext<'_>) -> T,
 ) -> T {
+    with_stub_world(renderer, None, body)
+}
+
+/// A stub context bound to a runtime vegetation world, for the commands that require one.
+pub fn with_stub_world<T>(
+    renderer: &mut StubRenderer,
+    world: Option<saffron_vegetation::VegetationWorld>,
+    body: impl FnOnce(&mut EngineContext<'_>) -> T,
+) -> T {
     let mut window = Window::headless();
     let mut scene_edit = SceneEditContext::new();
     let mut assets = AssetServer::new(std::env::temp_dir().join("saffron-control-test"));
@@ -890,15 +936,19 @@ pub fn with_stub<T>(
     let mut vegetation_jobs = crate::vegetation_jobs::VegetationEvaluationJobs::default();
     let mut vegetation_cook_jobs = crate::vegetation_cook_jobs::VegetationCookJobs::default();
     let mut vegetation_compute = None;
-    let mut vegetation = None;
+    let mut vegetation = world;
     let mut ctx = EngineContext {
         window: &mut window,
         renderer,
         scene_edit: &mut scene_edit,
         assets: &mut assets,
         spatial: &mut spatial,
+        vegetation_status: if vegetation.is_some() {
+            saffron_runtime::VegetationRuntimeBindingStatus::Available
+        } else {
+            saffron_runtime::VegetationRuntimeBindingStatus::default()
+        },
         vegetation: &mut vegetation,
-        vegetation_status: saffron_runtime::VegetationRuntimeBindingStatus::default(),
         vegetation_regeneration_cells: Vec::new(),
         vegetation_collision: None,
         vegetation_promotion: None,

@@ -1,27 +1,35 @@
-//! Wire → domain conversion for typed vegetation mutations: the `vegetation-mutate`
-//! command's records decode here into the reducer's exact vocabulary.
+//! Wire conversion for typed vegetation mutations, both ways: the `vegetation-mutate` command's
+//! records decode into the reducer's exact vocabulary, and the gesture inverse it replies with
+//! encodes back out.
 
 use std::str::FromStr;
 
 use saffron_protocol::{
-    FieldChannelDto, FieldChannelKindDto, PlantPointDto, PlantTransformDto, SurfaceAttachmentDto,
-    VegetationGuid, VegetationMutationDto, VegetationMutationHeaderDto,
-    VegetationMutationRecordDto,
+    FieldChannelDto, FieldChannelKindDto, PlantDeltaDto, PlantPointDto, PlantPromotionOriginDto,
+    PlantTransformDto, SurfaceAttachmentDto, VegetationGuid, VegetationMutationDto,
+    VegetationMutationHeaderDto, VegetationMutationRecordDto,
 };
 use saffron_spatial::{
     DecisionScalar, FieldChannel, QuantizedLocalPosition, SurfaceAttachment, SurfacePrimitiveId,
     SurfaceProviderId, SurfaceRevision, UnitInterval, WorldBounds, WorldCellKey, WorldPosition,
 };
 use saffron_vegetation::{
-    MutationHeader, PlantFlags, PlantId, PlantPoint, PromotionOriginState, QuantizedOrientation,
-    VegetationMutation, VegetationMutationRecord,
+    MutationHeader, PlantFlags, PlantId, PlantPersistentState, PlantPoint, PromotionOriginState,
+    QuantizedOrientation, VegetationMutation, VegetationMutationRecord,
 };
+
+use crate::vegetation_cook_dto::world_cell_dto;
 
 use crate::error::{Error, Result};
 
 fn parse_guid(value: &VegetationGuid) -> Result<u128> {
     u128::from_str_radix(&value.0, 16)
         .map_err(|_| Error::command("vegetation GUID is not canonical"))
+}
+
+/// Decodes the gesture a mutation batch groups under.
+pub(crate) fn parse_gesture(value: &VegetationGuid) -> Result<u128> {
+    parse_guid(value)
 }
 
 fn parse_u64(value: &str, field: &str) -> Result<u64> {
@@ -280,21 +288,12 @@ fn mutation(value: &VegetationMutationDto) -> Result<VegetationMutation> {
             phenotype: *phenotype,
             ecology_tick: parse_u64(ecology_tick, "mutation.ecologyTick")?,
         },
-        VegetationMutationDto::PromotionOriginState {
-            plant,
-            transform,
-            linear_velocity_bits,
-            angular_velocity_bits,
-        } => VegetationMutation::PromotionOriginState {
-            plant: parse_plant(plant)?,
-            state: PromotionOriginState {
-                position: position(transform)?,
-                orientation: orientation(transform.orientation)?,
-                scale: scalars(transform.scale_bits),
-                linear_velocity: scalars(*linear_velocity_bits),
-                angular_velocity: scalars(*angular_velocity_bits),
-            },
-        },
+        VegetationMutationDto::PromotionOriginState { plant, origin } => {
+            VegetationMutation::PromotionOriginState {
+                plant: parse_plant(plant)?,
+                state: promotion_from_dto(origin)?,
+            }
+        }
         VegetationMutationDto::DisturbanceMask {
             categories,
             tile,
@@ -304,6 +303,81 @@ fn mutation(value: &VegetationMutationDto) -> Result<VegetationMutation> {
             tile: parse_guid(tile)?,
             values: values.clone(),
         },
+        VegetationMutationDto::PlantDeltaRestore { plant, delta } => {
+            VegetationMutation::PlantDeltaRestore {
+                plant: parse_plant(plant)?,
+                delta: delta
+                    .as_deref()
+                    .map(delta_from_dto)
+                    .transpose()?
+                    .map(Box::new),
+            }
+        }
+        VegetationMutationDto::FieldTileClear {
+            layer,
+            channel: channel_dto,
+            tile,
+        } => VegetationMutation::FieldTileClear {
+            layer: parse_guid(layer)?,
+            channel: channel(channel_dto)?,
+            tile: parse_guid(tile)?,
+        },
+        VegetationMutationDto::DisturbanceMaskClear { categories, tile } => {
+            VegetationMutation::DisturbanceMaskClear {
+                categories: *categories,
+                tile: parse_guid(tile)?,
+            }
+        }
+    })
+}
+
+fn promotion_from_dto(value: &PlantPromotionOriginDto) -> Result<PromotionOriginState> {
+    Ok(PromotionOriginState {
+        position: position(&value.transform)?,
+        orientation: orientation(value.transform.orientation)?,
+        scale: scalars(value.transform.scale_bits),
+        linear_velocity: scalars(value.linear_velocity_bits),
+        angular_velocity: scalars(value.angular_velocity_bits),
+    })
+}
+
+fn delta_from_dto(value: &PlantDeltaDto) -> Result<PlantPersistentState> {
+    let transform = value
+        .transform
+        .as_ref()
+        .map(|transform| {
+            Ok::<_, Error>((
+                position(transform)?,
+                orientation(transform.orientation)?,
+                scalars(transform.scale_bits),
+            ))
+        })
+        .transpose()?;
+    Ok(PlantPersistentState {
+        addition: value.addition.as_ref().map(point_from_dto).transpose()?,
+        tombstoned: value.tombstoned,
+        transform,
+        lifecycle: value
+            .lifecycle
+            .map(crate::commands_vegetation_runtime::lifecycle_from_dto),
+        phenotype: value.phenotype,
+        ecology_tick: value
+            .ecology_tick
+            .as_deref()
+            .map(|tick| parse_u64(tick, "delta.ecologyTick"))
+            .transpose()?,
+        health: value.health.map(unit),
+        moisture: value.moisture.map(unit),
+        fuel: value.fuel.map(unit),
+        interaction_policy: value
+            .interaction_policy
+            .map(crate::commands_vegetation_runtime::interaction_from_dto),
+        ignited: value.ignited,
+        promotion_origin: value
+            .promotion_origin
+            .as_ref()
+            .map(promotion_from_dto)
+            .transpose()?,
     })
 }
 
@@ -315,4 +389,224 @@ pub(crate) fn record_from_dto(
         header: header(&value.header)?,
         mutation: mutation(&value.mutation)?,
     })
+}
+
+/// Encodes one reducer record for the wire.
+pub(crate) fn record_to_dto(value: &VegetationMutationRecord) -> VegetationMutationRecordDto {
+    VegetationMutationRecordDto {
+        header: VegetationMutationHeaderDto {
+            cell: world_cell_dto(value.header.cell),
+            transaction: guid_dto(value.header.transaction),
+            authority: guid_dto(value.header.authority),
+            logical_tick: value.header.logical_tick.to_string(),
+            idempotency_key: guid_dto(value.header.idempotency_key),
+            base_revision: value.header.base_revision.map(|value| value.to_string()),
+        },
+        mutation: mutation_to_dto(&value.mutation),
+    }
+}
+
+fn guid_dto(value: u128) -> VegetationGuid {
+    VegetationGuid(format!("{value:032x}"))
+}
+
+fn transform_dto(
+    position: WorldPosition,
+    orientation: QuantizedOrientation,
+    scale: [DecisionScalar; 3],
+) -> PlantTransformDto {
+    PlantTransformDto {
+        global_ticks: position.global_ticks().map(|tick| tick.to_string()),
+        orientation: orientation.bits(),
+        scale_bits: scale.map(DecisionScalar::bits),
+    }
+}
+
+pub(crate) fn promotion_dto(state: PromotionOriginState) -> PlantPromotionOriginDto {
+    PlantPromotionOriginDto {
+        transform: transform_dto(state.position, state.orientation, state.scale),
+        linear_velocity_bits: state.linear_velocity.map(DecisionScalar::bits),
+        angular_velocity_bits: state.angular_velocity.map(DecisionScalar::bits),
+    }
+}
+
+fn delta_dto(delta: &PlantPersistentState) -> PlantDeltaDto {
+    PlantDeltaDto {
+        addition: delta
+            .addition
+            .as_ref()
+            .map(crate::commands_asset::plant_point_dto),
+        tombstoned: delta.tombstoned,
+        transform: delta
+            .transform
+            .map(|(position, orientation, scale)| transform_dto(position, orientation, scale)),
+        lifecycle: delta
+            .lifecycle
+            .map(crate::commands_vegetation_runtime::lifecycle_dto),
+        phenotype: delta.phenotype,
+        ecology_tick: delta.ecology_tick.map(|tick| tick.to_string()),
+        health: delta.health.map(UnitInterval::bits),
+        moisture: delta.moisture.map(UnitInterval::bits),
+        fuel: delta.fuel.map(UnitInterval::bits),
+        interaction_policy: delta
+            .interaction_policy
+            .map(crate::commands_vegetation_runtime::interaction_dto),
+        ignited: delta.ignited,
+        promotion_origin: delta.promotion_origin.map(promotion_dto),
+    }
+}
+
+fn mutation_to_dto(value: &VegetationMutation) -> VegetationMutationDto {
+    match value {
+        VegetationMutation::FieldTilePatch {
+            layer,
+            channel,
+            tile,
+            dimensions,
+            quantum_bits,
+            values,
+        } => VegetationMutationDto::FieldTilePatch {
+            layer: guid_dto(*layer),
+            channel: crate::vegetation_cook_dto::field_channel_dto(*channel),
+            tile: guid_dto(*tile),
+            dimensions: *dimensions,
+            quantum_bits: *quantum_bits,
+            values: values.clone(),
+        },
+        VegetationMutation::AnchorAddition(point) => VegetationMutationDto::AnchorAddition {
+            point: crate::commands_asset::plant_point_dto(point),
+        },
+        VegetationMutation::Planting(point) => VegetationMutationDto::Planting {
+            point: crate::commands_asset::plant_point_dto(point),
+        },
+        VegetationMutation::Tombstone { plant } => VegetationMutationDto::Tombstone {
+            plant: plant_id_dto(*plant),
+        },
+        VegetationMutation::TransformOverride {
+            plant,
+            position,
+            orientation,
+            scale,
+        } => VegetationMutationDto::TransformOverride {
+            plant: plant_id_dto(*plant),
+            transform: transform_dto(*position, *orientation, *scale),
+        },
+        VegetationMutation::StateOverride {
+            plant,
+            lifecycle,
+            phenotype,
+            health,
+            moisture,
+            fuel,
+            interaction_policy,
+        } => VegetationMutationDto::StateOverride {
+            plant: plant_id_dto(*plant),
+            lifecycle: lifecycle.map(crate::commands_vegetation_runtime::lifecycle_dto),
+            phenotype: *phenotype,
+            health: health.map(UnitInterval::bits),
+            moisture: moisture.map(UnitInterval::bits),
+            fuel: fuel.map(UnitInterval::bits),
+            interaction_policy: interaction_policy
+                .map(crate::commands_vegetation_runtime::interaction_dto),
+        },
+        VegetationMutation::Damage {
+            plant,
+            amount,
+            phenotype,
+        } => VegetationMutationDto::Damage {
+            plant: plant_id_dto(*plant),
+            amount: amount.bits(),
+            phenotype: *phenotype,
+        },
+        VegetationMutation::MoistureFuel {
+            plant,
+            moisture,
+            fuel,
+        } => VegetationMutationDto::MoistureFuel {
+            plant: plant_id_dto(*plant),
+            moisture: moisture.bits(),
+            fuel: fuel.bits(),
+        },
+        VegetationMutation::LifecycleTransition {
+            plant,
+            from,
+            to,
+            ecology_tick,
+        } => VegetationMutationDto::LifecycleTransition {
+            plant: plant_id_dto(*plant),
+            from: from.map(crate::commands_vegetation_runtime::lifecycle_dto),
+            to: crate::commands_vegetation_runtime::lifecycle_dto(*to),
+            ecology_tick: ecology_tick.to_string(),
+        },
+        VegetationMutation::Harvest { plant, phenotype } => VegetationMutationDto::Harvest {
+            plant: plant_id_dto(*plant),
+            phenotype: *phenotype,
+        },
+        VegetationMutation::Burn {
+            plant,
+            phenotype,
+            remaining_fuel,
+        } => VegetationMutationDto::Burn {
+            plant: plant_id_dto(*plant),
+            phenotype: *phenotype,
+            remaining_fuel: remaining_fuel.bits(),
+        },
+        VegetationMutation::Ignite { plant } => VegetationMutationDto::Ignite {
+            plant: plant_id_dto(*plant),
+        },
+        VegetationMutation::Extinguish { plant } => VegetationMutationDto::Extinguish {
+            plant: plant_id_dto(*plant),
+        },
+        VegetationMutation::Regrow {
+            plant,
+            lifecycle,
+            phenotype,
+            ecology_tick,
+        } => VegetationMutationDto::Regrow {
+            plant: plant_id_dto(*plant),
+            lifecycle: crate::commands_vegetation_runtime::lifecycle_dto(*lifecycle),
+            phenotype: *phenotype,
+            ecology_tick: ecology_tick.to_string(),
+        },
+        VegetationMutation::PromotionOriginState { plant, state } => {
+            VegetationMutationDto::PromotionOriginState {
+                plant: plant_id_dto(*plant),
+                origin: promotion_dto(*state),
+            }
+        }
+        VegetationMutation::DisturbanceMask {
+            categories,
+            tile,
+            values,
+        } => VegetationMutationDto::DisturbanceMask {
+            categories: *categories,
+            tile: guid_dto(*tile),
+            values: values.clone(),
+        },
+        VegetationMutation::PlantDeltaRestore { plant, delta } => {
+            VegetationMutationDto::PlantDeltaRestore {
+                plant: plant_id_dto(*plant),
+                delta: delta.as_deref().map(delta_dto).map(Box::new),
+            }
+        }
+        VegetationMutation::FieldTileClear {
+            layer,
+            channel,
+            tile,
+        } => VegetationMutationDto::FieldTileClear {
+            layer: guid_dto(*layer),
+            channel: crate::vegetation_cook_dto::field_channel_dto(*channel),
+            tile: guid_dto(*tile),
+        },
+        VegetationMutation::DisturbanceMaskClear { categories, tile } => {
+            VegetationMutationDto::DisturbanceMaskClear {
+                categories: *categories,
+                tile: guid_dto(*tile),
+            }
+        }
+    }
+}
+
+fn plant_id_dto(value: PlantId) -> saffron_protocol::PlantId {
+    saffron_protocol::PlantId(value.to_string())
 }

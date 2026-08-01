@@ -30,9 +30,10 @@ pub(crate) fn register_runtime_mutation(reg: &mut CommandRegistry) {
     );
     reg.register::<saffron_protocol::VegetationMutateParams, saffron_protocol::VegetationMutateResult>(
         "vegetation-mutate",
-        "apply typed vegetation mutations (tombstone/override/anchor/…) through the reducer",
+        "apply one gesture of typed vegetation mutations through the reducer, replying with its inverse",
         |ctx, params| {
             require_runtime(ctx)?;
+            let gesture = crate::vegetation_mutation_dto::parse_gesture(&params.gesture)?;
             let records = params
                 .records
                 .iter()
@@ -45,13 +46,27 @@ pub(crate) fn register_runtime_mutation(reg: &mut CommandRegistry) {
                 .iter()
                 .filter_map(|record| record.canonical_byte_len().ok())
                 .sum::<usize>();
+            // The preimage is read before the batch reduces; afterwards it is gone.
+            let journal = saffron_vegetation::EditorJournalEnvelope::capture(
+                runtime(ctx)?.persistent_state(),
+                gesture,
+                records,
+            )
+            .map_err(Error::from)?;
             runtime_mut(ctx)?
-                .apply_confirmed_mutations(&records)
+                .apply_confirmed_mutations(&journal.forward)
                 .map_err(Error::from)?;
             if let Some(telemetry) = ctx.vegetation_telemetry.as_deref_mut() {
                 telemetry.record_mutation(bytes);
             }
-            Ok(saffron_protocol::VegetationMutateResult { applied })
+            Ok(saffron_protocol::VegetationMutateResult {
+                applied,
+                inverse: journal
+                    .inverse
+                    .iter()
+                    .map(crate::vegetation_mutation_dto::record_to_dto)
+                    .collect(),
+            })
         },
     );
     reg.register::<
@@ -67,6 +82,9 @@ pub(crate) fn register_runtime_mutation(reg: &mut CommandRegistry) {
             let report = with_ecology_clock(ctx, |clock, world| {
                 clock.advance_to(world, target, max_ticks)
             })?;
+            if let Some(telemetry) = ctx.vegetation_telemetry.as_deref_mut() {
+                telemetry.record_ecology_ticks(report.ticks_run);
+            }
             let checkpoint = runtime(ctx)?
                 .persistent_state()
                 .ecology()

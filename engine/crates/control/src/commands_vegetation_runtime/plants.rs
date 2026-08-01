@@ -78,6 +78,74 @@ pub(crate) fn register_runtime_plants(reg: &mut CommandRegistry) {
         },
     );
     reg.register::<
+        saffron_protocol::VegetationPlantVitalsParams,
+        saffron_protocol::VegetationPlantVitalsResult,
+    >(
+        "vegetation-plant-vitals",
+        "read a promoted plant's live biology, replacing the fields that are present",
+        |ctx, params| {
+            require_runtime(ctx)?;
+            let plant = PlantId::from_str(&params.plant.0).map_err(Error::from)?;
+            // Promotion spawns its views into the active scene, which is the play duplicate while
+            // play runs — the authored scene never carries one.
+            let scene = ctx.scene_edit.active_scene();
+            let promotion = ctx
+                .vegetation_promotion
+                .as_deref_mut()
+                .ok_or_else(|| Error::command("promotion requires a live play world"))?;
+            let mut vitals = promotion.vitals(scene, plant).ok_or_else(|| {
+                Error::command("plant carries no promoted entity view to read biology from")
+            })?;
+            let requested = params.lifecycle.is_some()
+                || params.health.is_some()
+                || params.moisture.is_some()
+                || params.fuel.is_some()
+                || params.ecology_tick.is_some();
+            if let Some(lifecycle) = params.lifecycle {
+                vitals.lifecycle = lifecycle_from_dto(lifecycle) as u32;
+            }
+            if let Some(health) = params.health {
+                vitals.health = unit_bits_to_f32(health);
+            }
+            if let Some(moisture) = params.moisture {
+                vitals.moisture = unit_bits_to_f32(moisture);
+            }
+            if let Some(fuel) = params.fuel {
+                vitals.fuel = unit_bits_to_f32(fuel);
+            }
+            if let Some(tick) = params.ecology_tick.as_deref() {
+                vitals.ecology_tick =
+                    crate::commands_vegetation::parse_u64(tick, "ecologyTick")?;
+            }
+            if requested {
+                promotion
+                    .set_vitals(scene, plant, vitals)
+                    .map_err(Error::command)?;
+                ctx.scene_edit.scene_version += 1;
+            }
+            let entity = match promotion.state(plant) {
+                saffron_runtime::PlantPromotionState::Promoted { entity }
+                | saffron_runtime::PlantPromotionState::Demoting { entity } => entity,
+                saffron_runtime::PlantPromotionState::Bulk
+                | saffron_runtime::PlantPromotionState::Promoting => {
+                    return Err(Error::command("plant carries no promoted entity view"));
+                }
+            };
+            Ok(saffron_protocol::VegetationPlantVitalsResult {
+                plant: params.plant,
+                entity: entity.into(),
+                lifecycle: lifecycle_dto(
+                    saffron_vegetation::PlantLifecycle::try_from(vitals.lifecycle)
+                        .map_err(Error::from)?,
+                ),
+                health: f32_to_unit_bits(vitals.health),
+                moisture: f32_to_unit_bits(vitals.moisture),
+                fuel: f32_to_unit_bits(vitals.fuel),
+                ecology_tick: vitals.ecology_tick.to_string(),
+            })
+        },
+    );
+    reg.register::<
         saffron_protocol::VegetationNavigationParams,
         saffron_protocol::VegetationNavigationResult,
     >(
@@ -210,6 +278,18 @@ pub(crate) fn event_dto(
             .map(|plant| WirePlantId(plant.to_string())),
         transition,
     }
+}
+
+/// The engine carries a promoted view's biology as `f32` in 0..1; the wire carries the reducer's
+/// unit-interval bits, so the two never disagree about what "half health" is.
+fn unit_bits_to_f32(bits: u16) -> f32 {
+    saffron_spatial::UnitInterval::from_bits(bits).to_f64() as f32
+}
+
+fn f32_to_unit_bits(value: f32) -> u16 {
+    saffron_spatial::UnitInterval::from_f64(f64::from(value.clamp(0.0, 1.0)))
+        .unwrap_or(saffron_spatial::UnitInterval::ZERO)
+        .bits()
 }
 
 pub(crate) fn promotion_state_dto(
@@ -392,13 +472,15 @@ pub(crate) fn plant_state_dto(
         moisture: state.moisture.map(|value| value.bits()),
         fuel: state.fuel.map(|value| value.bits()),
         interaction_policy: state.interaction_policy.map(interaction_dto),
-        promoted: state.promotion_origin.is_some(),
+        promotion_origin: state
+            .promotion_origin
+            .map(crate::vegetation_mutation_dto::promotion_dto),
     }
 }
 
-/// The renderer's phenotype resolution for one snapshot: the family asset's roles
-/// and windows against the scene calendar's seasonal phase; the cooked phenotype on
-/// any load miss.
+/// The renderer's phenotype resolution for one snapshot: the family asset's intrinsic
+/// curves against the scene calendar's seasonal phase and the plant's persistent
+/// lifecycle, health, and moisture; the cooked phenotype on any load miss.
 pub(crate) fn rendered_phenotype_for(
     assets: &saffron_assets::AssetServer,
     season_mille: u16,
@@ -410,13 +492,25 @@ pub(crate) fn rendered_phenotype_for(
                 family
                     .phenotypes
                     .iter()
-                    .map(|phenotype| (phenotype.id, phenotype.role, phenotype.season_window)),
+                    .map(|phenotype| (phenotype.id, phenotype.role, phenotype.response)),
                 snapshot.phenotype,
-                snapshot.lifecycle,
-                season_mille,
+                phenology_state(season_mille, snapshot),
             )
         })
         .unwrap_or(snapshot.phenotype)
+}
+
+/// The persistent state one snapshot resolves its phenotype against.
+pub(crate) fn phenology_state(
+    season_mille: u16,
+    snapshot: &VegetationPlantSnapshot,
+) -> saffron_vegetation::PhenologyState {
+    saffron_vegetation::PhenologyState {
+        lifecycle: snapshot.lifecycle,
+        season_mille,
+        health: snapshot.health,
+        moisture: snapshot.moisture,
+    }
 }
 
 pub(crate) fn plant_dto(

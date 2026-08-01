@@ -34,7 +34,7 @@ pub use commands_asset::{PreviewSubject, build_preview_scene_for_thumbnail};
 pub use context::{ControlContext, ControlPollContext};
 pub use error::{Error, Result};
 pub use registry::{
-    Command, CommandRegistry, ControlRenderer, EngineContext, PlantWindRecord,
+    Command, CommandRegistry, ControlRenderer, EngineContext, PlantWindRecord, SelectionPick,
     VegetationComputeExecutor, is_read_only_command, positional_or, register_builtin_commands,
 };
 pub use selector::{entity_ref_dto, entity_uuid, resolve_entity};

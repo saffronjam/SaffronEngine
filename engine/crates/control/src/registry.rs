@@ -44,6 +44,41 @@ pub struct PlantWindRecord {
     pub mechanics: [u32; 4],
 }
 
+/// What the GPU selection-ID readback resolved one viewport pixel to.
+///
+/// Every variant carries the surface point the pick landed on. The micro variant is deliberately
+/// identity-less: a blade is regenerated from its field every frame and is never a saved object.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum SelectionPick {
+    /// A scene entity.
+    Entity {
+        /// The entity the picked draw record mirrors.
+        entity: saffron_scene::Entity,
+        /// World-space surface point, in meters.
+        position: [f32; 3],
+        /// World-space geometric normal.
+        normal: [f32; 3],
+    },
+    /// A resident macro plant, addressed by its owning cell and stable identity.
+    Plant {
+        /// The cell the plant streams from.
+        cell: saffron_spatial::WorldCellKey,
+        /// The plant's stable identity.
+        plant: saffron_vegetation::PlantId,
+        /// World-space surface point, in meters.
+        position: [f32; 3],
+        /// World-space geometric normal.
+        normal: [f32; 3],
+    },
+    /// Micro vegetation — cosmetic geometry regenerated per frame, with no persistent identity.
+    Micro {
+        /// World-space surface point, in meters.
+        position: [f32; 3],
+        /// World-space geometric normal.
+        normal: [f32; 3],
+    },
+}
+
 /// The renderer seam every render-, scene-, and asset-domain command reaches through.
 ///
 /// The concrete `Renderer` cannot be built headless, so the borrow is taken behind this
@@ -78,6 +113,13 @@ pub trait ControlRenderer {
         cell: saffron_spatial::WorldCellKey,
         plant: saffron_vegetation::PlantId,
     ) -> std::result::Result<Option<PlantWindRecord>, String>;
+    /// One whole cascade of the world interaction field, reduced to a `resolution²` grid of
+    /// block means plus its placement and extremes. `None` before a frame has created the field.
+    fn capture_interaction_field(
+        &self,
+        cascade: u32,
+        resolution: u32,
+    ) -> std::result::Result<Option<saffron_rendering::InteractionFieldCapture>, String>;
     /// GPU missing-page requests drained since startup.
     fn page_faults(&self) -> u64;
 
@@ -184,6 +226,20 @@ pub trait ControlRenderer {
     fn mesh_shader_supported(&self) -> bool;
     /// Whether the shaded executor is running through the mesh stage this frame.
     fn mesh_executor_active(&self) -> bool;
+    /// Whether this device's mesh feature bits and output limits qualify for the mesh executor.
+    fn mesh_executor_supported(&self) -> bool;
+    /// Routes the shaded executor through the mesh stage, returning what is now in force.
+    fn set_mesh_executor(&mut self, mesh: bool) -> bool;
+    /// Whether the device exposes an independent compute queue family for the async lane.
+    fn async_compute_queue_supported(&self) -> bool;
+    /// Resolves one viewport pixel (`u`/`v` in `[0, 1]`, `v = 0` at the top edge) to the draw
+    /// record drawn there, through the GPU selection-ID readback over the frame's binned cut.
+    /// `None` when nothing the selection pass drew covers the pixel.
+    fn pick_selection_id(
+        &mut self,
+        u: f32,
+        v: f32,
+    ) -> std::result::Result<Option<SelectionPick>, String>;
     /// Occluders dropped from this frame's SDF list for want of capacity.
     fn sdf_instances_dropped(&self) -> u32;
     /// Occluders the cascade-window gate excluded this frame.
@@ -198,6 +254,8 @@ pub trait ControlRenderer {
     fn rt_skinned_blas_count(&self) -> u32;
     /// Tessellated full-rebuild structures active this frame.
     fn rt_tessellated_blas_count(&self) -> u32;
+    /// Placed uses whose wind-deformed geometry this frame materialized for ray tracing.
+    fn rt_wind_deformed(&self) -> u32;
     /// Whether cluster acceleration structures are enabled on this device.
     fn cluster_as_supported(&self) -> bool;
     /// Distinct cluster-composed bottom-level structures referenced this frame.
@@ -226,6 +284,9 @@ pub trait ControlRenderer {
     fn rt_omm_micromaps(&self) -> u32;
     /// Micro-triangles settled opaque, settled transparent, and left unknown.
     fn rt_omm_classes(&self) -> (u64, u64, u64);
+    /// Cooked micromaps uploaded meshes carried, and the micro-triangles their derivation
+    /// settled opaque, settled transparent, and left unknown.
+    fn rt_omm_derived(&self) -> (u64, u64, u64, u64);
     /// AS-storage bytes the distinct bottom-level structures occupy.
     fn rt_blas_bytes(&self) -> u64;
     /// What those structures would occupy uncompacted.

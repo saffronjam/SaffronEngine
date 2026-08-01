@@ -5,6 +5,7 @@ use saffron_protocol::VegetationRuntimeUnavailableReasonDto;
 use crate::registry::CommandRegistry;
 
 mod convert;
+mod network;
 mod plants;
 mod state;
 #[cfg(test)]

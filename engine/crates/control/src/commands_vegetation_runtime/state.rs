@@ -51,8 +51,9 @@ pub(crate) fn register_runtime_state(reg: &mut CommandRegistry) {
             require_runtime(ctx)?;
             let season = season_mille(ctx);
             let result = runtime_query(runtime(ctx)?, ctx.assets, season, params)?;
+            let cost = runtime(ctx)?.take_query_cost();
             if let Some(telemetry) = ctx.vegetation_telemetry.as_deref_mut() {
-                telemetry.record_query(result.hits.len());
+                telemetry.record_query(cost);
             }
             Ok(result)
         },
@@ -197,6 +198,7 @@ pub(crate) fn register_runtime_state(reg: &mut CommandRegistry) {
             flush_promoted_state(ctx)?;
             let world = runtime(ctx)?;
             let identity = world.manifest_identity();
+            let map = world.manifest().map;
             let bytes = world
                 .persistent_state()
                 .canonical_bytes()
@@ -204,7 +206,7 @@ pub(crate) fn register_runtime_state(reg: &mut CommandRegistry) {
             let cells = world.persistent_state().cells().len();
             ctx.assets
                 .vegetation_state_store()
-                .publish_baseline(identity, &bytes)
+                .publish_baseline(map, identity, &bytes)
                 .map_err(Error::command)?;
             Ok(saffron_protocol::VegetationStateBaselineResult {
                 manifest_identity: identity.to_string(),
@@ -257,6 +259,9 @@ pub(crate) fn register_runtime_state(reg: &mut CommandRegistry) {
                     synchronizations: work.synchronizations.to_string(),
                     queries: work.queries.to_string(),
                     query_hits: work.query_hits.to_string(),
+                    query_generations_visited: work.query_generations_visited.to_string(),
+                    query_nodes_visited: work.query_nodes_visited.to_string(),
+                    query_rows_tested: work.query_rows_tested.to_string(),
                     mutations: work.mutations.to_string(),
                     mutation_bytes: work.mutation_bytes.to_string(),
                     snapshots: work.snapshots.to_string(),
@@ -271,6 +276,7 @@ pub(crate) fn register_runtime_state(reg: &mut CommandRegistry) {
             })
         },
     );
+    super::network::register_runtime_network(reg);
 }
 
 pub(crate) fn runtime_status(ctx: &mut EngineContext<'_>) -> Result<VegetationRuntimeStatusDto> {
@@ -300,6 +306,7 @@ pub(crate) fn runtime_status(ctx: &mut EngineContext<'_>) -> Result<VegetationRu
                     felled_total: report.felled_total.to_string(),
                     failed_total: report.failed_total.to_string(),
                     flushed_total: report.flushed_total.to_string(),
+                    released_total: report.released_total.to_string(),
                 }
             });
             let world = runtime(ctx)?;
