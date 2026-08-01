@@ -5,6 +5,8 @@ import type {
   Environment,
   EnvironmentProfileListDto,
   EnvironmentProfileSummaryDto,
+  SampleWindResult,
+  WindInteractionFieldResult,
 } from "../../protocol";
 
 /// Sky, atmosphere, fog, clouds, wind, and the world clock. Every setter is a server-side merge
@@ -55,6 +57,17 @@ export const environmentCommands = {
   },
   setWind(wind: Partial<Environment["wind"]>): Promise<Environment> {
     return call("set-wind", wind);
+  },
+  /// The composed wind velocity at a world position, taken apart: the mean advection, the
+  /// turbulence, its per-octave spectrum, and what every local source contributed there.
+  sampleWind(params: CommandParamsMap["sample-wind"]): Promise<SampleWindResult> {
+    return call("sample-wind", params);
+  },
+  /// One whole cascade of the world interaction field, reduced to a grid of block means.
+  windInteractionField(
+    params: CommandParamsMap["wind-interaction-field"],
+  ): Promise<WindInteractionFieldResult> {
+    return call("wind-interaction-field", params);
   },
   /// Merge calendar, ephemeris, playback, and appearance-curve fields over the scene's
   /// time-of-day block. Environment curves use point objects; the command wire uses tuples.

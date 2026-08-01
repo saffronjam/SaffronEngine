@@ -2,6 +2,7 @@ import { call } from "./call";
 import type {
   BakeLookParams,
   BakeLookResult,
+  MeshExecutorResult,
   RenderQualityResult,
   RenderStats,
   SetBloomParams,
@@ -76,6 +77,12 @@ export const renderCommands = {
   /// when ray tracing is unsupported; echoes `{ rtReflections }` otherwise.
   setRtReflections(on: boolean): Promise<{ rtReflections: boolean }> {
     return call("set-rt-reflections", { enabled: on });
+  },
+  /// Routes the shaded executor through the mesh stage or the indexed path. `supported` reports
+  /// whether the device qualifies at all; asking for the mesh stage on one that does not leaves
+  /// `enabled` false rather than rejecting. Omit the argument to read which executor is in force.
+  setMeshExecutor(enabled?: boolean): Promise<MeshExecutorResult> {
+    return call("set-mesh-executor", enabled === undefined ? {} : { enabled });
   },
   /// Tonemap exposure in stops (exp2). This is the EFFECTIVE exposure; the env's
   /// `exposure` field is reserved on the wire. Echoes `{ exposureEv }`.

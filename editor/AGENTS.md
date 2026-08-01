@@ -16,7 +16,7 @@ live viewport. All window-system code is a compile-time backend per OS (`shell/s
 ```
 src/
   app/         shell (App.tsx), docking layout, menu/topbar, lifecycle wiring
-  panels/      Hierarchy, Inspector, Assets, Environment, Render(+Stats), Viewport, Topbar,
+  panels/      Hierarchy, Inspector, Assets, Environment, WindDebug, Render(+Stats), Viewport, Topbar,
                MaterialEditor + MaterialGraph, Profiler, Timeline, Physics, ScriptLogs (+ tree helpers),
                and the vegetation surface — Vegetation + EcologyTimeline (scene island), VegSummary +
                PlantGraph + BiomeGraph (asset-editor island), plus the brush/planting helpers; has its

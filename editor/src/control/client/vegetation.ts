@@ -12,8 +12,11 @@ export const vegetationCommands = {
   vegetationRuntimeStatus() {
     return call("vegetation-runtime-status");
   },
-  vegetationMutate(records: CommandParamsMap["vegetation-mutate"]["records"]) {
-    return call("vegetation-mutate", { records });
+  vegetationMutate(
+    gesture: CommandParamsMap["vegetation-mutate"]["gesture"],
+    records: CommandParamsMap["vegetation-mutate"]["records"],
+  ) {
+    return call("vegetation-mutate", { gesture, records });
   },
   plantGraph(plant: string) {
     return call("plant-graph", { plant, variation: 0 });
@@ -62,6 +65,15 @@ export const vegetationCommands = {
   },
   vegetationRuntimeInspect(plant: string) {
     return call("vegetation-runtime-inspect", { plant });
+  },
+  vegetationRuntimeQuery(params: CommandParamsMap["vegetation-runtime-query"]) {
+    return call("vegetation-runtime-query", params);
+  },
+  vegetationPromote(plant: string) {
+    return call("vegetation-promote", { plant });
+  },
+  vegetationDemote(plant: string) {
+    return call("vegetation-demote", { plant });
   },
   vegetationMapLayerCommit(params: CommandParamsMap["vegetation-map-layer-commit"]) {
     return call("vegetation-map-layer-commit", params);
