@@ -5,9 +5,6 @@
 import { afterAll, beforeAll, expect, test } from "bun:test";
 import { Engine } from "./harness.ts";
 import type {
-  EntityList,
-  EnvironmentDto,
-  InspectResult,
   SetTimeOfDayParams,
   Vec3,
 } from "@saffron/protocol";
@@ -22,7 +19,7 @@ async function screenshot(tag: string): Promise<Buffer> {
 }
 
 async function sunDirection(): Promise<Vec3> {
-  const inspected = await engine.call<InspectResult>("inspect", { entity: sunId });
+  const inspected = await engine.call("inspect", { entity: sunId });
   const light = inspected.components.DirectionalLight;
   if (!light) {
     throw new Error("starter Sun has no DirectionalLight component");
@@ -33,7 +30,7 @@ async function sunDirection(): Promise<Vec3> {
 beforeAll(async () => {
   engine = await bootEngine(cleaner, { SAFFRON_SCRATCH_PROJECT: "1" });
   await prepareScene(engine);
-  const entities = await engine.call<EntityList>("list-entities");
+  const entities = await engine.call("list-entities");
   const sun = entities.entities.find((entity) => entity.name === "Sun");
   if (!sun) {
     throw new Error("scratch project has no Sun entity");
@@ -43,7 +40,7 @@ beforeAll(async () => {
   const moon = trackEntity(
     cleaner,
     engine,
-    await engine.call<{ id: string }>("add-entity", { preset: "directional-light" }),
+    await engine.call("add-entity", { preset: "directional-light" }),
   );
   await engine.call("set-component-field", {
     entity: moon.id,
@@ -101,7 +98,7 @@ test("the complete time-of-day model round-trips through its single command", as
       [1, 0.25],
     ],
   };
-  const applied = await engine.call<EnvironmentDto>("set-time-of-day", params);
+  const applied = await engine.call("set-time-of-day", params);
   expect(applied.timeOfDay.enabled).toBe(true);
   expect(applied.timeOfDay.manualOverride).toBe(false);
   expect(applied.timeOfDay.timeOfDay).toBeCloseTo(0.25, 6);
@@ -126,7 +123,7 @@ test("the complete time-of-day model round-trips through its single command", as
   expect(applied.timeOfDay.cloudTypeCurve[0].y).toBeCloseTo(0.85, 6);
   expect(applied.timeOfDay.cloudTypeCurve[1].y).toBeCloseTo(0.25, 6);
 
-  const readBack = await engine.call<EnvironmentDto>("get-environment");
+  const readBack = await engine.call("get-environment");
   expect(readBack.timeOfDay).toEqual(applied.timeOfDay);
 });
 
@@ -174,7 +171,7 @@ test("pre-dawn and noon produce distinct validation-clean frames", async () => {
   await engine.settle(1200);
   const preDawn = await screenshot("pre-dawn");
 
-  const noon = await engine.call<EnvironmentDto>("set-time-of-day", { timeOfDay: 0.5 });
+  const noon = await engine.call("set-time-of-day", { timeOfDay: 0.5 });
   expect(noon.timeOfDay.timeOfDay).toBeCloseTo(0.5, 6);
   await engine.settle(1200);
   const midday = await screenshot("noon");

@@ -5,14 +5,7 @@
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { Engine } from "./harness.ts";
 import { prepareScene } from "./test-utils.ts";
-import type {
-  EntityRef,
-  EnvironmentDto,
-  InspectResult,
-  RenderStatsDto,
-  SetFogParams,
-  SetViewModeResult,
-} from "@saffron/protocol";
+import type { SetFogParams } from "@saffron/protocol";
 
 let engine: Engine;
 beforeAll(async () => {
@@ -29,7 +22,7 @@ afterAll(async () => {
 });
 
 test("fog is disabled by default in get-environment", async () => {
-  const env = await engine.call<EnvironmentDto>("get-environment");
+  const env = await engine.call("get-environment");
   expect(env.fog.enabled).toBe(false);
 });
 
@@ -41,7 +34,7 @@ test("set-fog echoes the merged fog block", async () => {
     directionalExponent: 16,
     maxOpacity: 0.8,
   };
-  const env = await engine.call<EnvironmentDto>("set-fog", params);
+  const env = await engine.call("set-fog", params);
   expect(env.fog.enabled).toBe(true);
   expect(env.fog.density).toBeCloseTo(0.05, 5);
   expect(env.fog.heightFalloff).toBeCloseTo(0.35, 5);
@@ -51,7 +44,7 @@ test("set-fog echoes the merged fog block", async () => {
 
 test("get-environment reflects the merged fog + runs validation-clean", async () => {
   await engine.settle(300);
-  const env = await engine.call<EnvironmentDto>("get-environment");
+  const env = await engine.call("get-environment");
   expect(env.fog.enabled).toBe(true);
   expect(env.fog.density).toBeCloseTo(0.05, 5);
   expect(engine.validationErrors()).toEqual([]);
@@ -64,7 +57,7 @@ describe("fog stays validation-clean across parameter changes", () => {
   const DENSITIES = [0.02, 0.1, 0.3];
   for (const density of DENSITIES) {
     test(`density=${density}`, async () => {
-      await engine.call<EnvironmentDto>("set-fog", {
+      await engine.call("set-fog", {
         enabled: true,
         density,
         heightFalloff: 0.2,
@@ -77,10 +70,10 @@ describe("fog stays validation-clean across parameter changes", () => {
   }
 
   test("disabling fog returns to a clean frame", async () => {
-    const env = await engine.call<EnvironmentDto>("set-fog", { enabled: false });
+    const env = await engine.call("set-fog", { enabled: false });
     expect(env.fog.enabled).toBe(false);
     await engine.settle(200);
-    const back = await engine.call<EnvironmentDto>("get-environment");
+    const back = await engine.call("get-environment");
     expect(back.fog.enabled).toBe(false);
     expect(engine.validationErrors()).toEqual([]);
   });
@@ -92,7 +85,7 @@ describe("fog stays validation-clean across parameter changes", () => {
 // stay validation-clean.
 describe("volumetric fog mode", () => {
   test("set-fog volumetric echoes the mode + medium params", async () => {
-    const env = await engine.call<EnvironmentDto>("set-fog", {
+    const env = await engine.call("set-fog", {
       enabled: true,
       mode: "volumetric",
       baseDensity: 0.05,
@@ -108,13 +101,13 @@ describe("volumetric fog mode", () => {
 
   test("get-environment reflects volumetric mode + runs validation-clean", async () => {
     await engine.settle(300);
-    const env = await engine.call<EnvironmentDto>("get-environment");
+    const env = await engine.call("get-environment");
     expect(env.fog.mode).toBe("volumetric");
     expect(engine.validationErrors()).toEqual([]);
   });
 
   test("switching back to analytic is validation-clean", async () => {
-    const env = await engine.call<EnvironmentDto>("set-fog", { mode: "analytic" });
+    const env = await engine.call("set-fog", { mode: "analytic" });
     expect(env.fog.mode).toBe("analytic");
     await engine.settle(200);
     expect(engine.validationErrors()).toEqual([]);
@@ -128,10 +121,10 @@ describe("volumetric fog mode", () => {
 // validation-clean render under volumetric fog proves that descriptor is correctly wired.
 describe("fog debug view mode", () => {
   test("set-view-mode fog echoes the mode + render-stats reflects it", async () => {
-    await engine.call<EnvironmentDto>("set-fog", { enabled: true, mode: "volumetric" });
-    const res = await engine.call<SetViewModeResult>("set-view-mode", { mode: "fog" });
+    await engine.call("set-fog", { enabled: true, mode: "volumetric" });
+    const res = await engine.call("set-view-mode", { mode: "fog" });
     expect(res.viewMode).toBe("fog");
-    const stats = await engine.call<RenderStatsDto>("render-stats");
+    const stats = await engine.call("render-stats");
     expect(stats.viewMode).toBe("fog");
   });
 
@@ -141,7 +134,7 @@ describe("fog debug view mode", () => {
   });
 
   test("restoring the lit view is validation-clean", async () => {
-    const res = await engine.call<SetViewModeResult>("set-view-mode", { mode: "lit" });
+    const res = await engine.call("set-view-mode", { mode: "lit" });
     expect(res.viewMode).toBe("lit");
     await engine.settle(200);
     expect(engine.validationErrors()).toEqual([]);
@@ -155,7 +148,7 @@ describe("fog debug view mode", () => {
 describe("volumetric quality tiers + temporal knobs", () => {
   for (const quality of ["low", "medium", "high"] as const) {
     test(`set-fog quality=${quality} echoes + reallocates validation-clean`, async () => {
-      const env = await engine.call<EnvironmentDto>("set-fog", {
+      const env = await engine.call("set-fog", {
         enabled: true,
         mode: "volumetric",
         quality,
@@ -167,7 +160,7 @@ describe("volumetric quality tiers + temporal knobs", () => {
   }
 
   test("temporal reprojection knobs echo + stay validation-clean", async () => {
-    const env = await engine.call<EnvironmentDto>("set-fog", {
+    const env = await engine.call("set-fog", {
       enabled: true,
       mode: "volumetric",
       historyBlend: 0.08,
@@ -182,7 +175,7 @@ describe("volumetric quality tiers + temporal knobs", () => {
   });
 
   test("an out-of-range historyBlend is rejected", async () => {
-    await expect(engine.call<EnvironmentDto>("set-fog", { historyBlend: 2 })).rejects.toThrow();
+    await expect(engine.call("set-fog", { historyBlend: 2 })).rejects.toThrow();
   });
 });
 
@@ -190,9 +183,9 @@ describe("per-light volumetric controls", () => {
   let lightId = "";
 
   test("a point light exposes the volumetric fields with defaults", async () => {
-    const ref = await engine.call<EntityRef>("add-entity", { preset: "point-light" });
+    const ref = await engine.call("add-entity", { preset: "point-light" });
     lightId = ref.id;
-    const info = await engine.call<InspectResult>("inspect", { entity: lightId });
+    const info = await engine.call("inspect", { entity: lightId });
     const light = info.components.PointLight as
       | { volumetricScattering?: number; castVolumetricShadow?: boolean }
       | undefined;
@@ -214,11 +207,8 @@ describe("per-light volumetric controls", () => {
       field: "volumetricScattering",
       value: 2,
     });
-    const info = await engine.call<InspectResult>("inspect", { entity: lightId });
-    const light = info.components.PointLight as {
-      volumetricScattering: number;
-      castVolumetricShadow: boolean;
-    };
+    const info = await engine.call("inspect", { entity: lightId });
+    const light = info.components.PointLight!;
     expect(light.volumetricScattering).toBeCloseTo(2, 5);
     expect(light.castVolumetricShadow).toBe(false);
     await engine.settle(250);
@@ -235,9 +225,9 @@ describe("local fog volumes", () => {
 
   test("add-entity fog-volume spawns a FogVolume with box defaults", async () => {
     await engine.call("set-fog", { enabled: true, mode: "volumetric" });
-    const ref = await engine.call<EntityRef>("add-entity", { preset: "fog-volume" });
+    const ref = await engine.call("add-entity", { preset: "fog-volume" });
     volumeId = ref.id;
-    const info = await engine.call<InspectResult>("inspect", { entity: volumeId });
+    const info = await engine.call("inspect", { entity: volumeId });
     const volume = info.components.FogVolume as
       | { shape?: string; density?: number; extents?: { x: number }; noiseIntensity?: number }
       | undefined;
@@ -266,12 +256,8 @@ describe("local fog volumes", () => {
       field: "wind",
       value: { x: 1, y: 0, z: 0.5 },
     });
-    const info = await engine.call<InspectResult>("inspect", { entity: volumeId });
-    const volume = info.components.FogVolume as {
-      density: number;
-      noiseIntensity: number;
-      wind: { x: number; y: number; z: number };
-    };
+    const info = await engine.call("inspect", { entity: volumeId });
+    const volume = info.components.FogVolume!;
     expect(volume.density).toBeCloseTo(1.5, 5);
     expect(volume.noiseIntensity).toBeCloseTo(0.8, 5);
     expect(volume.wind.x).toBeCloseTo(1, 5);
@@ -299,8 +285,8 @@ describe("local fog volumes", () => {
 // fill + composite stay validation-clean.
 describe("aerial perspective", () => {
   test("set-fog echoes aerialPerspective + aerialIntensity", async () => {
-    await engine.call<EnvironmentDto>("set-atmosphere", { enabled: true });
-    const env = await engine.call<EnvironmentDto>("set-fog", {
+    await engine.call("set-atmosphere", { enabled: true });
+    const env = await engine.call("set-fog", {
       enabled: true,
       mode: "analytic",
       aerialPerspective: true,
@@ -312,14 +298,14 @@ describe("aerial perspective", () => {
 
   test("get-environment reflects AP + the fill/composite run validation-clean", async () => {
     await engine.settle(300);
-    const env = await engine.call<EnvironmentDto>("get-environment");
+    const env = await engine.call("get-environment");
     expect(env.fog.aerialPerspective).toBe(true);
     expect(env.fog.aerialIntensity).toBeCloseTo(1.5, 5);
     expect(engine.validationErrors()).toEqual([]);
   });
 
   test("AP with fog disabled composites on the shared ledger validation-clean", async () => {
-    const env = await engine.call<EnvironmentDto>("set-fog", { enabled: false });
+    const env = await engine.call("set-fog", { enabled: false });
     expect(env.fog.enabled).toBe(false);
     expect(env.fog.aerialPerspective).toBe(true);
     await engine.settle(250);
@@ -327,21 +313,21 @@ describe("aerial perspective", () => {
   });
 
   test("disabling the atmosphere collapses AP to fog-only validation-clean", async () => {
-    await engine.call<EnvironmentDto>("set-atmosphere", { enabled: false });
-    await engine.call<EnvironmentDto>("set-fog", { enabled: true });
+    await engine.call("set-atmosphere", { enabled: false });
+    await engine.call("set-fog", { enabled: true });
     await engine.settle(250);
     expect(engine.validationErrors()).toEqual([]);
   });
 
   test("a negative aerialIntensity is rejected", async () => {
-    await expect(engine.call<EnvironmentDto>("set-fog", { aerialIntensity: -1 })).rejects.toThrow();
+    await expect(engine.call("set-fog", { aerialIntensity: -1 })).rejects.toThrow();
   });
 });
 
 // The `json` escape hatch merges an arbitrary object first (the same substrate the typed fields
 // write into); a color triple round-trips through the environment block.
 test("set-fog json escape hatch merges the albedo tint", async () => {
-  const env = await engine.call<EnvironmentDto>("set-fog", {
+  const env = await engine.call("set-fog", {
     enabled: true,
     json: { albedo: { x: 0.8, y: 0.4, z: 0.2 } },
   });

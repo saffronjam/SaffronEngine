@@ -12,7 +12,16 @@ import { existsSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-import type { CommandParamsMap, ControlFailureDto } from "@saffron/protocol";
+import type {
+  CommandParamsMap,
+  CommandResultMap,
+  ControlFailureDto,
+  EntityRef,
+  NewProjectParams,
+  ProjectStatusDto,
+  ThumbnailParams,
+  ThumbnailResult,
+} from "@saffron/protocol";
 
 // Every command the control plane serves. `call` takes only these, so a renamed or retired command
 // fails to typecheck instead of failing at runtime against a live host.
@@ -20,7 +29,7 @@ export type CommandName = keyof CommandParamsMap;
 
 // One command's request payload: its named params, or the positional `args` form the engine folds
 // into those names.
-export type CommandParams = CommandParamsMap[CommandName] | { args: unknown[] };
+export type CommandParams<C extends CommandName> = CommandParamsMap[C] | { args: unknown[] };
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 export const REPO = join(HERE, "..", "..");
@@ -183,8 +192,11 @@ export class Engine {
   }
 
   // Send one control command; resolves its `result`, rejects on `ok:false` or transport error.
-  call<T = unknown>(cmd: CommandName, params: CommandParams = {}): Promise<T> {
-    return new Promise<T>((resolve, reject) => {
+  // Both halves of the wire come from the generated maps — the params the command accepts and the
+  // result DTO it answers with — so a field the engine stops sending fails the typecheck instead of
+  // quietly turning an assertion vacuous.
+  call<C extends CommandName>(cmd: C, params?: CommandParams<C>): Promise<CommandResultMap[C]> {
+    return new Promise<CommandResultMap[C]>((resolve, reject) => {
       const socket = net.connect({ path: this.socketPath });
       const id = this.nextId++;
       let data = "";
@@ -199,7 +211,9 @@ export class Engine {
         },
         Number(process.env.SAFFRON_E2E_CALL_TIMEOUT_MS) || 15_000,
       );
-      socket.on("connect", () => socket.write(JSON.stringify({ id, cmd, params }) + "\n"));
+      socket.on("connect", () =>
+        socket.write(JSON.stringify({ id, cmd, params: params ?? {} }) + "\n"),
+      );
       socket.on("data", (chunk) => {
         data += chunk.toString();
         const nl = data.indexOf("\n");
@@ -209,7 +223,7 @@ export class Engine {
         clearTimeout(timer);
         socket.end();
         let envelope:
-          | { id: unknown; ok: true; result: T }
+          | { id: unknown; ok: true; result: CommandResultMap[C] }
           | { id: unknown; ok: false; error: ControlFailureDto };
         try {
           envelope = JSON.parse(data.slice(0, nl));
@@ -233,15 +247,15 @@ export class Engine {
   // Fetch a thumbnail, transparently retrying the `pending` reply the engine sends while its
   // worker thread generates a cold-cache entry (mirrors the editor's backoff). Resolves the final
   // PNG reply; rejects on an engine error or after `timeoutMs`.
-  async getThumbnail<T = { base64: string; width: number; height: number; format: string }>(
+  async getThumbnail(
     cmd: "get-thumbnail" | "view-asset",
-    params: Record<string, unknown>,
+    params: ThumbnailParams,
     timeoutMs = 10_000,
-  ): Promise<T> {
+  ): Promise<ThumbnailResult> {
     const start = Date.now();
     let delayMs = 30;
     for (;;) {
-      const reply = await this.call<T & { pending?: boolean }>(cmd, params);
+      const reply = await this.call(cmd, params);
       if (!reply.pending) {
         return reply;
       }
@@ -264,37 +278,23 @@ export class Engine {
   // scene or catalog. `project-status` is allow-listed during `Loading`.
   async awaitProjectReady(timeoutMs = 30_000): Promise<void> {
     const start = Date.now();
+    let status: ProjectStatusDto | undefined;
     for (;;) {
-      let status: {
-        phase: string;
-        error: string;
-        stage?: string;
-        currentItem?: string;
-        done?: number;
-        total?: number;
-      } = { phase: "loading", error: "" };
       try {
-        status = await this.call<{
-          phase: string;
-          error: string;
-          stage?: string;
-          currentItem?: string;
-          done?: number;
-          total?: number;
-        }>("project-status");
+        status = await this.call("project-status");
       } catch {
         // Socket briefly busy mid-load; retry.
       }
-      if (status.phase === "ready") {
+      if (status?.phase === "ready") {
         return;
       }
-      if (status.phase === "failed") {
+      if (status?.phase === "failed") {
         throw new Error(`project load failed: ${status.error}`);
       }
       if (Date.now() - start > timeoutMs) {
         throw new Error(
-          `timeout waiting for project ready (phase=${status.phase} stage=${status.stage} ` +
-            `${status.done}/${status.total} item=${status.currentItem})`,
+          `timeout waiting for project ready (phase=${status?.phase} stage=${status?.stage} ` +
+            `${status?.done}/${status?.total} item=${status?.currentItem})`,
         );
       }
       await delay(50);
@@ -314,7 +314,7 @@ export class Engine {
   }
 
   // Kick a fresh-project create + await the load.
-  async newProject(params: Record<string, unknown>): Promise<void> {
+  async newProject(params: NewProjectParams): Promise<void> {
     await this.call("new-project", params);
     await this.awaitProjectReady();
   }
@@ -328,21 +328,19 @@ export class Engine {
   // Import a glTF/OBJ as a .smodel asset, then instantiate it into the scene, returning the placed
   // root entity. The standard "get a model into the scene" path: import bakes the asset, instantiate
   // places it.
-  async importEntity(path: string, name?: string): Promise<{ id: string; name: string }> {
-    const model = await this.call<{ id: string }>("import-model", { path });
+  async importEntity(path: string, name?: string): Promise<EntityRef> {
+    const model = await this.call("import-model", { path });
     const params = name === undefined ? { asset: model.id } : { asset: model.id, name };
-    return this.call<{ id: string; name: string }>("instantiate-model", params);
+    return this.call("instantiate-model", params);
   }
 
   // The rig descendant of an instantiated model: a skinned model wraps its node forest under a
   // container root, so the SkinnedMesh (and the auto-fit BonePhysics) live on a child. Returns the
   // first entity carrying a SkinnedMesh, falling back to `root` for a non-skinned model.
   async rig(root: string): Promise<string> {
-    const { entities } = await this.call<{ entities: { id: string }[] }>("list-entities");
+    const { entities } = await this.call("list-entities");
     for (const e of entities) {
-      const info = await this.call<{ components: Record<string, unknown> }>("inspect", {
-        entity: e.id,
-      });
+      const info = await this.call("inspect", { entity: e.id });
       if (info.components.SkinnedMesh) {
         return e.id;
       }

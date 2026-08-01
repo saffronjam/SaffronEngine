@@ -8,7 +8,6 @@
 import { afterAll, beforeAll, expect, test } from "bun:test";
 import { join } from "node:path";
 import { Engine, REPO } from "./harness.ts";
-import type { InspectResult } from "@saffron/protocol";
 
 let engine: Engine;
 const FIXTURE = join(REPO, "tests", "e2e", "fixtures", "two-materials.gltf");
@@ -21,7 +20,7 @@ afterAll(async () => {
 });
 
 async function slot0Overrides(id: string): Promise<Record<string, unknown>> {
-  const info = await engine.call<InspectResult>("inspect", { entity: id });
+  const info = await engine.call("inspect", { entity: id });
   const set = info.components.MaterialSet as
     | { slots?: { overrides?: Record<string, unknown> }[] }
     | undefined;
@@ -29,9 +28,8 @@ async function slot0Overrides(id: string): Promise<Record<string, unknown>> {
 }
 
 async function slot0Material(id: string): Promise<string> {
-  const info = await engine.call<InspectResult>("inspect", { entity: id });
-  const set = info.components.MaterialSet as { slots?: { material?: string }[] } | undefined;
-  return set?.slots?.[0]?.material ?? "0";
+  const info = await engine.call("inspect", { entity: id });
+  return info.components.MaterialSet?.slots[0]?.material ?? "0";
 }
 
 async function setSlot0Blend(id: string, blend: string): Promise<void> {
@@ -51,7 +49,7 @@ test("an imported material has no blend override and its .smat is opaque", async
   meshId = imported.id;
   await engine.settle();
   expect((await slot0Overrides(meshId)).blend).toBeUndefined();
-  const m = await engine.call<{ blend: string }>("material-get", {
+  const m = await engine.call("material-get", {
     material: await slot0Material(meshId),
   });
   expect(m.blend).toBe("opaque");
@@ -79,7 +77,7 @@ test("the translucent blend override survives a project save + reload", async ()
   await engine.call("save-project");
   await engine.reloadProject();
   await engine.settle();
-  const list = await engine.call<{ entities: { id: string; name: string }[] }>("list-entities");
+  const list = await engine.call("list-entities");
   const entity = list.entities.find((e) => e.name === "Blended");
   expect(entity).toBeDefined();
   expect((await slot0Overrides(entity!.id)).blend).toBe("translucent");

@@ -14,6 +14,7 @@
 // (invalidating entity ids), so nothing that depends on a prior id follows it.
 
 import { afterAll, beforeAll, expect, test } from "bun:test";
+import type { ViewModeDto } from "@saffron/protocol";
 import { rmSync } from "node:fs";
 import { join } from "node:path";
 import { Engine, REPO } from "./harness.ts";
@@ -26,33 +27,6 @@ const FIXTURE = join(REPO, "engine", "assets", "models", "animated-strip.gltf");
 const projectDir = `/tmp/saffron-e2e-overlay-project-${process.pid}`;
 const cleaner = new Cleaner();
 
-interface Ref {
-  id: string;
-  name: string;
-}
-interface ViewModeResult {
-  viewMode: string;
-}
-interface RenderStats {
-  viewMode: string;
-}
-interface DebugOverlays {
-  bounds: boolean;
-  sceneAabb: boolean;
-  lightVolumes: boolean;
-  grid: boolean;
-  colliders: boolean;
-}
-interface OverlayState {
-  show: boolean;
-  axes: boolean;
-  jointSize: number;
-}
-interface Entry {
-  id: string;
-  name: string;
-}
-
 async function screenshot(tag: string): Promise<Buffer> {
   return captureViewport(engine, cleaner, `overlay-${tag}`);
 }
@@ -61,7 +35,7 @@ beforeAll(async () => {
   cleaner.defer(() => rmSync(projectDir, { recursive: true, force: true }));
   engine = await bootEngine(cleaner, { SAFFRON_SCRATCH_PROJECT: "1" });
   await prepareScene(engine, { camera: { yaw: 0, pitch: 0 } });
-  const cube = await engine.call<Ref>("add-entity", { args: ["cube"] });
+  const cube = await engine.call("add-entity", { args: ["cube"] });
   cubeId = cube.id;
   await engine.call("focus", { entity: cube.id });
   await engine.settle();
@@ -71,14 +45,14 @@ afterAll(async () => {
 });
 
 test("the default view mode is lit", async () => {
-  const stats = await engine.call<RenderStats>("render-stats", {});
+  const stats = await engine.call("render-stats", {});
   expect(stats.viewMode).toBe("lit");
 });
 
 test("set-view-mode echoes the mode and reads back through render-stats", async () => {
-  const set = await engine.call<ViewModeResult>("set-view-mode", { mode: "wireframe" });
+  const set = await engine.call("set-view-mode", { mode: "wireframe" });
   expect(set.viewMode).toBe("wireframe");
-  const stats = await engine.call<RenderStats>("render-stats", {});
+  const stats = await engine.call("render-stats", {});
   expect(stats.viewMode).toBe("wireframe");
 });
 
@@ -93,7 +67,7 @@ test("wireframe changes the render", async () => {
 });
 
 test("a buffer channel (albedo) round-trips and changes the render", async () => {
-  const set = await engine.call<ViewModeResult>("set-view-mode", { mode: "albedo" });
+  const set = await engine.call("set-view-mode", { mode: "albedo" });
   expect(set.viewMode).toBe("albedo");
   await engine.call("set-view-mode", { mode: "lit" });
   await engine.settle(300);
@@ -109,7 +83,7 @@ test("a buffer channel (albedo) round-trips and changes the render", async () =>
 // dedicated passes (lit-wireframe, motion-vectors). All must echo + read back through
 // render-stats; the dedicated passes no-op gracefully when their inputs are absent, but the
 // command round-trip is unconditional.
-const NEW_MODES = [
+const NEW_MODES: ViewModeDto[] = [
   "unlit",
   "lit-wireframe",
   "detail-lighting",
@@ -124,9 +98,9 @@ const NEW_MODES = [
 
 test("every new view mode echoes and reads back through render-stats", async () => {
   for (const mode of NEW_MODES) {
-    const set = await engine.call<ViewModeResult>("set-view-mode", { mode });
+    const set = await engine.call("set-view-mode", { mode });
     expect(set.viewMode).toBe(mode);
-    const stats = await engine.call<RenderStats>("render-stats", {});
+    const stats = await engine.call("render-stats", {});
     expect(stats.viewMode).toBe(mode);
   }
   await engine.call("set-view-mode", { mode: "lit" });
@@ -155,12 +129,12 @@ test("lit-wireframe overlays edges on the shaded scene", async () => {
 });
 
 test("the skeleton overlay is off by default", async () => {
-  const state = await engine.call<OverlayState>("get-skeleton-overlay", {});
+  const state = await engine.call("get-skeleton-overlay", {});
   expect(state.show).toBe(false);
 });
 
 test("set-skeleton-overlay round-trips through get", async () => {
-  const set = await engine.call<OverlayState>("set-skeleton-overlay", {
+  const set = await engine.call("set-skeleton-overlay", {
     show: true,
     axes: true,
     jointSize: 6,
@@ -168,7 +142,7 @@ test("set-skeleton-overlay round-trips through get", async () => {
   expect(set.show).toBe(true);
   expect(set.axes).toBe(true);
   expect(set.jointSize).toBeCloseTo(6, 4);
-  const got = await engine.call<OverlayState>("get-skeleton-overlay", {});
+  const got = await engine.call("get-skeleton-overlay", {});
   expect(got.show).toBe(true);
   expect(got.axes).toBe(true);
   await engine.call("set-skeleton-overlay", { show: false });
@@ -181,9 +155,9 @@ test("turning bones on draws the skeleton over the selected rig", async () => {
   // A rigged import places the SkinnedMesh on the mesh descendant of the imported root (the root
   // carries only ModelInstance + Relationship + Transform). The skeleton overlay self-gates to the
   // selected entity's SkinnedMeshComponent, so select the descendant that actually holds the rig.
-  const list = (await engine.call<{ entities: Entry[] }>("list-entities")).entities;
+  const list = (await engine.call("list-entities")).entities;
   for (const e of list) {
-    const info = await engine.call<{ components: { SkinnedMesh?: unknown } }>("inspect", {
+    const info = await engine.call("inspect", {
       entity: e.id,
     });
     if (info.components.SkinnedMesh) {
@@ -209,7 +183,7 @@ test("turning bones on draws the skeleton over the selected rig", async () => {
 });
 
 test("the debug overlays are off by default", async () => {
-  const state = await engine.call<DebugOverlays>("get-debug-overlays", {});
+  const state = await engine.call("get-debug-overlays", {});
   expect(state.bounds).toBe(false);
   expect(state.sceneAabb).toBe(false);
   expect(state.lightVolumes).toBe(false);
@@ -218,15 +192,15 @@ test("the debug overlays are off by default", async () => {
 });
 
 test("set-debug-overlays round-trips through get", async () => {
-  const set = await engine.call<DebugOverlays>("set-debug-overlays", { bounds: true });
+  const set = await engine.call("set-debug-overlays", { bounds: true });
   expect(set.bounds).toBe(true);
-  const got = await engine.call<DebugOverlays>("get-debug-overlays", {});
+  const got = await engine.call("get-debug-overlays", {});
   expect(got.bounds).toBe(true);
 });
 
 test("a partial update leaves the other flags untouched", async () => {
   await engine.call("set-debug-overlays", { bounds: true });
-  const after = await engine.call<DebugOverlays>("set-debug-overlays", { sceneAabb: true });
+  const after = await engine.call("set-debug-overlays", { sceneAabb: true });
   expect(after.bounds).toBe(true);
   expect(after.sceneAabb).toBe(true);
   expect(after.lightVolumes).toBe(false);
@@ -268,9 +242,9 @@ test("colliders round-trips and draws a wireframe over a collider", async () => 
   });
   await engine.settle(300);
   const off = await screenshot("col-off");
-  const on1 = await engine.call<DebugOverlays>("set-debug-overlays", { colliders: true });
+  const on1 = await engine.call("set-debug-overlays", { colliders: true });
   expect(on1.colliders).toBe(true);
-  const got = await engine.call<DebugOverlays>("get-debug-overlays", {});
+  const got = await engine.call("get-debug-overlays", {});
   expect(got.colliders).toBe(true);
   await engine.settle(300);
   const on = await screenshot("col-on");
@@ -296,7 +270,7 @@ test("the overlay toggles round-trip through project save/load", async () => {
   });
   await engine.loadProject(projectPath);
 
-  const loaded = await engine.call<DebugOverlays>("get-debug-overlays", {});
+  const loaded = await engine.call("get-debug-overlays", {});
   expect(loaded.bounds).toBe(true);
   expect(loaded.sceneAabb).toBe(false);
   expect(loaded.lightVolumes).toBe(true);

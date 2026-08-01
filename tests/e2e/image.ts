@@ -190,6 +190,20 @@ export function encodeRgba8Png(
   ]);
 }
 
+// The per-channel absolute difference of two same-sized images, as an image. Isolating one term of
+// the shading — a frame with a feature against the same frame without it — leaves an image every
+// other term has cancelled out of, which two such isolations can then be compared across.
+export function absoluteDifferenceImage(a: Rgb8Image, b: Rgb8Image): Rgb8Image {
+  if (a.width !== b.width || a.height !== b.height) {
+    throw new Error(`image sizes differ: ${a.width}x${a.height} vs ${b.width}x${b.height}`);
+  }
+  const pixels = Buffer.allocUnsafe(a.pixels.length);
+  for (let i = 0; i < a.pixels.length; i += 1) {
+    pixels[i] = Math.abs(a.pixels[i]! - b.pixels[i]!);
+  }
+  return { width: a.width, height: a.height, pixels };
+}
+
 // Mean absolute per-channel difference between two same-sized images, in `[0, 255]`. The metric a
 // cross-platform comparison scores: identical renders are 0, and a tolerance admits the
 // quantization and rounding two implementations are allowed to disagree on.
@@ -202,4 +216,41 @@ export function meanAbsoluteDifference(a: Rgb8Image, b: Rgb8Image): number {
     total += Math.abs(a.pixels[i]! - b.pixels[i]!);
   }
   return total / a.pixels.length;
+}
+
+// The greatest single-channel difference between two same-sized images, in `[0, 255]`.
+//
+// A mean answers "how much of the frame differs"; this answers "did anything differ *visibly*".
+// The two part company on a frame carrying denoiser residue: a pass that resolves across frames
+// keeps dithering the pixels it covers by one 8-bit level indefinitely, which a mean pools into a
+// number that grows with the area covered, while the peak reads it for what it is — a single
+// quantization step, no silhouette moved.
+export function peakAbsoluteDifference(a: Rgb8Image, b: Rgb8Image): number {
+  if (a.width !== b.width || a.height !== b.height) {
+    throw new Error(`image sizes differ: ${a.width}x${a.height} vs ${b.width}x${b.height}`);
+  }
+  let peak = 0;
+  for (let i = 0; i < a.pixels.length; i += 1) {
+    const difference = Math.abs(a.pixels[i]! - b.pixels[i]!);
+    if (difference > peak) {
+      peak = difference;
+    }
+  }
+  return peak;
+}
+
+// How many channels of two same-sized images differ by at least `step` levels. Paired with a
+// `step` above the frame's residue, this is a count of what actually moved rather than a score
+// of how much everything drifted.
+export function channelsDifferingBy(a: Rgb8Image, b: Rgb8Image, step: number): number {
+  if (a.width !== b.width || a.height !== b.height) {
+    throw new Error(`image sizes differ: ${a.width}x${a.height} vs ${b.width}x${b.height}`);
+  }
+  let count = 0;
+  for (let i = 0; i < a.pixels.length; i += 1) {
+    if (Math.abs(a.pixels[i]! - b.pixels[i]!) >= step) {
+      count += 1;
+    }
+  }
+  return count;
 }

@@ -6,17 +6,12 @@
 import { afterAll, beforeAll, expect, test } from "bun:test";
 import { join } from "node:path";
 import { Engine, REPO } from "./harness.ts";
-import type { AssetPlacementResult, EntityRef } from "@saffron/protocol";
 
 let engine: Engine;
 const FIXTURE = join(REPO, "tests", "e2e", "fixtures", "two-materials.gltf");
 
-interface EntityList {
-  entities: { id: string; name: string }[];
-}
-
 async function entityIds(): Promise<Set<string>> {
-  const list = await engine.call<EntityList>("list-entities");
+  const list = await engine.call("list-entities");
   return new Set(list.entities.map((e) => e.id));
 }
 
@@ -30,7 +25,7 @@ afterAll(async () => {
 let modelId = "";
 
 test("import the placement fixture", async () => {
-  const ref = await engine.call<{ id: string; type: string }>("import-model", { path: FIXTURE });
+  const ref = await engine.call("import-model", { path: FIXTURE });
   await engine.settle();
   expect(ref.type).toBe("model");
   modelId = ref.id;
@@ -39,7 +34,7 @@ test("import the placement fixture", async () => {
 test("a preview ghost renders but is invisible to the outliner", async () => {
   const before = await entityIds();
 
-  const r = await engine.call<AssetPlacementResult>("asset-placement", {
+  const r = await engine.call("asset-placement", {
     phase: "preview",
     asset: modelId,
     u: 0.5,
@@ -57,8 +52,8 @@ test("commit turns the ghost into exactly one new outliner entity", async () => 
   const before = await entityIds();
 
   // A drag-over update, then the drop.
-  await engine.call<AssetPlacementResult>("asset-placement", { phase: "preview", asset: modelId, u: 0.4, v: 0.6 });
-  const committed = await engine.call<AssetPlacementResult>("asset-placement", { phase: "commit" });
+  await engine.call("asset-placement", { phase: "preview", asset: modelId, u: 0.4, v: 0.6 });
+  const committed = await engine.call("asset-placement", { phase: "commit" });
   await engine.settle();
   expect(committed.entity).toBeDefined();
 
@@ -73,8 +68,8 @@ test("commit turns the ghost into exactly one new outliner entity", async () => 
 test("clear destroys the ghost and leaves the committed entity untouched", async () => {
   const before = await entityIds();
 
-  await engine.call<AssetPlacementResult>("asset-placement", { phase: "preview", asset: modelId, u: 0.6, v: 0.4 });
-  const cleared = await engine.call<AssetPlacementResult>("asset-placement", { phase: "clear" });
+  await engine.call("asset-placement", { phase: "preview", asset: modelId, u: 0.6, v: 0.4 });
+  const cleared = await engine.call("asset-placement", { phase: "clear" });
   await engine.settle();
   expect(cleared.active).toBe(false);
 
@@ -84,7 +79,7 @@ test("clear destroys the ghost and leaves the committed entity untouched", async
 
 test("a preview never persists across save and reload", async () => {
   // An active ghost at save time must not leak into the project file.
-  await engine.call<AssetPlacementResult>("asset-placement", { phase: "preview", asset: modelId, u: 0.5, v: 0.5 });
+  await engine.call("asset-placement", { phase: "preview", asset: modelId, u: 0.5, v: 0.5 });
   const before = await entityIds();
 
   const path = `/tmp/saffron-e2e-placement-${process.pid}.json`;

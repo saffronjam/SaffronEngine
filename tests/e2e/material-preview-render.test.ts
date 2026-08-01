@@ -13,7 +13,6 @@
 import { afterAll, afterEach, beforeAll, expect, test } from "bun:test";
 import { join } from "node:path";
 import { Engine, REPO } from "./harness.ts";
-import type { EntityRef, InspectResult } from "@saffron/protocol";
 import { bootEngine, captureViewport, Cleaner, prepareScene, trackEntity } from "./test-utils.ts";
 
 let engine: Engine;
@@ -46,12 +45,12 @@ async function screenshot(tag: string): Promise<Buffer> {
 }
 
 test("preview-render returns a PNG that reflects the material's color", async () => {
-  const a = await engine.call<{ id: string }>("material-create", { name: "PrevA" });
-  const b = await engine.call<{ id: string }>("material-create", { name: "PrevB" });
+  const a = await engine.call("material-create", { name: "PrevA" });
+  const b = await engine.call("material-create", { name: "PrevB" });
   await engine.call("material-update", { material: b.id, baseColor: { x: 1, y: 0, z: 0, w: 1 } });
 
-  const pa = await engine.call<{ png: string }>("preview-render", { material: a.id, size: 128 });
-  const pb = await engine.call<{ png: string }>("preview-render", { material: b.id, size: 128 });
+  const pa = await engine.call("preview-render", { material: a.id, size: 128 });
+  const pb = await engine.call("preview-render", { material: b.id, size: 128 });
 
   expect(pa.png.length).toBeGreaterThan(100);
   expect(pa.png.startsWith("iVBORw0KGgo")).toBe(true); // PNG magic, base64
@@ -60,8 +59,8 @@ test("preview-render returns a PNG that reflects the material's color", async ()
 });
 
 test("a foldable node graph drives the material like direct factors", async () => {
-  const a = await engine.call<{ id: string }>("material-create", { name: "GraphA" });
-  const b = await engine.call<{ id: string }>("material-create", { name: "DirectB" });
+  const a = await engine.call("material-create", { name: "GraphA" });
+  const b = await engine.call("material-create", { name: "DirectB" });
 
   const graph = {
     nodes: [
@@ -70,7 +69,7 @@ test("a foldable node graph drives the material like direct factors", async () =
     ],
     edges: [{ from: ["c", "rgba"], to: ["out", "baseColor"] }],
   };
-  const set = await engine.call<{ id: string; foldable: boolean }>("material-set-graph", {
+  const set = await engine.call("material-set-graph", {
     material: a.id,
     graph,
   });
@@ -78,15 +77,15 @@ test("a foldable node graph drives the material like direct factors", async () =
 
   await engine.call("material-update", { material: b.id, baseColor: { x: 1, y: 0, z: 0, w: 1 } });
 
-  const pa = await engine.call<{ png: string }>("preview-render", { material: a.id, size: 128 });
-  const pb = await engine.call<{ png: string }>("preview-render", { material: b.id, size: 128 });
+  const pa = await engine.call("preview-render", { material: a.id, size: 128 });
+  const pb = await engine.call("preview-render", { material: b.id, size: 128 });
 
   expect(pa.png).toBe(pb.png); // the graph folds to the same red material
   expect(engine.validationErrors()).toEqual([]);
 });
 
 test("a procedural graph renders via codegen in the preview", async () => {
-  const m = await engine.call<{ id: string }>("material-create", { name: "CodegenPrev" });
+  const m = await engine.call("material-create", { name: "CodegenPrev" });
   const graph = {
     nodes: [
       { id: "c1", type: "constant", props: { value: [1, 0, 0, 1] } },
@@ -102,14 +101,14 @@ test("a procedural graph renders via codegen in the preview", async () => {
   };
   await engine.call("material-set-graph", { material: m.id, graph });
 
-  const prev = await engine.call<{ png: string }>("preview-render", { material: m.id, size: 128 });
+  const prev = await engine.call("preview-render", { material: m.id, size: 128 });
   expect(prev.png.startsWith("iVBORw0KGgo")).toBe(true); // valid PNG from the codegen'd pipeline
   expect(prev.png.length).toBeGreaterThan(200);
   expect(engine.validationErrors()).toEqual([]);
 });
 
 test("a procedural uv/frac graph codegen-renders in the preview", async () => {
-  const m = await engine.call<{ id: string }>("material-create", { name: "Procedural" });
+  const m = await engine.call("material-create", { name: "Procedural" });
   const graph = {
     nodes: [
       { id: "uv", type: "uv" },
@@ -127,15 +126,15 @@ test("a procedural uv/frac graph codegen-renders in the preview", async () => {
   };
   await engine.call("material-set-graph", { material: m.id, graph });
 
-  const prev = await engine.call<{ png: string }>("preview-render", { material: m.id, size: 128 });
+  const prev = await engine.call("preview-render", { material: m.id, size: 128 });
   expect(prev.png.startsWith("iVBORw0KGgo")).toBe(true);
   expect(prev.png.length).toBeGreaterThan(200);
   expect(engine.validationErrors()).toEqual([]);
 });
 
 test("get-thumbnail renders a material preview PNG", async () => {
-  const m = await engine.call<{ id: string }>("material-create", { name: "Thumb" });
-  const thumb = await engine.getThumbnail<{ base64: string; format: string }>("get-thumbnail", {
+  const m = await engine.call("material-create", { name: "Thumb" });
+  const thumb = await engine.getThumbnail("get-thumbnail", {
     asset: m.id,
     size: 96,
   });
@@ -145,21 +144,21 @@ test("get-thumbnail renders a material preview PNG", async () => {
 });
 
 test("an assigned normal map perturbs the shaded result", async () => {
-  const asset = (await engine.call<{ id: string }>("import-model", { path: MAPPED })).id;
+  const asset = (await engine.call("import-model", { path: MAPPED })).id;
   const e = trackEntity(
     caseCleaner,
     engine,
-    await engine.call<EntityRef>("instantiate-model", { asset }),
+    await engine.call("instantiate-model", { asset }),
   );
   await engine.settle(300);
 
   // Reuse the fixture's own albedo texture (from the imported model's referenced `.smat`) as a
   // (deliberately non-flat) normal map.
-  const info = await engine.call<InspectResult>("inspect", { entity: e.id });
-  const slots = (info.components.MaterialSet as { slots?: { material: string }[] }).slots ?? [];
+  const info = await engine.call("inspect", { entity: e.id });
+  const slots = info.components.MaterialSet?.slots ?? [];
   expect(slots.length).toBeGreaterThan(0);
   const albedo = (
-    await engine.call<{ albedoTexture: string }>("material-get", { material: slots[0].material })
+    await engine.call("material-get", { material: slots[0].material })
   ).albedoTexture;
   expect(albedo).toBeDefined();
   expect(albedo).not.toBe("0");

@@ -37,14 +37,21 @@ cd tests/e2e && bun test       # inside the toolbox (host bun on PATH)
 - **The suite is typechecked, and `bun test` is not the thing that does it.** `bun test` strips
   types without checking them, so `tsc --noEmit` (`bun run typecheck`, `just e2e-typecheck`) runs in
   the gate's e2e step. A type error there fails the gate; keep it at zero.
-- Type results via `@saffron/protocol` (`engine.call<RenderStats>("render-stats")`) so a schema
-  change that breaks an assertion shows up at typecheck. `call` takes only a `CommandName` — a key
-  of the generated `CommandParamsMap` — so a renamed or retired command fails the typecheck instead
-  of a live host, and `params` takes a generated params DTO or the positional `{ args: […] }` form.
+- **`call` types itself from the command name — never pass a type argument.**
+  `engine.call("render-stats")` resolves to `CommandResultMap["render-stats"]` and its params to
+  `CommandParamsMap["render-stats"]`, both generated from the `saffron-protocol` DTOs. So a renamed
+  command, a params field the command does not accept, and a result field the engine stopped sending
+  are each a typecheck failure rather than a live-host surprise. `params` takes the generated params
+  DTO or the positional `{ args: […] }` form, which is also how a test drives a payload the typed
+  DTO cannot express (an invalid enum value a negative case needs the engine to reject).
 - **Assert against the generated DTO, not a hand-written shape.** A local `as { … }` cast or an
   inline structural result type states what the test wishes the wire were; the DTO states what it
   is. When the two disagree the DTO is the one to fix (`engine/crates/protocol`) — an internally
-  tagged enum whose tag `ts-rs` dropped reads as a test bug and is not one.
+  tagged enum whose tag `ts-rs` dropped reads as a test bug and is not one. Narrow a tagged union
+  through its tag (`vegetationMap`, `anchorOverride`) instead of restating one leg's fields.
+- **Unused locals and parameters fail the typecheck**, so a superseded local result shape cannot sit
+  in the tree unnoticed. Deleting an unused *binding* whose initializer does work (`const world =
+  await bindVegetationField(…)`) means keeping the call: drop the binding, not the statement.
 
 ## Vegetation
 
@@ -57,7 +64,9 @@ store, the runtime cell store, and the ecology clock.
   `cargo run -p xtask -- gen-vegetation-e2e-fixture`, which builds the plant, biome, graph, and map
   documents in Rust with stable UUIDs. Regenerate whenever a `.splant` (or other vegetation) schema
   identity changes — a hand-patched fixture passes locally and diverges from what the engine writes.
-- The suites also write a generated trunk OBJ before cooking; the fixture generator owns that too.
+- The suites also install each fixture's authored source files before cooking — the trunk OBJ, the
+  leaf-content glTF with its buffer, and the serration cutout PNG. The fixture generator owns those
+  too, and a fixture carries them as a `sources` list of project-relative paths.
 - Cooked artifacts land in the content-addressed store beside `assets/`, not inside it, and a
   published state baseline lands in a second root beside both. A test that asserts on packaged output
   must account for `<project>/cache/vegetation/` **and** `<project>/state/vegetation/`.

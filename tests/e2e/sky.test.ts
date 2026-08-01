@@ -1,12 +1,7 @@
 import { afterAll, beforeAll, expect, test } from "bun:test";
 import { Engine } from "./harness.ts";
 import { prepareScene } from "./test-utils.ts";
-import type {
-  EntityRef,
-  EnvironmentDto,
-  InspectResult,
-  SetAtmosphereParams,
-} from "@saffron/protocol";
+import type { SetAtmosphereParams } from "@saffron/protocol";
 
 let engine: Engine;
 
@@ -29,7 +24,7 @@ test("atmosphere and moon settings round-trip over the control plane", async () 
     perPixelTransmittance: true,
     skyCaptureCadence: 7,
   };
-  const applied = await engine.call<EnvironmentDto>("set-atmosphere", params);
+  const applied = await engine.call("set-atmosphere", params);
   expect(applied.atmosphere.enabled).toBe(true);
   expect(applied.atmosphere.sunDiskIntensity).toBeCloseTo(1.25, 5);
   expect(applied.atmosphere.moonDiskAngularRadius).toBeCloseTo(0.005, 5);
@@ -38,19 +33,19 @@ test("atmosphere and moon settings round-trip over the control plane", async () 
   expect(applied.atmosphere.perPixelTransmittance).toBe(true);
   expect(applied.atmosphere.skyCaptureCadence).toBeCloseTo(7, 5);
 
-  const environment = await engine.call<EnvironmentDto>("get-environment");
+  const environment = await engine.call("get-environment");
   expect(environment.atmosphere).toEqual(applied.atmosphere);
 });
 
 test("directional lights select the atmosphere sun or moon role", async () => {
-  const moon = await engine.call<EntityRef>("add-entity", { preset: "directional-light" });
+  const moon = await engine.call("add-entity", { preset: "directional-light" });
   await engine.call("set-component-field", {
     entity: moon.id,
     component: "DirectionalLight",
     field: "atmosphereRole",
     value: "moon",
   });
-  const inspected = await engine.call<InspectResult>("inspect", { entity: moon.id });
+  const inspected = await engine.call("inspect", { entity: moon.id });
   expect(inspected.components.DirectionalLight?.atmosphereRole).toBe("moon");
 });
 

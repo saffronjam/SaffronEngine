@@ -8,7 +8,6 @@ import { mkdtemp } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Engine } from "./harness.ts";
-import type { AssetList, EntityRef } from "@saffron/protocol";
 
 let engine: Engine;
 beforeAll(async () => {
@@ -18,10 +17,6 @@ afterAll(async () => {
   await engine?.shutdown();
 });
 
-interface Inspect {
-  components: Record<string, { mesh?: string; slots?: unknown[] }>;
-}
-
 const PRIMITIVES = [
   { preset: "cube", name: "Cube", mesh: "3" },
   { preset: "plane", name: "Plane", mesh: "4" },
@@ -29,12 +24,12 @@ const PRIMITIVES = [
 ] as const;
 
 test("primitives spawn as reserved-id meshes with a default material and add no catalog rows", async () => {
-  const before = await engine.call<AssetList>("list-assets");
+  const before = await engine.call("list-assets");
   const beforeCount = before.assets.length;
 
   for (const p of PRIMITIVES) {
-    const ref = await engine.call<EntityRef>("add-entity", { preset: p.preset });
-    const info = await engine.call<Inspect>("inspect", { entity: ref.id });
+    const ref = await engine.call("add-entity", { preset: p.preset });
+    const info = await engine.call("inspect", { entity: ref.id });
     // A native mesh reference by reserved id.
     expect(info.components).toHaveProperty("Mesh");
     expect(info.components.Mesh?.mesh).toBe(p.mesh);
@@ -44,7 +39,7 @@ test("primitives spawn as reserved-id meshes with a default material and add no 
   }
 
   // The whole point: primitives never touch the catalog — no rows added, none named for them.
-  const after = await engine.call<AssetList>("list-assets");
+  const after = await engine.call("list-assets");
   expect(after.assets.length).toBe(beforeCount);
   const names = after.assets.map((a) => a.name);
   for (const p of PRIMITIVES) {
@@ -53,17 +48,17 @@ test("primitives spawn as reserved-id meshes with a default material and add no 
 });
 
 test("a spawned primitive serializes as its reserved id and survives save/reload", async () => {
-  await engine.call<EntityRef>("add-entity", { preset: "sphere" });
+  await engine.call("add-entity", { preset: "sphere" });
   const dir = await mkdtemp(join(tmpdir(), "saffron-primitive-"));
   const projectPath = join(dir, "project.json");
   await engine.call("save-project", { path: projectPath });
   await engine.loadProject(projectPath);
 
   // Addressed by name after reload (ids re-mint); the reserved mesh id round-trips.
-  const info = await engine.call<Inspect>("inspect", { entity: "Sphere" });
+  const info = await engine.call("inspect", { entity: "Sphere" });
   expect(info.components.Mesh?.mesh).toBe("5");
 });
 
 test("add-entity rejects an unknown preset", async () => {
-  await expect(engine.call("add-entity", { preset: "pyramid" })).rejects.toThrow();
+  await expect(engine.call("add-entity", { args: ["pyramid"] })).rejects.toThrow();
 });

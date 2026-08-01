@@ -5,14 +5,16 @@
 // to zero, a subgroup path with no software equivalent. This boots two hosts differing only in
 // `VK_ICD_FILENAMES`, so scene, camera, and settle are identical by construction.
 //
-// `softwareGpu` is read back from `render-stats` rather than assumed, and the comparison is skipped
-// when the machine offers one adapter — if the loader ignored the override, both hosts would run
-// the same driver and every comparison would pass for the wrong reason.
+// `softwareGpu` is read back from `render-stats` rather than assumed. Where the software ICD is
+// installed the comparison is mandatory and a machine that hands back one adapter twice fails
+// here; where it is absent — MoltenVK is the only adapter — the suite reports as skipped rather
+// than as passed, so a green run never means the comparison quietly did not happen.
 //
 // The tolerance is measured, not guessed: two rasterizers differ in sample positions,
 // interpolation precision, and filtered-texel rounding, and this scene measures ~0.16 mean
 // absolute per-channel difference on 0-255. A real portability defect moves whole channel values.
 
+import { existsSync } from "node:fs";
 import { afterAll, beforeAll, expect, test } from "bun:test";
 import type { RenderStatsDto } from "@saffron/protocol";
 import { Engine } from "./harness.ts";
@@ -30,10 +32,14 @@ const CAMERA = { position: { x: 0, y: 2, z: 6 }, yaw: 0, pitch: -15 } as const;
 // calibration note above: this scene measures ~0.16 between them.
 const ADAPTER_TOLERANCE = 1.5;
 
+// Where the software ICD exists the comparison is required; where it does not, no second adapter
+// can be produced and every test below reports as skipped.
+const softwareIcdPresent = existsSync(LLVMPIPE_ICD);
+const comparable = test.skipIf(!softwareIcdPresent);
+
 const cleaner = new Cleaner();
 const frames: Record<string, Buffer> = {};
 const stats: Record<string, RenderStatsDto> = {};
-let bothAdaptersPresent = false;
 
 // Boots a host on the named adapter, builds the scene, and captures one settled frame.
 async function captureOn(label: string, env: Record<string, string>): Promise<Buffer> {
@@ -41,7 +47,7 @@ async function captureOn(label: string, env: Record<string, string>): Promise<Bu
   cleaner.defer(() => engine.shutdown());
   await prepareScene(engine, { width: 320, height: 180, camera: CAMERA });
   await engine.call("add-entity", { preset: "plane" });
-  const cube = await engine.call<{ id: string }>("add-entity", { preset: "cube" });
+  const cube = await engine.call("add-entity", { preset: "cube" });
   await engine.call("set-component", {
     entity: cube.id,
     component: "Transform",
@@ -56,7 +62,7 @@ async function captureOn(label: string, env: Record<string, string>): Promise<Bu
   await engine.call("set-wind", { speed: 0, gust: 0 });
   await engine.settle(1500);
   const frame = await captureViewport(engine, cleaner, `adapter-${label}`);
-  stats[label] = await engine.call<RenderStatsDto>("render-stats");
+  stats[label] = await engine.call("render-stats");
   // A portability difference often shows as a validation error on one adapter and silence on the
   // other, so each host is asserted clean on its own rather than only compared to the other.
   expect(engine.validationErrors()).toEqual([]);
@@ -64,50 +70,38 @@ async function captureOn(label: string, env: Record<string, string>): Promise<Bu
 }
 
 beforeAll(async () => {
+  if (!softwareIcdPresent) {
+    return;
+  }
   frames.native = await captureOn("native", {});
   frames.software = await captureOn("software", { VK_ICD_FILENAMES: LLVMPIPE_ICD });
-  // The override may be ignored, or the machine may offer one adapter. Either way the comparison
-  // is between a host and itself, which proves nothing about portability.
-  bothAdaptersPresent = stats.native.softwareGpu !== stats.software.softwareGpu;
 }, 240_000);
 
 afterAll(async () => {
   await cleaner.cleanup();
 });
 
-test("the two hosts really are different adapters", () => {
-  if (!bothAdaptersPresent) {
-    // Reported rather than silently green: a machine with one adapter cannot run this comparison,
-    // and pretending otherwise is how a portability suite stops meaning anything.
-    console.warn(
-      `cross-adapter parity skipped: both hosts reported softwareGpu=${stats.native.softwareGpu}`,
-    );
-    return;
-  }
+comparable("the two hosts really are different adapters", () => {
+  // The loader may have ignored the override, leaving a host compared against itself. That is a
+  // harness defect and it fails here rather than passing three comparisons for the wrong reason.
   expect(stats.software.softwareGpu).toBe(true);
   expect(stats.native.softwareGpu).toBe(false);
 });
 
-test("both adapters render the scene at the same extent", () => {
+comparable("both adapters render the scene at the same extent", () => {
   const native = decodeRgb8Png(frames.native);
   const software = decodeRgb8Png(frames.software);
   expect(native.width).toBe(software.width);
   expect(native.height).toBe(software.height);
 });
 
-test("the whole frame agrees within the measured tolerance", () => {
-  if (!bothAdaptersPresent) {
-    return;
-  }
+comparable("the whole frame agrees within the measured tolerance", () => {
   const native = decodeRgb8Png(frames.native);
   const software = decodeRgb8Png(frames.software);
   expect(meanAbsoluteDifference(native, software)).toBeLessThanOrEqual(ADAPTER_TOLERANCE);
 });
 
-test("each shading region agrees, not just the frame average", () => {
-  if (!bothAdaptersPresent) {
-    return;
-  }
+comparable("each shading region agrees, not just the frame average", () => {
   // A whole-frame mean hides a localized defect: a wrong object against a large correct sky
   // averages down to nothing. Scoring the regions separately is what catches one pass diverging.
   const native = decodeRgb8Png(frames.native);

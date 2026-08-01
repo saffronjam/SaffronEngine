@@ -3,10 +3,7 @@
 
 import { afterAll, beforeAll, expect, test } from "bun:test";
 import type {
-  EnvironmentDto,
-  RenderStatsDto,
   SetCloudsParams,
-  SetViewModeResult,
   SetWindParams,
 } from "@saffron/protocol";
 import { Engine } from "./harness.ts";
@@ -33,7 +30,7 @@ afterAll(async () => {
 });
 
 test("clouds are disabled by default", async () => {
-  const env = await engine.call<EnvironmentDto>("get-environment");
+  const env = await engine.call("get-environment");
   expect(env.cloud.enabled).toBe(false);
   expect(env.cloud.weatherTexture).toBe("0");
 });
@@ -61,7 +58,7 @@ test("set-clouds merges and round-trips the complete shape block", async () => {
     cloudShadowStrength: 0.8,
     cloudShadowOnSurfaceStrength: 0.65,
   };
-  const applied = await engine.call<EnvironmentDto>("set-clouds", params);
+  const applied = await engine.call("set-clouds", params);
   expect(applied.cloud.enabled).toBe(true);
   expect(applied.cloud.coverage).toBeCloseTo(0.7, 6);
   expect(applied.cloud.cloudType).toBeCloseTo(0.4, 6);
@@ -80,7 +77,7 @@ test("set-clouds merges and round-trips the complete shape block", async () => {
   expect(applied.cloud.cloudShadowStrength).toBeCloseTo(0.8, 6);
   expect(applied.cloud.cloudShadowOnSurfaceStrength).toBeCloseTo(0.65, 6);
 
-  const readBack = await engine.call<EnvironmentDto>("get-environment");
+  const readBack = await engine.call("get-environment");
   expect(readBack.cloud).toEqual(applied.cloud);
 });
 
@@ -97,7 +94,7 @@ test("shared wind and cloud shadows round-trip and affect the lit frame", async 
   await engine.settle(900);
   const unshadowed = await screenshot("integration-unshadowed");
 
-  const shadowedEnv = await engine.call<EnvironmentDto>("set-clouds", {
+  const shadowedEnv = await engine.call("set-clouds", {
     castCloudShadows: true,
   });
   expect(shadowedEnv.cloud.castCloudShadows).toBe(true);
@@ -108,7 +105,7 @@ test("shared wind and cloud shadows round-trip and affect the lit frame", async 
   expect(shadowed.equals(unshadowed)).toBe(false);
 
   const wind: SetWindParams = { orientation: 45, speed: 20, gust: 0.5 };
-  const windyEnv = await engine.call<EnvironmentDto>("set-wind", wind);
+  const windyEnv = await engine.call("set-wind", wind);
   expect(windyEnv.wind.orientation).toBeCloseTo(45, 6);
   expect(windyEnv.wind.speed).toBeCloseTo(20, 6);
   expect(windyEnv.wind.gust).toBeCloseTo(0.5, 6);
@@ -146,11 +143,11 @@ test("lit clouds composite before bloom and respond to physical lighting control
 });
 
 test("cloud-density view mode reaches render stats", async () => {
-  const result = await engine.call<SetViewModeResult>("set-view-mode", {
+  const result = await engine.call("set-view-mode", {
     mode: "cloud-density",
   });
   expect(result.viewMode).toBe("cloud-density");
-  const stats = await engine.call<RenderStatsDto>("render-stats");
+  const stats = await engine.call("render-stats");
   expect(stats.viewMode).toBe("cloud-density");
 });
 

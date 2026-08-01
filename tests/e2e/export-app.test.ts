@@ -23,18 +23,13 @@ afterAll(async () => {
   }
 });
 
-interface ExportResult {
-  path: string;
-  warnings: string[];
-}
-
 test("export-app stages a runnable app folder that the player boots clean", async () => {
   scratchRoot = mkdtempSync(join(tmpdir(), "saffron-export-"));
   const outputDir = join(scratchRoot, "E2E App");
   const appRoot = process.platform === "darwin" ? `${outputDir}.app` : outputDir;
   const app = { title: "E2E App", width: 800, height: 600, fullscreen: false, vsync: true };
 
-  const result = await engine.call<ExportResult>("export-app", { outputDir, app });
+  const result = await engine.call("export-app", { outputDir, app });
   expect(result.path).toBe(appRoot);
   expect(result.warnings).toEqual([]);
 

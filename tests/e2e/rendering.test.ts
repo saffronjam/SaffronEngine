@@ -4,12 +4,7 @@
 
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { Engine } from "./harness.ts";
-import type { EntityList, RenderStats } from "@saffron/protocol";
 
-interface Ref {
-  id: string;
-  name: string;
-}
 
 
 let engine: Engine;
@@ -22,16 +17,33 @@ afterAll(async () => {
 });
 
 test("boots clean: ping answers and no validation errors at startup", async () => {
-  const pong = await engine.call<{ pong: boolean }>("ping");
+  const pong = await engine.call("ping");
   expect(pong.pong).toBe(true);
+  expect(engine.validationErrors()).toEqual([]);
+});
+
+// Async-compute scheduling: the Global-SDF build declares the independent compute queue, and the
+// graph places it there whenever the device exposes a compute family it can derive the ownership
+// transfer for. `asyncComputeBatches` counts the command buffers the frame plan submitted on that
+// lane, so a production pass that stops asking for it — or a graph that stops honouring the
+// request — shows up here as zero.
+test("runs the distance-field build on the independent compute queue", async () => {
+  const stats = await engine.call("render-stats");
+  if (!stats.asyncComputeQueue) {
+    console.log("skip: this device exposes no independent compute queue family");
+    expect(stats.asyncComputeBatches).toBe(0);
+    return;
+  }
+  expect(stats.gdf).toBe(true);
+  expect(stats.asyncComputeBatches).toBeGreaterThan(0);
   expect(engine.validationErrors()).toEqual([]);
 });
 
 test("imports a model and reports a draw", async () => {
   await engine.call("add-entity", { preset: "cube" });
-  const entities = await engine.call<EntityList>("list-entities");
+  const entities = await engine.call("list-entities");
   expect(Array.isArray(entities.entities)).toBe(true);
-  const stats = await engine.call<RenderStats>("render-stats");
+  const stats = await engine.call("render-stats");
   expect(stats.drawCalls).toBeGreaterThan(0);
 });
 
@@ -40,7 +52,7 @@ test("imports a model and reports a draw", async () => {
 // count those formats reject on some GPUs (VUID-VkImageCreateInfo-samples-02258).
 test("set-aa across every level stays Vulkan-validation-clean", async () => {
   for (const mode of ["msaa2", "msaa4", "msaa8", "msaa2", "off"]) {
-    const result = await engine.call<{ aa: string }>("set-aa", { args: [mode] });
+    const result = await engine.call("set-aa", { args: [mode] });
     expect(typeof result.aa).toBe("string");
     await engine.settle(200);
   }
@@ -58,9 +70,9 @@ describe("depth-tested camera frustum overlay", () => {
     // A scene camera (showFrustum defaults true, so the overlay draws its frustum) at the origin
     // facing -Z, plus a cube parked inside the frustum so the depth-tested lines actually get
     // occluded.
-    const camera = await engine.call<Ref>("add-entity", { args: ["camera"] });
+    const camera = await engine.call("add-entity", { args: ["camera"] });
     await engine.call("set-transform", { entity: camera.id, translation: { x: 0, y: 0, z: 0 } });
-    const cube = await engine.call<Ref>("add-entity", { args: ["cube"] });
+    const cube = await engine.call("add-entity", { args: ["cube"] });
     await engine.call("set-transform", { entity: cube.id, translation: { x: 0, y: 0, z: -4 } });
     // View the frustum head-on from +Z so its edges project on-screen and the depth-tested draw
     // actually runs (an off-screen frustum would clip to zero vertices).

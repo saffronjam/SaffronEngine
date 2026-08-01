@@ -5,10 +5,8 @@
 // nothing normalizes a zero vector into a NaN).
 
 import { afterAll, beforeAll, expect, test } from "bun:test";
+import type { Components } from "@saffron/protocol";
 import { Engine } from "./harness.ts";
-
-type EntityList = { entities: { id: string; name: string }[] };
-type Inspect = { components: Record<string, unknown> };
 
 let engine: Engine;
 beforeAll(async () => {
@@ -19,11 +17,11 @@ afterAll(async () => {
 });
 
 async function entities(): Promise<{ id: string; name: string }[]> {
-  return (await engine.call<EntityList>("list-entities")).entities;
+  return (await engine.call("list-entities")).entities;
 }
 
-async function hasComponent(id: string, name: string): Promise<boolean> {
-  const info = await engine.call<Inspect>("inspect", { entity: id });
+async function hasComponent(id: string, name: keyof Components): Promise<boolean> {
+  const info = await engine.call("inspect", { entity: id });
   return info.components[name] !== undefined;
 }
 

@@ -6,11 +6,14 @@
     "moduleResolution": "bundler",
     "target": "esnext",
     "strict": true,
+    "noUnusedLocals": true,
+    "noUnusedParameters": true,
     "noEmit": true,
     "skipLibCheck": true,
     "baseUrl": ".",
     "paths": {
       "@saffron/protocol": ["../../editor/src/protocol/index.ts"]
     }
-  }
+  },
+  "include": ["**/*.ts", "../../tools/bench-foliage-phase1/**/*.ts"]
 }

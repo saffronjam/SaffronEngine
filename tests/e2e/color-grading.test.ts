@@ -8,13 +8,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Engine } from "./harness.ts";
 import { prepareScene } from "./test-utils.ts";
-import type {
-  BakeLookResult,
-  ImportLutResult,
-  RenderStats,
-  SetColorGradingParams,
-  SetColorGradingResult,
-} from "@saffron/protocol";
+import type { SetColorGradingParams } from "@saffron/protocol";
 
 // The neutral identity grade — every write spreads this so a test overrides only the fields it
 // exercises (the wire also fills missing fields from the same neutral default).
@@ -71,7 +65,7 @@ afterAll(async () => {
 });
 
 test("the default grade is neutral in render-stats", async () => {
-  const stats = await engine.call<RenderStats>("render-stats");
+  const stats = await engine.call("render-stats");
   expect(stats.colorGrading.temperature).toBeCloseTo(6500, 1);
   expect(stats.colorGrading.tint).toBe(0);
   expect(stats.colorGrading.contrast).toBe(1);
@@ -100,7 +94,7 @@ test("set-color-grading echoes the applied grade", async () => {
     offset: [0, 0.01, 0.02],
     power: [1, 1.05, 1.1],
   };
-  const res = await engine.call<SetColorGradingResult>("set-color-grading", params);
+  const res = await engine.call("set-color-grading", params);
   expect(res.temperature).toBeCloseTo(5000, 1);
   expect(res.tint).toBeCloseTo(0.1, 5);
   expect(res.contrast).toBeCloseTo(1.2, 5);
@@ -111,7 +105,7 @@ test("set-color-grading echoes the applied grade", async () => {
 
 test("render-stats reflects the applied grade + runs validation-clean", async () => {
   await engine.settle(300);
-  const stats = await engine.call<RenderStats>("render-stats");
+  const stats = await engine.call("render-stats");
   expect(stats.colorGrading.temperature).toBeCloseTo(5000, 1);
   expect(stats.colorGrading.contrast).toBeCloseTo(1.2, 5);
   expect(stats.colorGrading.saturation).toBeCloseTo(0.9, 5);
@@ -136,7 +130,7 @@ test("per-range, channel mixer, and split-tone round-trip through render-stats",
     channelMixer: [1, 0.1, 0, 0, 1, 0, 0.05, 0, 1],
     splitTone: { shadow: [0.4, 0.45, 0.6], highlight: [0.6, 0.55, 0.4], balance: 0.1 },
   };
-  const res = await engine.call<SetColorGradingResult>("set-color-grading", params);
+  const res = await engine.call("set-color-grading", params);
   expect(res.highlights.slope[0]).toBeCloseTo(0.9, 5);
   expect(res.highlights.power[2]).toBeCloseTo(0.9, 5);
   expect(res.highlights.saturation).toBeCloseTo(1.2, 5);
@@ -146,7 +140,7 @@ test("per-range, channel mixer, and split-tone round-trip through render-stats",
   expect(res.splitTone.balance).toBeCloseTo(0.1, 5);
 
   await engine.settle(300);
-  const stats = await engine.call<RenderStats>("render-stats");
+  const stats = await engine.call("render-stats");
   expect(stats.colorGrading.highlights.slope[0]).toBeCloseTo(0.9, 5);
   expect(stats.colorGrading.highlights.contrast).toBeCloseTo(1.15, 5);
   expect(stats.colorGrading.highlightsMin).toBeCloseTo(0.55, 5);
@@ -162,7 +156,7 @@ describe("the grade stays validation-clean across parameter changes", () => {
   const TEMPS = [3200, 6500, 9000];
   for (const temperature of TEMPS) {
     test(`temperature=${temperature}`, async () => {
-      await engine.call<SetColorGradingResult>("set-color-grading", {
+      await engine.call("set-color-grading", {
         ...NEUTRAL,
         temperature,
         contrast: 1.1,
@@ -173,10 +167,10 @@ describe("the grade stays validation-clean across parameter changes", () => {
   }
 
   test("returning to the neutral grade is validation-clean", async () => {
-    const res = await engine.call<SetColorGradingResult>("set-color-grading", { ...NEUTRAL });
+    const res = await engine.call("set-color-grading", { ...NEUTRAL });
     expect(res.temperature).toBeCloseTo(6500, 1);
     await engine.settle(200);
-    const stats = await engine.call<RenderStats>("render-stats");
+    const stats = await engine.call("render-stats");
     expect(stats.colorGrading.contrast).toBe(1);
     expect(engine.validationErrors()).toEqual([]);
   });
@@ -184,7 +178,7 @@ describe("the grade stays validation-clean across parameter changes", () => {
 
 // A partial `sa`-style call folds provided keys onto the neutral serde default.
 test("a partial grade leaves the unspecified fields neutral", async () => {
-  const res = await engine.call<SetColorGradingResult>("set-color-grading", { temperature: 5500 });
+  const res = await engine.call("set-color-grading", { args: [5500] });
   expect(res.temperature).toBeCloseTo(5500, 1);
   expect(res.contrast).toBe(1);
   expect(res.saturation).toBe(1);
@@ -204,16 +198,16 @@ test("set-color-grading rejects an out-of-range pivot", async () => {
 // `render-stats.creativeLut`, then that intensity 0 reports the neutral look — validation-clean.
 test("a creative .cube LUT imports, applies, and reads back its size/intensity", async () => {
   const path = writeCube(17);
-  const imported = await engine.call<ImportLutResult>("import-lut", { path });
+  const imported = await engine.call("import-lut", { path });
   expect(imported.lut).not.toBe("0");
 
-  await engine.call<SetColorGradingResult>("set-color-grading", {
+  await engine.call("set-color-grading", {
     ...NEUTRAL,
     creativeLutAsset: imported.lut,
     creativeLutIntensity: 0.8,
   });
   await engine.settle(300);
-  const stats = await engine.call<RenderStats>("render-stats");
+  const stats = await engine.call("render-stats");
   expect(stats.creativeLut).not.toBeNull();
   expect(stats.creativeLut?.asset).toBe(imported.lut);
   expect(stats.creativeLut?.size).toBe(17);
@@ -221,13 +215,13 @@ test("a creative .cube LUT imports, applies, and reads back its size/intensity",
   expect(engine.validationErrors()).toEqual([]);
 
   // Intensity 0 is the neutral (the LUT stays bound, one code path); the look reverts.
-  await engine.call<SetColorGradingResult>("set-color-grading", {
+  await engine.call("set-color-grading", {
     ...NEUTRAL,
     creativeLutAsset: imported.lut,
     creativeLutIntensity: 0,
   });
   await engine.settle(200);
-  const neutral = await engine.call<RenderStats>("render-stats");
+  const neutral = await engine.call("render-stats");
   expect(neutral.creativeLut?.intensity).toBe(0);
   expect(engine.validationErrors()).toEqual([]);
 });
@@ -257,29 +251,29 @@ function writeToneCurveCube(size: number): string {
 
 test("a tone-curve-baked .cube imports and applies through the creative-LUT slot", async () => {
   const path = writeToneCurveCube(17);
-  const imported = await engine.call<ImportLutResult>("import-lut", { path });
+  const imported = await engine.call("import-lut", { path });
   expect(imported.lut).not.toBe("0");
 
-  await engine.call<SetColorGradingResult>("set-color-grading", {
+  await engine.call("set-color-grading", {
     ...NEUTRAL,
     creativeLutAsset: imported.lut,
     creativeLutIntensity: 1,
   });
   await engine.settle(300);
-  const stats = await engine.call<RenderStats>("render-stats");
+  const stats = await engine.call("render-stats");
   expect(stats.creativeLut?.asset).toBe(imported.lut);
   expect(stats.creativeLut?.size).toBe(17);
   expect(stats.creativeLut?.intensity).toBeCloseTo(1, 5);
   expect(engine.validationErrors()).toEqual([]);
 
   // Clear the slot so the tone-curve look does not leak into the bake test below.
-  await engine.call<SetColorGradingResult>("set-color-grading", { ...NEUTRAL });
+  await engine.call("set-color-grading", { ...NEUTRAL });
 });
 
 // The bake folds grade + view transform + creative LUT into one 33³ log2-shaper `.slut` on the GPU,
 // reads it back, and registers it — validation-clean.
 test("bake-look writes a 33³ .slut and stays validation-clean", async () => {
-  const baked = await engine.call<BakeLookResult>("bake-look", { name: "E2E Baked" });
+  const baked = await engine.call("bake-look", { name: "E2E Baked" });
   expect(baked.size).toBe(33);
   expect(baked.path).toMatch(/\.slut$/);
   expect(baked.asset).not.toBe("0");

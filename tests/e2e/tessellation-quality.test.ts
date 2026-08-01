@@ -5,15 +5,15 @@
 //
 // Two things are asserted. `set-tessellation-quality` echoes the APPLIED, clamped budget, so
 // "ok:true" alone is not the check. And the amplified geometry reaches the framebuffer: the suite
-// screenshots the viewport with displacement on and off and compares the pixels, which is the only
-// assertion here that fails if the displaced draw stops drawing.
+// screenshots the viewport with displacement on and off, compares the pixels, and pairs that with
+// the rasterized-triangle count — together they separate an amplified surface from a plane that
+// stopped drawing at all, which moves the picture just as much.
 
 import { afterAll, beforeAll, expect, test } from "bun:test";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Engine } from "./harness.ts";
-import type { SetDisplacementResult, SetTessellationQualityResult } from "@saffron/protocol";
 import { Cleaner, bootEngine, captureViewport, prepareScene } from "./test-utils.ts";
 import { decodeRgb8Png, encodeRgba8Png, meanAbsoluteDifference } from "./image.ts";
 
@@ -42,14 +42,14 @@ beforeAll(async () => {
   cleaner.defer(() => rmSync(scratch, { recursive: true, force: true }));
   const heightPath = join(scratch, "relief.png");
   writeFileSync(heightPath, reliefPng(64));
-  const height = await engine.call<{ texture: string }>("import-texture", {
+  const height = await engine.call("import-texture", {
     path: heightPath,
     role: "height",
   });
 
   // Two calls, not one: `material-update` applies the fields it is given, and the height mode has
   // to be Displacement for the height map to amplify rather than shade.
-  const material = await engine.call<{ id: string }>("material-create", { name: "Relief" });
+  const material = await engine.call("material-create", { name: "Relief" });
   await engine.call("material-update", {
     material: material.id,
     heightTexture: height.texture,
@@ -57,7 +57,7 @@ beforeAll(async () => {
   });
   await engine.call("material-update", { material: material.id, heightMode: "displacement" });
 
-  const plane = await engine.call<{ id: string }>("add-entity", { preset: "plane" });
+  const plane = await engine.call("add-entity", { preset: "plane" });
   await engine.call("material-assign", { entity: plane.id, material: material.id });
   await engine.call("set-displacement", { enabled: true });
   await engine.settle(600);
@@ -67,13 +67,13 @@ afterAll(async () => {
 });
 
 const setQuality = (params: Record<string, unknown>) =>
-  engine.call<SetTessellationQualityResult>("set-tessellation-quality", params);
+  engine.call("set-tessellation-quality", params);
 
 // Captures the viewport once the loop reports the frame converged, so a capture never samples a
 // temporal accumulator mid-flight.
 async function settledShot(tag: string): Promise<Buffer> {
   for (let attempt = 0; attempt < 40; attempt += 1) {
-    if ((await engine.call<{ converged: boolean }>("render-stats")).converged) {
+    if ((await engine.call("render-stats")).converged) {
       break;
     }
     await engine.settle(100);
@@ -120,22 +120,38 @@ test("the amplified geometry reaches the framebuffer", async () => {
   const onA = await settledShot("tess-on-a");
   const onB = await settledShot("tess-on-b");
   const floor = meanAbsoluteDifference(decodeRgb8Png(onA), decodeRgb8Png(onB));
+  const onTriangles = (await engine.call("render-stats")).triangles;
 
-  const off = await engine.call<SetDisplacementResult>("set-displacement", { enabled: false });
+  const off = await engine.call("set-displacement", { enabled: false });
   expect(off.displacement).toBe(false);
   const flat = await settledShot("tess-off");
   expect(flat.equals(onB)).toBe(false);
   const spread = meanAbsoluteDifference(decodeRgb8Png(onB), decodeRgb8Png(flat));
   expect(spread).toBeGreaterThan(Math.max(4 * floor, 1));
 
+  // A displaced draw that stops drawing ALSO moves the picture — the plane simply vanishes — so
+  // the spread above cannot tell an amplified surface from a missing one. The rasterized-triangle
+  // counter can: the arena's packed micro-triangles are counted where the binner resolves the
+  // row's draw seed, so the amplified frame rasterizes several times the whole undisplaced scene.
+  const offTriangles = (await engine.call("render-stats")).triangles;
+  expect(onTriangles).toBeGreaterThan(3 * offTriangles);
+
   // And back: the difference tracks the toggle in both directions, so it belongs to the
   // displacement path rather than to anything drifting across the capture sequence.
-  const back = await engine.call<SetDisplacementResult>("set-displacement", { enabled: true });
+  const back = await engine.call("set-displacement", { enabled: true });
   expect(back.displacement).toBe(true);
   const restored = await settledShot("tess-on-c");
   expect(meanAbsoluteDifference(decodeRgb8Png(restored), decodeRgb8Png(flat))).toBeGreaterThan(
     Math.max(4 * floor, 1),
   );
+
+  // The restored picture is the ORIGINAL displaced picture, not merely a different one from flat:
+  // the toggle is reversible, so the displaced draw reproduces itself rather than landing somewhere
+  // new. Bounded against the measured floor with slack for the extra accumulation the round trip
+  // walks through, which is still far under the toggle spread above.
+  const roundTrip = meanAbsoluteDifference(decodeRgb8Png(restored), decodeRgb8Png(onB));
+  expect(roundTrip).toBeLessThan(Math.max(8 * floor, 2));
+  expect(roundTrip).toBeLessThan(spread);
 
   expect(engine.validationErrors()).toEqual([]);
 });

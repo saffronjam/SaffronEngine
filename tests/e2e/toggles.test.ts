@@ -5,11 +5,10 @@
 
 import { afterAll, beforeAll, expect, test } from "bun:test";
 import { Engine } from "./harness.ts";
-import type { RenderStats } from "@saffron/protocol";
 
 
 let engine: Engine;
-const stats = () => engine.call<RenderStats>("render-stats");
+const stats = () => engine.call("render-stats");
 
 beforeAll(async () => {
   // import-model needs a loaded project; SAFFRON_SCRATCH_PROJECT makes one (under the harness temp appdata dir).
@@ -63,7 +62,7 @@ test("set-gi ddgi|off round-trips through render-stats.ddgi", async () => {
 });
 
 test("set-exposure is reflected in render-stats.exposureEv", async () => {
-  const r = await engine.call<{ exposureEv: number }>("set-exposure", { args: [1.5] });
+  const r = await engine.call("set-exposure", { args: [1.5] });
   expect(r.exposureEv).toBeCloseTo(1.5, 3);
   expect((await stats()).exposureEv).toBeCloseTo(1.5, 3);
   await engine.call("set-exposure", { args: [0] });
@@ -87,9 +86,9 @@ test("ray-tracing toggles round-trip when the device supports RT", async () => {
 // ray-miss + contact GTAO). Validated by READ-BACK — the set-* command echoes its state and
 // render-stats reports the same `skyOcclusion` flag.
 test("set-sky-occlusion echoes the state it is given", async () => {
-  const on = await engine.call<{ skyOcclusion: boolean }>("set-sky-occlusion", { args: [1] });
+  const on = await engine.call("set-sky-occlusion", { args: [1] });
   expect(on.skyOcclusion).toBe(true);
-  const off = await engine.call<{ skyOcclusion: boolean }>("set-sky-occlusion", { args: [0] });
+  const off = await engine.call("set-sky-occlusion", { args: [0] });
   expect(off.skyOcclusion).toBe(false);
 });
 

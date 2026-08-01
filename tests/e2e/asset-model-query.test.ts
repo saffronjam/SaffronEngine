@@ -11,32 +11,6 @@ let engine: Engine;
 const LEG = join(REPO, "tests", "e2e", "fixtures", "leg.gltf");
 const STATIC = join(REPO, "tests", "e2e", "fixtures", "two-materials.gltf");
 
-interface Bone {
-  index: number;
-  name: string;
-  parent: number;
-  joint: boolean;
-}
-interface Capabilities {
-  meshCount: number;
-  materialCount: number;
-  nodeCount: number;
-  hasRig: boolean;
-  boneCount: number;
-  clipCount: number;
-}
-interface AssetModel {
-  mesh: string;
-  name: string;
-  capabilities: Capabilities;
-  bones: Bone[];
-  clips: { id: string; name: string; duration: number }[];
-}
-interface ModelInfo {
-  id: string;
-  subAssets: { id: string; name: string; type: string }[];
-}
-
 let legModel = "";
 let meshSub = "";
 let clipSub = "";
@@ -44,10 +18,10 @@ let clipName = "";
 
 beforeAll(async () => {
   engine = await Engine.boot({ SAFFRON_SCRATCH_PROJECT: "1" });
-  const ref = await engine.call<{ id: string }>("import-model", { path: LEG });
+  const ref = await engine.call("import-model", { path: LEG });
   legModel = ref.id;
   await engine.settle();
-  const info = await engine.call<ModelInfo>("model-info", { asset: legModel });
+  const info = await engine.call("model-info", { asset: legModel });
   meshSub = info.subAssets.find((s) => s.type === "mesh")!.id;
   const clip = info.subAssets.find((s) => s.type === "animation")!;
   clipSub = clip.id;
@@ -58,7 +32,7 @@ afterAll(async () => {
 });
 
 test("get-asset-model returns the skeleton (joints + parent indices), the clips, and capabilities", async () => {
-  const model = await engine.call<AssetModel>("get-asset-model", { asset: legModel });
+  const model = await engine.call("get-asset-model", { asset: legModel });
   expect(model.mesh).toBe(legModel);
   // leg.gltf: LegMesh + Hip/Knee/Ankle joints — the rig is the 3 joints, not the mesh node.
   expect(model.bones.length).toBe(3);
@@ -78,27 +52,25 @@ test("get-asset-model returns the skeleton (joints + parent indices), the clips,
 });
 
 test("get-asset-model on a mesh sub-asset resolves to the same model", async () => {
-  const model = await engine.call<AssetModel>("get-asset-model", { asset: meshSub });
+  const model = await engine.call("get-asset-model", { asset: meshSub });
   expect(model.mesh).toBe(legModel);
   expect(model.bones.length).toBe(3);
 });
 
 test("get-asset-model on a clip sub-asset resolves to the same model (clip<->mesh link is intrinsic)", async () => {
-  const model = await engine.call<AssetModel>("get-asset-model", { asset: clipSub });
+  const model = await engine.call("get-asset-model", { asset: clipSub });
   expect(model.mesh).toBe(legModel);
   expect(model.clips.some((c) => c.id === clipSub)).toBe(true);
 });
 
 test("list-clips honors the asset selector", async () => {
-  const filtered = await engine.call<{ clips: { id: string }[] }>("list-clips", { asset: legModel });
+  const filtered = await engine.call("list-clips", { asset: legModel });
   expect(filtered.clips.length).toBe(1);
   expect(filtered.clips[0].id).toBe(clipSub);
 });
 
 test("list-assets carries rigged on a rigged model's rows and duration on clips", async () => {
-  const list = await engine.call<{
-    assets: { id: string; type: string; rigged?: boolean; duration?: number }[];
-  }>("list-assets");
+  const list = await engine.call("list-assets");
   const mesh = list.assets.find((a) => a.id === meshSub);
   expect(mesh?.rigged).toBe(true);
   const clip = list.assets.find((a) => a.id === clipSub);
@@ -106,9 +78,9 @@ test("list-assets carries rigged on a rigged model's rows and duration on clips"
 });
 
 test("get-asset-model on a static (unskinned) model reports hasRig=false, not an error", async () => {
-  const ref = await engine.call<{ id: string }>("import-model", { path: STATIC });
+  const ref = await engine.call("import-model", { path: STATIC });
   await engine.settle();
-  const model = await engine.call<AssetModel>("get-asset-model", { asset: ref.id });
+  const model = await engine.call("get-asset-model", { asset: ref.id });
   expect(model.mesh).toBe(ref.id);
   expect(model.capabilities.hasRig).toBe(false);
   expect(model.bones).toEqual([]);
