@@ -1,6 +1,6 @@
 # CI / reproducible gate
 
-`tools/ci/check.sh` is the single reproducible gate for the engine + CEF editor. It runs ten
+`tools/ci/check.sh` is the single reproducible gate for the engine + CEF editor. It runs eleven
 steps in dependency order, accumulates
 failures (a failure in any one turns the whole gate red), and prints a per-step pass/fail
 summary ending in a clear `ALL GATES PASSED` / `SOME GATES FAILED` verdict.
@@ -24,15 +24,20 @@ summary ending in a clear `ALL GATES PASSED` / `SOME GATES FAILED` verdict.
    `assertRawU64` tripwire.
 7. **project startup smoke** — `tools/check-projects/check.sh` boots the host on a project,
    imports a model + texture, saves, restarts, and re-reads — asserting the on-disk asset layout.
-8. **e2e** — the `tests/e2e` bun suite against the host (`SAFFRON_ANIMA_BIN` repointed at
+8. **performance budgets** — `tools/bench-foliage-phase1/check.ts` re-measures the phase-1 fixture
+   and grades the fresh p95s and counters against `benchmarks/foliage-veg/phase-1-<device>.json`
+   for *this* device. Hardware with no record of its own defers rather than borrowing another
+   class's ceiling; a breach must reproduce before it fails.
+9. **e2e** — the `tests/e2e` bun suite against the host (`SAFFRON_ANIMA_BIN` repointed at
    `engine/target/debug/saffron-host`).
-9. **frontend** — `editor/` `bun run build` (gen `@saffron/protocol` → `tsc` → `vite build`) +
+10. **frontend** — `editor/` `bun run build` (gen `@saffron/protocol` → `tsc` → `vite build`) +
    `bun test`.
-10. **lint** — `cargo fmt --check` + `cargo clippy --workspace -- -D warnings`.
+11. **lint** — `cargo fmt --check` + `cargo clippy --workspace -- -D warnings`.
 
-The four standing gates are *in* the sequence, not adjacent to it: validation-clean (step 5),
-the control-schema contract (step 6), golden/snapshot + the cross-arch determinism gate (inside
-step 3's `cargo test`), and the e2e validation-clean assertions (step 8).
+The five standing gates are *in* the sequence, not adjacent to it: validation-clean (step 5),
+the control-schema contract (step 6), the recorded performance budgets (step 8, with the records'
+own derivation held inside step 3's `cargo test`), golden/snapshot + the cross-arch determinism
+gate (also inside step 3), and the e2e validation-clean assertions (step 9).
 
 ## Prerequisites
 
@@ -41,8 +46,9 @@ You need, all at once:
 
 - the toolbox (Rust toolchain via `rust-toolchain.toml`, Vulkan 1.4 headers/loader/validation/
   tools, SDL3/winit display deps, slang) — see `AGENTS.md`;
-- the **host bun** on `PATH` (steps 6–9 — the contract test, e2e, and frontend);
-- a **display** — steps 5–8 open a Vulkan swapchain, so run a headless weston compositor and
+- the **host bun** on `PATH` (steps 6–10 — the contract test, the budget grading, e2e, and
+  frontend);
+- a **display** — steps 5–9 open a Vulkan swapchain, so run a headless weston compositor and
   point SDL at it.
 
 ## Local one-liner (the everyday gate)

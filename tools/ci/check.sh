@@ -22,12 +22,15 @@
 #   3. unit + crate tests        cargo test --workspace (inline #[cfg(test)] + tests/, incl. the
 #                                golden/snapshot tests and the physics determinism gate)
 #   4. self-test-removal grep    no run*SelfTest / SAFFRON_SELFTEST / fn *self_test outside #[cfg(test)]
+#   4b. draw-path tripwire       no retired CPU draw-list / meshlet / raster-toggle symbol
+#   4c. front-door assertion     every Pipelines::request_* PSO has a caller outside test code
 #   5. present-only smoke        SAFFRON_EXIT_AFTER_FRAMES=5 + validation-clean log grep
 #   6. control-schema contract   check-control-schema/check.ts against the live host
 #   7. project startup smoke     check-projects/check.sh against the live host
-#   8. e2e                       tsc --noEmit over tests/e2e, then the bun suite against the host
-#   9. frontend                  editor/ bun run build + bun test
-#  10. lint                      cargo fmt --check + cargo clippy --workspace -- -D warnings
+#   8. performance budgets       bench-foliage-phase1/check.ts vs this device's recorded ceilings
+#   9. e2e                       tsc --noEmit over tests/e2e, then the bun suite against the host
+#  10. frontend                  editor/ bun run build + bun test
+#  11. lint                      cargo fmt --check + cargo clippy --workspace -- -D warnings
 #
 # A step whose prerequisite this environment lacks DEFERS with a reason instead of failing.
 set -uo pipefail
@@ -118,17 +121,29 @@ else
   fail_step "3. unit + crate tests" "cargo test --workspace"
 fi
 
-step "4. self-test-removal assertion (no runtime run*SelfTest / SAFFRON_SELFTEST / fn *self_test)"
-# Any of the three patterns outside a `#[cfg(test)]` module is a runtime self-test and fails.
-selftest_hits="$(
-  find "$ENGINE" -name '*.rs' -not -path '*/target/*' -print0 | xargs -0 awk '
-    /^#\[cfg\(test\)\]/ { intest = 1 }
-    /run[A-Za-z]+SelfTest|SAFFRON_SELFTEST|fn [A-Za-z0-9_]*self_test/ {
-      line = $0; sub(/^[ \t]+/, "", line)
-      if (line ~ /^\/\//) next
-      if (!intest) { print FILENAME ":" FNR ": " $0 }
-    }
+# Every line of a Rust tree that ships, as `file:line: text`: the test-only files (`tests.rs`, a
+# `tests/` directory) are dropped whole, and a `#[cfg(test)]` attribute hides the one line it
+# annotates when that line is a complete item (a `mod tests;` declaration, a test-only `use`) and
+# the rest of the file otherwise — which is where the convention puts an inline test module. The
+# steps below ask what production reaches, so a fixture's line must never answer for it. Build
+# output is excluded under both spellings: a private `CARGO_TARGET_DIR=engine/target-<name>` is the
+# convention for building off the shared cache, and its generated sources are not this tree's.
+production_lines() {
+  find "$1" -name '*.rs' -not -path '*/target/*' -not -path '*/target-*/*' -print0 | xargs -0 awk '
+    FNR == 1 { intest = (FILENAME ~ /\/tests\// || FILENAME ~ /tests\.rs$/); pending = 0 }
+    pending { pending = 0; if ($0 ~ /;[ \t]*$/) next; intest = 1; next }
+    /^[ \t]*#\[cfg\(test\)\]/ { pending = 1; next }
+    !intest { print FILENAME ":" FNR ": " $0 }
   '
+}
+
+step "4. self-test-removal assertion (no runtime run*SelfTest / SAFFRON_SELFTEST / fn *self_test)"
+# Any of the three patterns outside a `#[cfg(test)]` module is a runtime self-test and fails. A
+# commented-out mention is prose, not a self-test.
+selftest_hits="$(
+  production_lines "$ENGINE" |
+    grep -E 'run[A-Za-z]+SelfTest|SAFFRON_SELFTEST|fn [A-Za-z0-9_]*self_test' |
+    grep -vE ':[0-9]+:[[:space:]]*//' || true
 )"
 if [ -z "$selftest_hits" ]; then
   pass_step "4. self-test-removal assertion"
@@ -139,15 +154,19 @@ fi
 
 step "4b. draw-path tripwire (one production draw path, no retired symbol survives)"
 # The persistent GPU scene's visibility traversal binned into counted-indirect executor draws is
-# the ONE production draw path. Every identifier below named a path that path replaced: the CPU
-# gather/batcher types and their recorders, the per-instance meshlet loop, the retired raster
-# env toggle (`SAFFRON_MESH_EXECUTOR` selects the mesh executor now), and the second executor
-# depth PSO + shader pair that once shadowed the übershader's depth pre-pass. A hit in engine
-# source or in the shader tree means one of them is back.
+# the ONE production draw path. Each pattern names something the engine must not contain, matched
+# by class rather than by spelling: a `DrawList` type or a `<verb>_draw_list` function (a CPU draw
+# gather, a batcher, or a per-pass recorder of either), a per-instance meshlet loop, the
+# `SAFFRON_MESH_SHADER` raster toggle (the mesh executor is selected by the device's capabilities,
+# with `set-mesh-executor` to switch a running host), and any executor depth PSO or shader beside
+# the übershader's own depth pre-pass.
+# `crate::draw_list` — the module holding the frame's deformation state, resolved material
+# vocabulary, and render counters — is the one bare occurrence the class patterns deliberately do
+# not match. A hit in engine source or in the shader tree fails the gate.
 tripwire_hits="$(
-  grep -rnE 'DrawItem|DrawBatch|SceneDrawList|scene_draw_list|submit_draw_list|gather_static_draw_list|record_scene_draw_list|record_transparent_draw_list|SAFFRON_MESH_SHADER|MeshletRaster|record_meshlet_draws|scene_executor_depth' \
+  grep -rnE 'DrawItem|DrawBatch|[A-Za-z]*DrawList|[a-z]+_draw_list|SAFFRON_MESH_SHADER|MeshletRaster|record_meshlet_draws|scene_executor_depth' \
     "$ENGINE/crates" --include='*.rs' 2>/dev/null || true
-  # The retired shader pair, by filename as well as by reference: a resurrected entry point is a
+  # The shader pair by filename as well as by reference: a resurrected entry point arrives as a
   # new source file, and its name is the only thing a content grep would miss.
   find "$ENGINE/assets/shaders" -name 'scene_executor_depth*' -print 2>/dev/null || true
   grep -rnE 'scene_executor_depth' "$ENGINE/assets/shaders" 2>/dev/null || true
@@ -157,6 +176,28 @@ if [ -z "$tripwire_hits" ]; then
 else
   echo "$tripwire_hits" >&2
   fail_step "4b. draw-path tripwire" "a retired CPU draw-path symbol survives (see above)"
+fi
+
+step "4c. render-path front-door assertion (no PSO exists only for a test)"
+# A `Pipelines::request_*` front door whose only callers are fixtures is a second render path
+# built to make one test render, next to the production path it duplicates. A door with no
+# production caller fails the gate: either wire it into a pass or delete it with its shader.
+frontdoor_corpus="$(mktemp)"
+production_lines "$ENGINE/crates" >"$frontdoor_corpus"
+frontdoor_hits=""
+for door in $(grep -hoE 'pub fn request_[a-z0-9_]+' "$ENGINE"/crates/rendering/src/pipelines/*.rs |
+  sed 's/pub fn //' | sort -u); do
+  if ! grep -qE "(\.|Pipelines::)$door\(" "$frontdoor_corpus"; then
+    frontdoor_hits="${frontdoor_hits}Pipelines::$door has no caller outside test code
+"
+  fi
+done
+rm -f "$frontdoor_corpus"
+if [ -z "$frontdoor_hits" ]; then
+  pass_step "4c. render-path front-door assertion"
+else
+  printf '%s' "$frontdoor_hits" >&2
+  fail_step "4c. render-path front-door assertion" "a PSO front door is reachable only from tests (see above)"
 fi
 
 step "5. present-only smoke (bounded, headless) + validation-clean log grep"
@@ -203,44 +244,67 @@ else
   fail_step "7. project smoke" "the Rust host did not boot + answer ping (see probe log)"
 fi
 
-step "8. e2e (tsc --noEmit over the suite, then the tests/e2e bun suite against the Rust host)"
+step "8. performance budgets (re-measure the phase-1 fixture against this device's record)"
+# Runs ahead of the e2e suite so the measurement is taken on a machine this gate has not yet
+# loaded. It grades only the device it is running on: a checkout on hardware with no record in
+# benchmarks/foliage-veg/ defers rather than borrowing another class's ceiling.
 if ! command -v bun >/dev/null; then
-  defer_step "8. e2e" "e2e — bun not on PATH (add /var/home/saffronjam/.bun/bin)"
-elif host_ready; then
+  defer_step "8. performance budgets" "performance budgets — bun not on PATH (add /var/home/saffronjam/.bun/bin)"
+elif ! host_ready; then
+  fail_step "8. performance budgets" "the Rust host did not boot + answer ping (see probe log)"
+else
+  budget_log="/tmp/sa-ci-budget-$$.log"
+  ( cd "$REPO" && SAFFRON_ANIMA_BIN="$RUST_HOST" bun tools/bench-foliage-phase1/check.ts ) 2>&1 |
+    tee "$budget_log"
+  budget_status=${PIPESTATUS[0]}
+  case "$budget_status" in
+    0) pass_step "8. performance budgets" ;;
+    2) defer_step "8. performance budgets" \
+      "performance budgets — $(grep -m1 '^DEFER: ' "$budget_log" | cut -d' ' -f2-)" ;;
+    *) fail_step "8. performance budgets" "phase-1 budgets (see the graded legs above)" ;;
+  esac
+  rm -f "$budget_log"
+fi
+
+step "9. e2e (tsc --noEmit over the suite, then the tests/e2e bun suite against the Rust host)"
+if ! command -v bun >/dev/null; then
+  defer_step "9. e2e" "e2e — bun not on PATH (add /var/home/saffronjam/.bun/bin)"
+else
   rm -f /tmp/saffron-e2e-*.sock 2>/dev/null || true
   # `bun test` strips types without checking them, so the suite's assertions only stay bound to the
-  # generated @saffron/protocol types while `tsc` runs over them here.
+  # generated @saffron/protocol types while `tsc` runs over them here. It needs no host, so it runs
+  # ahead of the boot probe and reports a type error even when nothing can execute.
   if ! ( cd "$REPO/tests/e2e" && bun install --frozen-lockfile ); then
-    fail_step "8. e2e" "tests/e2e dependency install (bun install --frozen-lockfile)"
+    fail_step "9. e2e" "tests/e2e dependency install (bun install --frozen-lockfile)"
   elif ! ( cd "$REPO/tests/e2e" && bun run typecheck ); then
-    fail_step "8. e2e" "tests/e2e typecheck"
+    fail_step "9. e2e" "tests/e2e typecheck"
+  elif ! host_ready; then
+    fail_step "9. e2e" "the Rust host did not boot + answer ping (see probe log)"
   elif ( cd "$REPO/tests/e2e" && SAFFRON_ANIMA_BIN="$RUST_HOST" bun test --timeout 30000 --max-concurrency 4 ); then
-    pass_step "8. e2e"
+    pass_step "9. e2e"
   else
-    fail_step "8. e2e" "e2e suite"
+    fail_step "9. e2e" "e2e suite"
   fi
-else
-  fail_step "8. e2e" "the Rust host did not boot + answer ping (see probe log)"
 fi
 
-step "9. frontend: gen @saffron/protocol + tsc --noEmit + vite build + unit tests"
+step "10. frontend: gen @saffron/protocol + tsc --noEmit + vite build + unit tests"
 if ! command -v bun >/dev/null; then
-  defer_step "9. frontend" "frontend build — bun not on PATH (add /var/home/saffronjam/.bun/bin)"
+  defer_step "10. frontend" "frontend build — bun not on PATH (add /var/home/saffronjam/.bun/bin)"
 elif [ ! -x "$REPO/editor/node_modules/.bin/tsc" ]; then
-  defer_step "9. frontend" "frontend build — editor deps not installed (run \`cd editor && bun install\`)"
+  defer_step "10. frontend" "frontend build — editor deps not installed (run \`cd editor && bun install\`)"
 else
   if ( cd "$REPO/editor" && bun run build && bun test ); then
-    pass_step "9. frontend"
+    pass_step "10. frontend"
   else
-    fail_step "9. frontend" "frontend build/tests"
+    fail_step "10. frontend" "frontend build/tests"
   fi
 fi
 
-step "10. lint (cargo fmt --check + cargo clippy --workspace -- -D warnings)"
+step "11. lint (cargo fmt --check + cargo clippy --workspace -- -D warnings)"
 lint_ok=0
 ( cd "$ENGINE" && cargo fmt --check ) || lint_ok=1
 ( cd "$ENGINE" && cargo clippy --workspace -- -D warnings ) || lint_ok=1
-if [ "$lint_ok" -eq 0 ]; then pass_step "10. lint"; else fail_step "10. lint" "cargo fmt --check / cargo clippy --workspace -- -D warnings"; fi
+if [ "$lint_ok" -eq 0 ]; then pass_step "11. lint"; else fail_step "11. lint" "cargo fmt --check / cargo clippy --workspace -- -D warnings"; fi
 
 echo
 echo "=== per-step verdict ==="
