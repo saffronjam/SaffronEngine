@@ -128,8 +128,9 @@ pub const GPU_SCENE_INSTANCE_FLAG_WIND: u32 = 32;
 
 /// One wind-deformed instance's prepass output: the full sway displacement at the
 /// instance's bounds top for the current and previous frame times, the reciprocal
-/// of the local bounds-top height, and the world-space cull slack covering both
-/// sways. The device buffer holds one record per instance slot.
+/// of the local bounds-top height, and the world-space cull slack — both the whole
+/// instance's total and the per-term magnitudes a box weighs by its own height. The
+/// device buffer holds one record per instance slot.
 #[repr(C, align(16))]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Pod, Zeroable)]
 pub struct GpuWindInstanceRecord {
@@ -139,8 +140,8 @@ pub struct GpuWindInstanceRecord {
     pub height_scale: f32,
     /// World-space sway at the bounds top, previous frame time.
     pub sway_previous: [f32; 3],
-    /// Cull slack in metres: the larger sway magnitude plus the larger interaction
-    /// magnitude.
+    /// Whole-instance cull slack in metres: every deformation term at full height
+    /// weight. The instance-sphere test adds this; a box tests with its own weight.
     pub bounds_inflation: f32,
     /// World interaction-field displacement at the root, current frame.
     pub interaction_current: [f32; 3],
@@ -151,8 +152,10 @@ pub struct GpuWindInstanceRecord {
     /// The previous frame's interaction displacement (the field is stateful, so the
     /// prepass carries it forward from the record rather than recomputing).
     pub interaction_previous: [f32; 3],
-    /// Reserved ABI word.
-    pub reserved1: f32,
+    /// The larger sway magnitude alone, in metres. The vertex path scales sway by the
+    /// square of a vertex's height weight, so a box that knows its own height derives
+    /// its own slack from this instead of taking the whole instance's.
+    pub sway_slack: f32,
     /// Branch-mode quadrature (sin, cos of the mode angle) at the current and the
     /// previous frame's time — a per-use phase offset applies as
     /// `sin(ωt+φ) = s·cosφ + c·sinφ`, so time never reaches the vertex path.
@@ -161,11 +164,49 @@ pub struct GpuWindInstanceRecord {
     pub branch_amplitude: f32,
     /// Leaf-flutter amplitude in metres.
     pub flutter_amplitude: f32,
-    /// Reserved ABI words.
-    pub reserved2: [f32; 2],
+    /// The larger interaction magnitude alone, in metres. The vertex path scales
+    /// interaction by the height weight itself, not its square.
+    pub interaction_slack: f32,
+    /// Reserved ABI word.
+    pub reserved1: f32,
 }
 
 const _: () = assert!(size_of::<GpuWindInstanceRecord>() == 96);
+
+/// One world-interaction-field texel: the damped oscillator the step integrates. The stored
+/// world coordinate is absolute, so a texel the camera-centred window scrolled past reads as
+/// stale rather than as a neighbour's state.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Pod, Zeroable)]
+pub struct GpuInteractionTexel {
+    /// Horizontal displacement in metres.
+    pub displacement: [f32; 2],
+    /// Horizontal velocity in metres per second.
+    pub velocity: [f32; 2],
+    /// Ground depression in metres.
+    pub depress: f32,
+    /// Ground-depression velocity in metres per second.
+    pub depress_velocity: f32,
+    /// The absolute world texel coordinate this slot holds state for.
+    pub world_coord: [i32; 2],
+}
+
+const _: () = assert!(size_of::<GpuInteractionTexel>() == GPU_INTERACTION_TEXEL_SIZE as usize);
+
+/// The world interaction field's header: each cascade's centre texel in absolute world texel
+/// coordinates, plus the field generation.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Pod, Zeroable)]
+pub struct GpuInteractionHeader {
+    /// Per-cascade centre texel in absolute world texel coordinates.
+    pub center_texel: [[i32; 2]; GPU_INTERACTION_CASCADES as usize],
+    /// Monotonic field generation.
+    pub generation: u32,
+    /// Reserved ABI words.
+    pub reserved: [u32; 3],
+}
+
+const _: () = assert!(size_of::<GpuInteractionHeader>() == GPU_INTERACTION_HEADER_SIZE as usize);
 
 /// Cascades of the world interaction field.
 pub const GPU_INTERACTION_CASCADES: u32 = 2;

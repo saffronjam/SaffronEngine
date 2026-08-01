@@ -483,6 +483,78 @@ fn ray_candidate_classification_matches_the_cpu_classifier() {
             .expect("record");
         run_graph(&device, &mut graph);
 
+        // A cluster-composed structure resolves through its own tables: the candidate's geometry
+        // index is a cluster ordinal and its primitive is cluster-local, so neither addresses the
+        // shared index stream. The two clusters here sit in the OPPOSITE order to the submeshes
+        // they came from, which is what the cooked cache-optimized cluster order looks like and
+        // what a resolver reading the submesh slice directly gets wrong.
+        let cluster_records = [
+            crate::ClusterResolutionRecord {
+                submesh_element: 1,
+                first_corner: 0,
+                triangle_count: 1,
+                reserved: 0,
+            },
+            crate::ClusterResolutionRecord {
+                submesh_element: 0,
+                first_corner: 3,
+                triangle_count: 1,
+                reserved: 0,
+            },
+        ];
+        let cluster_corners: [u32; 6] = [1, 3, 2, 0, 1, 2];
+        let device_buffer = |bytes: &[u8]| {
+            crate::Buffer::from_slice_with_usage(
+                device.resources(),
+                bytes,
+                vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS,
+            )
+            .expect("device buffer")
+        };
+        let cluster_record_buffer = device_buffer(bytemuck::cast_slice(&cluster_records));
+        let cluster_corner_buffer = device_buffer(bytemuck::cast_slice(&cluster_corners));
+
+        // The per-frame identity table the packer writes and `gpuSceneRayInstance` reads back.
+        let ray_instances = [
+            crate::GpuRayInstanceRecord {
+                instance_slot: instance.raw().index,
+                first_submesh: 0,
+                cluster_count: 0,
+                reserved: 0,
+                cluster_records: 0,
+                cluster_corners: 0,
+            },
+            crate::GpuRayInstanceRecord {
+                instance_slot: instance.raw().index,
+                first_submesh: 1,
+                cluster_count: 0,
+                reserved: 0,
+                cluster_records: 0,
+                cluster_corners: 0,
+            },
+            crate::GpuRayInstanceRecord {
+                instance_slot: crate::RT_UNMIRRORED_INSTANCE,
+                first_submesh: 0,
+                cluster_count: 0,
+                reserved: 0,
+                cluster_records: 0,
+                cluster_corners: 0,
+            },
+            crate::GpuRayInstanceRecord {
+                instance_slot: instance.raw().index,
+                first_submesh: 0,
+                cluster_count: 2,
+                reserved: 0,
+                cluster_records: device.buffer_device_address(cluster_record_buffer.handle()),
+                cluster_corners: device.buffer_device_address(cluster_corner_buffer.handle()),
+            },
+        ];
+        let ray_instance_buffer = device_buffer(bytemuck::cast_slice(&ray_instances));
+        let ray_instance_addresses = (
+            device.buffer_device_address(ray_instance_buffer.handle()),
+            ray_instances.len() as u32,
+        );
+
         const PHASE: u32 = 5;
         let block = uploader.build_address_block(
             &device,
@@ -494,45 +566,47 @@ fn ray_candidate_classification_matches_the_cpu_classifier() {
             0,
             0,
             crate::DisplacedFrameAddresses::default(),
-            (0, 0),
+            ray_instance_addresses,
             PHASE,
         );
 
-        // (instance slot, first submesh, geometry index, primitive, sampled alpha,
-        // barycentrics). Each candidate names its submesh by `firstSubmesh + geometryIndex`
-        // and its primitive within that submesh's own index slice, which is what a traced
-        // candidate carries. Cases: geometry 0's default material, geometry 1's override,
-        // an out-of-capacity instance, an out-of-range primitive, the same geometry index
-        // rebased by a span start (an assembly prototype's structure), and a span start that
-        // walks off the submesh table.
-        let cases: [(u32, u32, u32, u32, f32, [f32; 2]); 6] = [
-            (instance.raw().index, 0, 0, 0, 0.625, [0.25, 0.5]),
-            (instance.raw().index, 0, 1, 0, 0.375, [0.5, 0.25]),
-            (u32::MAX, 0, 0, 0, 0.5, [0.25, 0.25]),
-            (instance.raw().index, 0, 0, 99, 0.5, [0.25, 0.25]),
-            (instance.raw().index, 1, 0, 0, 0.375, [0.5, 0.25]),
-            (instance.raw().index, 1, 1, 0, 0.5, [0.25, 0.25]),
+        // (ray instance, geometry index, primitive, sampled alpha, barycentrics). Each candidate
+        // names its identity by the `instanceCustomIndex` the packer wrote, which is a row of the
+        // table above; a triangle build then names its submesh by `firstSubmesh + geometryIndex`
+        // and its primitive within that submesh's own index slice.
+        let cases: [(u32, u32, u32, f32, [f32; 2]); 10] = [
+            (0, 0, 0, 0.625, [0.25, 0.5]),
+            (0, 1, 0, 0.375, [0.5, 0.25]),
+            (2, 0, 0, 0.5, [0.25, 0.25]),
+            (0, 0, 99, 0.5, [0.25, 0.25]),
+            (1, 0, 0, 0.375, [0.5, 0.25]),
+            (1, 1, 0, 0.5, [0.25, 0.25]),
+            (4, 0, 0, 0.5, [0.25, 0.25]),
+            (3, 0, 0, 0.375, [0.5, 0.25]),
+            (3, 1, 0, 0.625, [0.25, 0.5]),
+            (3, 2, 0, 0.5, [0.25, 0.25]),
         ];
         let mut case_bytes = Vec::with_capacity(cases.len() * 32);
-        for (slot, first_submesh, geometry, primitive, sampled, barycentrics) in cases {
+        for (ray_instance, geometry, primitive, sampled, barycentrics) in cases {
             for word in [
-                slot,
+                ray_instance,
                 primitive,
                 sampled.to_bits(),
-                first_submesh,
+                geometry,
                 barycentrics[0].to_bits(),
                 barycentrics[1].to_bits(),
-                geometry,
+                0,
                 0,
             ] {
                 case_bytes.extend_from_slice(&word.to_le_bytes());
             }
         }
+        const WORDS: usize = 20;
         let outputs = run_compute(
             std::sync::Arc::clone(&device),
             "gpu_scene_candidate_test",
             vec![
-                ComputeBuffer::zeroed(cases.len() * 16 * size_of::<u32>()),
+                ComputeBuffer::zeroed(cases.len() * WORDS * size_of::<u32>()),
                 ComputeBuffer::from_bytes(bytemuck::bytes_of(&block).to_vec()),
                 ComputeBuffer::from_bytes(case_bytes),
             ],
@@ -543,6 +617,7 @@ fn ray_candidate_classification_matches_the_cpu_classifier() {
             .chunks_exact(4)
             .map(|chunk| u32::from_le_bytes(chunk.try_into().unwrap()))
             .collect();
+        let case = |index: usize| &words[index * WORDS..(index + 1) * WORDS];
 
         // Case 0: primitive 0 (v0/v1/v2), weights (0.25, 0.25, 0.5) → uv/anchor
         // (0.25, 0.5); the slot-0 default masked albedo-alpha material.
@@ -562,7 +637,10 @@ fn ray_candidate_classification_matches_the_cpu_classifier() {
             false,
             false,
         );
-        let case0 = &words[0..16];
+        let case0 = case(0);
+        assert_eq!(case0[16], instance.raw().index, "case 0 reads its identity");
+        assert_eq!(case0[17], 0, "case 0 span start");
+        assert_eq!(case0[18], 0, "case 0 is a triangle build");
         assert_eq!(case0[0], 1, "case 0 resolves");
         assert_eq!(case0[1], 0.25_f32.to_bits(), "case 0 uv.x");
         assert_eq!(case0[2], 0.5_f32.to_bits(), "case 0 uv.y");
@@ -598,7 +676,7 @@ fn ray_candidate_classification_matches_the_cpu_classifier() {
             true,
             false,
         );
-        let case1 = &words[16..32];
+        let case1 = case(1);
         assert_eq!(case1[0], 1, "case 1 resolves");
         assert_eq!(case1[1], 0.75_f32.to_bits(), "case 1 uv.x");
         assert_eq!(case1[2], 0.75_f32.to_bits(), "case 1 uv.y");
@@ -613,25 +691,42 @@ fn ray_candidate_classification_matches_the_cpu_classifier() {
         assert_eq!(case1[14], 0.25_f32.to_bits(), "case 1 cutoff");
         assert_eq!(case1[15], CANONICAL_SALT[0], "case 1 salt low word");
 
-        // Cases 2, 3 and 5 do not resolve; the ray verdict falls back to covered.
+        // These do not resolve; the ray verdict falls back to covered.
         for (index, label) in [
-            (2, "out-of-capacity instance"),
+            (2, "unmirrored identity"),
             (3, "out-of-range primitive"),
             (5, "span start past the submesh table"),
+            (6, "ray instance past the table bound"),
+            (9, "geometry index past the cluster count"),
         ] {
-            let case = &words[index * 16..(index + 1) * 16];
-            assert_eq!(case[0], 0, "{label} stays unresolved");
-            assert_eq!(case[12], 1.0_f32.to_bits(), "{label} alpha");
-            assert_eq!(case[13], 1, "{label} counts as covered");
+            let row = case(index);
+            assert_eq!(row[0], 0, "{label} stays unresolved");
+            assert_eq!(row[12], 1.0_f32.to_bits(), "{label} alpha");
+            assert_eq!(row[13], 1, "{label} counts as covered");
         }
+        // The two unresolved-identity cases fail for different reasons, and the identity words
+        // separate them: row 2 is a mirrored table read of the unmirrored sentinel, row 6 is
+        // past `rayInstanceCount` and never read at all — both surface the sentinel, which is
+        // exactly why the resolver must treat the sentinel as unresolvable.
+        assert_eq!(
+            case(2)[16],
+            crate::RT_UNMIRRORED_INSTANCE,
+            "the unmirrored sentinel comes back from the table"
+        );
+        assert_eq!(
+            case(6)[16],
+            crate::RT_UNMIRRORED_INSTANCE,
+            "an index at the table bound reads as unmirrored rather than out of bounds"
+        );
 
         // Case 4: geometry index 0 rebased by a span start of one resolves the SAME submesh
         // case 1 reached through geometry index 1 — the assembly-prototype path, where a
         // structure's geometry 0 is its span's first submesh rather than the family's. A
         // resolver that ignored the span start would answer with case 0's default material
         // instead, so this pins the rebase rather than the arithmetic around it.
-        let case4 = &words[64..80];
+        let case4 = case(4);
         assert_eq!(case4[0], 1, "case 4 resolves");
+        assert_eq!(case4[17], 1, "case 4's identity carries the span start");
         assert_eq!(
             case4[1], case1[1],
             "case 4 uv.x matches the rebased submesh"
@@ -641,7 +736,43 @@ fn ray_candidate_classification_matches_the_cpu_classifier() {
         assert_eq!(case4[14], 0.25_f32.to_bits(), "case 4 cutoff");
         assert_eq!(case4[15], CANONICAL_SALT[0], "case 4 salt low word");
 
+        // Cases 7 and 8: the cluster-composed structure. Cluster ordinal 0 carries submesh 1's
+        // triangle and ordinal 1 carries submesh 0's, so a resolver that read `firstSubmesh +
+        // geometryIndex` and the submesh's own index slice — which is what a triangle build
+        // means — would answer each with the other's material and UV.
+        let case7 = case(7);
+        assert_eq!(case7[18], 2, "case 7's identity is cluster-composed");
+        assert_eq!(case7[19], 1, "case 7 carries a corner stream");
+        assert_eq!(case7[0], 1, "case 7 resolves");
+        assert_eq!(
+            case7[1], case1[1],
+            "cluster 0 lands on submesh 1's triangle"
+        );
+        assert_eq!(case7[2], case1[2], "cluster 0 uv.y");
+        assert_eq!(
+            case7[6],
+            CoverageSourceKind::Texture as u32,
+            "cluster 0 reads submesh 1's overridden material"
+        );
+        assert_eq!(case7[14], 0.25_f32.to_bits(), "cluster 0 cutoff");
+        let case8 = case(8);
+        assert_eq!(case8[0], 1, "case 8 resolves");
+        assert_eq!(
+            case8[1], case0[1],
+            "cluster 1 lands on submesh 0's triangle"
+        );
+        assert_eq!(case8[2], case0[2], "cluster 1 uv.y");
+        assert_eq!(
+            case8[6],
+            CoverageSourceKind::AlbedoAlpha as u32,
+            "cluster 1 reads submesh 0's default material"
+        );
+        assert_eq!(case8[14], 0.5_f32.to_bits(), "cluster 1 cutoff");
+
         device.wait_idle().expect("idle");
+        drop(ray_instance_buffer);
+        drop(cluster_corner_buffer);
+        drop(cluster_record_buffer);
         drop(gpu_scene);
         drop(uploader);
         drop(gpu_data);

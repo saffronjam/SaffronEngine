@@ -81,9 +81,17 @@ pub struct GpuPageClusterRecord {
     pub bounds_max: [f32; 3],
     /// Quantized cone axis and conservative cutoff, packed `i8x4` little-endian.
     pub cone: u32,
+    /// Conservative swept cluster minimum, local metres.
+    pub deformed_min: [f32; 3],
+    /// Padding: std430 starts a three-component vector on a 16-byte boundary.
+    pub reserved0: u32,
+    /// Conservative swept cluster maximum, local metres.
+    pub deformed_max: [f32; 3],
+    /// Padding: std430 starts a three-component vector on a 16-byte boundary.
+    pub reserved1: u32,
 }
 
-const _: () = assert!(size_of::<GpuPageClusterRecord>() == 48);
+const _: () = assert!(size_of::<GpuPageClusterRecord>() == 80);
 
 /// One voxel-surface vertex within a page payload.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Pod, Zeroable)]
@@ -275,6 +283,10 @@ pub fn build_page_payload(
                     appearance_total: cluster.appearance_error.total,
                     bounds_max: bounds_max(&cluster.bounds),
                     cone: u32::from_le_bytes(cluster.cone.map(|axis| axis as u8)),
+                    deformed_min: bounds_min(&cluster.deformed_bounds),
+                    reserved0: 0,
+                    deformed_max: bounds_max(&cluster.deformed_bounds),
+                    reserved1: 0,
                 });
             }
             header.cluster_count = u32::try_from(clusters.len())
@@ -423,6 +435,22 @@ mod tests {
                         for local in &cluster.local_indices {
                             expected.push(cluster.source_vertices[*local as usize]);
                         }
+                        let record = &records[(cluster_index - first) as usize];
+                        assert_eq!(
+                            record.deformed_min,
+                            bounds_min(&cluster.deformed_bounds),
+                            "the cluster's swept minimum reaches the record"
+                        );
+                        assert_eq!(
+                            record.deformed_max,
+                            bounds_max(&cluster.deformed_bounds),
+                            "the cluster's swept maximum reaches the record"
+                        );
+                        assert!(
+                            record.deformed_min <= record.bounds_min
+                                && record.deformed_max >= record.bounds_max,
+                            "swept bounds enclose the cluster's static bounds"
+                        );
                     }
                     assert_eq!(indices, expected, "geometry-relative index blob");
                     let total: u32 = records.iter().map(|record| record.index_count).sum();

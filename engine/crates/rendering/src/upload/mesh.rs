@@ -215,12 +215,19 @@ impl Uploader {
         if let Some(assembly) = assembly.as_mut() {
             let mut submesh = 0_usize;
             let mut prototype_spans = Vec::new();
-            for prototype in &hierarchy.prototypes {
+            for (index, prototype) in hierarchy.prototypes.iter().enumerate() {
                 let start = submesh.min(mesh.submeshes.len());
                 let end = (submesh + prototype.submesh_count as usize).min(mesh.submeshes.len());
                 let span = &mesh.submeshes[start..end];
                 let first_index = span.first().map_or(0, |s| s.first_index);
                 let index_count: u32 = span.iter().map(|s| s.index_count).sum();
+                // The vertex base comes from the part table rather than being re-accumulated
+                // here: the executor's vertex fetch reads that one, and two derivations of the
+                // same base is how a raster pass and a materialized ray slice come to disagree.
+                let first_vertex = assembly
+                    .prototypes
+                    .get(index)
+                    .map_or(0, |record| record.vertex_base);
                 assembly
                     .prototype_slices
                     .push(crate::AssemblyPrototypeSlice {
@@ -228,6 +235,8 @@ impl Uploader {
                         submesh_count: (end - start) as u32,
                         first_index,
                         index_count,
+                        first_vertex,
+                        vertex_count: prototype.vertex_count,
                     });
                 prototype_spans.push(start..end);
                 submesh += prototype.submesh_count as usize;
@@ -378,7 +387,7 @@ impl Uploader {
             index_count: mesh.indices.len() as u32,
             vertex_count: mesh.vertices.len() as u32,
             submeshes: mesh.submeshes.clone(),
-            cooked_opaque: submesh_opaque.iter().all(|&opaque| opaque),
+            submesh_opaque,
             micromaps: micromaps
                 .into_iter()
                 .map(|(_, micromap)| micromap)

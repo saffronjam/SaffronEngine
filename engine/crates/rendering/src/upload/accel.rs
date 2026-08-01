@@ -38,6 +38,15 @@ impl Uploader {
         &self,
         hierarchy: &PortableVirtualHierarchy,
     ) -> Vec<(u32, Arc<crate::Micromap>)> {
+        // Tally what the cook derived before any device or opt-out gate, so the derivation is
+        // measurable on a target that cannot attach a micromap at all.
+        for micromap in &hierarchy.opacity_micromaps {
+            self.resources.add_derived_micromap(
+                micromap.classes.0,
+                micromap.classes.1,
+                micromap.classes.2,
+            );
+        }
         // `SAFFRON_OMM=off` suppresses attachment: a micromap may only remove classifier work,
         // so the two must render the same picture, which is only testable if it can be turned off.
         if std::env::var("SAFFRON_OMM").is_ok_and(|value| value == "off") {
@@ -178,11 +187,14 @@ impl Uploader {
             .take(prototype as usize)
             .map(|prototype| u64::from(prototype.vertex_count))
             .sum();
+        let vertex_base = u32::try_from(vertex_base).map_err(|_| {
+            Error::InvalidUploadData("prototype vertex base exceeds u32".to_owned())
+        })?;
         let mut inputs = Vec::with_capacity(clusters.len());
         for cluster in &clusters {
             let mut positions = Vec::with_capacity(cluster.source_vertices.len());
             for source in &cluster.source_vertices {
-                let index = usize::try_from(vertex_base + u64::from(*source)).map_err(|_| {
+                let index = usize::try_from(vertex_base.saturating_add(*source)).map_err(|_| {
                     Error::InvalidUploadData("cluster vertex index exceeds usize".to_owned())
                 })?;
                 let Some(vertex) = mesh.vertices.get(index) else {
@@ -190,15 +202,26 @@ impl Uploader {
                 };
                 positions.push([vertex.position.x, vertex.position.y, vertex.position.z]);
             }
+            // Geometry-local corners for candidate resolution: the cluster's 8-bit corner picks
+            // one of its own vertices, which names a prototype vertex, which the prototype's base
+            // lifts into the family stream the resolver interpolates from.
+            let mut corners = Vec::with_capacity(cluster.local_indices.len());
+            for corner in &cluster.local_indices {
+                let Some(source) = cluster.source_vertices.get(*corner as usize) else {
+                    return Ok(None);
+                };
+                corners.push(vertex_base.saturating_add(*source));
+            }
             inputs.push(crate::rt_cluster::ClusterBuildInput {
                 cluster_id: cluster.id,
-                geometry_index: cluster.source_submesh,
+                submesh_element: cluster.source_submesh,
                 opaque: submesh_opaque
                     .get(span.start + cluster.source_submesh as usize)
                     .copied()
                     .unwrap_or(false),
                 positions,
                 local_indices: cluster.local_indices.clone(),
+                corners,
             });
         }
         let Some(plan) = builder.plan(&self.resources, &inputs)? else {

@@ -561,17 +561,25 @@ pub(super) fn create_logical_device(
     ))
 }
 
-/// Creates the VMA allocator over the ash instance/device.
+/// Creates the VMA allocator over the ash instance/device. `memory_budget` says whether
+/// `VK_EXT_memory_budget` was enabled on the device.
 pub(super) fn create_allocator(
     instance: &ash::Instance,
     device: &ash::Device,
     physical_device: vk::PhysicalDevice,
+    memory_budget: bool,
 ) -> Result<vk_mem::Allocator> {
     let mut create_info = vk_mem::AllocatorCreateInfo::new(instance, device, physical_device);
     create_info.vulkan_api_version = API_VERSION;
     // The required feature set enables bufferDeviceAddress, which AS builds need —
     // and VMA must know about it to size BDA-flagged allocations.
     create_info.flags = vk_mem::AllocatorCreateFlags::BUFFER_DEVICE_ADDRESS;
+    // Without this bit `vmaGetHeapBudgets` reports VMA's own block totals against a fraction of
+    // each heap's size; with it the figures come from the driver and cover every allocation on
+    // the adapter, which is what a residency budget is held against.
+    if memory_budget {
+        create_info.flags |= vk_mem::AllocatorCreateFlags::EXT_MEMORY_BUDGET;
+    }
 
     // SAFETY: the ash seam. The instance/device/physical-device handles are valid
     // for the allocator's whole lifetime (it is dropped before they are destroyed,

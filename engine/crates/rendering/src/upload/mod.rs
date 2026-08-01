@@ -76,6 +76,12 @@ pub struct GpuQueue {
     inner: Arc<Mutex<vk::Queue>>,
 }
 
+/// How many times a diagnostic query tries for the queue lock before giving up on it.
+const QUEUE_LOCK_ATTEMPTS: u32 = 20;
+
+/// How long a diagnostic query waits between attempts at the queue lock.
+const QUEUE_LOCK_BACKOFF: std::time::Duration = std::time::Duration::from_millis(10);
+
 // SAFETY: a `vk::Queue` is a raw handle; the `Mutex` provides the external
 // synchronization Vulkan requires for queue submission.
 unsafe impl Send for GpuQueue {}
@@ -114,6 +120,10 @@ impl GpuQueue {
 
     /// Logs the queue's last-reached diagnostic checkpoints after a device loss, so the log
     /// names the wedged submission. A no-op when the extension is absent.
+    ///
+    /// Takes the queue's external-synchronization lock without ever blocking on it: this also runs
+    /// on the hang-watchdog thread, and `vkDeviceWaitIdle` holds that lock for as long as the GPU
+    /// is stuck — the one situation in which the report must still come out.
     pub(crate) fn log_device_loss_checkpoints(
         &self,
         checkpoints: Option<&crate::checkpoints::Checkpoints>,
@@ -121,10 +131,33 @@ impl GpuQueue {
         let Some(checkpoints) = checkpoints else {
             return;
         };
-        let queue = self.inner.lock().expect("gpu queue mutex");
-        for line in checkpoints.last_reached(*queue) {
-            tracing::error!("device loss checkpoint: {line}");
+        for attempt in 0..QUEUE_LOCK_ATTEMPTS {
+            let Ok(queue) = self.inner.try_lock() else {
+                if attempt + 1 < QUEUE_LOCK_ATTEMPTS {
+                    std::thread::sleep(QUEUE_LOCK_BACKOFF);
+                }
+                continue;
+            };
+            for line in checkpoints.last_reached(*queue) {
+                tracing::error!("device loss checkpoint: {line}");
+            }
+            return;
         }
+        tracing::error!("device loss checkpoints unavailable: the queue is held by a blocked call");
+    }
+
+    /// Whether the device reports itself lost, asked with an empty submit: it enqueues no work and
+    /// waits for nothing, so it is the cheapest legal way to learn that the device is gone. `false`
+    /// while the queue's external-synchronization lock is held, so the caller asks again rather
+    /// than blocking behind a wedged wait.
+    pub(crate) fn reports_device_lost(&self, raw: &ash::Device) -> bool {
+        let Ok(queue) = self.inner.try_lock() else {
+            return false;
+        };
+        // SAFETY: the ash seam. The queue is externally synchronized by the guard held across the
+        // call; an empty batch list with a null fence submits nothing.
+        let probe = unsafe { raw.queue_submit2(*queue, &[], vk::Fence::null()) };
+        probe == Err(vk::Result::ERROR_DEVICE_LOST)
     }
 
     /// Presents one swapchain image under the same external-synchronization lock as submits.

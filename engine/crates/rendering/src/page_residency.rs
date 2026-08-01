@@ -38,7 +38,17 @@ pub struct PageDemandView {
     pub gi_min: saffron_geometry::glam::Vec3,
     /// Maximum corner of the reachable window.
     pub gi_max: saffron_geometry::glam::Vec3,
+    /// Wall interval this frame spans, so eye travel and an instance's `previous`→`current`
+    /// world transforms convert to metres per second. Zero disables the predictive lead.
+    pub frame_seconds: f32,
 }
+
+/// How far ahead page demand is scored.
+///
+/// A payload takes several frames to reach the arena, so the frontier is ranked at its closest
+/// approach over this horizon rather than at the frame's standing distance — otherwise the page a
+/// moving camera is about to need only outranks its neighbours once the camera is already on it.
+pub const PAGE_DEMAND_PREDICTION_SECONDS: f32 = 0.5;
 
 /// Ceiling for a CPU-predicted page-demand priority.
 ///

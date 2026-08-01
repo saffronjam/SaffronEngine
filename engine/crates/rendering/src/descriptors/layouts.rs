@@ -282,12 +282,13 @@ pub(super) fn instance_layout_bindings(
             .descriptor_type(vk::DescriptorType::UNIFORM_BUFFER)
             .descriptor_count(1)
             .stage_flags(scene_stages),
-        // The active view's semantic record stream the executor vertex path indexes.
+        // The active view's semantic record stream the executor vertex path indexes, and the
+        // selection fragment reads back through to answer a pick with the record's identity.
         vk::DescriptorSetLayoutBinding::default()
             .binding(4)
             .descriptor_type(storage)
             .descriptor_count(1)
-            .stage_flags(executor_stages),
+            .stage_flags(scene_stages),
         // The binner's indexed command stream. The indexed executor consumes it as draw
         // arguments; the mesh executor reads the same words as data, recovering its draw from
         // `SV_DrawIndex` and its triangle block from the group id.

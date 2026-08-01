@@ -497,7 +497,12 @@ impl Device {
         let compute_timestamp_valid_bits =
             compute_queue_family.map(|family| queue_families[family as usize].timestamp_valid_bits);
 
-        let allocator = create_allocator(&instance, &device, physical_device)?;
+        let allocator = create_allocator(
+            &instance,
+            &device,
+            physical_device,
+            selection.capabilities.memory_budget,
+        )?;
         let swapchain_loader = swapchain::Device::new(&instance, &device);
         // Resolve the acceleration-structure dispatch only when the RT extensions were
         // enabled on the device.
@@ -921,6 +926,23 @@ impl Device {
             self.log_device_loss_checkpoints();
         }
         result
+    }
+
+    /// Logs what the GPU was doing while a submission is wedged, for the hang watchdog. Reports
+    /// whether it logged anything.
+    ///
+    /// Both diagnostic queries read valid data only once the device is in the lost state
+    /// (`VUID-vkGetQueueCheckpointDataNV-queue-02025`,
+    /// `VUID-vkGetDeviceFaultInfoEXT-device-07336`), so a hang that has not become a loss reports
+    /// nothing rather than issuing an illegal query — the caller asks again as the hang continues.
+    pub fn log_hang_diagnostics(&self) -> bool {
+        if !crate::watchdog::device_lost_observed()
+            && !self.graphics_queue.reports_device_lost(self.raw())
+        {
+            return false;
+        }
+        self.log_device_loss_checkpoints();
+        true
     }
 
     /// Logs every queue's last-reached diagnostic checkpoints and the driver's fault report

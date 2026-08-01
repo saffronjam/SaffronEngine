@@ -33,12 +33,14 @@ pub struct GpuMesh {
     /// still references it frees memory the traversal reads — a fault that surfaces far from its
     /// cause. They live exactly as long as the mesh whose geometry they refine.
     pub micromaps: Vec<Arc<Micromap>>,
-    /// Whether every submesh's BLAS geometry was built `OPAQUE`, from the cooked material class.
+    /// Whether each submesh's BLAS geometry was built `OPAQUE`, from its cooked material class,
+    /// parallel to [`GpuMesh::submeshes`].
     ///
-    /// An entity compares its resolved materials against this to decide whether it must override
-    /// the structure's opacity. Equal means the geometry flags already say what the entity wants,
-    /// and the instance can leave them alone — which is what an attached micromap requires.
-    pub cooked_opaque: bool,
+    /// Per submesh because that is the granularity a structure carries opacity at: every build
+    /// over this mesh — the upload-time static one and each per-frame deforming refit — lays one
+    /// geometry per submesh with its own class. An entity compares its resolved materials against
+    /// [`GpuMesh::cooked_opaque`] to decide whether it must override the structure's opacity.
+    pub submesh_opaque: Vec<bool>,
     /// Local-space AABB minimum (for ray picking).
     pub bounds_min: Vec3,
     /// Local-space AABB maximum (for ray picking).
@@ -123,6 +125,24 @@ impl RtBlas {
             Self::Cluster(blas) => blas.size() + blas.clas_bytes(),
         }
     }
+
+    /// `(resolution table, corner stream, cluster count)` for a cluster-composed structure.
+    ///
+    /// A KHR build reports `None`: its geometry index already names a submesh and its primitive
+    /// index is a position in that submesh's slice of the shared stream. A cluster build reports
+    /// neither — its primitive index is cluster-local over a cache-optimized permutation — so a
+    /// candidate resolves through these two tables instead.
+    #[must_use]
+    pub fn cluster_resolution(&self) -> Option<(vk::DeviceAddress, vk::DeviceAddress, u32)> {
+        match self {
+            Self::Khr(_) => None,
+            Self::Cluster(blas) => Some((
+                blas.resolution_address(),
+                blas.corners_address(),
+                blas.cluster_count(),
+            )),
+        }
+    }
 }
 
 /// The assembly-part table a multi-prototype [`GpuMesh`] carries: the records the mirror
@@ -161,6 +181,12 @@ pub struct AssemblyPrototypeSlice {
     pub first_index: u32,
     /// Indices the run spans.
     pub index_count: u32,
+    /// First vertex of the prototype's run within the family's flattened vertex stream. The
+    /// index stream addresses family vertices absolutely, so anything that materializes one
+    /// prototype's geometry alone rebases by this.
+    pub first_vertex: u32,
+    /// Vertices the run spans.
+    pub vertex_count: u32,
 }
 
 impl MeshAssembly {
@@ -282,8 +308,8 @@ pub struct GpuMeshParts {
     pub vertex_count: u32,
     /// The draw ranges.
     pub submeshes: Vec<Submesh>,
-    /// Whether every submesh's geometry was built `OPAQUE` from its cooked material class.
-    pub cooked_opaque: bool,
+    /// Whether each submesh's geometry was built `OPAQUE` from its cooked material class.
+    pub submesh_opaque: Vec<bool>,
     /// The opacity micromaps the BLAS geometries reference; retained for the mesh's lifetime.
     pub micromaps: Vec<Arc<Micromap>>,
     /// Local-space AABB minimum.
@@ -327,7 +353,7 @@ impl GpuMesh {
             index_count: parts.index_count,
             vertex_count: parts.vertex_count,
             submeshes: parts.submeshes,
-            cooked_opaque: parts.cooked_opaque,
+            submesh_opaque: parts.submesh_opaque,
             micromaps: parts.micromaps,
             bounds_min: parts.bounds_min,
             bounds_max: parts.bounds_max,
@@ -341,6 +367,13 @@ impl GpuMesh {
             hierarchy_pages: parts.hierarchy_pages,
             assembly: parts.assembly,
         }
+    }
+
+    /// Whether every submesh classifies opaque, so an instance binding the cooked materials
+    /// needs no instance-level opacity override.
+    #[must_use]
+    pub fn cooked_opaque(&self) -> bool {
+        self.submesh_opaque.iter().all(|&opaque| opaque)
     }
 
     /// The per-mesh signed distance fields — one tight field per primitive (and per spatial

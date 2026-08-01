@@ -61,6 +61,46 @@ pub struct DeviceResources {
     /// than a per-frame figure because that is what the work is — structures are built when content
     /// arrives, not every frame.
     accel_build_ns: std::sync::atomic::AtomicU64,
+    /// Cooked opacity micromaps meshes have offered at upload, and the micro-triangle states
+    /// their derivation settled, summed over the session.
+    ///
+    /// Counted from the cooked hierarchy before any device gate, so it measures the derivation
+    /// rather than the attachment: a target without `VK_EXT_opacity_micromap` reports the same
+    /// figures as one with it, and the two together say whether a zero on the device side is an
+    /// absent extension or an empty cook.
+    omm_derived: [std::sync::atomic::AtomicU64; 4],
+}
+
+/// Device-local memory occupancy and headroom, in bytes.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct VramUsage {
+    /// Bytes currently occupied across the device-local heaps.
+    pub usage_bytes: u64,
+    /// Bytes the driver says this process may occupy across those heaps. Smaller than the heap
+    /// sizes whenever something else on the adapter holds memory.
+    pub budget_bytes: u64,
+}
+
+/// Folds the per-heap `(usage, budget)` pairs `vmaGetHeapBudgets` reports, keeping only the heaps
+/// flagged `DEVICE_LOCAL`.
+///
+/// A discrete adapter flags exactly its video memory, which is the figure a VRAM budget means. A
+/// unified-memory adapter flags every heap, so the sum is system memory — and that is still the
+/// pool the renderer competes for there, so no device class needs a second reading.
+fn device_local_vram(
+    heaps: &[vk::MemoryHeap],
+    budgets: impl IntoIterator<Item = (u64, u64)>,
+) -> VramUsage {
+    heaps
+        .iter()
+        .zip(budgets)
+        .filter(|(heap, _)| heap.flags.contains(vk::MemoryHeapFlags::DEVICE_LOCAL))
+        .fold(VramUsage::default(), |total, (_, (usage, budget))| {
+            VramUsage {
+                usage_bytes: total.usage_bytes.saturating_add(usage),
+                budget_bytes: total.budget_bytes.saturating_add(budget),
+            }
+        })
 }
 
 impl DeviceResources {
@@ -75,6 +115,26 @@ impl DeviceResources {
     pub fn accel_build_nanos(&self) -> u64 {
         self.accel_build_ns
             .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Adds one cooked micromap and its settled micro-triangle states to the session totals.
+    pub fn add_derived_micromap(&self, opaque: u64, transparent: u64, unknown: u64) {
+        for (counter, value) in self
+            .omm_derived
+            .iter()
+            .zip([1, opaque, transparent, unknown])
+        {
+            counter.fetch_add(value, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    /// Session totals of cooked micromaps and their opaque / transparent / unknown
+    /// micro-triangles.
+    #[must_use]
+    pub fn derived_micromaps(&self) -> (u64, u64, u64, u64) {
+        let read =
+            |index: usize| self.omm_derived[index].load(std::sync::atomic::Ordering::Relaxed);
+        (read(0), read(1), read(2), read(3))
     }
 
     /// Bundles the allocator + device. Called once by [`super::Device::new`]; the
@@ -93,7 +153,32 @@ impl DeviceResources {
             checkpoints,
             device_fault,
             accel_build_ns: std::sync::atomic::AtomicU64::new(0),
+            omm_derived: std::array::from_fn(|_| std::sync::atomic::AtomicU64::new(0)),
         })
+    }
+
+    /// This instant's device-local memory occupancy and headroom, summed over the heaps the
+    /// device flags `DEVICE_LOCAL`.
+    ///
+    /// `vmaGetHeapBudgets` is a cached read rather than a walk of the allocations, so this is a
+    /// per-frame call. With `VK_EXT_memory_budget` on the device the two figures are the
+    /// driver's, so they cover memory this allocator never handed out — swapchain images,
+    /// pipelines, descriptor heaps, and whatever else shares the adapter — which is the number a
+    /// residency budget has to be held against.
+    #[must_use]
+    pub fn vram_usage(&self) -> VramUsage {
+        let allocator = self.allocator();
+        let Ok(budgets) = allocator.get_heap_budgets() else {
+            return VramUsage::default();
+        };
+        // SAFETY: the VMA seam. Returns the memory properties VMA captured at creation and holds
+        // for its whole lifetime; the borrow ends with this expression.
+        let properties = unsafe { allocator.get_memory_properties() };
+        let heaps = &properties.memory_heaps[..properties.memory_heap_count as usize];
+        device_local_vram(
+            heaps,
+            budgets.iter().map(|budget| (budget.usage, budget.budget)),
+        )
     }
 
     /// The diagnostic-checkpoint dispatch, when the extension is enabled on the device.

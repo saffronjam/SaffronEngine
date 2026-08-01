@@ -172,7 +172,7 @@ fn wrappers_drop_reclaims_every_allocation() {
                 .expect("create_buffer")
         };
         let parts = GpuMeshParts {
-            cooked_opaque: true,
+            submesh_opaque: vec![true],
             micromaps: Vec::new(),
             vertex: make_buffer(96, vk::BufferUsageFlags::VERTEX_BUFFER),
             index: make_buffer(48, vk::BufferUsageFlags::INDEX_BUFFER),
@@ -308,4 +308,42 @@ fn full_resource_set_teardown_is_validation_clean() {
          (saw {} new issue(s))",
         after.saturating_sub(before)
     );
+}
+
+/// A heap the reported budgets are folded over.
+fn heap(size: vk::DeviceSize, device_local: bool) -> vk::MemoryHeap {
+    vk::MemoryHeap {
+        size,
+        flags: if device_local {
+            vk::MemoryHeapFlags::DEVICE_LOCAL
+        } else {
+            vk::MemoryHeapFlags::empty()
+        },
+    }
+}
+
+#[test]
+fn vram_folds_only_the_device_local_heaps() {
+    // A discrete adapter as the driver describes it: video memory, a host-visible upload window
+    // carved out of it, and system memory the driver can also allocate from.
+    let heaps = [
+        heap(8 * 1024 * 1024 * 1024, true),
+        heap(256 * 1024 * 1024, true),
+        heap(16 * 1024 * 1024 * 1024, false),
+    ];
+    let budgets = [
+        (1_500_000_000, 7_600_000_000),
+        (40_000_000, 250_000_000),
+        (900_000_000, 15_000_000_000),
+    ];
+    let vram = device_local_vram(&heaps, budgets);
+    assert_eq!(vram.usage_bytes, 1_540_000_000);
+    assert_eq!(vram.budget_bytes, 7_850_000_000);
+}
+
+#[test]
+fn vram_is_zero_when_no_heap_is_device_local() {
+    let heaps = [heap(4 * 1024 * 1024 * 1024, false)];
+    let vram = device_local_vram(&heaps, [(123_456, 789_012)]);
+    assert_eq!(vram, VramUsage::default());
 }
