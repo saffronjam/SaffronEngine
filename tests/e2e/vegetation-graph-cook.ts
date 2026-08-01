@@ -5,19 +5,19 @@
 import { expect } from "bun:test";
 import type {
   GpuSceneMirrorStatsDto,
-  VegetationCellInspectResult,
-  VegetationCookJobDto,
   VegetationCookStatusDto,
-  VegetationManifestResult,
+  VegetationMapChunkKeyDto,
+  VegetationMapChunkPayloadDto,
 } from "@saffron/protocol";
 import type { Engine } from "./harness.ts";
 import {
-  CELL,
-  TICKS_PER_METER,
   awaitCook,
   awaitResidentCell,
+  CELL,
   cookCells,
+  TICKS_PER_METER,
   type VegetationFixture,
+  vegetationMap,
 } from "./vegetation-utils.ts";
 
 // The camera framing that puts the cooked cell in view; the residency polls nudge it so the
@@ -52,7 +52,7 @@ export async function readManifest(
   fixture: VegetationFixture,
   cooked: VegetationCookStatusDto,
 ): Promise<void> {
-  const manifest = await engine.call<VegetationManifestResult>("vegetation-manifest", {
+  const manifest = await engine.call("vegetation-manifest", {
     map: fixture.map,
   });
   expect(manifest.manifest.identity).toBe(cooked.manifest!.identity);
@@ -72,12 +72,46 @@ export async function readManifest(
   expect(manifest.latestCook).toEqual(cooked.statistics!);
 }
 
+// Scheduling never reaches published bytes. The first cook commits the plant source observation
+// back to the authored family, so its generation is the one that settles; from there the same scope
+// cooked on four workers and then on two lands on the same generation identity, the same artifacts,
+// and every node satisfied from the store.
+export async function recookAcrossWorkerCounts(
+  engine: Engine,
+  fixture: VegetationFixture,
+): Promise<VegetationCookStatusDto> {
+  const cook = async (workers: number) => {
+    const started = await engine.call("vegetation-cook", {
+      map: fixture.map,
+      scope: { kind: "cells", cells: [CELL] },
+      workers,
+    });
+    return awaitCook(engine, started.job);
+  };
+  const settled = await cook(4);
+  const repeated = await cook(2);
+  expect(repeated.manifest!.identity).toBe(settled.manifest!.identity);
+  expect(repeated.manifest!.cells.map((cell) => cell.artifactHash)).toEqual(
+    settled.manifest!.cells.map((cell) => cell.artifactHash),
+  );
+  expect(repeated.manifest!.plants.map((plant) => plant.artifactHash)).toEqual(
+    settled.manifest!.plants.map((plant) => plant.artifactHash),
+  );
+  expect(repeated.manifest!.dependencies).toEqual(settled.manifest!.dependencies);
+  expect(repeated.manifest!.cells[0]!.actual.cacheHit).toBe(true);
+  expect(repeated.statistics!.nodes).toBe(settled.statistics!.nodes);
+  expect(repeated.statistics!.cacheHits).toBe(settled.statistics!.nodes);
+  expect(repeated.statistics!.cacheMisses).toBe("0");
+  expect(repeated.statistics!.publishedCells).toBe("1");
+  return repeated;
+}
+
 export async function inspectCookedCell(
   engine: Engine,
   fixture: VegetationFixture,
   cooked: VegetationCookStatusDto,
 ): Promise<void> {
-  const inspected = await engine.call<VegetationCellInspectResult>("vegetation-cell-inspect", {
+  const inspected = await engine.call("vegetation-cell-inspect", {
     map: fixture.map,
     cell: CELL,
   });
@@ -112,7 +146,7 @@ async function pollSceneStats(
   timeoutMs: number,
 ): Promise<GpuSceneMirrorStatsDto> {
   const deadline = Date.now() + timeoutMs;
-  let stats = await engine.call<GpuSceneMirrorStatsDto>("gpu-scene-stats");
+  let stats = await engine.call("gpu-scene-stats");
   let jiggle = 0;
   while (Date.now() < deadline) {
     jiggle += 1;
@@ -120,7 +154,7 @@ async function pollSceneStats(
       ...OVERVIEW,
       position: { ...OVERVIEW.position, y: OVERVIEW.position.y + (jiggle % 2) * 0.01 },
     });
-    stats = await engine.call<GpuSceneMirrorStatsDto>("gpu-scene-stats");
+    stats = await engine.call("gpu-scene-stats");
     if (ready(stats)) {
       break;
     }
@@ -171,11 +205,7 @@ export async function awaitMicroCandidates(engine: Engine): Promise<void> {
 // The per-family/per-cell telemetry matrix: the birch family rows up with its resident plants,
 // field tiles, and predicted budget, and the resident cell reports its population.
 export async function readRenderStats(engine: Engine, expectedPlants: number): Promise<void> {
-  const renderStats = await engine.call<{
-    families: { family: string; instances: number; fieldTiles: number; microPredicted: number }[];
-    cells: { cell: { coordinates: string[]; level: number }; plants: number; fieldTiles: number }[];
-    pageFaults: string;
-  }>("vegetation-render-stats");
+  const renderStats = await engine.call("vegetation-render-stats");
   expect(renderStats.families.length).toBeGreaterThan(0);
   const populated = renderStats.families.find((row) => row.instances > 0);
   expect(populated).toBeDefined();
@@ -189,24 +219,18 @@ export async function readRenderStats(engine: Engine, expectedPlants: number): P
   expect(Number(renderStats.pageFaults)).toBeGreaterThanOrEqual(0);
 }
 
-interface ChunkRead {
-  generation: string;
-  chunks: {
-    key: { layer: string; kind: string };
-    revision: string;
-    payload: {
-      kind: string;
-      explicitPlants: { id: string; family: string; point: { id: string } }[];
-      pins: string[];
-    };
-  }[];
+// The anchor-override leg of a chunk payload; a field chunk here means the read answered with the
+// wrong chunk.
+function anchorOverride(
+  payload: VegetationMapChunkPayloadDto,
+): Extract<VegetationMapChunkPayloadDto, { kind: "anchor-override" }> {
+  if (payload.kind !== "anchor-override") {
+    throw new Error(`the chunk carries a ${payload.kind} payload, not an anchor override`);
+  }
+  return payload;
 }
 
-interface DirtySummary {
-  summary: { kind: string; asset: { dirtyLayers: string[] } };
-}
-
-function anchorChunkKey(fixture: VegetationFixture) {
+function anchorChunkKey(fixture: VegetationFixture): VegetationMapChunkKeyDto {
   return {
     layer: fixture.authoredLayer,
     tile: { kind: "cell", cell: CELL },
@@ -214,7 +238,10 @@ function anchorChunkKey(fixture: VegetationFixture) {
   };
 }
 
-function anchorOverridePayload(fixture: VegetationFixture, anchorId: string) {
+function anchorOverridePayload(
+  fixture: VegetationFixture,
+  anchorId: string,
+): VegetationMapChunkPayloadDto {
   const ticks = (meters: number) => String(meters * TICKS_PER_METER);
   return {
     kind: "anchor-override",
@@ -265,23 +292,20 @@ export async function commitBrushChunk(
   fixture: VegetationFixture,
   cooked: VegetationCookStatusDto,
 ): Promise<void> {
-  const summary = await engine.call<{ summary: { asset: { generation: string } } }>(
-    "vegetation-asset-summary",
-    { asset: fixture.map },
-  );
+  const summary = await engine.call("vegetation-asset-summary", { asset: fixture.map });
   const chunkAnchorId = `5${"d".repeat(31)}`;
   const key = anchorChunkKey(fixture);
-  const committed = await engine.call<{ generation: string }>("vegetation-map-chunk-commit", {
+  const committed = await engine.call("vegetation-map-chunk-commit", {
     map: fixture.map,
-    expectedGeneration: summary.summary.asset.generation,
+    expectedGeneration: vegetationMap(summary).generation,
     upserts: [{ key, revision: "1", payload: anchorOverridePayload(fixture, chunkAnchorId) }],
     removals: [],
   });
-  expect(BigInt(committed.generation)).toBeGreaterThan(BigInt(summary.summary.asset.generation));
+  expect(BigInt(committed.generation)).toBeGreaterThan(BigInt(vegetationMap(summary).generation));
 
   // The read side of the brush wire: the committed chunk reads back by its logical key with the
   // round-tripped anchor row, and an absent key contributes no row.
-  const readBack = await engine.call<ChunkRead>("vegetation-map-chunk-read", {
+  const readBack = await engine.call("vegetation-map-chunk-read", {
     map: fixture.map,
     keys: [key, { layer: fixture.authoredLayer, tile: { kind: "global" }, kind: "field" }],
   });
@@ -290,20 +314,20 @@ export async function commitBrushChunk(
   const chunk = readBack.chunks[0]!;
   expect(chunk.key.kind).toBe("anchor-override");
   expect(chunk.revision).toBe("1");
-  expect(chunk.payload.kind).toBe("anchor-override");
-  expect(chunk.payload.explicitPlants).toHaveLength(1);
-  expect(chunk.payload.explicitPlants[0]!.id).toBe(chunkAnchorId);
-  expect(chunk.payload.explicitPlants[0]!.family).toBe(fixture.plant);
-  expect(chunk.payload.explicitPlants[0]!.point.id).toBe(chunkAnchorId);
+  const anchors = anchorOverride(chunk.payload);
+  expect(anchors.explicitPlants).toHaveLength(1);
+  expect(anchors.explicitPlants[0]!.id).toBe(chunkAnchorId);
+  expect(anchors.explicitPlants[0]!.family).toBe(fixture.plant);
+  expect(anchors.explicitPlants[0]!.point.id).toBe(chunkAnchorId);
 
   // The committed chunk diverges from what the current manifest consumed: the authored layer
   // reads dirty until the recook below folds it in.
-  const dirty = await engine.call<DirtySummary>("vegetation-asset-summary", {
+  const dirty = await engine.call("vegetation-asset-summary", {
     asset: fixture.map,
   });
-  expect(dirty.summary.asset.dirtyLayers).toContain(fixture.authoredLayer);
+  expect(vegetationMap(dirty).dirtyLayers).toContain(fixture.authoredLayer);
 
-  const recook = await engine.call<VegetationCookJobDto>("vegetation-cook", {
+  const recook = await engine.call("vegetation-cook", {
     map: fixture.map,
     scope: { kind: "cells", cells: [CELL] },
     workers: 1,
@@ -325,10 +349,10 @@ export async function commitBrushChunk(
   expect(recooked.manifest!.plants[0]!.artifactHash).toBe(cooked.manifest!.plants[0]!.artifactHash);
   expect(recooked.statistics).toMatchObject({ cacheHits: "1", cacheMisses: "1" });
 
-  const clean = await engine.call<DirtySummary>("vegetation-asset-summary", {
+  const clean = await engine.call("vegetation-asset-summary", {
     asset: fixture.map,
   });
-  expect(clean.summary.asset.dirtyLayers).not.toContain(fixture.authoredLayer);
+  expect(vegetationMap(clean).dirtyLayers).not.toContain(fixture.authoredLayer);
 
   await assertTopologyDiff(engine, fixture, cooked, recooked, chunkAnchorId);
   await togglePin(engine, fixture, chunkAnchorId);
@@ -344,17 +368,7 @@ async function assertTopologyDiff(
   recooked: VegetationCookStatusDto,
   chunkAnchorId: string,
 ): Promise<void> {
-  interface TopologyDiff {
-    from: string;
-    to: string;
-    cells: {
-      added: string;
-      removed: string;
-      moved: string;
-      conflicts: { kind: string; plant: string; layer: string }[];
-    }[];
-  }
-  const diff = await engine.call<TopologyDiff>("vegetation-topology-diff", {
+  const diff = await engine.call("vegetation-topology-diff", {
     map: fixture.map,
     from: cooked.manifest!.identity,
     to: recooked.manifest!.identity,
@@ -382,12 +396,13 @@ async function togglePin(
   chunkAnchorId: string,
 ): Promise<void> {
   const key = anchorChunkKey(fixture);
-  const before = await engine.call<ChunkRead>("vegetation-map-chunk-read", {
+  const before = await engine.call("vegetation-map-chunk-read", {
     map: fixture.map,
     keys: [key],
   });
   const chunk = before.chunks[0]!;
-  expect(chunk.payload.pins).toHaveLength(0);
+  const unpinned = anchorOverride(chunk.payload);
+  expect(unpinned.pins).toHaveLength(0);
   await engine.call("vegetation-map-chunk-commit", {
     map: fixture.map,
     expectedGeneration: before.generation,
@@ -395,17 +410,18 @@ async function togglePin(
       {
         key,
         revision: (BigInt(chunk.revision) + 1n).toString(),
-        payload: { ...chunk.payload, pins: [chunkAnchorId] },
+        payload: { ...unpinned, pins: [chunkAnchorId] },
       },
     ],
     removals: [],
   });
-  const pinned = await engine.call<ChunkRead>("vegetation-map-chunk-read", {
+  const pinned = await engine.call("vegetation-map-chunk-read", {
     map: fixture.map,
     keys: [key],
   });
-  expect(pinned.chunks[0]!.payload.pins).toEqual([chunkAnchorId]);
-  expect(pinned.chunks[0]!.payload.explicitPlants).toHaveLength(1);
+  const repinned = anchorOverride(pinned.chunks[0]!.payload);
+  expect(repinned.pins).toEqual([chunkAnchorId]);
+  expect(repinned.explicitPlants).toHaveLength(1);
   await engine.call("vegetation-map-chunk-commit", {
     map: fixture.map,
     expectedGeneration: pinned.generation,
@@ -413,7 +429,7 @@ async function togglePin(
       {
         key,
         revision: (BigInt(pinned.chunks[0]!.revision) + 1n).toString(),
-        payload: { ...pinned.chunks[0]!.payload, pins: [] },
+        payload: { ...repinned, pins: [] },
       },
     ],
     removals: [],

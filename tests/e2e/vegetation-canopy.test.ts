@@ -12,16 +12,21 @@
 // mutation re-mirrors its cell.
 
 import { afterAll, beforeAll, expect, test } from "bun:test";
-import type { VegetationRuntimeQueryResult } from "@saffron/protocol";
+import type {
+  PlantId,
+  VegetationMutationRecordDto,
+  WorldCellDto,
+} from "@saffron/protocol";
 import type { Engine } from "./harness.ts";
 import { decodeRgb8Png, meanAbsoluteDifference } from "./image.ts";
 import { Cleaner, bootEngine, captureViewport, prepareScene } from "./test-utils.ts";
 import {
-  WIDE_BOUNDS,
   bindVegetationField,
   cookCells,
   importVegetationPackage,
   loadFixture,
+  queryPlants,
+  WIDE_BOUNDS,
 } from "./vegetation-utils.ts";
 
 // Faces the cooked cell's tallest plant from the far side (this map spans 64 m cells).
@@ -34,7 +39,7 @@ const RESTORE_TOLERANCE = 0.05;
 
 const cleaner = new Cleaner();
 let engine: Engine;
-let subjects: { plant: string; cell: unknown }[] = [];
+let subjects: { plant: PlantId; cell: WorldCellDto }[] = [];
 
 beforeAll(async () => {
   engine = await bootEngine(cleaner, { SAFFRON_SCRATCH_PROJECT: "1" });
@@ -42,14 +47,12 @@ beforeAll(async () => {
 
   const fixture = loadFixture("vegetation-canopy");
   await importVegetationPackage(engine, cleaner, fixture, "canopy");
-  const world = await bindVegetationField(engine, cleaner, fixture, "Canopy vegetation");
+  await bindVegetationField(engine, cleaner, fixture, "Canopy vegetation");
   await cookCells(engine, fixture.map);
   await engine.call("set-camera", CAMERA);
   const deadline = Date.now() + 40_000;
   for (;;) {
-    const hits = await engine.call<VegetationRuntimeQueryResult>("vegetation-runtime-query", {
-      query: { kind: "bounds", bounds: WIDE_BOUNDS },
-    });
+    const hits = await queryPlants(engine, WIDE_BOUNDS);
     if (hits.hits.length > 0) {
       subjects = hits.hits.map((hit) => ({ plant: hit.plant.plant, cell: hit.plant.cell }));
       break;
@@ -73,9 +76,7 @@ test("the assembly family draws, and its crossfades settle at the fine cut", asy
   // defect this suite pins.
   await engine.call("set-hierarchy-cut", { cut: "fine" });
   await engine.settle(1500);
-  const gpu = await engine.call<{ visibility: { voxelRecords: number; records: number } }>(
-    "gpu-scene-stats",
-  );
+  const gpu = await engine.call("gpu-scene-stats");
   expect(gpu.visibility.voxelRecords).toBe(0);
   expect(gpu.visibility.records).toBeGreaterThan(0);
   await engine.call("set-hierarchy-cut", { cut: "auto" });
@@ -85,7 +86,8 @@ test("the assembly family draws, and its crossfades settle at the fine cut", asy
 test("a confirmed phenotype flip re-mirrors the cell and masks the crown's records", async () => {
   const override = async (transaction: string, phenotype: number) => {
     await engine.call("vegetation-mutate", {
-      records: subjects.map((subject, index) => ({
+      gesture: `e2e0000000000000000000000000${transaction}`,
+      records: subjects.map<VegetationMutationRecordDto>((subject, index) => ({
         header: {
           cell: subject.cell,
           transaction: `e2e0000000000000000000000000${transaction}`,
@@ -93,7 +95,16 @@ test("a confirmed phenotype flip re-mirrors the cell and masks the crown's recor
           logicalTick: "1",
           idempotencyKey: `e2e00000000000000000000000${transaction}${index.toString(16).padStart(2, "0")}`,
         },
-        mutation: { kind: "state-override", plant: subject.plant, phenotype },
+        mutation: {
+          kind: "state-override",
+          plant: subject.plant,
+          phenotype,
+          lifecycle: null,
+          health: null,
+          moisture: null,
+          fuel: null,
+          interactionPolicy: null,
+        },
       })),
     });
   };
@@ -107,7 +118,7 @@ test("a confirmed phenotype flip re-mirrors the cell and masks the crown's recor
   await engine.call("set-hierarchy-cut", { cut: "fine" });
   await engine.settle(1500);
   const records = async () =>
-    (await engine.call<{ visibility: { records: number } }>("gpu-scene-stats")).visibility.records;
+    (await engine.call("gpu-scene-stats")).visibility.records;
   const healthy = await records();
   const healthyFrame = decodeRgb8Png(await captureViewport(engine, cleaner, "canopy-healthy"));
 
@@ -130,20 +141,13 @@ test("a confirmed phenotype flip re-mirrors the cell and masks the crown's recor
 }, 120_000);
 
 test("on a cluster-AS device the family's structures compose from its cooked clusters", async () => {
-  const stats = await engine.call<{ rtSupported: boolean; clusterAsSupported: boolean }>(
-    "render-stats",
-  );
+  const stats = await engine.call("render-stats");
   if (!stats.rtSupported) {
     return;
   }
   await engine.call("set-rt-shadows", { enabled: true });
   await engine.settle(800);
-  const rt = await engine.call<{
-    rtInstances: number;
-    clusterAsSupported: boolean;
-    clusterBlasCount: number;
-    clasCount: number;
-  }>("render-stats");
+  const rt = await engine.call("render-stats");
   await engine.call("set-rt-shadows", { enabled: false });
   // The canopy family is the assembly: per-part prototypes whose bottom levels compose
   // from the cooked clusters when the device has the extension. The counts are

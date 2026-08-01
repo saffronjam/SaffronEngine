@@ -28,11 +28,12 @@ import {
   inspectCookedCell,
   readManifest,
   readRenderStats,
+  recookAcrossWorkerCounts,
 } from "./vegetation-graph-cook.ts";
 import {
   assertPhenologyHoldsAcrossSeasons,
+  pickGroundClearOfTrunks,
   pickMacroPlant,
-  pickMicroField,
   plantAnchor,
   readTrunkRects,
   reloadField,
@@ -53,7 +54,7 @@ let fixture: VegetationFixture;
 beforeAll(async () => {
   engine = await bootEngine(cleaner, { SAFFRON_SCRATCH_PROJECT: "1" });
   fixture = loadFixture("vegetation-phase3");
-  expect(fixture.formatVersion).toBe(3);
+  expect(fixture.formatVersion).toBe(4);
 });
 
 afterAll(async () => {
@@ -73,6 +74,7 @@ test("canonical vegetation package evaluates, explains, cooks, and inspects one 
   const cooked = await cookCanonicalCell(engine, fixture);
   await readManifest(engine, fixture, cooked);
   await inspectCookedCell(engine, fixture, cooked);
+  const settled = await recookAcrossWorkerCounts(engine, fixture);
 
   const expectedPlants = Number(fixture.expectedAccepted);
   await awaitLiveScene(engine, expectedPlants);
@@ -81,13 +83,13 @@ test("canonical vegetation package evaluates, explains, cooks, and inspects one 
   const picked = await pickMacroPlant(engine);
   const trunkRects = await readTrunkRects(engine);
   await assertPhenologyHoldsAcrossSeasons(engine);
-  await pickMicroField(engine, trunkRects);
+  await pickGroundClearOfTrunks(engine, trunkRects);
 
   const repicked = await reloadField(engine, fixture, world, expectedPlants, picked);
   const baselinePlants = await tombstonePickedPlant(engine, repicked);
   await plantAnchor(engine, fixture, baselinePlants);
 
-  await commitBrushChunk(engine, fixture, cooked);
+  await commitBrushChunk(engine, fixture, settled);
   await awaitMicroCandidates(engine);
   await cancelPreparedEvaluation(engine, fixture);
 

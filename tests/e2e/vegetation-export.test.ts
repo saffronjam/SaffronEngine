@@ -6,7 +6,6 @@ import { afterAll, beforeAll, expect, test } from "bun:test";
 import { existsSync, mkdtempSync, readdirSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import type { ExportAppResult } from "@saffron/protocol";
 import { IS_MACOS, type Engine } from "./harness.ts";
 import { Cleaner, bootEngine } from "./test-utils.ts";
 import {
@@ -46,8 +45,8 @@ function tree(dir: string, prefix = ""): string[] {
 
 test("an exported package carries its cooked vegetation and no authored sources", async () => {
   const fixture = loadFixture("vegetation-phase3");
-  const sources = await importVegetationPackage(engine, cleaner, fixture, "export");
-  const world = await bindVegetationField(engine, cleaner, fixture, "Exported vegetation");
+  await importVegetationPackage(engine, cleaner, fixture, "export");
+  await bindVegetationField(engine, cleaner, fixture, "Exported vegetation");
   await cookCells(engine, fixture.map);
   await engine.call("save-project", {});
 
@@ -56,26 +55,20 @@ test("an exported package carries its cooked vegetation and no authored sources"
   await engine.call("set-camera", { position: { x: 32, y: 8, z: 44 }, yaw: 0, pitch: -10 });
   await engine.call("play");
   await engine.settle(200);
-  const baseline = await engine.call<{ manifestIdentity: string; bytes: string; cells: string }>(
-    "vegetation-state-baseline",
-  );
+  const baseline = await engine.call("vegetation-state-baseline");
   expect(baseline.manifestIdentity).toMatch(/^[0-9a-f]{64}$/);
   expect(Number(baseline.bytes)).toBeGreaterThan(0);
   await engine.call("stop");
 
   // Every artifact the generation names rehashes to the identity its name claims.
-  const verified = await engine.call<{
-    checked: string;
-    repaired: string;
-    faults: { path: string; fault: string }[];
-  }>("vegetation-verify-artifacts", { repair: false });
+  const verified = await engine.call("vegetation-verify-artifacts", { repair: false });
   expect(Number(verified.checked)).toBeGreaterThan(0);
   expect(verified.faults).toEqual([]);
   expect(Number(verified.repaired)).toBe(0);
 
   const output = mkdtempSync(join(tmpdir(), "saffron-export-"));
   cleaner.defer(() => rmSync(output, { recursive: true, force: true }));
-  const exported = await engine.call<ExportAppResult>("export-app", {
+  const exported = await engine.call("export-app", {
     outputDir: join(output, "Exported"),
     app: { title: "Exported", width: 320, height: 240, vsync: true, fullscreen: false },
   });

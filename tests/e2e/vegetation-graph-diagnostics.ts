@@ -4,7 +4,7 @@
 
 import { expect } from "bun:test";
 import type { Engine } from "./harness.ts";
-import { CELL, type VegetationFixture } from "./vegetation-utils.ts";
+import { CELL, vegetationMap, type VegetationFixture } from "./vegetation-utils.ts";
 
 // A plant family previews as its compiled renderable form: enter frames a real subject
 // (positive distance) and reports the authored combination domain; a combination scrub
@@ -13,11 +13,7 @@ export async function previewPlantFamily(
   engine: Engine,
   fixture: VegetationFixture,
 ): Promise<void> {
-  const preview = await engine.call<{
-    rootEntity: string;
-    distance: number;
-    plantCombinations?: { variation: number; phenotype: number }[];
-  }>("enter-asset-preview", { asset: fixture.plant });
+  const preview = await engine.call("enter-asset-preview", { asset: fixture.plant });
   expect(preview.rootEntity).not.toBe("0");
   expect(preview.distance).toBeGreaterThan(0);
   await engine.settle(300);
@@ -36,21 +32,17 @@ export async function previewPlantFamily(
 // spawned cube hits its top face with an upward geometric normal; an upward cast from the same
 // origin misses.
 export async function castSurfaceRay(engine: Engine): Promise<void> {
-  const cube = await engine.call<{ id: string }>("add-entity", { preset: "cube" });
+  const cube = await engine.call("add-entity", { preset: "cube" });
   await engine.call("set-transform", {
     entity: cube.id,
     translation: { x: 500, y: 0, z: 500 },
   });
   await engine.settle(100);
-  const cast = await engine.call<{
-    hit: boolean;
-    position?: [number, number, number];
-    normal?: [number, number, number];
-  }>("query-surface-ray", { originM: [500, 100, 500], direction: [0, -1, 0] });
+  const cast = await engine.call("query-surface-ray", { originM: [500, 100, 500], direction: [0, -1, 0] });
   expect(cast.hit).toBe(true);
   expect(cast.position![1]).toBeLessThan(100);
   expect(cast.normal![1]).toBeGreaterThan(0.5);
-  const miss = await engine.call<{ hit: boolean }>("query-surface-ray", {
+  const miss = await engine.call("query-surface-ray", {
     originM: [500, 100, 500],
     direction: [0, 1, 0],
   });
@@ -63,13 +55,7 @@ export async function castSurfaceRay(engine: Engine): Promise<void> {
 // the cook statistics — this manifest covers exactly the one cooked cell, so the summary's
 // per-reason totals sum to the cell's rejected-row count.
 export async function readRejections(engine: Engine, fixture: VegetationFixture): Promise<void> {
-  interface Rejections {
-    candidates: string;
-    accepted: string;
-    totalRejected: string;
-    rows: { reason: string; positionTicks: [string, string, string]; ordinal: string }[];
-  }
-  const rejections = await engine.call<Rejections>("vegetation-rejections", {
+  const rejections = await engine.call("vegetation-rejections", {
     map: fixture.map,
     cell: CELL,
   });
@@ -83,14 +69,8 @@ export async function readRejections(engine: Engine, fixture: VegetationFixture)
     }
   }
 
-  interface CookStats {
-    summary: {
-      kind: string;
-      asset: { latestCook?: { rejections: { reason: string; count: string }[] } };
-    };
-  }
-  const stats = await engine.call<CookStats>("vegetation-asset-summary", { asset: fixture.map });
-  const statTotal = (stats.summary.asset.latestCook?.rejections ?? []).reduce(
+  const stats = await engine.call("vegetation-asset-summary", { asset: fixture.map });
+  const statTotal = (vegetationMap(stats).latestCook?.rejections ?? []).reduce(
     (sum, row) => sum + Number(row.count),
     0,
   );
@@ -100,22 +80,16 @@ export async function readRejections(engine: Engine, fixture: VegetationFixture)
 // The vegetation debug overlays: resident cell boxes + lifecycle-colored plant bounds render
 // validation-clean over the live world and echo their flags.
 export async function toggleDebugOverlays(engine: Engine): Promise<void> {
-  interface OverlayFlags {
-    vegetationCells: boolean;
-    vegetationBounds: boolean;
-    vegetationRejections: boolean;
-    vegetationHeatmap: boolean;
-  }
   const flags = (value: boolean) => ({
     vegetationCells: value,
     vegetationBounds: value,
     vegetationRejections: value,
     vegetationHeatmap: value,
   });
-  const overlays = await engine.call<OverlayFlags>("set-debug-overlays", flags(true));
+  const overlays = await engine.call("set-debug-overlays", flags(true));
   expect(overlays).toMatchObject(flags(true));
   await engine.settle(300);
-  const cleared = await engine.call<OverlayFlags>("set-debug-overlays", flags(false));
+  const cleared = await engine.call("set-debug-overlays", flags(false));
   expect(cleared).toMatchObject(flags(false));
 }
 
@@ -125,7 +99,7 @@ export async function renderFamilyThumbnail(
   engine: Engine,
   fixture: VegetationFixture,
 ): Promise<void> {
-  const thumb = await engine.getThumbnail<{ base64: string; format: string }>("get-thumbnail", {
+  const thumb = await engine.getThumbnail("get-thumbnail", {
     asset: fixture.plant,
     size: 96,
   });

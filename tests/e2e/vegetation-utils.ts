@@ -8,11 +8,14 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import type {
   EntityRef,
-  ImportVegetationAssetResult,
-  VegetationCookJobDto,
+  VegetationAssetSummaryResult,
   VegetationCookStatusDto,
-  VegetationEvaluationStatusDto,
+  VegetationMapSummaryDto,
   VegetationRuntimeCellResult,
+  VegetationRuntimeQueryFilterDto,
+  VegetationRuntimeQueryResult,
+  WorldBoundsDto,
+  WorldCellDto,
 } from "@saffron/protocol";
 import { EngineCallError, type Engine } from "./harness.ts";
 import { trackEntity, type Cleaner } from "./test-utils.ts";
@@ -23,15 +26,15 @@ const FIXTURE_DIR = join(dirname(fileURLToPath(import.meta.url)), "fixtures");
 export const TICKS_PER_METER = 4096;
 
 // The level-zero cell at the world origin, which every fixture cooks into.
-export const CELL = { coordinates: ["0", "0", "0"], level: 0 } as const;
+export const CELL: WorldCellDto = { coordinates: ["0", "0", "0"], level: 0 };
 
 // Region bounds spanning `meters` from the origin on every axis.
-export function regionBounds(meters: number) {
+export function regionBounds(meters: number): WorldBoundsDto {
   const extent = String(meters * TICKS_PER_METER);
   return {
     minTicks: ["0", "0", "0"],
     maxTicksExclusive: [extent, extent, extent],
-  } as const;
+  };
 }
 
 // The region the canonical (4 m cell) fixtures place into.
@@ -50,6 +53,11 @@ export interface VegetationMapObjectFixture {
   hex: string;
 }
 
+export interface VegetationSourceFixture {
+  path: string;
+  hex: string;
+}
+
 export interface VegetationFixture {
   formatVersion: number;
   stress?: string;
@@ -58,10 +66,7 @@ export interface VegetationFixture {
   biomeHex: string;
   mapHex: string;
   mapObjects: VegetationMapObjectFixture[];
-  trunkObjHex: string;
-  trunkObjPath: string;
-  trunkMtlHex?: string;
-  trunkMtlPath?: string;
+  sources: VegetationSourceFixture[];
   plant: string;
   biome: string;
   map: string;
@@ -96,16 +101,15 @@ export function authoredAssets(
   return assets;
 }
 
-// Writes the fixture's trunk OBJ into the live project's assets folder.
-export async function installTrunkObj(engine: Engine, fixture: VegetationFixture) {
-  const status = await engine.call<{ path: string }>("project-status");
+// Writes the fixture's authored source files (geometry, its material sidecars, and any
+// coverage texture) into the live project's assets folder.
+export async function installPlantSources(engine: Engine, fixture: VegetationFixture) {
+  const status = await engine.call("project-status");
   const projectRoot = status.path.endsWith("project.json") ? dirname(status.path) : status.path;
-  const trunkPath = join(projectRoot, "assets", fixture.trunkObjPath);
-  mkdirSync(dirname(trunkPath), { recursive: true });
-  writeFileSync(trunkPath, Buffer.from(fixture.trunkObjHex, "hex"));
-  if (fixture.trunkMtlHex && fixture.trunkMtlPath) {
-    const mtlPath = join(projectRoot, "assets", fixture.trunkMtlPath);
-    writeFileSync(mtlPath, Buffer.from(fixture.trunkMtlHex, "hex"));
+  for (const source of fixture.sources) {
+    const path = join(projectRoot, "assets", source.path);
+    mkdirSync(dirname(path), { recursive: true });
+    writeFileSync(path, Buffer.from(source.hex, "hex"));
   }
 }
 
@@ -118,9 +122,9 @@ export async function importVegetationPackage(
   tag: string,
 ): Promise<Record<"plant" | "biome" | "map", string>> {
   const sources = authoredAssets(cleaner, fixture, tag);
-  await installTrunkObj(engine, fixture);
+  await installPlantSources(engine, fixture);
   for (const path of [sources.plant, sources.biome, sources.map]) {
-    await engine.call<ImportVegetationAssetResult>("import-vegetation-asset", { path });
+    await engine.call("import-vegetation-asset", { path });
   }
   return sources;
 }
@@ -135,7 +139,7 @@ export async function bindVegetationField(
   const world = trackEntity(
     cleaner,
     engine,
-    await engine.call<EntityRef>("create-entity", { name }),
+    await engine.call("create-entity", { name }),
   );
   await engine.call("add-component", { entity: world.id, component: "VegetationField" });
   await engine.call("set-component", {
@@ -150,14 +154,43 @@ export async function bindVegetationField(
 export async function cookCells(
   engine: Engine,
   map: string,
-  cells: readonly unknown[] = [CELL],
+  cells: WorldCellDto[] = [CELL],
 ): Promise<VegetationCookStatusDto> {
-  const cook = await engine.call<VegetationCookJobDto>("vegetation-cook", {
+  const cook = await engine.call("vegetation-cook", {
     map,
     scope: { kind: "cells", cells },
     workers: 1,
   });
   return awaitCook(engine, cook.job);
+}
+
+// The `.svegmap` leg of a catalog summary reply; any other kind is a broken test setup.
+export function vegetationMap(result: VegetationAssetSummaryResult): VegetationMapSummaryDto {
+  if (result.summary.kind !== "vegetation-map") {
+    throw new Error(`the catalog summarises this asset as ${result.summary.kind}, not a map`);
+  }
+  return result.summary.asset;
+}
+
+// The runtime query filter selects everything when every list is empty.
+export const UNFILTERED: VegetationRuntimeQueryFilterDto = {
+  families: [],
+  requiredTags: [],
+  lifecycles: [],
+  interactionPolicies: [],
+};
+
+// Every plant the runtime authority reports inside `bounds`, unfiltered.
+export function queryPlants(
+  engine: Engine,
+  bounds: WorldBoundsDto,
+  limit?: number,
+): Promise<VegetationRuntimeQueryResult> {
+  return engine.call("vegetation-runtime-query", {
+    query: { kind: "bounds", bounds },
+    filter: UNFILTERED,
+    limit,
+  });
 }
 
 // Waits until the runtime reports `cell` resident with at least the expected macro plants
@@ -171,7 +204,7 @@ export async function awaitResidentCell(
   for (;;) {
     let resident: VegetationRuntimeCellResult | undefined;
     try {
-      resident = await engine.call<VegetationRuntimeCellResult>("vegetation-runtime-cell", {
+      resident = await engine.call("vegetation-runtime-cell", {
         cell: CELL,
       });
     } catch {
@@ -194,10 +227,7 @@ export async function awaitResidentCell(
 export async function awaitEvaluation(engine: Engine, job: string, timeoutMs = 30_000) {
   const deadline = Date.now() + timeoutMs;
   for (;;) {
-    const status = await engine.call<VegetationEvaluationStatusDto>(
-      "vegetation-evaluation-status",
-      { job },
-    );
+    const status = await engine.call("vegetation-evaluation-status", { job });
     if (status.state === "completed") {
       expect(status.summary).toBeDefined();
       return status.summary!;
@@ -225,7 +255,7 @@ export async function awaitCook(
 ): Promise<VegetationCookStatusDto> {
   const deadline = Date.now() + timeoutMs;
   for (;;) {
-    const status = await engine.call<VegetationCookStatusDto>("vegetation-cook-status", { job });
+    const status = await engine.call("vegetation-cook-status", { job });
     if (status.state === "completed") {
       expect(status.statistics).toBeDefined();
       expect(status.manifest).toBeDefined();

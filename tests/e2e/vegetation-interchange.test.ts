@@ -5,17 +5,13 @@ import { afterAll, beforeAll, expect, test } from "bun:test";
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import type {
-  ImportVegetationAssetResult,
-  VegetationExportPointsResult,
-  VegetationImportPointsResult,
-} from "@saffron/protocol";
 import type { Engine } from "./harness.ts";
 import { Cleaner, bootEngine } from "./test-utils.ts";
 import {
   authoredAssets,
-  installTrunkObj,
+  installPlantSources,
   loadFixture,
+  vegetationMap,
 } from "./vegetation-utils.ts";
 
 const cleaner = new Cleaner();
@@ -151,35 +147,32 @@ function instancedGltf(name: string) {
 test("instanced points import as anchors and export back addressing the same plants", async () => {
   const fixture = loadFixture("vegetation-phase3");
   const sources = authoredAssets(cleaner, fixture, "interchange");
-  await installTrunkObj(engine, fixture);
+  await installPlantSources(engine, fixture);
   for (const path of [sources.plant, sources.biome, sources.map]) {
-    await engine.call<ImportVegetationAssetResult>("import-vegetation-asset", { path });
+    await engine.call("import-vegetation-asset", { path });
   }
 
-  interface MapSummary {
-    summary: { asset: { generation: string } };
-  }
-  const before = await engine.call<MapSummary>("vegetation-asset-summary", { asset: fixture.map });
+  const before = await engine.call("vegetation-asset-summary", { asset: fixture.map });
   const scratch = mkdtempSync(join(tmpdir(), "saffron-interchange-"));
   cleaner.defer(() => rmSync(scratch, { recursive: true, force: true }));
   const scatterPath = join(scratch, "oaks.geo");
   writeFileSync(scatterPath, JSON.stringify(scatter("oak")));
 
-  const imported = await engine.call<VegetationImportPointsResult>("vegetation-import-points", {
+  const imported = await engine.call("vegetation-import-points", {
     map: fixture.map,
     layer: fixture.authoredLayer,
     path: scatterPath,
     prototypes: [{ name: "oak", family: fixture.plant }],
-    expectedGeneration: before.summary.asset.generation,
+    expectedGeneration: vegetationMap(before).generation,
   });
   expect(imported.anchors).toBe(2);
   expect(imported.prototypes).toBe(1);
   // The colour attribute has nowhere to go in the canonical vocabulary, and says so.
   expect(imported.unsupported).toEqual(["Cd"]);
-  expect(Number(imported.generation)).toBeGreaterThan(Number(before.summary.asset.generation));
+  expect(Number(imported.generation)).toBeGreaterThan(Number(vegetationMap(before).generation));
 
   const exportPath = join(scratch, "oaks-back.geo");
-  const exported = await engine.call<VegetationExportPointsResult>("vegetation-export-points", {
+  const exported = await engine.call("vegetation-export-points", {
     map: fixture.map,
     layer: fixture.authoredLayer,
     path: exportPath,
@@ -193,13 +186,13 @@ test("instanced points import as anchors and export back addressing the same pla
   expect(exportedName).toBeTruthy();
 
   // Re-importing what was exported re-addresses the same plants rather than adding more.
-  const after = await engine.call<MapSummary>("vegetation-asset-summary", { asset: fixture.map });
-  const again = await engine.call<VegetationImportPointsResult>("vegetation-import-points", {
+  const after = await engine.call("vegetation-asset-summary", { asset: fixture.map });
+  const again = await engine.call("vegetation-import-points", {
     map: fixture.map,
     layer: fixture.authoredLayer,
     path: exportPath,
     prototypes: [{ name: exportedName!, family: fixture.plant }],
-    expectedGeneration: after.summary.asset.generation,
+    expectedGeneration: vegetationMap(after).generation,
   });
   expect(again.anchors).toBe(2);
   expect(again.tiles).toBe(imported.tiles);
@@ -211,7 +204,7 @@ test("instanced points import as anchors and export back addressing the same pla
     const gltfPath = join(scratch, "scatter.gltf");
     writeFileSync(gltfPath, JSON.stringify(instancedGltf("oakScatter")));
     const generation = again.generation;
-    const fromGltf = await engine.call<VegetationImportPointsResult>("vegetation-import-points", {
+    const fromGltf = await engine.call("vegetation-import-points", {
       map: fixture.map,
       layer: fixture.authoredLayer,
       path: gltfPath,
@@ -227,7 +220,7 @@ test("instanced points import as anchors and export back addressing the same pla
   // A USD PointInstancer says it a third way, and a USD export reads back through the same door.
   {
     const usdaOut = join(scratch, "plants.usda");
-    const written = await engine.call<VegetationExportPointsResult>("vegetation-export-points", {
+    const written = await engine.call("vegetation-export-points", {
       map: fixture.map,
       layer: fixture.authoredLayer,
       path: usdaOut,
@@ -237,19 +230,16 @@ test("instanced points import as anchors and export back addressing the same pla
     expect(stage).toContain("def PointInstancer");
     expect(stage).toContain("int64[] ids");
 
-    const summary = await engine.call<MapSummary>("vegetation-asset-summary", {
+    const summary = await engine.call("vegetation-asset-summary", {
       asset: fixture.map,
     });
-    const roundTripped = await engine.call<VegetationImportPointsResult>(
-      "vegetation-import-points",
-      {
-        map: fixture.map,
-        layer: fixture.authoredLayer,
-        path: usdaOut,
-        prototypes: [{ name: exportedName!, family: fixture.plant }],
-        expectedGeneration: summary.summary.asset.generation,
-      },
-    );
+    const roundTripped = await engine.call("vegetation-import-points", {
+      map: fixture.map,
+      layer: fixture.authoredLayer,
+      path: usdaOut,
+      prototypes: [{ name: exportedName!, family: fixture.plant }],
+      expectedGeneration: vegetationMap(summary).generation,
+    });
     expect(roundTripped.anchors).toBe(written.instances);
     expect(roundTripped.unsupported).toEqual([]);
   }

@@ -4,15 +4,28 @@
 
 import { afterAll, beforeAll, expect, test } from "bun:test";
 import type {
-  BotanicalGrowthDto,
-  PlantCreateResult,
-  PlantElementsResult,
-  PlantGraphResult,
-  PlantSourceLocatorDto,
-  PlantValidationResult,
+  BotanicalManualEditDto,
+  PlantGraftSourceDto,
+  PlantImportSettingsDto,
 } from "@saffron/protocol";
 import type { Engine } from "./harness.ts";
 import { Cleaner, bootEngine } from "./test-utils.ts";
+
+// What a source is read with when the caller states nothing: metres, Y-up, right-handed,
+// counter-clockwise, unit scale.
+const SOURCE_DEFAULTS: PlantImportSettingsDto = {
+  units: "meters",
+  upAxis: "positive-y",
+  forwardAxis: "positive-z",
+  handedness: "right",
+  scaleBits: 65536,
+  pivot: { kind: "source-origin" },
+  winding: "counter-clockwise",
+  uvOrigin: "top-left",
+  uvScaleBits: [65536, 65536],
+  uvOffsetBits: [0, 0],
+  tangentPolicy: "generate-missing",
+};
 
 const cleaner = new Cleaner();
 let engine: Engine;
@@ -25,12 +38,17 @@ afterAll(async () => {
   await cleaner.cleanup();
 });
 
+// Creates a family from the starter graph. A zero seed derives one from the name.
+function createPlant(name: string, materials: string[], folder = "") {
+  return engine.call("plant-create", { name, folder, seed: "0", materials });
+}
+
 // Two materials for the graph's slots: bark and leaves.
 let slots: string[] = [];
 async function materials() {
   if (slots.length === 0) {
-    const bark = await engine.call<{ id: string }>("material-create", { name: "E2E bark" });
-    const leaf = await engine.call<{ id: string }>("material-create", { name: "E2E leaf" });
+    const bark = await engine.call("material-create", { name: "E2E bark" });
+    const leaf = await engine.call("material-create", { name: "E2E leaf" });
     slots = [bark.id, leaf.id];
   }
   return slots;
@@ -38,11 +56,7 @@ async function materials() {
 
 test("a created native family grows geometry and validates through the shared compiler", async () => {
   const [bark, leaf] = await materials();
-  const created = await engine.call<PlantCreateResult>("plant-create", {
-    name: "E2E native birch",
-    folder: "plants",
-    materials: [bark, leaf],
-  });
+  const created = await createPlant("E2E native birch", [bark, leaf], "plants");
   expect(Number(created.plant)).toBeGreaterThan(0);
 
   const growth = created.growth;
@@ -58,13 +72,14 @@ test("a created native family grows geometry and validates through the shared co
   expect(growth.graph).toMatch(/^[0-9a-f]{64}$/);
 
   // Reading it back grows the same plant: the graph is the whole source of truth.
-  const reread = await engine.call<BotanicalGrowthDto>("plant-growth", {
+  const reread = await engine.call("plant-growth", {
     plant: String(created.plant),
+    variation: 0,
   });
   expect(reread).toEqual(growth);
 
   // And it normalizes through the one plant compiler, with no diagnostics.
-  const validation = await engine.call<PlantValidationResult>("plant-validate", {
+  const validation = await engine.call("plant-validate", {
     plant: String(created.plant),
   });
   expect(validation.diagnostics.filter((entry) => entry.severity === "error")).toEqual([]);
@@ -73,14 +88,8 @@ test("a created native family grows geometry and validates through the shared co
 
 test("two families created the same way are two different individuals", async () => {
   const [bark, leaf] = await materials();
-  const first = await engine.call<PlantCreateResult>("plant-create", {
-    name: "E2E native oak",
-    materials: [bark, leaf],
-  });
-  const second = await engine.call<PlantCreateResult>("plant-create", {
-    name: "E2E native elm",
-    materials: [bark, leaf],
-  });
+  const first = await createPlant("E2E native oak", [bark, leaf]);
+  const second = await createPlant("E2E native elm", [bark, leaf]);
   // The seed is derived from the name, so the two differ without the caller managing seeds.
   expect(first.growth.seed).not.toBe(second.growth.seed);
   expect(first.growth.variations).toBe(1);
@@ -89,25 +98,22 @@ test("two families created the same way are two different individuals", async ()
 
   // A family with no materials for its slots is refused rather than binding slot zero twice.
   await expect(
-    engine.call("plant-create", { name: "E2E native short", materials: [bark] }),
+    createPlant("E2E native short", [bark]),
   ).rejects.toThrow();
   // And an empty name is refused.
   await expect(
-    engine.call("plant-create", { name: "  ", materials: [String(bark), String(leaf)] }),
+    createPlant("  ", [String(bark), String(leaf)]),
   ).rejects.toThrow();
   expect(engine.validationErrors()).toEqual([]);
 });
 
 test("a manual edit layer survives a parameter change and reports what it lost", async () => {
   const [bark, leaf] = await materials();
-  const created = await engine.call<PlantCreateResult>("plant-create", {
-    name: "E2E native hand-edited",
-    materials: [bark, leaf],
-  });
+  const created = await createPlant("E2E native hand-edited", [bark, leaf]);
   const plant = String(created.plant);
 
   // The addressable elements: this is what an authoring panel selects in, and what an edit targets.
-  const elements = await engine.call<PlantElementsResult>("plant-elements", { plant });
+  const elements = await engine.call("plant-elements", { plant, variation: 0 });
   expect(elements.axes.length).toBe(created.growth.axes);
   expect(elements.elements.length).toBe(created.growth.elements);
   const trunk = elements.axes.find((axis) => axis.element === "trunk");
@@ -116,19 +122,30 @@ test("a manual edit layer survives a parameter change and reports what it lost",
   expect(trunk!.parent).toBeNull();
   expect(BigInt(target.id)).toBeGreaterThan(0n);
 
+  // Every placement names the axis carrying its frame, and that axis is in the same report — the
+  // structure tree hangs it there directly. The starter graph puts its leaves on trunk frames that
+  // no axis grew from, so nothing about the host is recoverable from the axis list alone.
+  const axisIds = new Set(elements.axes.map((axis) => axis.id));
+  expect(elements.elements.every((element) => axisIds.has(element.axis))).toBe(true);
+  expect([...new Set(elements.elements.map((element) => element.axis))]).toEqual([trunk!.id]);
+  expect(elements.axes.some((axis) => Boolean(axis.frame))).toBe(false);
+
   // Lay one offset over a leaf and one cut over the trunk, then write the graph back.
-  const read = await engine.call<PlantGraphResult>("plant-graph", { plant });
+  const read = await engine.call("plant-graph", { plant, variation: 0 });
   expect(read.graph.edits).toEqual([]);
-  const layer = [
+  const layer: BotanicalManualEditDto[] = [
     {
       target: target.id,
       action: { kind: "transform", offsetBits: [65536, 0, 0], roll: 0, scaleBits: 131072 },
     },
     { target: trunk!.id, action: { kind: "trim", at: 49152 } },
-  ].sort((first, second) => (BigInt(first.target) < BigInt(second.target) ? -1 : 1));
-  const edited = await engine.call<PlantGraphResult>("plant-graph-set", {
+  ];
+  layer.sort((first, second) => (BigInt(first.target) < BigInt(second.target) ? -1 : 1));
+  const edited = await engine.call("plant-graph-set", {
     plant,
     graph: { ...read.graph, edits: layer },
+    grafts: [],
+    modules: [],
   });
   expect(edited.graph.edits.length).toBe(2);
   expect(edited.growth.appliedEdits).toBe(2);
@@ -139,7 +156,7 @@ test("a manual edit layer survives a parameter change and reports what it lost",
   expect(edited.growth.graph).not.toBe(created.growth.graph);
 
   // The leaf offset lands where it was asked to.
-  const moved = await engine.call<PlantElementsResult>("plant-elements", { plant });
+  const moved = await engine.call("plant-elements", { plant, variation: 0 });
   const after = moved.elements.find((element) => element.id === target.id);
   expect(after).toBeDefined();
   expect(after!.positionBits[0] - target.positionBits[0]).toBe(65536);
@@ -152,9 +169,11 @@ test("a manual edit layer survives a parameter change and reports what it lost",
       node.operator.nodes = 1;
     }
   }
-  const regrown = await engine.call<PlantGraphResult>("plant-graph-set", {
+  const regrown = await engine.call("plant-graph-set", {
     plant,
     graph: sparse,
+    grafts: [],
+    modules: [],
   });
   expect(regrown.graph.edits.length).toBe(2);
   const orphan = regrown.growth.orphans.find((entry) => entry.target === target.id);
@@ -163,7 +182,7 @@ test("a manual edit layer survives a parameter change and reports what it lost",
   expect(orphan!.action.kind).toBe("transform");
 
   // The compiler surfaces the same thing as a warning, and still publishes the family.
-  const validation = await engine.call<PlantValidationResult>("plant-validate", { plant });
+  const validation = await engine.call("plant-validate", { plant });
   expect(validation.diagnostics.filter((entry) => entry.severity === "error")).toEqual([]);
   expect(validation.diagnostics.some((entry) => entry.code === "orphaned-edit")).toBe(true);
 
@@ -181,6 +200,8 @@ test("a manual edit layer survives a parameter change and reports what it lost",
           { target: target.id, action: { kind: "remove" } },
         ],
       },
+      grafts: [],
+      modules: [],
     }),
   ).rejects.toThrow();
   expect(engine.validationErrors()).toEqual([]);
@@ -188,26 +209,23 @@ test("a manual edit layer survives a parameter change and reports what it lost",
 
 test("a graft declares its hero mesh on the family and the graph names it", async () => {
   const [bark, leaf] = await materials();
-  const created = await engine.call<PlantCreateResult>("plant-create", {
-    name: "E2E native grafted",
-    materials: [bark, leaf],
-  });
+  const created = await createPlant("E2E native grafted", [bark, leaf]);
   const plant = String(created.plant);
-  const elements = await engine.call<PlantElementsResult>("plant-elements", { plant });
+  const elements = await engine.call("plant-elements", { plant, variation: 0 });
   const target = elements.elements[0]!;
-  const read = await engine.call<PlantGraphResult>("plant-graph", { plant });
+  const read = await engine.call("plant-graph", { plant, variation: 0 });
   expect(read.grafts).toEqual([]);
 
   // The top two bits are reserved for the identities a native family derives.
   const source = "3e".repeat(16);
-  const graft = {
+  const graft: PlantGraftSourceDto = {
     id: source,
     locator: {
       kind: "file",
       uri: "file:///plants/hero-branch.glb",
-    } satisfies PlantSourceLocatorDto,
+    },
     selector: { kind: "whole" },
-    settings: { units: "centimeters", upAxis: "positive-z" },
+    settings: { ...SOURCE_DEFAULTS, units: "centimeters", upAxis: "positive-z" },
     provenance: {
       source: "e2e",
       sourceUri: "file:///plants/hero-branch.glb",
@@ -218,13 +236,14 @@ test("a graft declares its hero mesh on the family and the graph names it", asyn
       requiresAttribution: false,
     },
   };
-  const edited = await engine.call<PlantGraphResult>("plant-graph-set", {
+  const edited = await engine.call("plant-graph-set", {
     plant,
     graph: {
       ...read.graph,
       edits: [{ target: target.id, action: { kind: "graft", source, selector: { kind: "whole" } } }],
     },
     grafts: [graft],
+    modules: [],
   });
   // The graft stands in for the generated element: one fewer instanced quad, one graft.
   expect(edited.growth.grafts).toBe(1);
@@ -252,6 +271,7 @@ test("a graft declares its hero mesh on the family and the graph names it", asyn
         ],
       },
       grafts: [],
+      modules: [],
     }),
   ).rejects.toThrow();
   expect(engine.validationErrors()).toEqual([]);
@@ -259,22 +279,21 @@ test("a graft declares its hero mesh on the family and the graph names it", asyn
 
 test("a declared variation is its own individual with its own geometry", async () => {
   const [bark, leaf] = await materials();
-  const created = await engine.call<PlantCreateResult>("plant-create", {
-    name: "E2E native aged",
-    materials: [bark, leaf],
-  });
+  const created = await createPlant("E2E native aged", [bark, leaf]);
   const plant = String(created.plant);
-  const read = await engine.call<PlantGraphResult>("plant-graph", { plant });
+  const read = await engine.call("plant-graph", { plant, variation: 0 });
   expect(read.graph.variations.length).toBe(1);
   const mature = read.graph.variations[0]!;
 
   // Add a sapling: the same individual seen earlier, at half the age.
-  const edited = await engine.call<PlantGraphResult>("plant-graph-set", {
+  const edited = await engine.call("plant-graph-set", {
     plant,
     graph: {
       ...read.graph,
       variations: [mature, { seed: mature.seed, age: 32768, name: "Sapling" }],
     },
+    grafts: [],
+    modules: [],
   });
   expect(edited.graph.variations.length).toBe(2);
   expect(edited.growth.variations).toBe(2);
@@ -282,7 +301,7 @@ test("a declared variation is its own individual with its own geometry", async (
   expect(edited.growth.variation).toBe(0);
   expect(edited.growth.age).toBe(65535);
 
-  const sapling = await engine.call<BotanicalGrowthDto>("plant-growth", { plant, variation: 1 });
+  const sapling = await engine.call("plant-growth", { plant, variation: 1 });
   expect(sapling.variation).toBe(1);
   expect(sapling.age).toBe(32768);
   // Same structure, smaller plant.
@@ -291,17 +310,14 @@ test("a declared variation is its own individual with its own geometry", async (
   expect(sapling.heightBits).toBeLessThan(edited.growth.heightBits);
 
   // The element identities do not depend on the age, so one edit layer fits both.
-  const grownElements = await engine.call<PlantElementsResult>("plant-elements", { plant });
-  const youngElements = await engine.call<PlantElementsResult>("plant-elements", {
-    plant,
-    variation: 1,
-  });
+  const grownElements = await engine.call("plant-elements", { plant, variation: 0 });
+  const youngElements = await engine.call("plant-elements", { plant, variation: 1 });
   expect(youngElements.elements.map((element) => element.id)).toEqual(
     grownElements.elements.map((element) => element.id),
   );
 
   // The family it compiles to carries a variation row per individual, and validates.
-  const validation = await engine.call<PlantValidationResult>("plant-validate", { plant });
+  const validation = await engine.call("plant-validate", { plant });
   expect(validation.diagnostics.filter((entry) => entry.severity === "error")).toEqual([]);
 
   // Two variations that are the same individual twice are refused.
@@ -309,6 +325,8 @@ test("a declared variation is its own individual with its own geometry", async (
     engine.call("plant-graph-set", {
       plant,
       graph: { ...read.graph, variations: [mature, mature] },
+      grafts: [],
+      modules: [],
     }),
   ).rejects.toThrow();
   expect(engine.validationErrors()).toEqual([]);
@@ -316,25 +334,27 @@ test("a declared variation is its own individual with its own geometry", async (
 
 test("a native family derives its collision and navigation proxies", async () => {
   const [bark, leaf] = await materials();
-  const created = await engine.call<PlantCreateResult>("plant-create", {
-    name: "E2E native proxied",
-    materials: [bark, leaf],
-  });
+  const created = await createPlant("E2E native proxied", [bark, leaf]);
   const plant = String(created.plant);
-  const summary = await engine.call<PlantValidationResult>("plant-validate", { plant });
+  const summary = await engine.call("plant-validate", { plant });
   expect(summary.diagnostics.filter((entry) => entry.severity === "error")).toEqual([]);
 
   // Derived proxies survive a regrow as the new graph's, not the previous graph's leftovers.
-  const read = await engine.call<PlantGraphResult>("plant-graph", { plant });
+  const read = await engine.call("plant-graph", { plant, variation: 0 });
   const taller = structuredClone(read.graph);
   for (const node of taller.nodes) {
     if (node.operator.kind === "trunk") {
       node.operator.lengthBits *= 2;
     }
   }
-  const regrown = await engine.call<PlantGraphResult>("plant-graph-set", { plant, graph: taller });
+  const regrown = await engine.call("plant-graph-set", {
+    plant,
+    graph: taller,
+    grafts: [],
+    modules: [],
+  });
   expect(regrown.growth.heightBits).toBeGreaterThan(created.growth.heightBits);
-  const after = await engine.call<PlantValidationResult>("plant-validate", { plant });
+  const after = await engine.call("plant-validate", { plant });
   expect(after.diagnostics.filter((entry) => entry.severity === "error")).toEqual([]);
   expect(engine.validationErrors()).toEqual([]);
 });

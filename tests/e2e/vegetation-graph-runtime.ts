@@ -3,34 +3,23 @@
 // mutations that remove and plant a macro plant.
 
 import { expect } from "bun:test";
-import type { EntityRef, VegetationRuntimeCellResult } from "@saffron/protocol";
+import type { EntityRef, PickResult, PlantId } from "@saffron/protocol";
 import type { Engine } from "./harness.ts";
 import {
   BOUNDS,
   CELL,
   TICKS_PER_METER,
-  awaitResidentCell,
   type VegetationFixture,
+  awaitResidentCell,
+  queryPlants,
 } from "./vegetation-utils.ts";
 
 // Aimed straight at a trunk from inside the cooked cell.
 const TRUNK_VIEW = { position: { x: 16, y: 4, z: 30 }, yaw: 0, pitch: 0 } as const;
 
-interface Pick {
-  hit: boolean;
-  kind?: string;
-  plant?: string;
-  position?: number[];
-}
-
 // A pick the assertions have already proven carries a stable plant identity.
-export interface PickedPlant extends Pick {
-  plant: string;
-}
-
-interface RuntimeInspect {
-  plant: string;
-  resident?: { family: string } | null;
+export interface PickedPlant extends PickResult {
+  plant: PlantId;
 }
 
 interface TrunkRect {
@@ -40,13 +29,13 @@ interface TrunkRect {
   maxZ: number;
 }
 
-// The one viewport pick merges the vegetation vocabulary: aimed at a trunk, the nearest hit is
-// the macro plant, returned by stable identity (resolved through the CPU cell snapshot, never a
-// GPU slot).
+// The one viewport pick merges the vegetation vocabulary: aimed at a trunk, the GPU selection-ID
+// readback answers with the macro plant, returned by stable identity — the readback names a
+// GPU-scene slot and the mirror translates it back, so a slot never reaches the wire.
 export async function pickMacroPlant(engine: Engine): Promise<PickedPlant> {
   await engine.call("set-camera", TRUNK_VIEW);
   await engine.settle(200);
-  const picked = await engine.call<Pick>("pick", { u: 0.5, v: 0.5 });
+  const picked = await engine.call("pick", { u: 0.5, v: 0.5 });
   expect(picked.hit).toBe(true);
   expect(picked.kind).toBe("vegetation");
   expect(picked.plant).toMatch(/^[0-9a-f]{32}$/);
@@ -56,12 +45,7 @@ export async function pickMacroPlant(engine: Engine): Promise<PickedPlant> {
 // The runtime query supplies the trunk bounds so the micro scan only samples spots whose ray
 // misses every plant.
 export async function readTrunkRects(engine: Engine): Promise<TrunkRect[]> {
-  const runtimePlants = await engine.call<{
-    hits: { plant: { bounds: { minTicks: string[]; maxTicksExclusive: string[] } } }[];
-  }>("vegetation-runtime-query", {
-    query: { kind: "bounds", bounds: BOUNDS },
-    limit: 256,
-  });
+  const runtimePlants = await queryPlants(engine, BOUNDS, 256);
   expect(runtimePlants.hits.length).toBeGreaterThan(0);
   return runtimePlants.hits.map(({ plant }) => ({
     minX: Number(plant.bounds.minTicks[0]) / TICKS_PER_METER,
@@ -77,10 +61,7 @@ export async function readTrunkRects(engine: Engine): Promise<TrunkRect[]> {
 // cell rebuild.
 export async function assertPhenologyHoldsAcrossSeasons(engine: Engine): Promise<void> {
   const query = async () =>
-    engine.call<{ hits: { plant: { phenotype: number; renderedPhenotype: number } }[] }>(
-      "vegetation-runtime-query",
-      { query: { kind: "bounds", bounds: BOUNDS }, limit: 8 },
-    );
+    queryPlants(engine, BOUNDS, 8);
   for (const hit of (await query()).hits) {
     expect(hit.plant.renderedPhenotype).toBe(hit.plant.phenotype);
   }
@@ -121,19 +102,24 @@ function microSampleSpots(trunkRects: TrunkRect[]): { x: number; z: number }[] {
   return spots;
 }
 
-// Aimed straight down at vegetated ground away from every macro trunk, the pick falls through to
-// the micro field: a nonpersistent paint-feedback point on the cell floor, carrying a position
-// but no identity.
-export async function pickMicroField(engine: Engine, trunkRects: TrunkRect[]): Promise<void> {
+// Aimed straight down at vegetated ground away from every macro trunk, the pick answers with
+// whatever the frame drew at that pixel. Micro blades are cosmetic: a blade that covers the pixel
+// answers as a nonpersistent point with no identity, and bare ground between blades answers
+// nothing at all. What must never happen there is a macro plant identity — the paint tools treat
+// a returned PlantId as a selected, saved object. `vegetation-micro-pick.test.ts` carries the
+// other half of that vocabulary, over a field dense enough for a ray to land on a blade.
+export async function pickGroundClearOfTrunks(
+  engine: Engine,
+  trunkRects: TrunkRect[],
+): Promise<void> {
   const clearOfTrunks = (x: number, z: number) =>
     trunkRects.every(
       (rect) =>
         x < rect.minX - 0.5 || x > rect.maxX + 0.5 || z < rect.minZ - 0.5 || z > rect.maxZ + 0.5,
     );
-  let microPick: Pick = { hit: false };
   let attempts = 0;
   for (const spot of microSampleSpots(trunkRects)) {
-    if (attempts >= 60) {
+    if (attempts >= 24) {
       break;
     }
     if (spot.x < 1 || spot.x >= 63 || spot.z < 1 || spot.z >= 63 || !clearOfTrunks(spot.x, spot.z)) {
@@ -146,21 +132,20 @@ export async function pickMicroField(engine: Engine, trunkRects: TrunkRect[]): P
       pitch: -89,
     });
     await engine.settle(100);
-    microPick = await engine.call<Pick>("pick", { u: 0.5, v: 0.5 });
-    if (microPick.kind === "micro-vegetation") {
-      break;
+    const picked = await engine.call("pick", { u: 0.5, v: 0.5 });
+    expect(picked.kind === "vegetation").toBe(false);
+    expect(picked.plant).toBeUndefined();
+    if (picked.kind !== "micro-vegetation") {
+      continue;
     }
+    const microPoint = picked.position ?? [];
+    expect(microPoint).toHaveLength(3);
+    expect(microPoint[0]).toBeGreaterThanOrEqual(0);
+    expect(microPoint[0]).toBeLessThan(64);
+    expect(microPoint[2]).toBeGreaterThanOrEqual(0);
+    expect(microPoint[2]).toBeLessThan(64);
   }
-  expect(microPick.hit).toBe(true);
-  expect(microPick.kind).toBe("micro-vegetation");
-  expect(microPick.plant).toBeUndefined();
-  const microPoint = microPick.position ?? [];
-  expect(microPoint).toHaveLength(3);
-  expect(microPoint[1]).toBeCloseTo(0, 3);
-  expect(microPoint[0]).toBeGreaterThanOrEqual(0);
-  expect(microPoint[0]).toBeLessThan(64);
-  expect(microPoint[2]).toBeGreaterThanOrEqual(0);
-  expect(microPoint[2]).toBeLessThan(64);
+  expect(attempts).toBeGreaterThan(0);
 }
 
 // Reload stability: disable and re-enable the field, forcing the runtime world to rebuild from
@@ -187,11 +172,11 @@ export async function reloadField(
 
   await engine.call("set-camera", TRUNK_VIEW);
   await engine.settle(200);
-  const hit = await engine.call<Pick>("pick", { u: 0.5, v: 0.5 });
+  const hit = await engine.call("pick", { u: 0.5, v: 0.5 });
   expect(hit.kind).toBe("vegetation");
   expect(hit.plant).toBe(picked.plant);
   const repicked: PickedPlant = { ...hit, plant: hit.plant! };
-  const reinspected = await engine.call<RuntimeInspect>("vegetation-runtime-inspect", {
+  const reinspected = await engine.call("vegetation-runtime-inspect", {
     plant: repicked.plant,
   });
   expect(reinspected.plant).toBe(repicked.plant);
@@ -203,7 +188,7 @@ export async function reloadField(
 async function awaitMacroCount(engine: Engine, expected: number, what: string): Promise<void> {
   const deadline = Date.now() + 15_000;
   for (;;) {
-    const after = await engine.call<VegetationRuntimeCellResult>("vegetation-runtime-cell", {
+    const after = await engine.call("vegetation-runtime-cell", {
       cell: CELL,
     });
     if (Number(after.macroPlants) === expected) {
@@ -223,10 +208,11 @@ export async function tombstonePickedPlant(
   engine: Engine,
   picked: PickedPlant,
 ): Promise<number> {
-  const before = await engine.call<VegetationRuntimeCellResult>("vegetation-runtime-cell", {
+  const before = await engine.call("vegetation-runtime-cell", {
     cell: CELL,
   });
-  const mutate = await engine.call<{ applied: number }>("vegetation-mutate", {
+  const mutate = await engine.call("vegetation-mutate", {
+    gesture: "e2e00000000000000000000000c70001",
     records: [
       {
         header: {
@@ -235,7 +221,6 @@ export async function tombstonePickedPlant(
           authority: "e".padStart(32, "0"),
           logicalTick: "1",
           idempotencyKey: "a".padStart(32, "0"),
-          baseRevision: null,
         },
         mutation: { kind: "tombstone", plant: picked.plant },
       },
@@ -245,12 +230,12 @@ export async function tombstonePickedPlant(
   const baseline = Number(before.macroPlants);
   await awaitMacroCount(engine, baseline - 1, "the tombstoned plant to leave the cell");
 
-  const tombstoned = await engine.call<RuntimeInspect>("vegetation-runtime-inspect", {
+  const tombstoned = await engine.call("vegetation-runtime-inspect", {
     plant: picked.plant,
   });
   expect(tombstoned.resident ?? null).toBeNull();
   await engine.settle(200);
-  const postPick = await engine.call<Pick>("pick", { u: 0.5, v: 0.5 });
+  const postPick = await engine.call("pick", { u: 0.5, v: 0.5 });
   expect(postPick.plant === picked.plant).toBe(false);
   return baseline;
 }
@@ -264,7 +249,8 @@ export async function plantAnchor(
 ): Promise<void> {
   const anchorId = `4${"c".repeat(31)}`;
   const ticks = (meters: number) => String(meters * TICKS_PER_METER);
-  const anchor = await engine.call<{ applied: number }>("vegetation-mutate", {
+  const anchor = await engine.call("vegetation-mutate", {
+    gesture: "e2e00000000000000000000000c70002",
     records: [
       {
         header: {
@@ -310,7 +296,7 @@ export async function plantAnchor(
   expect(anchor.applied).toBe(1);
   await awaitMacroCount(engine, baselinePlants, "the anchored plant to join the cell");
 
-  const anchored = await engine.call<RuntimeInspect>("vegetation-runtime-inspect", {
+  const anchored = await engine.call("vegetation-runtime-inspect", {
     plant: anchorId,
   });
   expect(anchored.resident).toBeTruthy();

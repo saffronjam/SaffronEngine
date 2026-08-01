@@ -6,16 +6,6 @@
 // in-crate byte-for-byte test makes, but through the wire, against a live runtime.
 
 import { afterAll, beforeAll, expect, test } from "bun:test";
-import type {
-  VegetationCombustionDto,
-  VegetationEcologyClockDto,
-  VegetationEcologyReportDto,
-  VegetationEcologyStatusDto,
-  VegetationNavigationResult,
-  VegetationRuntimeQueryResult,
-  VegetationRuntimeStatusDto,
-  VegetationTelemetryResult,
-} from "@saffron/protocol";
 import type { Engine } from "./harness.ts";
 import { Cleaner, bootEngine } from "./test-utils.ts";
 import {
@@ -25,6 +15,8 @@ import {
   cookCells,
   importVegetationPackage,
   loadFixture,
+  queryPlants,
+  UNFILTERED,
 } from "./vegetation-utils.ts";
 
 // Growing weather: enough water and warmth that a tick is not dormant.
@@ -42,22 +34,22 @@ afterAll(async () => {
 });
 
 async function advance(targetTick: number, maxTicks: number) {
-  return engine.call<VegetationEcologyReportDto>("vegetation-advance-ecology", {
+  return engine.call("vegetation-advance-ecology", {
     targetTick: String(targetTick),
     maxTicks,
   });
 }
 
 async function status() {
-  return engine.call<VegetationEcologyStatusDto>("vegetation-ecology-status");
+  return engine.call("vegetation-ecology-status");
 }
 
 async function clock(params: Record<string, unknown> = {}) {
-  return engine.call<VegetationEcologyClockDto>("vegetation-ecology-clock", params);
+  return engine.call("vegetation-ecology-clock", params);
 }
 
 async function navigation() {
-  return engine.call<VegetationNavigationResult>("vegetation-nav-contributions", {});
+  return engine.call("vegetation-nav-contributions", {});
 }
 
 test("biological time advances, regions catch up under a budget, and the route does not matter", async () => {
@@ -75,14 +67,12 @@ test("biological time advances, regions catch up under a budget, and the route d
   {
     const deadline = Date.now() + 30_000;
     for (;;) {
-      const hits = await engine.call<VegetationRuntimeQueryResult>("vegetation-runtime-query", {
-        query: { kind: "bounds", bounds: BOUNDS },
-      });
+      const hits = await queryPlants(engine, BOUNDS);
       if (hits.hits.length > 0) {
         break;
       }
       if (Date.now() >= deadline) {
-        const runtime = await engine.call<VegetationRuntimeStatusDto>("vegetation-runtime-status");
+        const runtime = await engine.call("vegetation-runtime-status");
         throw new Error(`timeout waiting for a resident macro plant: ${JSON.stringify(runtime)}`);
       }
       await engine.settle(50);
@@ -154,7 +144,7 @@ test("the world simulation clock ages biology while play runs, and the telemetry
 
   const before = await status();
   const ticksBefore = Number(
-    (await engine.call<VegetationTelemetryResult>("vegetation-telemetry")).work.ecologyTicks,
+    (await engine.call("vegetation-telemetry")).work.ecologyTicks,
   );
 
   await engine.call("play");
@@ -165,7 +155,7 @@ test("the world simulation clock ages biology while play runs, and the telemetry
   expect(Number(after.worldTick)).toBeGreaterThan(Number(before.worldTick));
   expect(after.checkpoint).not.toBe(before.checkpoint);
   // Nothing asked for these ticks: the world advanced and biology advanced with it.
-  const telemetry = await engine.call<VegetationTelemetryResult>("vegetation-telemetry");
+  const telemetry = await engine.call("vegetation-telemetry");
   expect(Number(telemetry.work.ecologyTicks)).toBeGreaterThan(ticksBefore);
 
   // Stopping the clock stops biology: no further tick, and no payment of what a budget left owed.
@@ -223,18 +213,14 @@ test("a cell mid-catch-up publishes for no facet", async () => {
 });
 
 test("a volume reports what would burn, and ignition is persistent typed state", async () => {
-  const sample = await engine.call<VegetationCombustionDto>("vegetation-combustion", {
-    bounds: BOUNDS,
-  });
+  const sample = await engine.call("vegetation-combustion", { bounds: BOUNDS, filter: UNFILTERED });
   expect(sample.plants).toBeGreaterThan(0);
   expect(sample.ignited).toBe(0);
   expect(sample.occupancy).toBeGreaterThanOrEqual(0);
   // Growing ticks settled moisture toward the supply, so the sample is not the cooked zero.
   expect(sample.moisture).toBeGreaterThan(0);
 
-  const hits = await engine.call<VegetationRuntimeQueryResult>("vegetation-runtime-query", {
-    query: { kind: "bounds", bounds: BOUNDS },
-  });
+  const hits = await queryPlants(engine, BOUNDS);
   const plant = hits.hits[0]!.plant.plant;
   const header = (transaction: string, key: string) => ({
     cell: CELL,
@@ -244,19 +230,17 @@ test("a volume reports what would burn, and ignition is persistent typed state",
     idempotencyKey: `e2e0000000000000000000000000${key}`,
   });
   await engine.call("vegetation-mutate", {
+    gesture: "e2e00000000000000000000000ec0001",
     records: [{ header: header("7001", "8001"), mutation: { kind: "ignite", plant } }],
   });
-  const alight = await engine.call<VegetationCombustionDto>("vegetation-combustion", {
-    bounds: BOUNDS,
-  });
+  const alight = await engine.call("vegetation-combustion", { bounds: BOUNDS, filter: UNFILTERED });
   expect(alight.ignited).toBe(1);
 
   await engine.call("vegetation-mutate", {
+    gesture: "e2e00000000000000000000000ec0002",
     records: [{ header: header("7002", "8002"), mutation: { kind: "extinguish", plant } }],
   });
-  const out = await engine.call<VegetationCombustionDto>("vegetation-combustion", {
-    bounds: BOUNDS,
-  });
+  const out = await engine.call("vegetation-combustion", { bounds: BOUNDS, filter: UNFILTERED });
   expect(out.ignited).toBe(0);
   expect(engine.validationErrors()).toEqual([]);
 });

@@ -5,20 +5,18 @@
 import { expect } from "bun:test";
 import type {
   EntityRef,
-  ImportVegetationAssetResult,
-  ProvenanceExplanationDto,
   VegetationCompileBiomeResult,
   VegetationEvaluationJobDto,
-  VegetationEvaluationStatusDto,
 } from "@saffron/protocol";
 import type { Engine } from "./harness.ts";
 import { Cleaner, trackEntity } from "./test-utils.ts";
 import {
+  awaitEvaluation,
   BOUNDS,
   CELL,
-  awaitEvaluation,
-  installTrunkObj,
+  installPlantSources,
   type VegetationFixture,
+  vegetationMap,
 } from "./vegetation-utils.ts";
 
 // The nodes the fixture's graph executes on the GPU, in declaration order.
@@ -29,11 +27,6 @@ function guid(value: number): string {
   return value.toString(16).padStart(32, "0");
 }
 
-interface MapSummary {
-  summary: { kind: string; asset: { generation: string } };
-  layers: { id: string; muted: boolean; revision: string; [key: string]: unknown }[];
-}
-
 export async function importPackage(
   engine: Engine,
   fixture: VegetationFixture,
@@ -41,15 +34,15 @@ export async function importPackage(
 ): Promise<void> {
   // The plant recipe references its trunk geometry by project-relative path; write the
   // fixture's OBJ into the live project's assets before anything resolves it.
-  await installTrunkObj(engine, fixture);
+  await installPlantSources(engine, fixture);
 
-  const plant = await engine.call<ImportVegetationAssetResult>("import-vegetation-asset", {
+  const plant = await engine.call("import-vegetation-asset", {
     path: sources.plant,
   });
-  const biome = await engine.call<ImportVegetationAssetResult>("import-vegetation-asset", {
+  const biome = await engine.call("import-vegetation-asset", {
     path: sources.biome,
   });
-  const map = await engine.call<ImportVegetationAssetResult>("import-vegetation-asset", {
+  const map = await engine.call("import-vegetation-asset", {
     path: sources.map,
   });
   expect(plant).toMatchObject({ id: fixture.plant, type: "plant" });
@@ -64,7 +57,7 @@ export async function commitLayerTransaction(
   engine: Engine,
   fixture: VegetationFixture,
 ): Promise<void> {
-  const before = await engine.call<MapSummary>("vegetation-asset-summary", {
+  const before = await engine.call("vegetation-asset-summary", {
     asset: fixture.map,
   });
   expect(before.layers).toHaveLength(1);
@@ -77,23 +70,23 @@ export async function commitLayerTransaction(
     revision: revision.toString(),
   });
   const revision = BigInt(layer.revision);
-  const mutedCommit = await engine.call<{ generation: string }>("vegetation-map-layer-commit", {
+  const mutedCommit = await engine.call("vegetation-map-layer-commit", {
     map: fixture.map,
-    expectedGeneration: before.summary.asset.generation,
+    expectedGeneration: vegetationMap(before).generation,
     upserts: [commitLayer(true, revision + 1n)],
     removals: [],
   });
-  const mid = await engine.call<MapSummary>("vegetation-asset-summary", { asset: fixture.map });
-  expect(mid.summary.asset.generation).toBe(mutedCommit.generation);
+  const mid = await engine.call("vegetation-asset-summary", { asset: fixture.map });
+  expect(vegetationMap(mid).generation).toBe(mutedCommit.generation);
   expect(mid.layers[0]!.muted).toBe(true);
-  const restored = await engine.call<{ generation: string }>("vegetation-map-layer-commit", {
+  const restored = await engine.call("vegetation-map-layer-commit", {
     map: fixture.map,
     expectedGeneration: mutedCommit.generation,
     upserts: [commitLayer(false, revision + 2n)],
     removals: [],
   });
   expect(BigInt(restored.generation)).toBe(BigInt(mutedCommit.generation) + 1n);
-  const after = await engine.call<MapSummary>("vegetation-asset-summary", { asset: fixture.map });
+  const after = await engine.call("vegetation-asset-summary", { asset: fixture.map });
   expect(after.layers[0]!.muted).toBe(false);
 }
 
@@ -105,7 +98,7 @@ export async function bindWorld(
   const world = trackEntity(
     cleaner,
     engine,
-    await engine.call<EntityRef>("create-entity", { name: "Vegetation world" }),
+    await engine.call("create-entity", { name: "Vegetation world" }),
   );
   await engine.call("add-component", { entity: world.id, component: "VegetationField" });
   await engine.call("set-component", {
@@ -120,7 +113,7 @@ export async function compileBiome(
   engine: Engine,
   fixture: VegetationFixture,
 ): Promise<VegetationCompileBiomeResult> {
-  const compiled = await engine.call<VegetationCompileBiomeResult>("vegetation-compile-biome", {
+  const compiled = await engine.call("vegetation-compile-biome", {
     target: {
       scope: "instance",
       map: fixture.map,
@@ -144,7 +137,7 @@ async function preflightRegion(
   engine: Engine,
   fixture: VegetationFixture,
 ): Promise<VegetationEvaluationJobDto> {
-  return engine.call<VegetationEvaluationJobDto>("vegetation-preflight-region", {
+  return engine.call("vegetation-preflight-region", {
     map: fixture.map,
     biomeInstance: fixture.biomeInstance,
     bounds: BOUNDS,
@@ -195,16 +188,13 @@ export async function evaluateRegion(
   );
   expect(BigInt(prepared.preflight.transferBytes)).toBeGreaterThan(0n);
 
-  const reconnected = await engine.call<VegetationEvaluationStatusDto>(
-    "vegetation-evaluation-status",
-    { job: prepared.job },
-  );
+  const reconnected = await engine.call("vegetation-evaluation-status", { job: prepared.job });
   expect(reconnected.state).toBe("prepared");
   expect(reconnected.preflight).toEqual(prepared.preflight);
   expect(reconnected.summary).toBeNull();
   expect(reconnected.error).toBeNull();
 
-  const started = await engine.call<VegetationEvaluationJobDto>("vegetation-start-evaluation", {
+  const started = await engine.call("vegetation-start-evaluation", {
     job: prepared.job,
   });
   expect(started.state).toBe("running");
@@ -265,7 +255,7 @@ export async function explainAcceptedPlant(
   fixture: VegetationFixture,
   job: string,
 ): Promise<void> {
-  const explanation = await engine.call<ProvenanceExplanationDto>("vegetation-explain-point", {
+  const explanation = await engine.call("vegetation-explain-point", {
     job,
     cell: CELL,
     subject: { kind: "plant", plant: fixture.expectedPlant },
@@ -309,10 +299,7 @@ export async function cancelPreparedEvaluation(
   fixture: VegetationFixture,
 ): Promise<void> {
   const prepared = await preflightRegion(engine, fixture);
-  const cancelled = await engine.call<VegetationEvaluationStatusDto>(
-    "vegetation-cancel-evaluation",
-    { job: prepared.job },
-  );
+  const cancelled = await engine.call("vegetation-cancel-evaluation", { job: prepared.job });
   expect(cancelled.state).toBe("cancelled");
   expect(cancelled.preflight).toEqual(prepared.preflight);
   await expect(
