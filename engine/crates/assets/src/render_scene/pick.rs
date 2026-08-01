@@ -1,33 +1,17 @@
 use super::*;
 
-/// Picks the nearest entity the camera ray strikes: a per-mesh AABB broad-phase rejects far
-/// meshes, then a ray-triangle narrow-phase finds the true surface hit (so a click through
-/// the empty space inside a loose bounding box misses).
-///
-/// Covers static [`MeshComponent`] (rest verts transformed by the entity's world matrix) and
-/// [`SkinnedMesh`] (verts CPU-skinned through a freshly-rebuilt joint palette into world
-/// space, exactly as the GPU does). `ndc` is the click point in clip space `[-1, 1]` matching
-/// the rendered image (Y-flipped proj). Returns [`Entity::NULL`] on a miss.
-///
-/// Takes the upload seam + the active `(width, height)` viewport directly rather than a
-/// full [`SceneRenderer`] — picking needs only the AABB mesh upload + the aspect ratio, not
-/// the per-frame render driver — so the control plane drives it through
-/// `ControlRenderer::with_gpu_uploader` + the viewport-size query.
-pub fn pick_entity(
-    gpu: &dyn GpuUploader,
-    viewport: (u32, u32),
-    scene: &mut Scene,
-    assets: &mut AssetServer,
-    camera: &CameraView,
-    ndc: Vec2,
-) -> crate::Result<Entity> {
-    Ok(
-        pick_scene_surface(gpu, viewport, scene, assets, camera, ndc)?
-            .map_or(Entity::NULL, |hit| hit.entity),
-    )
-}
-
 /// Picks the nearest rendered surface hit for a viewport NDC point.
+///
+/// A per-mesh AABB broad-phase rejects far meshes, then a ray-triangle narrow-phase finds the true
+/// surface hit, so a ray through the empty space inside a loose bounding box misses. Covers static
+/// [`MeshComponent`] (rest verts transformed by the entity's world matrix) and [`SkinnedMesh`]
+/// (verts CPU-skinned through a freshly-rebuilt joint palette into world space, exactly as the GPU
+/// does). `ndc` is the point in clip space `[-1, 1]` matching the rendered image (Y-flipped proj).
+///
+/// Takes the upload seam + the active `(width, height)` viewport directly rather than a full
+/// [`SceneRenderer`] — it needs only the AABB mesh upload + the aspect ratio, not the per-frame
+/// render driver — so the control plane drives it through `ControlRenderer::with_gpu_uploader` +
+/// the viewport-size query.
 pub fn pick_scene_surface(
     gpu: &dyn GpuUploader,
     viewport: (u32, u32),
@@ -146,8 +130,7 @@ pub fn query_scene_surface_ray(
             .collect();
         let material_assets =
             assets.resolve_entity_material_assets(scene, entity, &mesh_ref.submeshes);
-        let coverage =
-            canonical_cpu_coverage(assets, &material_assets, gpu.coverage_temporal_phase());
+        let coverage = canonical_cpu_coverage(assets, &material_assets);
         if let Some((triangle_index, triangle_hit)) = nearest_triangle_filtered(
             &world_ray,
             &deformed,
@@ -358,7 +341,11 @@ fn static_scene_surface_snapshots(
     });
     let mut providers = Vec::new();
     for (entity, mesh) in statics {
-        if scene.has_component::<PreviewGhost>(entity) {
+        // A promoted plant's entity view is a transient derived representation of a plant the cook
+        // itself placed, and it falls under physics: admitting it would let a cook read its own
+        // output as a surface, and would move the surface set every frame a view is standing.
+        if scene.has_component::<PreviewGhost>(entity) || scene.has_component::<PlantOrigin>(entity)
+        {
             continue;
         }
         if let Some(provider) = static_mesh_surface_provider(gpu, scene, assets, entity, mesh)? {
@@ -420,7 +407,7 @@ fn static_mesh_surface_provider(
     let model = scene.world_matrix(entity);
     let material_tags = surface_material_tags(scene, entity);
     let material_assets = assets.resolve_entity_material_assets(scene, entity, &mesh_ref.submeshes);
-    let coverage = canonical_cpu_coverage(assets, &material_assets, gpu.coverage_temporal_phase());
+    let coverage = canonical_cpu_coverage(assets, &material_assets);
     let revision = mesh_surface_revision(
         mesh.mesh.value(),
         &mesh_ref.cpu_vertices,
@@ -449,7 +436,6 @@ fn static_mesh_surface_provider(
 fn canonical_cpu_coverage(
     assets: &mut AssetServer,
     materials: &[MaterialAsset],
-    temporal_phase: u32,
 ) -> Vec<CanonicalCpuCoverage> {
     materials
         .iter()
@@ -534,7 +520,6 @@ fn canonical_cpu_coverage(
                 texture_extent,
                 hash_extent,
                 salt,
-                temporal_phase,
                 reference_cutoff,
                 canonical_probability,
                 uv_tiling: material.uv_tiling,
@@ -651,22 +636,6 @@ fn scene_surface_is_nearer(candidate: &SceneSurfaceHit, current: Option<&SceneSu
 }
 
 /// Builds the world-space viewport ray used by picking and placement.
-/// The viewport pick ray in the vegetation query vocabulary — the same origin and
-/// direction the scene-surface pick casts, with a finite far bound.
-#[must_use]
-pub fn viewport_pick_ray(
-    viewport: (u32, u32),
-    camera: &CameraView,
-    ndc: Vec2,
-) -> Option<saffron_vegetation::VegetationQueryRay> {
-    if viewport.0 == 0 || viewport.1 == 0 {
-        return None;
-    }
-    let ray = viewport_ray(viewport, camera, ndc);
-    let origin = WorldPosition::from_render_relative(ray.origin, WorldPosition::origin()).ok()?;
-    saffron_vegetation::VegetationQueryRay::new(origin, ray.dir.as_dvec3(), 10_000.0).ok()
-}
-
 pub fn viewport_ray(viewport: (u32, u32), camera: &CameraView, ndc: Vec2) -> Ray {
     let (width, height) = viewport;
     let aspect = width as f32 / height as f32;
@@ -764,7 +733,7 @@ mod tests {
             RecordingRenderer::new(1024, 768, false).with_gpu(&fx.uploader, &fx.descriptors);
         let camera = test_camera();
         // The triangle straddles the origin; a ray through clip-space center (0,0) hits it.
-        let hit = pick_entity(
+        let hit = pick_scene_surface(
             &renderer,
             (1024, 768),
             &mut scene,
@@ -772,12 +741,13 @@ mod tests {
             &camera,
             Vec2::ZERO,
         )
-        .unwrap();
+        .unwrap()
+        .map_or(Entity::NULL, |hit| hit.entity);
         assert_eq!(hit, e, "a click through the center hits the triangle");
 
         // A click far in the corner of the loose AABB but outside the triangle misses (the
         // narrow-phase ray-triangle rejects the empty corner).
-        let miss = pick_entity(
+        let miss = pick_scene_surface(
             &renderer,
             (1024, 768),
             &mut scene,
@@ -785,7 +755,8 @@ mod tests {
             &camera,
             Vec2::new(-0.99, -0.99),
         )
-        .unwrap();
+        .unwrap()
+        .map_or(Entity::NULL, |hit| hit.entity);
         assert_eq!(miss, Entity::NULL, "a click into empty space misses");
 
         drop(renderer);
@@ -810,7 +781,7 @@ mod tests {
         let camera = test_camera();
         // The bone is at the origin with identity inverse-bind, so the rest triangle straddles
         // the origin; a center ray skins each vertex through the (identity) palette and hits.
-        let hit = pick_entity(
+        let hit = pick_scene_surface(
             &renderer,
             (1024, 768),
             &mut scene,
@@ -818,7 +789,8 @@ mod tests {
             &camera,
             Vec2::ZERO,
         )
-        .unwrap();
+        .unwrap()
+        .map_or(Entity::NULL, |hit| hit.entity);
         assert_eq!(hit, e, "the skinned triangle picks against a fresh palette");
 
         drop(renderer);
