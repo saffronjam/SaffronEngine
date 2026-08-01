@@ -24,7 +24,7 @@ let engine: Engine;
 let rtSupported = false;
 
 async function stats(): Promise<RenderStatsDto> {
-  return engine.call<RenderStatsDto>("render-stats");
+  return engine.call("render-stats");
 }
 
 beforeAll(async () => {
@@ -138,15 +138,19 @@ test("the opacity-micromap capability is reported and the device came up clean w
   // never be true without ray tracing.
   if (s.ommSupported) {
     expect(s.rtSupported).toBe(true);
+  } else {
+    // Nothing can be attached without the extension, so a nonzero count would mean the
+    // telemetry is reporting structures the device never built.
+    expect(s.ommMicromaps).toBe(0);
   }
   expect(engine.validationErrors()).toEqual([]);
 });
 
 test("the GI occluder list reports what it dropped rather than only logging it", async () => {
   const s = await stats();
-  // The SDF list is gathered by an unculled scan and hard-capped, so past the cap occluders
-  // vanish from global illumination with no hierarchy to coarsen into. A warning in the log
-  // cannot be asserted on; this can. A scene this size must drop nothing.
+  // The occluder region is hard-capped, so past the cap occluders vanish from global illumination
+  // with no hierarchy to coarsen into. A warning in the log cannot be asserted on; this can. A
+  // scene this size must drop nothing.
   expect(s.sdfInstancesDropped).toBe(0);
 });
 

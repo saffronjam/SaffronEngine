@@ -9,39 +9,49 @@
 // draw from `SV_DrawIndex` and its triangle block from the group id. Identical cluster cuts are
 // therefore structural, and a divergence would mean one executor ignored records the binner emitted.
 //
-// That leaves the image, measured by booting two hosts differing in one environment variable. The
-// frames are compared for bit-identity, not closeness: the mesh entry calls the same
-// `executorVertexOutput` helper the vertex entry does, over the same records, behind the same
-// indexed depth pre-pass — so every shaded fragment resolves from identical inputs. The capture
-// turns anti-aliasing off, because a temporally accumulated frame's value depends on how many
-// frames it settled for, which is wall-clock and would put boot-to-boot noise in front of the
-// property being measured.
+// That leaves the image, measured by rendering the same scene twice in one host with
+// `set-mesh-executor` between the captures — one process, one device, one scene, so the executor is
+// the only thing that differs. The frames are compared for bit-identity, not closeness: the mesh
+// entry calls the same `executorVertexOutput` helper the vertex entry does, over the same records,
+// behind the same indexed depth pre-pass — so every shaded fragment resolves from identical inputs.
+// The capture turns off everything that accumulates across frames and then waits for the frame to
+// stop changing, because a frame still reaching its fixed point differs from itself between two
+// readings, and either capture taken there measures how long it settled rather than which executor
+// drew it.
 
 import { afterAll, beforeAll, expect, test } from "bun:test";
-import type { RenderStatsDto } from "@saffron/protocol";
 import { Engine } from "./harness.ts";
-import { Cleaner, captureViewport, prepareScene } from "./test-utils.ts";
+import { Cleaner, captureSettledViewport, prepareScene } from "./test-utils.ts";
 import { decodeRgb8Png, meanAbsoluteDifference } from "./image.ts";
 
-// The pose both hosts render from.
+// The pose both captures render from.
 const CAMERA = { position: { x: 0, y: 5, z: 9 }, yaw: 0, pitch: -25 };
 
 const cleaner = new Cleaner();
 const frames: Record<string, Buffer> = {};
-// Which executor each run actually used, read back from the engine rather than assumed.
+// Which executor each capture actually used, read back from the engine rather than assumed.
 const active: Record<string, boolean> = {};
-let meshShaderSupported = false;
+let meshExecutorSupported = false;
+// Which executor a freshly booted host draws through, before anything asks for one.
+let bootExecutor = false;
 
-// Boots a host with the executor selected, builds the scene, and captures one settled frame.
-async function captureWithExecutor(meshExecutor: boolean): Promise<Buffer> {
-  const engine = await Engine.boot({
-    SAFFRON_SCRATCH_PROJECT: "1",
-    SAFFRON_MESH_EXECUTOR: meshExecutor ? "1" : "0",
-  });
+beforeAll(async () => {
+  const engine = await Engine.boot({ SAFFRON_SCRATCH_PROJECT: "1" });
   cleaner.defer(() => engine.shutdown());
+
+  // The capability is device-dependent: MoltenVK has no mesh stage, and a device whose mesh
+  // output limits fall short of one workgroup's shape does not qualify either. There the whole
+  // comparison is correctly skipped rather than faked.
+  const boot = await engine.call("set-mesh-executor", {});
+  meshExecutorSupported = boot.supported;
+  bootExecutor = boot.enabled;
+  if (!meshExecutorSupported) {
+    return;
+  }
+
   await prepareScene(engine, { width: 480, height: 270, camera: CAMERA });
   await engine.call("add-entity", { preset: "plane" });
-  const cube = await engine.call<{ id: string }>("add-entity", { preset: "cube" });
+  const cube = await engine.call("add-entity", { preset: "cube" });
   await engine.call("set-component", {
     entity: cube.id,
     component: "Transform",
@@ -52,47 +62,50 @@ async function captureWithExecutor(meshExecutor: boolean): Promise<Buffer> {
     },
   });
   await engine.call("set-wind", { speed: 0, gust: 0 });
-  // No temporal accumulation in the capture: the comparison below is exact.
-  const aa = await engine.call<{ aa: string }>("set-aa", { mode: "off" });
+  // Nothing that accumulates over frames: the comparison below is exact, and a temporal history
+  // or a round-robin probe update makes a capture a function of how long it settled rather than
+  // of what drew it. None of them is what this suite measures — the executors differ in how
+  // vertices reach the rasterizer, and every one of these passes consumes the resolved frame.
+  const aa = await engine.call("set-aa", { mode: "off" });
   expect(aa.aa).toBe("off");
-  await engine.settle(1200);
-  const frame = await captureViewport(engine, cleaner, `mesh-exec-${meshExecutor}`);
-  active[meshExecutor ? "mesh" : "indexed"] = (
-    await engine.call<RenderStatsDto>("render-stats")
-  ).meshExecutor;
-  expect(engine.validationErrors()).toEqual([]);
-  return frame;
-}
+  await engine.call("set-gi", { mode: "off" });
+  await engine.call("set-gdf", { enabled: false });
 
-beforeAll(async () => {
-  // The capability is device-dependent: MoltenVK has no mesh stage, so there the whole
-  // comparison is correctly skipped rather than faked.
-  const probe = await Engine.boot({ SAFFRON_SCRATCH_PROJECT: "1" });
-  meshShaderSupported = (await probe.call<RenderStatsDto>("render-stats")).meshShader;
-  await probe.shutdown();
-  if (!meshShaderSupported) {
-    return;
+  for (const [name, mesh] of [
+    ["indexed", false],
+    ["mesh", true],
+  ] as const) {
+    const selected = await engine.call("set-mesh-executor", { enabled: mesh });
+    expect(selected.enabled).toBe(mesh);
+    frames[name] = await captureSettledViewport(engine, cleaner, `mesh-exec-${name}`);
+    active[name] = (await engine.call("render-stats")).meshExecutor;
   }
-  frames.indexed = await captureWithExecutor(false);
-  frames.mesh = await captureWithExecutor(true);
+  expect(engine.validationErrors()).toEqual([]);
 }, 300_000);
 
 afterAll(async () => {
   await cleaner.cleanup();
 });
 
-test("the two runs really used different executors", () => {
-  if (!meshShaderSupported) {
+test("the device's own capability selects the executor, with nothing to opt into", () => {
+  // The mesh stage is not an opt-in mode layered over the capability: a host that comes up on a
+  // qualifying device is already drawing through it, and one that does not qualify is on the
+  // indexed path. `set-mesh-executor` exists to compare the two, not to enable one.
+  expect(bootExecutor).toBe(meshExecutorSupported);
+});
+
+test("the two captures really used different executors", () => {
+  if (!meshExecutorSupported) {
     return;
   }
-  // Without this the image comparison below could pass because the toggle did nothing and both
-  // runs rendered through the indexed path — a parity test that proves nothing at all.
+  // Without this the image comparison below could pass because the switch did nothing and both
+  // captures rendered through the indexed path — a parity test that proves nothing at all.
   expect(active.indexed).toBe(false);
   expect(active.mesh).toBe(true);
 });
 
 test("the mesh executor renders the indexed executor's image", () => {
-  if (!meshShaderSupported) {
+  if (!meshExecutorSupported) {
     return;
   }
   const indexed = decodeRgb8Png(frames.indexed!);
@@ -103,7 +116,7 @@ test("the mesh executor renders the indexed executor's image", () => {
 });
 
 test("both executors drew something", () => {
-  if (!meshShaderSupported) {
+  if (!meshExecutorSupported) {
     return;
   }
   // Two blank frames would satisfy the comparison above perfectly. This is the control:
@@ -114,3 +127,16 @@ test("both executors drew something", () => {
   const differs = mesh.pixels.some((value) => Math.abs(value - first) > 8);
   expect(differs).toBe(true);
 });
+
+test("a device that does not qualify keeps the indexed executor", async () => {
+  if (meshExecutorSupported) {
+    return;
+  }
+  // The other half of the capability gate: asking for the mesh executor on a device short of the
+  // feature bits or the output limits must leave the indexed path in force, not fail the call.
+  const engine = await Engine.boot({ SAFFRON_SCRATCH_PROJECT: "1" });
+  cleaner.defer(() => engine.shutdown());
+  const asked = await engine.call("set-mesh-executor", { enabled: true });
+  expect(asked.enabled).toBe(false);
+  expect((await engine.call("render-stats")).meshExecutor).toBe(false);
+}, 120_000);

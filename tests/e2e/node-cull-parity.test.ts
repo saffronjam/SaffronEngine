@@ -21,11 +21,7 @@
 // bound sits between them.
 
 import { afterAll, beforeAll, expect, test } from "bun:test";
-import type {
-  EntityRef,
-  GpuSceneMirrorStatsDto,
-  VegetationRuntimeQueryResult,
-} from "@saffron/protocol";
+import type { GpuSceneMirrorStatsDto } from "@saffron/protocol";
 import { Engine } from "./harness.ts";
 import { Cleaner, captureViewport, prepareScene } from "./test-utils.ts";
 import { decodeRgb8Png, meanAbsoluteDifference } from "./image.ts";
@@ -34,6 +30,7 @@ import {
   cookCells,
   importVegetationPackage,
   loadFixture,
+  queryPlants,
 } from "./vegetation-utils.ts";
 
 // The cooked plants stand near (1, 0, 1) and are roughly a quarter-metre across, so these
@@ -68,7 +65,7 @@ async function sweepWithNodeCull(nodeCull: boolean): Promise<Record<string, Capt
 
   const fixture = loadFixture("vegetation-phase3");
   await importVegetationPackage(engine, cleaner, fixture, `node-cull-${label}`);
-  const world = await engine.call<EntityRef>("create-entity", { name: "Node-cull vegetation" });
+  const world = await engine.call("create-entity", { name: "Node-cull vegetation" });
   await engine.call("add-component", { entity: world.id, component: "VegetationField" });
   await engine.call("set-component", {
     entity: world.id,
@@ -79,9 +76,7 @@ async function sweepWithNodeCull(nodeCull: boolean): Promise<Record<string, Capt
 
   const deadline = Date.now() + 30_000;
   for (;;) {
-    const hits = await engine.call<VegetationRuntimeQueryResult>("vegetation-runtime-query", {
-      query: { kind: "bounds", bounds: BOUNDS },
-    });
+    const hits = await queryPlants(engine, BOUNDS);
     if (hits.hits.length > 0) {
       break;
     }
@@ -101,7 +96,7 @@ async function sweepWithNodeCull(nodeCull: boolean): Promise<Record<string, Capt
     await engine.settle(900);
     captures[pose] = {
       frame: await captureViewport(engine, cleaner, `node-cull-${label}-${pose}`),
-      stats: await engine.call<GpuSceneMirrorStatsDto>("gpu-scene-stats"),
+      stats: await engine.call("gpu-scene-stats"),
     };
   }
   expect(engine.validationErrors()).toEqual([]);

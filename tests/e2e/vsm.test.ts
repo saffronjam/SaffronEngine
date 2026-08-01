@@ -6,7 +6,6 @@
 // that the physical-atlas design needs no sparse-residency support.
 
 import { afterAll, beforeAll, expect, test } from "bun:test";
-import type { EntityRef, RenderStatsDto } from "@saffron/protocol";
 import type { Engine } from "./harness.ts";
 import { Cleaner, bootEngine, trackEntity } from "./test-utils.ts";
 
@@ -22,7 +21,7 @@ afterAll(async () => {
 });
 
 async function vsm() {
-  const stats = await engine.call<RenderStatsDto>("render-stats");
+  const stats = await engine.call("render-stats");
   return stats.vsm;
 }
 
@@ -58,7 +57,7 @@ test("the page atlas serves directional, spot, and point shadow casters", async 
   const floor = trackEntity(
     cleaner,
     engine,
-    await engine.call<EntityRef>("add-entity", { preset: "plane" }),
+    await engine.call("add-entity", { preset: "plane" }),
   );
   await engine.call("set-component", {
     entity: floor.id,
@@ -68,7 +67,7 @@ test("the page atlas serves directional, spot, and point shadow casters", async 
   const caster = trackEntity(
     cleaner,
     engine,
-    await engine.call<EntityRef>("add-entity", { preset: "cube" }),
+    await engine.call("add-entity", { preset: "cube" }),
   );
   await engine.call("rename-entity", { entity: caster.id, name: "VSM caster" });
   await engine.call("set-component", {
@@ -80,7 +79,7 @@ test("the page atlas serves directional, spot, and point shadow casters", async 
   const spot = trackEntity(
     cleaner,
     engine,
-    await engine.call<EntityRef>("create-entity", { name: "VSM spot" }),
+    await engine.call("create-entity", { name: "VSM spot" }),
   );
   await engine.call("add-component", { entity: spot.id, component: "SpotLight" });
   await engine.call("set-component", {
@@ -92,7 +91,7 @@ test("the page atlas serves directional, spot, and point shadow casters", async 
   const point = trackEntity(
     cleaner,
     engine,
-    await engine.call<EntityRef>("create-entity", { name: "VSM point" }),
+    await engine.call("create-entity", { name: "VSM point" }),
   );
   await engine.call("add-component", { entity: point.id, component: "PointLight" });
   await engine.call("set-component", {
@@ -139,7 +138,7 @@ test("repeat demand is answered from resident pages, not re-allocated", async ()
 });
 
 test("a moving caster dirties pages without invalidating the whole atlas", async () => {
-  const caster = await engine.call<{ entities: { id: string; name: string }[] }>("list-entities");
+  const caster = await engine.call("list-entities");
   const moving = caster.entities.find((entity) => entity.name === "VSM caster");
   expect(moving).toBeDefined();
 
@@ -155,10 +154,13 @@ test("a moving caster dirties pages without invalidating the whole atlas", async
     });
     await engine.settle(50);
   }
-  // A one-cube move is not a whole-atlas storm: whatever the frame dirties, it stays far below the
-  // atlas's page count and never overflows residency.
+  // A one-cube move is not a whole-atlas storm: whatever the frame dirties, it stays inside the
+  // pages the frame actually demanded and never overflows residency. How TIGHT the dirty set is
+  // around the caster's own footprint is a property of the page-span derivation, which
+  // `a_thin_caster_dirties_a_strip_where_a_cube_dirties_a_square` pins exactly; what this asserts
+  // is that the whole live path stays bounded by the working set.
   const after = await vsm();
-  expect(after.dirtied).toBeLessThan(1024);
+  expect(after.dirtied).toBeLessThanOrEqual(after.requested);
   expect(after.overflow).toBe(0);
   expect(engine.validationErrors()).toEqual([]);
 });

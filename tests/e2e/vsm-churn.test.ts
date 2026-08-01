@@ -14,7 +14,6 @@
 // the pressure really happened rather than trusting the knob.
 
 import { afterAll, beforeAll, expect, test } from "bun:test";
-import type { EntityRef, RenderStatsDto } from "@saffron/protocol";
 import type { Engine } from "./harness.ts";
 import { Cleaner, bootEngine, captureViewport, prepareScene, trackEntity } from "./test-utils.ts";
 import { decodeRgb8Png, meanAbsoluteDifference } from "./image.ts";
@@ -32,11 +31,11 @@ let engine: Engine;
 beforeAll(async () => {
   engine = await bootEngine(cleaner, { SAFFRON_SCRATCH_PROJECT: "1" });
   await prepareScene(engine, { camera: CAMERA });
-  trackEntity(cleaner, engine, await engine.call<EntityRef>("add-entity", { preset: "plane" }));
+  trackEntity(cleaner, engine, await engine.call("add-entity", { preset: "plane" }));
   const caster = trackEntity(
     cleaner,
     engine,
-    await engine.call<EntityRef>("add-entity", { preset: "cube" }),
+    await engine.call("add-entity", { preset: "cube" }),
   );
   await engine.call("set-component", {
     entity: caster.id,
@@ -91,7 +90,7 @@ test("the atlas converges back to its settled image after wind and camera churn"
   // The churn must not have overflowed the atlas or left the run dirty.
   await engine.call("set-camera", CAMERA);
   await engine.settle(200);
-  const stats = await engine.call<RenderStatsDto>("render-stats");
+  const stats = await engine.call("render-stats");
   expect(stats.vsm.overflow).toBe(0);
   expect(engine.validationErrors()).toEqual([]);
 });
@@ -115,7 +114,7 @@ test("a starved page budget still reconverges to the reference image", async () 
     await engine.call("set-wind", { speed, gust: speed > 0 ? 0.9 : 0 });
     await engine.call("set-camera", { position: { x: 18, y: 10, z: 26 }, yaw: 24, pitch: -30 });
     await engine.settle(120);
-    const during = await engine.call<RenderStatsDto>("render-stats");
+    const during = await engine.call("render-stats");
     peakDirtied = Math.max(peakDirtied, during.vsm.dirtied);
     peakRendered = Math.max(peakRendered, during.vsm.rendered);
     await engine.call("set-camera", CAMERA);
@@ -136,7 +135,7 @@ test("a starved page budget still reconverges to the reference image", async () 
   const settled = decodeRgb8Png(await captureViewport(engine, cleaner, "starved-settled"));
   expect(meanAbsoluteDifference(reference, settled)).toBeLessThan(CONVERGENCE_TOLERANCE);
 
-  const recovered = await engine.call<RenderStatsDto>("render-stats");
+  const recovered = await engine.call("render-stats");
   expect(recovered.vsm.overflow).toBe(0);
   expect(engine.validationErrors()).toEqual([]);
 });

@@ -7,17 +7,22 @@
 // is `sampled * baseColorAlpha` against the reference cutoff, and with no albedo texture bound
 // `sampled` is the default-white 1.0, so the base-colour alpha alone decides.
 //
+// Shadow maps are off for the duration, so the only thing darkening the receiver is the ray
+// shadow. Sharing the receiver with the raster shadow would make the measurement meaningless: the
+// blocker's coverage cuts it out of the shadow-map pass too, so the patch would brighten whether or
+// not a single ray candidate was ever classified.
+//
 // The assertion samples the receiver patch the ray shadow falls on, not the whole frame: the
 // blocker's own shading also responds to its coverage, so a frame-wide comparison cannot separate
-// "the candidate was rejected" from "the blocker looks different". The patch was located by diffing
-// a normal frame against a build that rejects every candidate, and it lies just below the blocker,
-// clear of the blocker's own pixels.
+// "the candidate was rejected" from "the blocker looks different". The guard case pins the patch to
+// the ray shadow — with ray-query shadows disabled it reads as bright as a rejected candidate
+// leaves it.
 
 import { afterAll, beforeAll, expect, test } from "bun:test";
-import type { EntityRef, RenderStatsDto } from "@saffron/protocol";
+import type { MaterialSurfaceDto } from "@saffron/protocol";
 import type { Engine } from "./harness.ts";
 import { Cleaner, bootEngine, captureViewport, prepareScene, trackEntity } from "./test-utils.ts";
-import { decodeRgb8Png, regionMean } from "./image.ts";
+import { type Rgb8Image, decodeRgb8Png, regionMean } from "./image.ts";
 
 const cleaner = new Cleaner();
 let engine: Engine;
@@ -27,7 +32,7 @@ let material = "";
 
 // A thin-sheet foliage surface whose coverage comes from albedo alpha and is `masked`, so the
 // classifier — not the geometry — decides whether a ray candidate commits.
-const MASKED_THIN_SHEET = {
+const MASKED_THIN_SHEET: MaterialSurfaceDto = {
   model: "thin-sheet-foliage",
   parameters: {
     frontAlbedoResponse: 20_000,
@@ -67,24 +72,36 @@ async function setBlockerAlpha(alpha: number): Promise<void> {
   await engine.call("material-update", {
     material,
     surface: MASKED_THIN_SHEET,
-    baseColor: [0.5, 0.5, 0.5, alpha],
+    baseColor: { x: 0.5, y: 0.5, z: 0.5, w: alpha },
   });
   await engine.settle(400);
+}
+
+// The receiver patch the candidate-driven ray shadow lands on, in frame fractions so it survives a
+// viewport size change. Located by diffing a ray-shadowed frame against one with ray shadows off,
+// which is the same thing the guard case asserts.
+function shadowPatch(frame: Rgb8Image) {
+  return {
+    x: Math.floor(frame.width * 0.465),
+    y: Math.floor(frame.height * 0.557),
+    width: Math.max(1, Math.floor(frame.width * 0.037)),
+    height: Math.max(1, Math.floor(frame.height * 0.053)),
+  };
 }
 
 beforeAll(async () => {
   engine = await bootEngine(cleaner, { SAFFRON_SCRATCH_PROJECT: "1" });
   await prepareScene(engine, { camera: { position: { x: 0, y: 5, z: 9 }, yaw: 0, pitch: -25 } });
-  rtSupported = (await engine.call<RenderStatsDto>("render-stats")).rtSupported;
+  rtSupported = (await engine.call("render-stats")).rtSupported;
   if (!rtSupported) {
     return;
   }
   // A receiver to catch the shadow, and a blocker between it and the sun.
-  trackEntity(cleaner, engine, await engine.call<EntityRef>("add-entity", { preset: "plane" }));
+  trackEntity(cleaner, engine, await engine.call("add-entity", { preset: "plane" }));
   const cube = trackEntity(
     cleaner,
     engine,
-    await engine.call<EntityRef>("add-entity", { preset: "cube" }),
+    await engine.call("add-entity", { preset: "cube" }),
   );
   blocker = cube.id;
   await engine.call("set-component", {
@@ -96,9 +113,10 @@ beforeAll(async () => {
       rotation: { x: 0, y: 0, z: 0 },
     },
   });
-  const created = await engine.call<{ id: string }>("material-create", { name: "AnyHitLeaf" });
+  const created = await engine.call("material-create", { name: "AnyHitLeaf" });
   material = created.id;
   await engine.call("material-assign", { entity: blocker, material });
+  await engine.call("set-shadows", { enabled: false });
   await engine.call("set-rt-shadows", { enabled: true });
   await engine.settle(500);
 });
@@ -111,10 +129,20 @@ test("ray-query shadows are armed and the blocker is in the TLAS", async () => {
   if (!rtSupported) {
     return;
   }
-  const stats = await engine.call<RenderStatsDto>("render-stats");
+  const stats = await engine.call("render-stats");
   expect(stats.rtShadows).toBe(true);
   expect(stats.rtInstances).toBeGreaterThan(0);
   expect(stats.blasCount).toBeGreaterThan(0);
+  // Every instance in this scene is a mirrored entity, so every one of them resolves its
+  // candidates against a scene record rather than committing unconditionally. The two
+  // representations that legitimately resolve nothing — a family-space aggregate and a
+  // generated-topology structure, neither of which names a submesh — are absent here, and the
+  // difference says so instead of leaving a bare equality to rot once one of them appears.
+  expect(stats.rtAggregateInstances).toBe(0);
+  expect(stats.tessellatedBlasCount).toBe(0);
+  expect(stats.rtResolvableInstances).toBe(
+    stats.rtInstances - stats.rtAggregateInstances - stats.tessellatedBlasCount,
+  );
 });
 
 test("a rejected coverage candidate lets the shadow ray through; a committed one shadows", async () => {
@@ -126,19 +154,25 @@ test("a rejected coverage candidate lets the shadow ray through; a committed one
   const covered = decodeRgb8Png(await captureViewport(engine, cleaner, "anyhit-covered"));
   await setBlockerAlpha(0.0);
   const cutOut = decodeRgb8Png(await captureViewport(engine, cleaner, "anyhit-cutout"));
+  // The guard: the same covered blocker with ray-query shadows off. It says what the patch would
+  // read if no ray shadow reached it at all, which is what a rejected candidate should reproduce.
+  await setBlockerAlpha(1.0);
+  await engine.call("set-rt-shadows", { enabled: false });
+  await engine.settle(400);
+  const noRayShadow = decodeRgb8Png(await captureViewport(engine, cleaner, "anyhit-guard"));
+  await engine.call("set-rt-shadows", { enabled: true });
+  await engine.settle(400);
 
-  // The receiver patch the candidate-driven ray shadow lands on, in frame fractions so it survives
-  // a viewport size change.
-  const shadowPatch = {
-    x: Math.floor(covered.width * 0.465),
-    y: Math.floor(covered.height * 0.557),
-    width: Math.max(1, Math.floor(covered.width * 0.037)),
-    height: Math.max(1, Math.floor(covered.height * 0.053)),
-  };
-  const shadowed = regionMean(covered, shadowPatch);
-  const lit = regionMean(cutOut, shadowPatch);
+  const patch = shadowPatch(covered);
+  const shadowed = regionMean(covered, patch);
+  const lit = regionMean(cutOut, patch);
+  const unshadowed = regionMean(noRayShadow, patch);
   // A committed candidate darkens the receiver; a rejected one lets the ray through and leaves it
   // lit. The margin is far above the frame-to-frame noise the whole-frame metric sits in.
   expect(lit).toBeGreaterThan(shadowed + 5);
+  // The patch is a ray-shadow receiver, not some other surface that happens to change: with the
+  // ray shadow disabled it brightens by the same amount rejecting the candidate does.
+  expect(unshadowed).toBeGreaterThan(shadowed + 5);
+  expect(Math.abs(lit - unshadowed)).toBeLessThan(2);
   expect(engine.validationErrors()).toEqual([]);
 });

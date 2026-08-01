@@ -9,29 +9,44 @@
 // no other way to reach the KHR path, and a self-comparison cannot tell a correct structure from a
 // consistently wrong one.
 //
-// Two validation messages are expected and whitelisted by VUID, which is why this suite sits apart
-// from `rt-telemetry`. The SDK layers ship the extension's header but do not model it: a partitioned
+// Two validation messages are expected and tolerated, which is why this suite sits apart from
+// `rt-telemetry`. The SDK layers ship the extension's header but do not model it: a partitioned
 // structure has no SPIR-V form for a shader variable to declare, so the shader declares an ordinary
 // acceleration structure and the layer calls that a descriptor mismatch, and it is memory rather
 // than an object, so the layer cannot resolve its address. Neither is reachable from engine code,
 // and every other validation message still fails this suite.
 
 import { afterAll, beforeAll, expect, test } from "bun:test";
-import type { RenderStatsDto } from "@saffron/protocol";
 import type { Engine } from "./harness.ts";
 import { decodeRgb8Png, meanAbsoluteDifference } from "./image.ts";
 import { Cleaner, bootEngine, captureViewport, prepareScene } from "./test-utils.ts";
 
-// The layer gaps this suite tolerates, by VUID. Anything else is a real failure.
-const EXPECTED_VUIDS = [
-  "VUID-VkGraphicsPipelineCreateInfo-layout-07990",
-  "VUID-vkCmdDrawIndexedIndirectCount-None-08114",
+// The layer gaps this suite tolerates. Anything else is a real failure.
+//
+// The descriptor-mismatch gap is one VUID. The unresolvable-address gap is a rule the layers
+// instantiate per draw entry point — `-None-08114` carries the recording command's own name, so
+// the indexed and mesh executors report the same gap under different VUIDs. It is matched by the
+// rule plus the two things only this gap says: the descriptor is the partitioned structure, and
+// the handle it resolved is null, because a partitioned structure is memory rather than an object.
+// A genuinely destroyed acceleration structure names a real handle and still fails this suite.
+//
+// The layer also announces when it stops repeating a message, and that announcement carries the
+// VUID without the body. Tolerating it cannot hide a real fault: the ten messages that earn the
+// announcement are matched on their bodies first, and a real one fails there.
+const DUPLICATE_LIMIT = "duplicate_message_limit";
+const EXPECTED_GAPS: ((line: string) => boolean)[] = [
+  (line) => line.includes("VUID-VkGraphicsPipelineCreateInfo-layout-07990"),
+  (line) =>
+    /VUID-vkCmd\w+-None-08114/.test(line) &&
+    ((line.includes("partitioned acceleration structure descriptor") &&
+      line.includes("VkAccelerationStructureNV 0x0")) ||
+      line.includes(DUPLICATE_LIMIT)),
 ];
 
 function unexpectedValidation(engine: Engine): string[] {
   return engine
     .validationErrors()
-    .filter((line) => !EXPECTED_VUIDS.some((vuid) => line.includes(vuid)));
+    .filter((line) => !EXPECTED_GAPS.some((tolerated) => tolerated(line)));
 }
 
 const cleaner = new Cleaner();
@@ -52,7 +67,7 @@ beforeAll(async () => {
     SAFFRON_PTLAS: "1",
   });
   await buildScene(partitioned);
-  supported = (await partitioned.call<RenderStatsDto>("render-stats")).ptlasSupported;
+  supported = (await partitioned.call("render-stats")).ptlasSupported;
 }, 120_000);
 
 afterAll(async () => {
@@ -67,7 +82,7 @@ test("a partitioned top level traces the same picture as the KHR one", async () 
 
   const khr = await bootEngine(cleaner, { SAFFRON_SCRATCH_PROJECT: "1" });
   await buildScene(khr);
-  const khrStats = await khr.call<RenderStatsDto>("render-stats");
+  const khrStats = await khr.call("render-stats");
   // The control: this host really did take the other path, and really did trace.
   expect(khrStats.ptlasSupported).toBe(false);
   expect(khrStats.rtShadows).toBe(true);
@@ -92,7 +107,7 @@ async function peakOps(engine: Engine, samples: number): Promise<{ writes: numbe
   let writes = 0;
   let ops = 0;
   for (let i = 0; i < samples; i += 1) {
-    const stats = await engine.call<RenderStatsDto>("render-stats");
+    const stats = await engine.call("render-stats");
     writes = Math.max(writes, stats.ptlasWrites);
     ops = Math.max(ops, stats.ptlasWrites + stats.ptlasUpdates);
     await engine.settle(30);
@@ -107,7 +122,7 @@ test("a settled frame advances the structure instead of rebuilding it", async ()
   // The instances are placed and nothing has changed since, so the ops a frame emits are
   // the whole point: a rebuilt-whole structure would write every instance every frame.
   await partitioned.settle(600);
-  const before = await partitioned.call<RenderStatsDto>("render-stats");
+  const before = await partitioned.call("render-stats");
   expect(before.rtInstances).toBeGreaterThan(0);
   expect(before.ptlasPartitions).toBeGreaterThan(0);
   const settled = await peakOps(partitioned, 20);
@@ -117,7 +132,7 @@ test("a settled frame advances the structure instead of rebuilding it", async ()
   // reporting no work — the reading that would make the assertion above vacuous.
   await partitioned.call("add-entity", { preset: "cube" });
   const churned = await peakOps(partitioned, 20);
-  const after = await partitioned.call<RenderStatsDto>("render-stats");
+  const after = await partitioned.call("render-stats");
   expect(after.rtInstances).toBeGreaterThan(before.rtInstances);
   expect(churned.writes).toBeGreaterThan(0);
   // And only what changed is written, not the table.

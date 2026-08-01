@@ -7,12 +7,9 @@
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { Engine } from "./harness.ts";
 import type {
-  CaptureStartResult,
-  CaptureStatusResult,
   CaptureStopResult,
   ProfileSpanDto,
   ProfilerModeResult,
-  RenderPassTimingsDto,
   RenderStats,
 } from "@saffron/protocol";
 
@@ -22,12 +19,12 @@ beforeAll(async () => {
   engine = await Engine.boot({ SAFFRON_SCRATCH_PROJECT: "1" });
   // Need a drawn scene for the per-pass breakdown + throughput counters to be non-trivial.
   await engine.call("add-entity", { preset: "cube" });
-  caps = await engine.call<ProfilerModeResult>("profiler.set-mode", { args: ["timestamps"] });
+  caps = await engine.call("profiler.set-mode", { args: ["timestamps"] });
   // Let the frame telemetry warm up: the project-load reset withholds the smoothed
   // CPU headline for its warm-up frames, so poll (each query is itself a redraw
   // signal) until the headline is live instead of guessing a wall-clock delay.
   for (let i = 0; i < 40; i++) {
-    const stats = await engine.call<RenderStats>("render-stats");
+    const stats = await engine.call("render-stats");
     if (stats.cpuFrameMs > 0) break;
     await engine.settle(250);
   }
@@ -47,7 +44,7 @@ test("set-mode reports a coherent capability set", () => {
 });
 
 test("render-stats reports throughput counters and the CPU/GPU split", async () => {
-  const stats = await engine.call<RenderStats>("render-stats");
+  const stats = await engine.call("render-stats");
   expect(stats.drawCalls).toBeGreaterThan(0);
   expect(stats.triangles).toBeGreaterThan(0);
   expect(stats.sceneGatherMs).toBeGreaterThanOrEqual(0);
@@ -64,23 +61,35 @@ test("render-stats reports throughput counters and the CPU/GPU split", async () 
   }
 });
 
+// Device-local memory is the one telemetry axis with no device gate: with VK_EXT_memory_budget the
+// driver reports it, and without it VMA reports its own block totals against a fraction of the heap
+// sizes. Either way a running renderer occupies memory and has headroom, so a zero here means the
+// figures are not being sampled at all — which is what made every recorded baseline read `0`.
+test("render-stats reports device-local memory against the driver's budget", async () => {
+  const stats = await engine.call("render-stats");
+  expect(stats.vramBudgetBytes).toBeGreaterThan(0);
+  expect(stats.vramUsageBytes).toBeGreaterThan(0);
+  expect(stats.vramUsageBytes).toBeLessThan(stats.vramBudgetBytes);
+});
+
 // Render preparation scales with what the frame CHANGED, not with what the scene holds. The claim
 // is only worth asserting comparatively: a bound on one scene's counter passes for an
 // implementation that walks every instance, whereas a small scene and a much larger one reporting
 // the same steady-frame cost cannot.
 test("steady-frame preparation cost does not grow with the scene", async () => {
-  // Polls until the loop reports the frame converged, then reads the steady-frame counters. A
-  // mutation re-cuts for a frame or two, so a sample taken mid-settle measures the change rather
-  // than the steady state.
+  // Polls on convergence ALONE, so the preparation-cost claim below is the assertion's and not
+  // the poll's: a helper that waited for `sceneGatherEntities === 0` would spin until the
+  // property it is meant to test happened to hold. A mutation re-cuts for a frame or two, so a
+  // sample taken mid-settle measures the change rather than the steady state.
   async function settled(): Promise<RenderStats> {
     for (let attempt = 0; attempt < 60; attempt += 1) {
-      const stats = await engine.call<RenderStats>("render-stats");
-      if (stats.converged && stats.sceneGatherEntities === 0) {
+      const stats = await engine.call("render-stats");
+      if (stats.converged) {
         return stats;
       }
       await engine.settle(100);
     }
-    return engine.call<RenderStats>("render-stats");
+    return engine.call("render-stats");
   }
 
   const small = await settled();
@@ -89,7 +98,7 @@ test("steady-frame preparation cost does not grow with the scene", async () => {
 
   const added: string[] = [];
   for (let i = 0; i < 64; i += 1) {
-    const entity = await engine.call<{ id: string }>("add-entity", { preset: "cube" });
+    const entity = await engine.call("add-entity", { preset: "cube" });
     added.push(entity.id);
     await engine.call("set-transform", {
       entity: entity.id,
@@ -110,7 +119,7 @@ test("steady-frame preparation cost does not grow with the scene", async () => {
 });
 
 test("pass-timings returns a non-empty per-pass breakdown", async () => {
-  const timings = await engine.call<RenderPassTimingsDto>("pass-timings");
+  const timings = await engine.call("pass-timings");
   if (!caps.timestampsSupported) {
     return; // device cannot time passes; nothing to assert
   }
@@ -128,7 +137,7 @@ test("pass-timings returns a non-empty per-pass breakdown", async () => {
 test("disabling the profiler returns to baseline", async () => {
   await engine.call("profiler.set-mode", { args: ["off"] });
   await engine.settle(200);
-  const stats = await engine.call<RenderStats>("render-stats");
+  const stats = await engine.call("render-stats");
   expect(stats.profilerMode).toBe("off");
   expect(engine.validationErrors()).toEqual([]);
 });
@@ -143,15 +152,15 @@ describe("profiler capture", () => {
 
   // Arm a single-frame capture, poll the non-destructive status until ready, then drain.
   async function captureSingle(): Promise<CaptureStopResult> {
-    await engine.call<CaptureStartResult>("profiler.capture-start", { mode: "single" });
+    await engine.call("profiler.capture-start", { mode: "single" });
     for (let i = 0; i < 60; i++) {
-      const status = await engine.call<CaptureStatusResult>("profiler.capture-status");
+      const status = await engine.call("profiler.capture-status");
       if (status.state === "ready") {
         break;
       }
       await engine.settle(60);
     }
-    return engine.call<CaptureStopResult>("profiler.capture-stop");
+    return engine.call("profiler.capture-stop");
   }
 
   beforeAll(async () => {
@@ -229,15 +238,15 @@ describe("profiler capture", () => {
   });
 
   test("a frames:N capture writes a file and still returns inline spans", async () => {
-    await engine.call<CaptureStartResult>("profiler.capture-start", { mode: "frames", frames: 4 });
+    await engine.call("profiler.capture-start", { mode: "frames", frames: 4 });
     for (let i = 0; i < 80; i++) {
-      const status = await engine.call<CaptureStatusResult>("profiler.capture-status");
+      const status = await engine.call("profiler.capture-status");
       if (status.state === "ready") {
         break;
       }
       await engine.settle(60);
     }
-    const frames = await engine.call<CaptureStopResult>("profiler.capture-stop");
+    const frames = await engine.call("profiler.capture-stop");
     expect(frames.ready).toBe(true);
     expect(frames.mode).toBe("frames");
     expect(frames.frameCount).toBeGreaterThan(1);

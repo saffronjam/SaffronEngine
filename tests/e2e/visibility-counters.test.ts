@@ -28,11 +28,11 @@ beforeAll(async () => {
     camera: { position: { x: 0, y: 2, z: 6 }, yaw: 0, pitch: -15 },
   });
   await engine.settle(900);
-  empty = await engine.call<GpuSceneMirrorStatsDto>("gpu-scene-stats");
+  empty = await engine.call("gpu-scene-stats");
 
   await engine.call("add-entity", { preset: "plane" });
   for (const x of [-2, 0, 2]) {
-    const cube = await engine.call<{ id: string }>("add-entity", { preset: "cube" });
+    const cube = await engine.call("add-entity", { preset: "cube" });
     await engine.call("set-component", {
       entity: cube.id,
       component: "Transform",
@@ -44,7 +44,7 @@ beforeAll(async () => {
     });
   }
   await engine.settle(1200);
-  populated = await engine.call<GpuSceneMirrorStatsDto>("gpu-scene-stats");
+  populated = await engine.call("gpu-scene-stats");
 }, 180_000);
 
 afterAll(async () => {
@@ -89,13 +89,13 @@ test("the reach view keeps what a gather can read, not what the camera can see",
   // cannot move at all, and without the box test everything would stay visible forever.
   await engine.call("set-camera", { position: { x: 100_000, y: 2, z: 100_000 }, yaw: 0, pitch: 0 });
   await engine.settle(900);
-  const away = await engine.call<GpuSceneMirrorStatsDto>("gpu-scene-stats");
+  const away = await engine.call("gpu-scene-stats");
   expect(away.visibility.giReachCulled).toBeGreaterThan(0);
   expect(away.visibility.giReachVisible).toBe(0);
 
   await engine.call("set-camera", { position: { x: 0, y: 2, z: 6 }, yaw: 0, pitch: -15 });
   await engine.settle(900);
-  const back = await engine.call<GpuSceneMirrorStatsDto>("gpu-scene-stats");
+  const back = await engine.call("gpu-scene-stats");
   expect(back.visibility.giReachVisible).toBeGreaterThan(0);
   expect(engine.validationErrors()).toEqual([]);
 }, 60_000);
@@ -116,16 +116,10 @@ test("no view class raises a missing-page request the buffer cannot hold", async
 
   // The budget is what makes the region reachable at all, so it has to be drivable and it
   // has to refuse to exceed what is allocated.
-  const lowered = await engine.call<{ entries: number; capacity: number }>(
-    "page-request-budget",
-    { entries: 1 },
-  );
+  const lowered = await engine.call("page-request-budget", { entries: 1 });
   expect(lowered.entries).toBe(1);
   expect(lowered.capacity).toBeGreaterThan(1);
-  const restored = await engine.call<{ entries: number; capacity: number }>(
-    "page-request-budget",
-    { entries: lowered.capacity * 4 },
-  );
+  const restored = await engine.call("page-request-budget", { entries: lowered.capacity * 4 });
   expect(restored.entries).toBe(restored.capacity);
   expect(engine.validationErrors()).toEqual([]);
 }, 60_000);
@@ -143,16 +137,16 @@ test("covered samples count real lanes only while something is measuring", async
   // means anything if the counter is genuinely zero when nothing is measuring and genuinely
   // nonzero when something is. Both halves are asserted, because a counter that is always zero
   // reads as healthy and a counter that always fires costs an atomic per fragment forever.
-  const idle = await engine.call<GpuSceneMirrorStatsDto>("gpu-scene-stats");
+  const idle = await engine.call("gpu-scene-stats");
   expect(idle.visibility.coveredSamples).toBe(0);
 
   await engine.call("profiler.set-mode", { mode: "timestamps" });
   await engine.settle(400);
-  const armed = await engine.call<GpuSceneMirrorStatsDto>("gpu-scene-stats");
+  const armed = await engine.call("gpu-scene-stats");
   expect(armed.visibility.coveredSamples).toBeGreaterThan(0);
 
   await engine.call("profiler.set-mode", { mode: "off" });
   await engine.settle(400);
-  const stopped = await engine.call<GpuSceneMirrorStatsDto>("gpu-scene-stats");
+  const stopped = await engine.call("gpu-scene-stats");
   expect(stopped.visibility.coveredSamples).toBe(0);
 });

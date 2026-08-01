@@ -16,7 +16,7 @@ let rtSupported = false;
 const cleaner = new Cleaner();
 
 async function stats(): Promise<RenderStats> {
-  return engine.call<RenderStats>("render-stats");
+  return engine.call("render-stats");
 }
 
 beforeAll(async () => {
