@@ -31,10 +31,25 @@ belong to `saffron-vegetation` (`engine/crates/vegetation/AGENTS.md`).
   it.
 - **Bulk suppression lives on `VegetationWorld`, keyed by `PlantId`** (`promote_plant`,
   `demote_plant`, `is_bulk_suppressed`, `cell_bulk_revision` in `saffron-vegetation`'s
-  `runtime_world.rs`) — deliberately *not* in the immutable published generation, so it survives a
+  `runtime_world/state.rs`) — deliberately *not* in the immutable published generation, so it survives a
   cell unload, republish, and reload. Every consumer keys its per-cell cache on
   `(generation, cell_bulk_revision)`; caching on generation alone makes a promotion invisible until
   the next recook. `promote_plant` rejects a plant that is already suppressed.
+- **A view stands only while the promotion authority owns the plant.** `promote_plant` claims
+  simulation ownership on `VegetationWorld` beside the bulk suppression, and every committed
+  mutation that says *where a plant is* or *whether it exists* — transform override, promotion
+  write-back, whole-delta restore, tombstone, removal, regrow — records its committer as the new
+  owner. Biology (damage, harvest, wetting, ordinary lifecycle steps) claims nothing, so a script
+  damaging a promoted plant does not take it away from the view simulating it. `reconcile_ownership`
+  runs before the pending transitions and drops a view whose plant changed hands, *without* a
+  write-back; `commit_demotion` and `flush_state` skip the write-back for the same reason. A
+  wholesale state replacement (save load, snapshot import, network join) moves
+  `VegetationWorld::authority_epoch` instead, and every view yields.
+- **Momentum is a round trip, not a one-way write.** `origin_state` records linear/angular velocity
+  in the reducer's per-fixed-tick units at demotion; it rides the persistent delta into every
+  generation the cell publishes (`CellPersistentOverlay`), reaches the next promotion through
+  `VegetationPlantSnapshot`, and `restore_momentum` converts it back into Jolt's per-second units on
+  the fresh body. Dropping either half makes a re-promoted plant silently start at rest.
 - **`PlantOrigin` is runtime-only and immutable; `PlantVitals` is runtime-only and mutable.** Both
   live in `saffron-scene`'s `component.rs` and neither is registered for serialization. `PlantOrigin`
   behaves like `IdComponent` — the scene rejects a replacement and rejects a mutable borrow, because
@@ -45,7 +60,9 @@ belong to `saffron-vegetation` (`engine/crates/vegetation/AGENTS.md`).
   is an operation, not a state, so its queue stays separate from the promotion state machine.
 - **A rebind whose manifest identity changed calls `abandon()`.** Writing back into a different
   world records state against plants that are not the ones observed. Conversely, clearing vegetation
-  must demote *with* write-back first, while the world is still live.
+  must demote *with* write-back first, while the world is still live. The persistent state itself
+  does cross: the bind rebases what the outgoing world held (or, on a cold bind, the map's baseline)
+  onto the incoming generation, so a recook re-keys the world without emptying it.
 - **Transaction ids are content-derived, never a session counter.** The reducer ignores a replay
   whose canonical content is identical and errors on the same id carrying different content — so a
   session-local counter collides across reloads and its writes are then **silently dropped**.
@@ -57,6 +74,12 @@ belong to `saffron-vegetation` (`engine/crates/vegetation/AGENTS.md`).
   static body. A scattered plant inherits its family's declared interaction policy — hardcoding
   `Decorative` at the scatter site makes every procedurally placed tree non-collidable, which reads
   as a physics bug and is not one.
+- **A committed vegetation transition reaches scripts through the session, not through a poll.**
+  `step` drains the world's transition ring into `dispatch_vegetation_event` before `on_update`, in
+  commit order, with the vegetation borrow released first so a handler may query or mutate back
+  through the bridge. The cursor resets on `stop`, on `clear_vegetation`, and whenever the bound
+  generation changes — the incoming world numbers its ring from one, so a carried-over cursor would
+  swallow its first events.
 - **Physics casts report only collision-resident targets.** `sa.raycast` must not start hitting
   non-collidable grass. Vegetation's own spatial queries may report any CPU-resident macro plant;
   editor picking merges the two explicitly, and that merge must not change physics semantics.

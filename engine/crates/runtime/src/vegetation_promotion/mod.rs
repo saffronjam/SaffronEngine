@@ -77,6 +77,10 @@ pub struct VegetationPromotionReport {
     pub failed_total: u64,
     /// Plants whose state has been written back through the reducer.
     pub flushed_total: u64,
+    /// Entity views dropped without a write-back because the plant they viewed stopped being the
+    /// promotion authority's to simulate: another authority claimed it, it was removed, or the
+    /// whole persistent state was replaced beneath it.
+    pub released_total: u64,
 }
 
 /// A promotion request that could not be committed.
@@ -102,10 +106,18 @@ pub enum VegetationPromotionError {
 #[derive(Default)]
 pub struct VegetationPromotion {
     states: BTreeMap<PlantId, PlantPromotionState>,
+    /// The vitals each live view was stamped with, and what a later write-back is measured
+    /// against. Only the difference travels back, so biology the macro row went on accruing
+    /// underneath the view is never overwritten by the snapshot the view started from.
+    baselines: BTreeMap<PlantId, PlantVitals>,
     /// Plants queued for felling, in request order (a felling is an operation, not a state).
     felling: Vec<PlantId>,
     report: VegetationPromotionReport,
     flush_sequence: u64,
+    /// The bound world's authority epoch at the last synchronization point. A move means another
+    /// authority replaced persistent state wholesale, so every live view describes a world nobody
+    /// here observed.
+    authority_epoch: Option<u64>,
 }
 
 impl VegetationPromotion {
@@ -199,6 +211,46 @@ impl VegetationPromotion {
         self.report
     }
 
+    /// The live biology of `plant`'s entity view, absent while the plant is bulk.
+    #[must_use]
+    pub fn vitals(&self, scene: &Scene, plant: PlantId) -> Option<PlantVitals> {
+        let handle = scene.find_entity_by_uuid(self.live_entity(plant)?)?;
+        scene.component::<PlantVitals>(handle).ok()
+    }
+
+    /// Replaces the live biology of `plant`'s entity view: damage, drying, and growth happen to
+    /// the view, and the demotion returns whatever it settled at.
+    ///
+    /// # Errors
+    ///
+    /// [`VegetationPromotionError::State`] when the plant carries no live entity view.
+    pub fn set_vitals(
+        &self,
+        scene: &mut Scene,
+        plant: PlantId,
+        vitals: PlantVitals,
+    ) -> Result<(), VegetationPromotionError> {
+        let rejected = || VegetationPromotionError::State {
+            plant: plant.to_string(),
+            requested: "vitals",
+        };
+        let entity = self.live_entity(plant).ok_or_else(rejected)?;
+        let handle = scene.find_entity_by_uuid(entity).ok_or_else(rejected)?;
+        scene
+            .with_component_mut::<PlantVitals, _>(handle, |live| *live = vitals)
+            .map_err(|_| rejected())
+    }
+
+    /// The uuid of the entity that currently views `plant`, live through a pending demotion.
+    fn live_entity(&self, plant: PlantId) -> Option<Uuid> {
+        match self.state(plant) {
+            PlantPromotionState::Promoted { entity } | PlantPromotionState::Demoting { entity } => {
+                Some(entity)
+            }
+            PlantPromotionState::Bulk | PlantPromotionState::Promoting => None,
+        }
+    }
+
     /// Commits every queued transition: pending promotions spawn their entity view and suppress
     /// the plant's bulk representation; pending demotions write the entity's state back through
     /// the reducer and destroy it. A promotion that cannot build a view returns to bulk.
@@ -211,6 +263,10 @@ impl VegetationPromotion {
         physics: Option<&mut World>,
     ) {
         let mut physics = physics;
+        // Ownership first: a view the promotion authority no longer owns must be gone before the
+        // pending transitions run, or a demotion would write its state into a world that has
+        // already moved on without it.
+        self.reconcile_ownership(vegetation, scene, physics.as_deref_mut());
         let pending: Vec<(PlantId, PlantPromotionState)> = self
             .states
             .iter()
@@ -284,10 +340,18 @@ impl VegetationPromotion {
             let PlantPromotionState::Promoted { entity } = state else {
                 continue;
             };
+            // A plant another authority has claimed since the view came up is not this session's
+            // to describe; the next synchronization point drops the view outright.
+            if !self.owns(vegetation, plant) {
+                continue;
+            }
             let Some(handle) = scene.find_entity_by_uuid(entity) else {
                 continue;
             };
-            let vitals = scene.component::<PlantVitals>(handle).ok();
+            let vitals = scene.component::<PlantVitals>(handle).ok().map(|vitals| {
+                let baseline = self.baselines.get(&plant).copied().unwrap_or(vitals);
+                (vitals, vitals_mutations(plant, vitals, baseline))
+            });
             states.push((plant, origin_state(scene, handle, entity, physics)?, vitals));
         }
         if states.is_empty() {
@@ -297,21 +361,10 @@ impl VegetationPromotion {
         self.flush_sequence += 1;
         let logical_tick = self.flush_sequence;
         let mut digest = Vec::new();
-        for (plant, state, _) in &states {
-            digest.extend_from_slice(&plant.bytes());
-            digest.extend_from_slice(&state.position.global_ticks()[0].to_be_bytes());
-            digest.extend_from_slice(&state.position.global_ticks()[1].to_be_bytes());
-            digest.extend_from_slice(&state.position.global_ticks()[2].to_be_bytes());
-            for lane in state.orientation.bits() {
-                digest.extend_from_slice(&lane.to_be_bytes());
-            }
-            for lane in state
-                .scale
-                .iter()
-                .chain(&state.linear_velocity)
-                .chain(&state.angular_velocity)
-            {
-                digest.extend_from_slice(&lane.bits().to_be_bytes());
+        for (plant, state, vitals) in &states {
+            digest.extend_from_slice(&demotion_digest(*plant, state));
+            if let Some((vitals, _)) = vitals {
+                digest.extend_from_slice(&vitals_digest(*vitals));
             }
         }
         let transaction = leading_u128(ContentHash::of(&digest).bytes());
@@ -334,14 +387,21 @@ impl VegetationPromotion {
                     state: *state,
                 },
             });
-            if let Some(vitals) = vitals {
+            for (salt, mutation) in vitals.iter().flat_map(|(_, moved)| moved).enumerate() {
                 records.push(VegetationMutationRecord {
-                    header: header((index << 8) | 1),
-                    mutation: vitals_mutation(*plant, *vitals),
+                    header: header((index << 8) | (salt as u128 + 1)),
+                    mutation: mutation.clone(),
                 });
             }
         }
         vegetation.apply_confirmed_mutations(&records)?;
+        // What the flush recorded is what a later write-back measures against: the barrier already
+        // carried it, and repeating it at demotion would overwrite whatever happened since.
+        for (plant, _, vitals) in &states {
+            if let Some((vitals, _)) = vitals {
+                self.baselines.insert(*plant, *vitals);
+            }
+        }
         self.report.flushed_total += states.len() as u64;
         Ok(states.len())
     }
@@ -374,12 +434,18 @@ impl VegetationPromotion {
         self.refresh_counts();
     }
 
+    /// Whether the promotion authority is still `plant`'s simulation owner.
+    fn owns(&self, vegetation: &VegetationWorld, plant: PlantId) -> bool {
+        vegetation.plant_simulation_authority(plant) == Some(PROMOTION_AUTHORITY)
+    }
+
     /// Drops every entity view without a write-back, for a rebind whose source generation is
     /// gone: the plants those views described no longer exist in the bound manifest, so writing
     /// their state back would record it against a different world.
     pub(crate) fn abandon(&mut self, scene: &mut Scene, physics: Option<&mut World>) {
         let mut physics = physics;
         let abandoned = self.states.len();
+        self.baselines.clear();
         for (_, state) in std::mem::take(&mut self.states) {
             let entity = match state {
                 PlantPromotionState::Promoted { entity }
@@ -396,15 +462,75 @@ impl VegetationPromotion {
         }
         self.report = VegetationPromotionReport::default();
         self.flush_sequence = 0;
+        self.authority_epoch = None;
     }
 
     /// Forgets every view after the play world itself was dropped (the entities and bodies died
     /// with it).
     pub(crate) fn reset(&mut self) {
         self.states.clear();
+        self.baselines.clear();
         self.felling.clear();
         self.report = VegetationPromotionReport::default();
         self.flush_sequence = 0;
+        self.authority_epoch = None;
+    }
+
+    /// Drops every view whose plant the promotion authority has stopped owning: another authority
+    /// moved, restored, or removed the plant, or replaced persistent state wholesale (a save load,
+    /// an undo of the whole state, a network join). The view is dropped *without* a write-back —
+    /// its state describes a plant the local session no longer speaks for — and the plant gets its
+    /// bulk representation back, so exactly one owner survives the handover.
+    fn reconcile_ownership(
+        &mut self,
+        vegetation: &mut VegetationWorld,
+        scene: &mut Scene,
+        physics: Option<&mut World>,
+    ) {
+        let mut physics = physics;
+        let epoch = vegetation.authority_epoch();
+        let replaced = self.authority_epoch.is_some_and(|last| last != epoch);
+        self.authority_epoch = Some(epoch);
+        let released: Vec<PlantId> = self
+            .states
+            .iter()
+            .filter(|(_, state)| {
+                matches!(
+                    state,
+                    PlantPromotionState::Promoted { .. } | PlantPromotionState::Demoting { .. }
+                )
+            })
+            .map(|(plant, _)| *plant)
+            .filter(|plant| {
+                replaced
+                    || vegetation.plant_simulation_authority(*plant) != Some(PROMOTION_AUTHORITY)
+            })
+            .collect();
+        for plant in released {
+            self.release_view(plant, vegetation, scene, physics.as_deref_mut());
+        }
+    }
+
+    /// Destroys one view without a write-back and restores the plant's bulk representation.
+    fn release_view(
+        &mut self,
+        plant: PlantId,
+        vegetation: &mut VegetationWorld,
+        scene: &mut Scene,
+        physics: Option<&mut World>,
+    ) {
+        if let Some(entity) = self.live_entity(plant) {
+            destroy_view(scene, entity, physics);
+        }
+        if let Err(error) = vegetation.demote_plant(plant) {
+            tracing::warn!("vegetation promotion: releasing plant {plant}: {error}");
+        }
+        self.states.remove(&plant);
+        self.baselines.remove(&plant);
+        self.report.released_total += 1;
+        tracing::warn!(
+            "vegetation promotion: released plant {plant} — another authority owns it now"
+        );
     }
 
     fn commit_promotion(
@@ -439,19 +565,23 @@ impl VegetationPromotion {
         scene.update_world_transforms();
         if let Some(world) = physics {
             let mut cook = |_: Uuid| Err("a promoted plant view uses analytic shapes".to_owned());
-            if let Err(error) = world.add_entity_body(scene, entity, &mut cook) {
-                tracing::warn!("vegetation promotion: plant {plant} view has no body: {error}");
+            match world.add_entity_body(scene, entity, &mut cook) {
+                Ok(_) => restore_momentum(world, uuid, &snapshot),
+                Err(error) => {
+                    tracing::warn!("vegetation promotion: plant {plant} view has no body: {error}");
+                }
             }
         }
 
         // Suppress the bulk representation last: if anything above failed, the plant never lost
         // its bulk owner.
-        if let Err(error) = vegetation.promote_plant(plant) {
+        if let Err(error) = vegetation.promote_plant(plant, PROMOTION_AUTHORITY) {
             scene.destroy_entity(entity);
             return Err(error.into());
         }
         self.states
             .insert(plant, PlantPromotionState::Promoted { entity: uuid });
+        self.baselines.insert(plant, snapshot_vitals(&snapshot));
         self.report.promoted_total += 1;
         Ok(())
     }
@@ -464,10 +594,28 @@ impl VegetationPromotion {
         scene: &mut Scene,
         physics: Option<&mut World>,
     ) -> Result<(), VegetationPromotionError> {
-        if let Some(handle) = scene.find_entity_by_uuid(entity) {
+        // The write-back happens only while the promotion authority still owns the plant. Another
+        // authority's claim is the newer truth about where the plant is, and this view's answer
+        // would overwrite it.
+        let owned = self.owns(vegetation, plant);
+        if let Some(handle) = scene.find_entity_by_uuid(entity).filter(|_| owned) {
             let state = origin_state(scene, handle, entity, physics.as_deref())?;
-            let transaction =
-                leading_u128(ContentHash::of(&demotion_digest(plant, &state)).bytes());
+            // Whatever the view's vitals settled at is the plant's state now: damage, drying, and
+            // growth all happened to the entity, and the macro row has to learn about them. Only
+            // the difference from what the view was stamped with travels, so the row keeps the
+            // biology it accrued while the view stood.
+            let moved = scene
+                .component::<PlantVitals>(handle)
+                .map(|vitals| {
+                    let baseline = self.baselines.get(&plant).copied().unwrap_or(vitals);
+                    (vitals, vitals_mutations(plant, vitals, baseline))
+                })
+                .ok();
+            let mut digest = demotion_digest(plant, &state);
+            if let Some((vitals, _)) = &moved {
+                digest.extend_from_slice(&vitals_digest(*vitals));
+            }
+            let transaction = leading_u128(ContentHash::of(&digest).bytes());
             let mut records = vec![VegetationMutationRecord {
                 header: MutationHeader {
                     cell: state.position.cell(),
@@ -479,19 +627,17 @@ impl VegetationPromotion {
                 },
                 mutation: VegetationMutation::PromotionOriginState { plant, state },
             }];
-            // Whatever the view's vitals settled at is the plant's state now: damage, drying, and
-            // growth all happened to the entity, and the macro row has to learn about them.
-            if let Ok(vitals) = scene.component::<PlantVitals>(handle) {
+            for (salt, mutation) in moved.iter().flat_map(|(_, moved)| moved).enumerate() {
                 records.push(VegetationMutationRecord {
                     header: MutationHeader {
                         cell: state.position.cell(),
                         transaction,
                         authority: PROMOTION_AUTHORITY,
                         logical_tick: self.flush_sequence + 1,
-                        idempotency_key: transaction ^ 0x5654, // "VT": the vitals record
+                        idempotency_key: transaction ^ (salt as u128 + 1),
                         base_revision: None,
                     },
-                    mutation: vitals_mutation(plant, vitals),
+                    mutation: mutation.clone(),
                 });
             }
             vegetation.apply_confirmed_mutations(&records)?;
@@ -501,6 +647,7 @@ impl VegetationPromotion {
         destroy_view(scene, entity, physics);
         vegetation.demote_plant(plant)?;
         self.states.remove(&plant);
+        self.baselines.remove(&plant);
         self.report.demoted_total += 1;
         Ok(())
     }
@@ -630,16 +777,7 @@ fn spawn_view(
     );
     // The view carries the plant's live biological state, so gameplay reads and writes it like any
     // other component and the demotion returns whatever it settled at.
-    let _ = scene.add_component(
-        entity,
-        PlantVitals {
-            lifecycle: snapshot.lifecycle as u32,
-            health: snapshot.health.to_f64() as f32,
-            moisture: snapshot.moisture.to_f64() as f32,
-            fuel: snapshot.fuel.to_f64() as f32,
-            ecology_tick: snapshot.ecology_tick,
-        },
-    );
+    let _ = scene.add_component(entity, snapshot_vitals(snapshot));
     let _ = scene.add_component(
         entity,
         PlantVariant {
@@ -729,6 +867,24 @@ fn primary_collider(proxies: &[PlantCollisionProxy], scale: Vec3) -> Option<(Sha
         }
     }
     best.map(|(_, shape, half_extents, offset)| (shape, half_extents, offset))
+}
+
+/// Hands a fresh view the momentum the plant's last promoted simulation ended with, so a
+/// demote/re-promote cycle continues the motion rather than restarting it from rest.
+///
+/// The reducer stores metres per fixed tick and turns per fixed tick; Jolt works in per-second
+/// units, which is what [`origin_state`] converts out of and this converts back into. A plant at
+/// rest writes nothing, so a view without a dynamic body raises no warning.
+fn restore_momentum(world: &mut World, entity: Uuid, snapshot: &VegetationPlantSnapshot) {
+    let linear = dequantize_vec3(snapshot.linear_velocity) / saffron_physics::FIXED_STEP;
+    let angular = dequantize_vec3(snapshot.angular_velocity) * std::f32::consts::TAU
+        / saffron_physics::FIXED_STEP;
+    if linear != Vec3::ZERO {
+        world.set_linear_velocity(entity, linear);
+    }
+    if angular != Vec3::ZERO {
+        world.set_angular_velocity(entity, angular);
+    }
 }
 
 /// Reads the entity view's live world state as the quantized payload the reducer stores. Velocity
@@ -833,6 +989,26 @@ fn spawn_product(
     Ok(entity)
 }
 
+/// The biology a macro row hands its entity view at promotion.
+fn snapshot_vitals(snapshot: &VegetationPlantSnapshot) -> PlantVitals {
+    PlantVitals {
+        lifecycle: snapshot.lifecycle as u32,
+        health: snapshot.health.to_f64() as f32,
+        moisture: snapshot.moisture.to_f64() as f32,
+        fuel: snapshot.fuel.to_f64() as f32,
+        ecology_tick: snapshot.ecology_tick,
+    }
+}
+
+fn vitals_digest(vitals: PlantVitals) -> Vec<u8> {
+    let mut digest = vitals.lifecycle.to_be_bytes().to_vec();
+    for lane in [vitals.health, vitals.moisture, vitals.fuel] {
+        digest.extend_from_slice(&lane.to_be_bytes());
+    }
+    digest.extend_from_slice(&vitals.ecology_tick.to_be_bytes());
+    digest
+}
+
 fn felling_digest(plant: PlantId, ecology_tick: u64) -> Vec<u8> {
     let mut digest = b"fell".to_vec();
     digest.extend_from_slice(&plant.bytes());
@@ -840,22 +1016,54 @@ fn felling_digest(plant: PlantId, ecology_tick: u64) -> Vec<u8> {
     digest
 }
 
-/// The state-override mutation one view's settled vitals describe. Clamped into the closed unit
-/// vocabulary the reducer stores, and the lifecycle falls back to the row's own value when the
-/// discriminant is out of range.
-fn vitals_mutation(plant: PlantId, vitals: PlantVitals) -> VegetationMutation {
+/// The mutations one view's settled vitals describe, measured against the vitals it was stamped
+/// with. Only what moved travels: the macro row keeps ageing under a standing view, so writing
+/// back an unchanged value would overwrite ecology with the snapshot promotion copied out.
+///
+/// Values are clamped into the closed unit vocabulary the reducer stores, and a lifecycle whose
+/// discriminant is out of range leaves the row's own stage alone.
+fn vitals_mutations(
+    plant: PlantId,
+    vitals: PlantVitals,
+    baseline: PlantVitals,
+) -> Vec<VegetationMutation> {
     let unit = |value: f32| {
         UnitInterval::from_f64(f64::from(value.clamp(0.0, 1.0))).unwrap_or(UnitInterval::ZERO)
     };
-    VegetationMutation::StateOverride {
-        plant,
-        lifecycle: PlantLifecycle::try_from(vitals.lifecycle).ok(),
-        phenotype: None,
-        health: Some(unit(vitals.health)),
-        moisture: Some(unit(vitals.moisture)),
-        fuel: Some(unit(vitals.fuel)),
-        interaction_policy: None,
+    // The reducer stores quantized values, so a change smaller than one quantum is not a change.
+    let moved = |live: f32, was: f32| (unit(live) != unit(was)).then(|| unit(live));
+    let lifecycle = PlantLifecycle::try_from(vitals.lifecycle).ok();
+    let health = moved(vitals.health, baseline.health);
+    let moisture = moved(vitals.moisture, baseline.moisture);
+    let fuel = moved(vitals.fuel, baseline.fuel);
+    let staged = lifecycle.filter(|_| vitals.lifecycle != baseline.lifecycle);
+    let aged = vitals.ecology_tick != baseline.ecology_tick;
+
+    let mut mutations = Vec::new();
+    if health.is_some() || moisture.is_some() || fuel.is_some() || staged.is_some() {
+        mutations.push(VegetationMutation::StateOverride {
+            plant,
+            lifecycle: staged,
+            phenotype: None,
+            health,
+            moisture,
+            fuel,
+            interaction_policy: None,
+        });
     }
+    // Biological age is carried by the lifecycle transition, which is the only mutation that
+    // states one; a view that aged without changing stage still has to hand that age back.
+    if let Some(lifecycle) = lifecycle
+        && (aged || staged.is_some())
+    {
+        mutations.push(VegetationMutation::LifecycleTransition {
+            plant,
+            from: None,
+            to: lifecycle,
+            ecology_tick: vitals.ecology_tick,
+        });
+    }
+    mutations
 }
 
 /// Destroys the entity view and the body it owned, in the order that never leaves a live body
@@ -910,6 +1118,14 @@ fn quantize_orientation(rotation: Quat) -> Result<QuantizedOrientation, saffron_
     QuantizedOrientation::new(lanes)
 }
 
+fn dequantize_vec3(value: [DecisionScalar; 3]) -> Vec3 {
+    Vec3::new(
+        value[0].to_f64() as f32,
+        value[1].to_f64() as f32,
+        value[2].to_f64() as f32,
+    )
+}
+
 fn quantize_vec3(value: Vec3) -> Result<[DecisionScalar; 3], saffron_spatial::Error> {
     let value = DVec3::new(f64::from(value.x), f64::from(value.y), f64::from(value.z));
     Ok([
@@ -927,218 +1143,4 @@ fn leading_u128(bytes: [u8; 32]) -> u128 {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use saffron_core::Uuid;
-    use saffron_spatial::DecisionScalar;
-    use saffron_vegetation::{PlantCollisionProxy, PlantCollisionShape};
-
-    fn plant(byte: u8) -> PlantId {
-        PlantId::explicit([byte; 16]).expect("plant id")
-    }
-
-    fn scalar(value: f64) -> DecisionScalar {
-        DecisionScalar::from_f64(value).expect("finite decision scalar")
-    }
-
-    fn snapshot_fixture(plant: PlantId) -> VegetationPlantSnapshot {
-        VegetationPlantSnapshot {
-            variation: 0,
-            plant,
-            ecology_tick: 12,
-            handle: saffron_vegetation::VegetationPlantHandle {
-                plant,
-                generation: saffron_vegetation::VegetationCellGenerationId {
-                    cell: saffron_spatial::WorldCellKey::base(0, 0, 0),
-                    generation: 3,
-                },
-            },
-            position: WorldPosition::origin(),
-            orientation: QuantizedOrientation::identity(),
-            scale: [scalar(1.0); 3],
-            bounds: saffron_spatial::WorldBounds::new([0, 0, 0], [1, 1, 1]).expect("bounds"),
-            family: Uuid(4),
-            tags: Vec::new(),
-            lifecycle: PlantLifecycle::Mature,
-            phenotype: 1,
-            interaction_policy: saffron_vegetation::InteractionPolicy::Harvestable,
-            health: UnitInterval::ONE,
-            moisture: UnitInterval::ZERO,
-            fuel: UnitInterval::ZERO,
-            ignited: false,
-            provenance: None,
-        }
-    }
-
-    fn family_fixture() -> saffron_vegetation::PlantFamilyAsset {
-        saffron_vegetation::PlantFamilyAsset {
-            role: saffron_vegetation::PlantFamilyRole::Family,
-            modules: Vec::new(),
-            module_recursion_limit: saffron_vegetation::MAX_PLANT_MODULE_RECURSION,
-            version: saffron_vegetation::PLANT_ASSET_VERSION,
-            id: Uuid(4),
-            name: "fixture".to_owned(),
-            tags: Vec::new(),
-            source: saffron_vegetation::PlantFamilySource::Native {
-                graph: saffron_vegetation::BotanicalGraphDocument::sapling(0x5a11),
-                grafts: Vec::new(),
-            },
-            parts: Vec::new(),
-            dimensions: saffron_vegetation::PlantDimensions {
-                height: scalar(4.0),
-                trunk_radius: scalar(0.3),
-                crown_radius: [scalar(1.0); 2],
-                root_radius: [scalar(0.5); 2],
-                local_bounds_min: [scalar(-1.0); 3],
-                local_bounds_max: [scalar(1.0); 3],
-            },
-            material_slots: vec![Uuid(11)],
-            spines: Vec::new(),
-            mechanics: saffron_vegetation::MechanicalResponse {
-                stiffness: scalar(1.0),
-                damping: UnitInterval::from_bits(1000),
-                drag: scalar(0.5),
-                flutter: scalar(0.2),
-                bend_limit: UnitInterval::from_bits(2000),
-                damage_threshold: scalar(0.5),
-                break_threshold: scalar(0.9),
-            },
-            variations: Vec::new(),
-            phenotypes: Vec::new(),
-            collision_proxies: vec![proxy(PlantCollisionShape::Capsule, 0.3, 2.0)],
-            navigation_proxies: Vec::new(),
-            interaction_policy: saffron_vegetation::InteractionPolicy::Harvestable,
-            habitat: None,
-            ecology: saffron_vegetation::PlantEcologyDeclaration::default(),
-        }
-    }
-
-    fn proxy(shape: PlantCollisionShape, radius: f64, height: f64) -> PlantCollisionProxy {
-        PlantCollisionProxy {
-            id: 1,
-            shape,
-            part: 0,
-            center: [scalar(0.0), scalar(height), scalar(0.0)],
-            dimensions: [scalar(radius), scalar(height), scalar(radius)],
-            breakable: false,
-        }
-    }
-
-    #[test]
-    fn requests_move_through_the_lifecycle_and_reject_repeats() {
-        let mut promotion = VegetationPromotion::default();
-        let tree = plant(3);
-        assert_eq!(promotion.state(tree), PlantPromotionState::Bulk);
-
-        promotion.request_promotion(tree).expect("promote request");
-        assert_eq!(promotion.state(tree), PlantPromotionState::Promoting);
-        // A second promotion of the same plant would mean two owners.
-        assert!(promotion.request_promotion(tree).is_err());
-
-        // Demoting an uncommitted promotion cancels it outright.
-        promotion.request_demotion(tree).expect("cancel request");
-        assert_eq!(promotion.state(tree), PlantPromotionState::Bulk);
-        assert!(promotion.request_demotion(tree).is_err());
-    }
-
-    #[test]
-    fn demotion_of_a_live_view_is_cancelled_by_a_new_promotion() {
-        let mut promotion = VegetationPromotion::default();
-        let tree = plant(4);
-        let entity = Uuid(77);
-        promotion
-            .states
-            .insert(tree, PlantPromotionState::Promoted { entity });
-
-        promotion.request_demotion(tree).expect("demote request");
-        assert_eq!(
-            promotion.state(tree),
-            PlantPromotionState::Demoting { entity }
-        );
-        // Re-promoting before the transition commits keeps the same live entity.
-        promotion.request_promotion(tree).expect("re-promote");
-        assert_eq!(
-            promotion.state(tree),
-            PlantPromotionState::Promoted { entity }
-        );
-    }
-
-    #[test]
-    fn felling_requests_queue_once_and_products_carry_no_plant_identity() {
-        let mut promotion = VegetationPromotion::default();
-        let tree = plant(5);
-        promotion.request_felling(tree).expect("felling request");
-        // A second request would fell the same plant twice.
-        assert!(promotion.request_felling(tree).is_err());
-        // Felling is an operation, not a state: the plant is still bulk until it commits.
-        assert_eq!(promotion.state(tree), PlantPromotionState::Bulk);
-
-        // The product entity a felling spawns is deliberately not the plant.
-        let mut scene = Scene::new();
-        let snapshot = snapshot_fixture(tree);
-        let family = family_fixture();
-        let product = spawn_product(&mut scene, tree, &snapshot, &family).expect("product");
-        assert!(
-            !scene.has_component::<PlantOrigin>(product),
-            "a felled log must never resolve as the rooted plant it came from"
-        );
-        assert!(
-            !scene.has_component::<PlantVitals>(product),
-            "the product carries no plant biology — the stump keeps it"
-        );
-        // It is an ordinary dynamic entity that renders the same mass.
-        assert!(scene.has_component::<MeshComponent>(product));
-        assert!(scene.has_component::<Rigidbody>(product));
-    }
-
-    #[test]
-    fn primary_collider_picks_the_largest_scaled_proxy() {
-        let proxies = [
-            proxy(PlantCollisionShape::Capsule, 0.2, 2.0),
-            proxy(PlantCollisionShape::Box, 0.05, 0.05),
-            proxy(PlantCollisionShape::ConvexHull, 5.0, 5.0),
-        ];
-        let (shape, half_extents, offset) =
-            primary_collider(&proxies, Vec3::new(2.0, 1.0, 2.0)).expect("a primary shape");
-        // The capsule wins; a convex hull has no cooked geometry so it never competes.
-        assert_eq!(shape, Shape::Capsule);
-        assert!((half_extents.x - 0.4).abs() < 1e-4);
-        assert!((half_extents.y - 2.0).abs() < 1e-4);
-        // The proxy centre scales per axis into the collider's local offset.
-        assert!((offset.y - 2.0).abs() < 1e-4);
-    }
-
-    #[test]
-    fn hull_only_families_get_no_primary_collider() {
-        let proxies = [proxy(PlantCollisionShape::ConvexHull, 1.0, 1.0)];
-        assert!(primary_collider(&proxies, Vec3::ONE).is_none());
-    }
-
-    #[test]
-    fn orientation_round_trips_through_quantization() {
-        let rotation = Quat::from_rotation_y(0.75).normalize();
-        let quantized = quantize_orientation(rotation).expect("quantized orientation");
-        let restored = orientation_quat(quantized);
-        assert!(
-            restored.dot(rotation).abs() > 0.9999,
-            "quantization preserved the orientation ({restored:?} vs {rotation:?})"
-        );
-    }
-
-    #[test]
-    fn content_derived_keys_are_stable_and_non_zero() {
-        let state = PromotionOriginState {
-            position: WorldPosition::origin(),
-            orientation: QuantizedOrientation::identity(),
-            scale: [scalar(1.0); 3],
-            linear_velocity: [scalar(0.5); 3],
-            angular_velocity: [scalar(0.1); 3],
-        };
-        let first = leading_u128(ContentHash::of(&demotion_digest(plant(9), &state)).bytes());
-        let again = leading_u128(ContentHash::of(&demotion_digest(plant(9), &state)).bytes());
-        let other = leading_u128(ContentHash::of(&demotion_digest(plant(10), &state)).bytes());
-        assert_eq!(first, again, "identical contents replay as one transaction");
-        assert_ne!(first, other, "a different plant is a different transaction");
-        assert_ne!(first, 0, "a zero transaction id is rejected by the reducer");
-    }
-}
+mod tests;

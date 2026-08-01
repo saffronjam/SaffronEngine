@@ -18,6 +18,7 @@ use std::collections::BTreeMap;
 
 use glam::DVec3;
 use saffron_assets::AssetServer;
+use saffron_core::Uuid;
 use saffron_spatial::{PlantId, ResidencyFacet, WorldBounds, WorldCellKey};
 use saffron_vegetation::{
     EcologyInfluence, InteractionPolicy, PlantNavigationProxy, VegetationNavigationContribution,
@@ -72,7 +73,53 @@ pub struct VegetationNavigationReport {
 struct NavCell {
     generation: u64,
     bulk_revision: u64,
+    /// Whether each contributing plant was derived as promoted, in canonical identity order. A
+    /// bulk-revision move re-derives exactly the plants whose bit changed — a promotion changes one
+    /// plant's declaration, and dirtying the rest would ask a consumer to rebuild ground nothing
+    /// moved on.
+    promoted: BTreeMap<PlantId, bool>,
+    /// Every published row, in canonical plant order.
     contributions: Vec<NavigationContribution>,
+}
+
+impl NavCell {
+    /// Re-derives the plants whose bulk suppression moved and returns the world bounds they cover.
+    fn resuppress(
+        &mut self,
+        rows: &[VegetationNavigationContribution],
+        bulk_revision: u64,
+        suppressed: &dyn Fn(PlantId) -> bool,
+        proxies: &mut dyn FnMut(Uuid) -> Option<Vec<PlantNavigationProxy>>,
+    ) -> Vec<WorldBounds> {
+        self.bulk_revision = bulk_revision;
+        let mut dirty = Vec::new();
+        for row in rows {
+            let promoted = suppressed(row.plant);
+            if self.promoted.get(&row.plant) == Some(&promoted) {
+                continue;
+            }
+            self.promoted.insert(row.plant, promoted);
+            let Some(proxies) = proxies(row.family) else {
+                continue;
+            };
+            let derived = derive_contributions(row, promoted, &proxies);
+            dirty.extend(
+                self.contributions
+                    .iter()
+                    .filter(|existing| existing.plant == row.plant)
+                    .map(|existing| existing.bounds),
+            );
+            self.contributions
+                .retain(|existing| existing.plant != row.plant);
+            dirty.extend(derived.iter().map(|contribution| contribution.bounds));
+            self.contributions.extend(derived);
+        }
+        // A stable sort by identity restores canonical order and keeps each plant's proxies in the
+        // order its family authored them.
+        self.contributions
+            .sort_by_key(|contribution| contribution.plant);
+        dirty
+    }
 }
 
 /// Publishes vegetation's navigation contributions per resident cell and accumulates the dirty
@@ -85,9 +132,14 @@ pub struct VegetationNavigationSeam {
 }
 
 impl VegetationNavigationSeam {
-    /// Rebuilds the contributions of every cell whose published generation or promoted-plant set
-    /// moved, marking the affected world bounds dirty. Runs at the same fixed synchronization
-    /// point as collision residency, so a consumer never reads a half-updated cell.
+    /// Reconciles every navigation-resident cell against the world, marking the affected bounds
+    /// dirty. Runs at the same fixed synchronization point as collision residency, so a consumer
+    /// never reads a half-updated cell.
+    ///
+    /// A republished generation retires the whole cell: every row it carried may have moved. A
+    /// promotion or demotion moves only the cell's bulk-suppression revision, and then only the
+    /// plants whose suppression actually flipped are re-derived — promoting one tree must not ask
+    /// a consumer to rebuild the tiles under every other plant in the cell.
     pub(crate) fn advance(
         &mut self,
         vegetation: &VegetationWorld,
@@ -110,12 +162,10 @@ impl VegetationNavigationSeam {
             .cells
             .iter()
             .filter(|(cell, entry)| {
-                desired.get(*cell).map(|generation| {
-                    (
-                        generation.id().generation,
-                        vegetation.cell_bulk_revision(**cell),
-                    )
-                }) != Some((entry.generation, entry.bulk_revision))
+                desired
+                    .get(*cell)
+                    .map(|generation| generation.id().generation)
+                    != Some(entry.generation)
             })
             .map(|(cell, _)| *cell)
             .collect();
@@ -127,29 +177,45 @@ impl VegetationNavigationSeam {
         }
 
         for (cell, generation) in desired {
-            if self.cells.contains_key(&cell) {
-                continue;
-            }
-            let mut contributions = Vec::new();
-            for row in generation.navigation_contributions().unwrap_or(&[]) {
-                let promoted = vegetation.is_bulk_suppressed(row.plant);
-                if let Some(family) = families.get(row.family, assets) {
-                    contributions.extend(derive_contributions(
-                        row,
-                        promoted,
-                        &family.navigation_proxies,
-                    ));
+            let bulk_revision = vegetation.cell_bulk_revision(cell);
+            let rows = generation.navigation_contributions().unwrap_or(&[]);
+            let mut resolve = |family: Uuid| {
+                families
+                    .get(family, assets)
+                    .map(|family| family.navigation_proxies.clone())
+            };
+            let dirty = match self.cells.get_mut(&cell) {
+                Some(entry) if entry.bulk_revision == bulk_revision => continue,
+                Some(entry) => entry.resuppress(
+                    rows,
+                    bulk_revision,
+                    &|plant| vegetation.is_bulk_suppressed(plant),
+                    &mut resolve,
+                ),
+                None => {
+                    let mut promoted = BTreeMap::new();
+                    let mut contributions = Vec::new();
+                    for row in rows {
+                        let suppressed = vegetation.is_bulk_suppressed(row.plant);
+                        promoted.insert(row.plant, suppressed);
+                        if let Some(proxies) = resolve(row.family) {
+                            contributions.extend(derive_contributions(row, suppressed, &proxies));
+                        }
+                    }
+                    let dirty = contributions.iter().map(|row| row.bounds).collect();
+                    self.cells.insert(
+                        cell,
+                        NavCell {
+                            generation: generation.id().generation,
+                            bulk_revision,
+                            promoted,
+                            contributions,
+                        },
+                    );
+                    dirty
                 }
-            }
-            self.mark_dirty(contributions.iter().map(|row| row.bounds));
-            self.cells.insert(
-                cell,
-                NavCell {
-                    generation: generation.id().generation,
-                    bulk_revision: vegetation.cell_bulk_revision(cell),
-                    contributions,
-                },
-            );
+            };
+            self.mark_dirty(dirty.into_iter());
         }
 
         self.refresh_counts();
@@ -293,14 +359,42 @@ mod tests {
         WorldBounds::new([min, 0, min], [min + 1024, 2048, min + 1024]).expect("bounds")
     }
 
+    fn plant(byte: u8) -> PlantId {
+        PlantId::explicit([byte; 16]).expect("plant id")
+    }
+
     fn row(policy: InteractionPolicy, min: i128) -> VegetationNavigationContribution {
+        row_for(plant(31), policy, min)
+    }
+
+    fn row_for(
+        plant: PlantId,
+        policy: InteractionPolicy,
+        min: i128,
+    ) -> VegetationNavigationContribution {
         VegetationNavigationContribution {
-            plant: PlantId::explicit([31; 16]).expect("plant id"),
+            plant,
             family: Uuid(9),
             bounds: bounds(min),
             interaction_policy: policy,
             lifecycle: PlantLifecycle::Mature,
         }
+    }
+
+    /// Builds the cell entry the seam's own build path produces, for the tests that then move one
+    /// plant's suppression.
+    fn nav_cell(rows: &[VegetationNavigationContribution]) -> NavCell {
+        let mut cell = NavCell {
+            generation: 1,
+            bulk_revision: 0,
+            promoted: rows.iter().map(|row| (row.plant, false)).collect(),
+            contributions: Vec::new(),
+        };
+        for row in rows {
+            cell.contributions
+                .extend(derive_contributions(row, false, &[proxy()]));
+        }
+        cell
     }
 
     fn proxy() -> PlantNavigationProxy {
@@ -341,6 +435,64 @@ mod tests {
         assert_eq!(
             promoted[0].kind,
             NavigationContributionKind::DynamicObstacle
+        );
+    }
+
+    /// Promoting one plant dirties one plant's ground. The cell's other contributions keep the rows
+    /// they already published, and the ground under them is never handed back for a rebuild — a
+    /// whole-cell re-publication would coalesce into a region spanning every plant in the cell.
+    #[test]
+    fn one_promotion_dirties_only_that_plant() {
+        let rows = [
+            row_for(plant(1), InteractionPolicy::Structural, 0),
+            row_for(plant(2), InteractionPolicy::Structural, 8_192),
+            row_for(plant(3), InteractionPolicy::Structural, 16_384),
+        ];
+        let mut cell = nav_cell(&rows);
+        let before = cell.contributions.clone();
+
+        let promoted = plant(2);
+        let dirty = cell.resuppress(&rows, 1, &|id| id == promoted, &mut |_| Some(vec![proxy()]));
+
+        // Only the promoted plant's own bounds came back, and they came back once for what it
+        // covered and once for what it now covers — both the same box.
+        assert!(
+            dirty.iter().all(|region| *region == bounds(8_192)),
+            "the promotion dirtied ground no plant moved on: {dirty:?}"
+        );
+        assert!(
+            !dirty.is_empty(),
+            "the promoted plant's ground must rebuild"
+        );
+
+        // The untouched plants kept the exact rows they published.
+        let kept: Vec<&NavigationContribution> = cell
+            .contributions
+            .iter()
+            .filter(|row| row.plant != promoted)
+            .collect();
+        let expected: Vec<&NavigationContribution> =
+            before.iter().filter(|row| row.plant != promoted).collect();
+        assert_eq!(kept, expected);
+        assert_eq!(
+            cell.contributions
+                .iter()
+                .filter(|row| row.plant == promoted)
+                .map(|row| row.kind)
+                .collect::<Vec<_>>(),
+            vec![NavigationContributionKind::DynamicObstacle]
+        );
+        // Canonical identity order survives the splice.
+        assert!(
+            cell.contributions
+                .windows(2)
+                .all(|pair| pair[0].plant <= pair[1].plant)
+        );
+
+        // A revision that moved without any suppression moving re-derives nothing at all.
+        assert!(
+            cell.resuppress(&rows, 2, &|id| id == promoted, &mut |_| Some(vec![proxy()]))
+                .is_empty()
         );
     }
 

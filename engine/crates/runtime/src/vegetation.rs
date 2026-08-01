@@ -264,27 +264,30 @@ impl VegetationRuntimeScheduler {
             .as_ref()
             .is_none_or(|world| world.manifest_identity() != identity)
         {
-            if runtime.as_ref().is_some_and(|world| {
-                !world.persistent_state().cells().is_empty()
-                    && world.manifest_identity() != identity
-            }) {
-                return Err(VegetationRuntimeError::Binding(
-                    "cooked vegetation generation changed while persistent runtime state is active",
-                ));
-            }
+            // What the outgoing world accumulated in memory outranks what the map last wrote to
+            // disk; a bind that read the durable copy instead would drop every mutation taken
+            // since the last save barrier.
+            let carried = match runtime.as_ref() {
+                Some(world) => Some(world.persistent_state().clone()),
+                None => assets
+                    .vegetation_state_store()
+                    .read_baseline_if_present(manifest.map)
+                    .map_err(|error| VegetationRuntimeError::Asset(Box::new(error)))?,
+            };
             self.join_workers()?;
-            let mut world = VegetationWorld::new(manifest, VegetationResidencyBudgets::default())?;
-            // A shipped world often starts with authored disturbance or growth already in it. The
-            // baseline is that starting state, keyed by the generation it belongs to, so a package
-            // boots into the world the author saw rather than into an untouched one. A baseline that
-            // does not decode against this generation is a hard error: importing it would apply
-            // another world's state to this one.
-            let baseline = assets
-                .vegetation_state_store()
-                .read_baseline_if_present(identity)
-                .map_err(|error| VegetationRuntimeError::Asset(Box::new(error)))?;
-            if let Some(bytes) = baseline {
-                world.import_state_snapshot(&bytes)?;
+            let mut world =
+                VegetationWorld::new(manifest.clone(), VegetationResidencyBudgets::default())?;
+            // A world often starts with disturbance or growth already in it: an author's saved
+            // barrier, or a shipped package's starting state. State binds to one generation and a
+            // recook publishes another, so it rebases onto the incoming base — dropping only what
+            // that base no longer carries — rather than being silently discarded.
+            if let Some(state) = carried {
+                let bound = if state.manifest_identity() == identity.bytes() {
+                    state
+                } else {
+                    state.rebase(&manifest)?
+                };
+                world.replace_persistent_state(bound)?;
             }
             *runtime = Some(world);
             self.missing_cells.clear();

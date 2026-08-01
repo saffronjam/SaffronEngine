@@ -23,7 +23,7 @@ use saffron_spatial::ResidencyManager;
 
 use crate::bridge::{
     RuntimeScriptBridge, ScriptLogLine, SharedPhysics, SharedScene, SharedScriptSink,
-    SharedVegetation,
+    SharedVegetation, script_vegetation_event,
 };
 use crate::vegetation::VegetationRuntimeScheduler;
 use crate::vegetation_collision::{VegetationCollisionReport, VegetationCollisionResidency};
@@ -64,6 +64,9 @@ pub struct RuntimeSession {
     pose_targets: Vec<PoseTarget>,
     /// The per-tick contact → script dispatch high-water cursor.
     contact_cursor: u64,
+    /// The per-tick vegetation-transition → script dispatch high-water cursor. It resets with
+    /// the session and with the bound world, whose ring restarts its numbering at one.
+    vegetation_event_cursor: u64,
     /// Whether a script VM is live (set by [`start`](Self::start), cleared by [`stop`](Self::stop)).
     script_vm_active: bool,
     /// Whether the Jolt process globals are installed — set true the first time a world is built.
@@ -122,6 +125,7 @@ impl RuntimeSession {
             error_sink: Vec::new(),
             pose_targets: Vec::new(),
             contact_cursor: 0,
+            vegetation_event_cursor: 0,
             script_vm_active: false,
             physics_init: false,
             vegetation,
@@ -294,6 +298,25 @@ impl RuntimeSession {
             }
         }
 
+        // Then the vegetation transitions committed since the last tick. A reducer commit is the
+        // one place a vegetation change becomes observable, so scripts see it the frame it lands
+        // and in commit order. The world borrow is released before dispatch, so a handler may
+        // query or mutate vegetation back through the bridge.
+        for event in self.drain_vegetation_events() {
+            if let Some(err) =
+                self.script
+                    .dispatch_vegetation_event(scene, Arc::clone(&self.registry), &event)
+            {
+                tracing::error!(
+                    "script vegetation handler in '{}': {}",
+                    err.script,
+                    err.message
+                );
+                self.error_sink.push(err);
+                return;
+            }
+        }
+
         // Derive this tick's input edges, then run every instance's `on_update`.
         derive_script_input_edges(input);
         if let Some(err) =
@@ -303,6 +326,24 @@ impl RuntimeSession {
             tracing::error!("script error in '{}': {}", err.script, err.message);
             self.error_sink.push(err);
         }
+    }
+
+    /// Reads the committed vegetation transitions newer than the dispatch cursor and advances it.
+    /// A cursor left behind the ring's retained tail resyncs to the tail rather than replaying a
+    /// gap it cannot fill.
+    fn drain_vegetation_events(&mut self) -> Vec<saffron_script::VegetationEventInfo> {
+        let vegetation = self.vegetation.borrow();
+        let Some(world) = vegetation.as_ref() else {
+            return Vec::new();
+        };
+        let drain = world.drain_events(self.vegetation_event_cursor);
+        if drain.overflowed {
+            tracing::warn!(
+                "script vegetation events: the dispatch cursor fell behind the retained ring"
+            );
+        }
+        self.vegetation_event_cursor = drain.high_water_seq;
+        drain.events.iter().map(script_vegetation_event).collect()
     }
 
     /// Advances the world one frame in play: ticks animation in `Play` mode then steps the
@@ -336,6 +377,7 @@ impl RuntimeSession {
         self.log_sink.borrow_mut().clear();
         self.error_sink.clear();
         self.contact_cursor = 0;
+        self.vegetation_event_cursor = 0;
     }
 
     /// Stops the script VM (a teardown step; it never touches the scene, so it tears down before
@@ -437,8 +479,10 @@ impl RuntimeSession {
                     .map(|world| world.manifest_identity());
                 if bound_now != bound_identity {
                     // A different generation is bound, so the accumulated simulated time and the
-                    // ticks the last catch-up left owed belong to a world that is gone.
+                    // ticks the last catch-up left owed belong to a world that is gone — and so
+                    // does the sequence the incoming ring restarts from.
                     self.vegetation_ecology.rebind();
+                    self.vegetation_event_cursor = 0;
                 }
                 // Biology advances before the facets derive from it, so a tick's committed
                 // generation is the one collision, navigation, and promotion see this frame.
@@ -577,6 +621,7 @@ impl RuntimeSession {
         drop(world_ref);
         self.vegetation_navigation.clear();
         self.vegetation_families.clear();
+        self.vegetation_event_cursor = 0;
         self.vegetation_scheduler.clear(&mut vegetation_ref)?;
         self.vegetation_status = VegetationRuntimeBindingStatus::Unavailable {
             reason: VegetationRuntimeUnavailableReason::NoProject,
@@ -642,6 +687,12 @@ impl RuntimeSession {
     #[must_use]
     pub fn contact_cursor(&self) -> u64 {
         self.contact_cursor
+    }
+
+    /// The per-tick vegetation-transition dispatch high-water cursor.
+    #[must_use]
+    pub fn vegetation_event_cursor(&self) -> u64 {
+        self.vegetation_event_cursor
     }
 
     /// The animation runtime (for tests / the host's preview-prune assertions).

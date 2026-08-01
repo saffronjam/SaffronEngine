@@ -9,6 +9,8 @@
 
 use std::time::{Duration, Instant};
 
+use saffron_vegetation::VegetationQueryCost;
+
 /// Wall-clock time one synchronization spent, split by stage.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct VegetationStageTimes {
@@ -39,8 +41,15 @@ pub struct VegetationWorkCounters {
     pub synchronizations: u64,
     /// Spatial queries answered.
     pub queries: u64,
-    /// Plants those queries returned, which is what makes a query expensive.
+    /// Plants those queries matched, before any caller-side result limit.
     pub query_hits: u64,
+    /// Resident macro generations those queries walked.
+    pub query_generations_visited: u64,
+    /// Bounds-hierarchy nodes those queries tested.
+    pub query_nodes_visited: u64,
+    /// Macro rows those queries tested exactly. Together with the node count this is what makes a
+    /// query expensive, and neither term can move with cosmetic blade count.
+    pub query_rows_tested: u64,
     /// Mutation transactions reduced.
     pub mutations: u64,
     /// Bytes those transactions carried.
@@ -120,10 +129,13 @@ impl VegetationTelemetry {
         std::mem::take(&mut self.spans)
     }
 
-    /// Records one answered query and how many plants it returned.
-    pub fn record_query(&mut self, hits: usize) {
-        self.work.queries += 1;
-        self.work.query_hits += hits as u64;
+    /// Folds in the traversal work the vegetation world drained after answering a query.
+    pub fn record_query(&mut self, cost: VegetationQueryCost) {
+        self.work.queries += cost.queries;
+        self.work.query_hits += cost.hits;
+        self.work.query_generations_visited += cost.generations_visited;
+        self.work.query_nodes_visited += cost.nodes_visited;
+        self.work.query_rows_tested += cost.rows_tested;
     }
 
     /// Records one reduced mutation transaction and the bytes it carried.
@@ -225,13 +237,30 @@ mod tests {
     #[test]
     fn counters_accumulate_until_a_rebind() {
         let mut telemetry = VegetationTelemetry::default();
-        telemetry.record_query(12);
-        telemetry.record_query(0);
+        telemetry.record_query(VegetationQueryCost {
+            queries: 1,
+            hits: 12,
+            generations_visited: 2,
+            nodes_visited: 9,
+            rows_tested: 30,
+        });
+        telemetry.record_query(VegetationQueryCost {
+            queries: 1,
+            ..VegetationQueryCost::default()
+        });
         telemetry.record_mutation(256);
         telemetry.record_snapshot(4_096);
         telemetry.record_ecology_ticks(3);
         let work = telemetry.work();
         assert_eq!((work.queries, work.query_hits), (2, 12));
+        assert_eq!(
+            (
+                work.query_generations_visited,
+                work.query_nodes_visited,
+                work.query_rows_tested
+            ),
+            (2, 9, 30)
+        );
         assert_eq!((work.mutations, work.mutation_bytes), (1, 256));
         assert_eq!((work.snapshots, work.snapshot_bytes), (1, 4_096));
         assert_eq!(work.ecology_ticks, 3);

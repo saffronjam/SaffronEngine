@@ -18,7 +18,9 @@ use glam::Vec3;
 use saffron_core::Uuid;
 use saffron_physics::World;
 use saffron_scene::{MorphComponent, MorphWeightOverride, Scene};
-use saffron_script::{ScriptHostBridge, ScriptPlantHit, ScriptRagdollState, ScriptRayHit};
+use saffron_script::{
+    ScriptHostBridge, ScriptPlantFilter, ScriptPlantHit, ScriptRagdollState, ScriptRayHit,
+};
 
 /// The live play physics world, shared between the session and the bridge (`None` before
 /// start / after stop).
@@ -159,6 +161,79 @@ pub(crate) fn script_target(
     }
 }
 
+/// Flattens one committed vegetation transition into the script-side POD, in the same kebab-case
+/// vocabulary the control plane reports so a handler and an `sa vegetation-drain-events` call name
+/// the same transition identically.
+pub(crate) fn script_vegetation_event(
+    event: &saffron_vegetation::VegetationEvent,
+) -> saffron_script::VegetationEventInfo {
+    use saffron_vegetation::VegetationTransitionKind as Kind;
+    let unit = |value: saffron_spatial::UnitInterval| value.to_f64() as f32;
+    let mut info = saffron_script::VegetationEventInfo {
+        seq: event.seq,
+        kind: "",
+        plant: event.transition.plant.map(|plant| plant.canonical_hex()),
+        cell: event.transition.cell.coordinates(),
+        cell_level: event.transition.cell.level(),
+        lifecycle: None,
+        previous_lifecycle: None,
+        phenotype: None,
+        amount: None,
+        health: None,
+        moisture: None,
+        fuel: None,
+        categories: None,
+    };
+    match event.transition.kind {
+        Kind::Damaged { amount, health } => {
+            info.kind = "damaged";
+            info.amount = Some(unit(amount));
+            info.health = Some(unit(health));
+        }
+        Kind::Harvested { phenotype } => {
+            info.kind = "harvested";
+            info.phenotype = Some(phenotype);
+        }
+        Kind::Burned {
+            phenotype,
+            remaining_fuel,
+        } => {
+            info.kind = "burned";
+            info.phenotype = Some(phenotype);
+            info.fuel = Some(unit(remaining_fuel));
+        }
+        Kind::Removed => info.kind = "removed",
+        Kind::Planted => info.kind = "planted",
+        Kind::Regrew {
+            lifecycle,
+            phenotype,
+        } => {
+            info.kind = "regrew";
+            info.lifecycle = Some(lifecycle_name(lifecycle));
+            info.phenotype = Some(phenotype);
+        }
+        Kind::LifecycleChanged { from, to } => {
+            info.kind = "lifecycle-changed";
+            info.previous_lifecycle = from.map(lifecycle_name);
+            info.lifecycle = Some(lifecycle_name(to));
+        }
+        Kind::Ignited => info.kind = "ignited",
+        Kind::Extinguished => info.kind = "extinguished",
+        Kind::Wetted { moisture, fuel } => {
+            info.kind = "wetted";
+            info.moisture = Some(unit(moisture));
+            info.fuel = Some(unit(fuel));
+        }
+        Kind::StateReplaced => info.kind = "state-replaced",
+        Kind::Moved => info.kind = "moved",
+        Kind::Disturbed { categories } => {
+            info.kind = "disturbed";
+            info.categories = Some(categories);
+        }
+    }
+    info
+}
+
 impl ScriptHostBridge for RuntimeScriptBridge {
     fn raycast(&self, origin: Vec3, dir: Vec3, max_dist: f32) -> ScriptRayHit {
         match self.physics.borrow().as_ref() {
@@ -277,9 +352,16 @@ impl ScriptHostBridge for RuntimeScriptBridge {
         }
     }
 
-    fn vegetation_raycast(&self, origin: Vec3, dir: Vec3, max_dist: f32) -> Option<ScriptPlantHit> {
+    fn vegetation_raycast(
+        &self,
+        origin: Vec3,
+        dir: Vec3,
+        max_dist: f32,
+        filter: &ScriptPlantFilter,
+    ) -> Option<ScriptPlantHit> {
         let world = self.vegetation.borrow();
         let world = world.as_ref()?;
+        let filter = query_filter(filter)?;
         let origin_position = render_relative_position(origin)?;
         let ray = saffron_vegetation::VegetationQueryRay::new(
             origin_position,
@@ -287,23 +369,23 @@ impl ScriptHostBridge for RuntimeScriptBridge {
             f64::from(max_dist),
         )
         .ok()?;
-        let hits = world
-            .query_ray(ray, &saffron_vegetation::VegetationQueryFilter::default())
-            .ok()?;
+        let hits = world.query_ray(ray, &filter).ok()?;
         hits.first()
             .map(|hit| plant_hit(&hit.plant, hit.distance_m))
     }
 
-    fn vegetation_nearest(&self, position: Vec3, radius: f32) -> Option<ScriptPlantHit> {
+    fn vegetation_nearest(
+        &self,
+        position: Vec3,
+        radius: f32,
+        filter: &ScriptPlantFilter,
+    ) -> Option<ScriptPlantHit> {
         let world = self.vegetation.borrow();
         let world = world.as_ref()?;
+        let filter = query_filter(filter)?;
         let center = render_relative_position(position)?;
         world
-            .query_nearest(
-                center,
-                Some(f64::from(radius)),
-                &saffron_vegetation::VegetationQueryFilter::default(),
-            )
+            .query_nearest(center, Some(f64::from(radius)), &filter)
             .ok()
             .flatten()
             .map(|hit| plant_hit(&hit.plant, hit.distance_m))
@@ -314,20 +396,20 @@ impl ScriptHostBridge for RuntimeScriptBridge {
         position: Vec3,
         radius: f32,
         limit: usize,
+        filter: &ScriptPlantFilter,
     ) -> Vec<ScriptPlantHit> {
         let world = self.vegetation.borrow();
         let Some(world) = world.as_ref() else {
+            return Vec::new();
+        };
+        let Some(filter) = query_filter(filter) else {
             return Vec::new();
         };
         let Some(center) = render_relative_position(position) else {
             return Vec::new();
         };
         let origin = center.world_meters();
-        let Ok(plants) = world.query_radius(
-            center,
-            f64::from(radius),
-            &saffron_vegetation::VegetationQueryFilter::default(),
-        ) else {
+        let Ok(plants) = world.query_radius(center, f64::from(radius), &filter) else {
             return Vec::new();
         };
         let mut hits: Vec<ScriptPlantHit> = plants
@@ -385,6 +467,42 @@ fn leading_u128(bytes: [u8; 32]) -> u128 {
     u128::from_be_bytes(leading) | 1
 }
 
+/// Resolves the script-side text filter into the engine's closed macro-query filter. A name or id
+/// that resolves to nothing returns `None`, and the query answers as a miss rather than as a
+/// wider question than the script asked.
+fn query_filter(filter: &ScriptPlantFilter) -> Option<saffron_vegetation::VegetationQueryFilter> {
+    let families = filter
+        .families
+        .iter()
+        .map(|family| family.parse::<u64>().ok().map(saffron_core::Uuid))
+        .collect::<Option<Vec<_>>>()?;
+    let required_tags = filter
+        .required_tags
+        .iter()
+        .map(|tag| {
+            tag.parse::<u64>()
+                .ok()
+                .and_then(|value| saffron_vegetation::PlantTagId::new(value).ok())
+        })
+        .collect::<Option<_>>()?;
+    let lifecycles = filter
+        .lifecycles
+        .iter()
+        .map(|name| lifecycle_from_name(name))
+        .collect::<Option<_>>()?;
+    let interaction_policies = filter
+        .interaction_policies
+        .iter()
+        .map(|name| policy_from_name(name))
+        .collect::<Option<Vec<_>>>()?;
+    Some(saffron_vegetation::VegetationQueryFilter {
+        families,
+        required_tags,
+        lifecycles,
+        interaction_policies,
+    })
+}
+
 /// Quantizes a script-supplied render-relative position into the exact world vocabulary.
 fn render_relative_position(position: Vec3) -> Option<saffron_spatial::WorldPosition> {
     saffron_spatial::WorldPosition::from_render_relative(
@@ -423,6 +541,32 @@ fn lifecycle_name(lifecycle: saffron_vegetation::PlantLifecycle) -> &'static str
         Lifecycle::Dead => "dead",
         Lifecycle::Stump => "stump",
         Lifecycle::Removed => "removed",
+    }
+}
+
+fn lifecycle_from_name(name: &str) -> Option<saffron_vegetation::PlantLifecycle> {
+    use saffron_vegetation::PlantLifecycle as Lifecycle;
+    match name {
+        "seed" => Some(Lifecycle::Seed),
+        "sprout" => Some(Lifecycle::Sprout),
+        "juvenile" => Some(Lifecycle::Juvenile),
+        "mature" => Some(Lifecycle::Mature),
+        "senescent" => Some(Lifecycle::Senescent),
+        "dead" => Some(Lifecycle::Dead),
+        "stump" => Some(Lifecycle::Stump),
+        "removed" => Some(Lifecycle::Removed),
+        _ => None,
+    }
+}
+
+fn policy_from_name(name: &str) -> Option<saffron_vegetation::InteractionPolicy> {
+    use saffron_vegetation::InteractionPolicy as Policy;
+    match name {
+        "decorative" => Some(Policy::Decorative),
+        "interactive" => Some(Policy::Interactive),
+        "harvestable" => Some(Policy::Harvestable),
+        "structural" => Some(Policy::Structural),
+        _ => None,
     }
 }
 
@@ -496,13 +640,22 @@ mod tests {
     fn vegetation_calls_without_an_authority_are_safe_no_ops() {
         let (physics, scene, vegetation, sink) = cells();
         let bridge = RuntimeScriptBridge::new(physics, scene, vegetation, sink);
+        let filter = ScriptPlantFilter::default();
         assert!(
             bridge
-                .vegetation_raycast(Vec3::ZERO, Vec3::Z, 50.0)
+                .vegetation_raycast(Vec3::ZERO, Vec3::Z, 50.0, &filter)
                 .is_none()
         );
-        assert!(bridge.vegetation_nearest(Vec3::ZERO, 10.0).is_none());
-        assert!(bridge.vegetation_in_radius(Vec3::ZERO, 10.0, 8).is_empty());
+        assert!(
+            bridge
+                .vegetation_nearest(Vec3::ZERO, 10.0, &filter)
+                .is_none()
+        );
+        assert!(
+            bridge
+                .vegetation_in_radius(Vec3::ZERO, 10.0, 8, &filter)
+                .is_empty()
+        );
         // A malformed identity is refused before the authority is even consulted.
         assert!(!bridge.vegetation_damage("not-a-plant-id", 0.5));
         assert!(!bridge.vegetation_damage("40aabbccddeeff00112233445566778899", 0.5));
