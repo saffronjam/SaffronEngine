@@ -196,7 +196,7 @@ pub(super) fn base_family(material: Uuid, source: PlantFamilySource) -> PlantFam
         phenotypes: vec![PlantPhenotype {
             id: 0,
             role: PhenotypeRole::Healthy,
-            season_window: None,
+            response: saffron_vegetation::PhenotypeResponse::default(),
             variation: 0,
             material_remap: Vec::new(),
             active_parts: Vec::new(),

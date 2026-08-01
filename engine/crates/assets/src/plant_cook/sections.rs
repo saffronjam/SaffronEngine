@@ -249,7 +249,7 @@ pub(super) fn skeleton_section(
 
 pub(super) fn phenotype_section(asset: &PlantFamilyAsset) -> Vec<u8> {
     let mut bytes = Vec::new();
-    append_domain(&mut bytes, b"saffron-anima/splantc/phenotypes/v1");
+    append_domain(&mut bytes, b"saffron-anima/splantc/phenotypes/v2");
     append_u64(&mut bytes, asset.phenotypes.len() as u64);
     for phenotype in &asset.phenotypes {
         append_u32(&mut bytes, phenotype.id);
@@ -264,14 +264,7 @@ pub(super) fn phenotype_section(asset: &PlantFamilyAsset) -> Vec<u8> {
             saffron_vegetation::PhenotypeRole::Senescent => 7,
             saffron_vegetation::PhenotypeRole::Wet => 8,
         });
-        match phenotype.season_window {
-            Some((start, end)) => {
-                bytes.push(1);
-                bytes.extend_from_slice(&start.to_le_bytes());
-                bytes.extend_from_slice(&end.to_le_bytes());
-            }
-            None => bytes.push(0),
-        }
+        append_phenotype_response(&mut bytes, phenotype.response);
         append_u32(&mut bytes, phenotype.variation);
         append_u64(&mut bytes, phenotype.material_remap.len() as u64);
         for (from, to) in &phenotype.material_remap {
@@ -593,6 +586,30 @@ pub(super) fn append_skin(bytes: &mut Vec<u8>, skin: &[VertexSkin]) {
 
 pub(super) fn append_json(bytes: &mut Vec<u8>, value: &saffron_json::Value) {
     append_bytes(bytes, saffron_json::dump_json_sorted(value, -1).as_bytes());
+}
+
+/// Encodes one phenotype's intrinsic expression curve: each band as a presence byte plus
+/// its two endpoints, then the shared edge ramp.
+fn append_phenotype_response(bytes: &mut Vec<u8>, response: saffron_vegetation::PhenotypeResponse) {
+    match response.season_window {
+        Some((start, end)) => {
+            bytes.push(1);
+            bytes.extend_from_slice(&start.to_le_bytes());
+            bytes.extend_from_slice(&end.to_le_bytes());
+        }
+        None => bytes.push(0),
+    }
+    for band in [response.health_band, response.moisture_band] {
+        match band {
+            Some((low, high)) => {
+                bytes.push(1);
+                bytes.extend_from_slice(&low.bits().to_le_bytes());
+                bytes.extend_from_slice(&high.bits().to_le_bytes());
+            }
+            None => bytes.push(0),
+        }
+    }
+    bytes.extend_from_slice(&response.ramp_mille.to_le_bytes());
 }
 
 pub(super) fn append_domain(bytes: &mut Vec<u8>, domain: &[u8]) {

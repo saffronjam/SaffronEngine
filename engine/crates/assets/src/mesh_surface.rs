@@ -15,6 +15,12 @@ use saffron_spatial::{
 };
 use saffron_vegetation::AlphaClassification;
 
+/// The one phase the CPU coverage decision evaluates at. A surface-field answer reaches cooked
+/// vegetation bytes, and [`SurfaceProviderDescriptor::revision`] does not cover the coverage
+/// record, so a phase that moved per frame would change published bytes while every cook key
+/// stayed identical. The raster path advances a separate phase for TAA.
+const CANONICAL_COVERAGE_PHASE: u32 = 0;
+
 /// CPU-resident projection of one material's canonical coverage contract.
 #[derive(Clone)]
 pub struct CanonicalCpuCoverage {
@@ -30,8 +36,6 @@ pub struct CanonicalCpuCoverage {
     pub hash_extent: [u32; 2],
     /// Stable object-space stochastic-coverage salt.
     pub salt: u64,
-    /// Temporal coverage phase shared with this frame's raster draws.
-    pub temporal_phase: u32,
     /// Authored alpha cutoff.
     pub reference_cutoff: f32,
     /// Whether the decoded alpha already stores coverage probability.
@@ -59,7 +63,7 @@ impl CanonicalCpuCoverage {
             self.base_color_alpha,
             self.hash_extent,
             self.salt,
-            self.temporal_phase,
+            CANONICAL_COVERAGE_PHASE,
             self.reference_cutoff,
             0.0,
             self.canonical_probability,
@@ -770,7 +774,6 @@ mod tests {
                     texture_extent: [1, 1],
                     hash_extent: [1, 1],
                     salt: 0,
-                    temporal_phase: 0,
                     reference_cutoff: 0.5,
                     canonical_probability: true,
                     uv_tiling: Vec2::ONE,
@@ -784,7 +787,6 @@ mod tests {
                     texture_extent: [1, 1],
                     hash_extent: [1, 1],
                     salt: 0,
-                    temporal_phase: 0,
                     reference_cutoff: 0.5,
                     canonical_probability: true,
                     uv_tiling: Vec2::ONE,

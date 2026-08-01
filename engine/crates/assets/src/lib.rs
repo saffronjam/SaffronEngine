@@ -68,8 +68,9 @@ pub use environment_profile::{
 pub use error::{Error, Result};
 pub use gpu::{GpuUploader, RendererUploader};
 pub use gpu_scene_mirror::{
-    GpuSceneMirror, GpuSceneMirrorStats, GpuSceneMirrorTarget, VegetationBudgets,
-    VegetationCellRenderRow, VegetationFamilyRenderRow, VegetationRenderBreakdown,
+    GpuSceneMirror, GpuSceneMirrorStats, GpuSceneMirrorTarget, MirrorInstanceIdentity,
+    VegetationBudgets, VegetationCellRenderRow, VegetationFamilyRenderRow,
+    VegetationRenderBreakdown,
 };
 pub use graph::{emit_graph_surface, lower_graph_to_params};
 pub use import::{
@@ -125,9 +126,8 @@ pub use project_load::{DocProgress, DocStage, LoadInput, LoadedDoc, ProjectDocWo
 pub use render_material::{ResolvedMaterials, build_submesh_material};
 pub use render_scene::{
     RendererScene, SceneRenderer, SceneSurfaceHit, SceneSurfaceProvider, model_render_aabb,
-    pick_entity, pick_scene_surface, query_scene_surface_ray, render_scene,
-    sample_scene_surface_field, scene_render_aabb, scene_surface_field_snapshots,
-    scene_surface_providers, viewport_pick_ray, viewport_ray,
+    pick_scene_surface, query_scene_surface_ray, render_scene, sample_scene_surface_field,
+    scene_render_aabb, scene_surface_field_snapshots, scene_surface_providers, viewport_ray,
 };
 pub use scan::{
     colorspace_for_role_explicit, detect_height_mode, detect_material_role, infer_texture_role,

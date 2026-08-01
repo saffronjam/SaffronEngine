@@ -5,12 +5,13 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use saffron_core::Uuid;
+use saffron_scene::AssetType;
 use saffron_spatial::SurfaceField;
 use saffron_vegetation::{
     BiomeAsset, BiomeGraphResolver, CompiledBiomeGraph, CompiledGraphUnit, GraphCompileOptions,
     GraphDependencySource, PlantPrototype, VegetationMapChunkKind, VegetationMapChunkPayload,
     VegetationMapTileKey, canonical_surface_provider_set_hash, compile_biome_graph,
-    vegetation_content_hash,
+    read_plant_asset, vegetation_content_hash,
 };
 
 use crate::cook_reader::CookAssetAccess;
@@ -61,11 +62,12 @@ impl BiomeGraphResolver for CookBiomeGraphResolver<'_> {
                     reason: "catalog asset is missing".to_owned(),
                 }
             })?;
+            let asset_type = entry.asset_type;
             let bytes = self
                 .assets
                 .read_file(&self.assets.root().join(&entry.path))
                 .map_err(|error| dependency_error(source, error))?;
-            return Ok(vegetation_content_hash(&bytes));
+            return asset_dependency_hash(source, asset_type, &bytes);
         }
         self.external_dependencies
             .get(&source)
@@ -117,7 +119,7 @@ impl BiomeGraphResolver for CatalogBiomeGraphResolver<'_> {
             })?;
             let bytes = std::fs::read(self.assets.root.join(&entry.path))
                 .map_err(|error| dependency_error(source, Error::Io(error.to_string())))?;
-            return Ok(vegetation_content_hash(&bytes));
+            return asset_dependency_hash(source, entry.asset_type, &bytes);
         }
         self.external_dependencies
             .get(&source)
@@ -298,6 +300,27 @@ pub(crate) fn vegetation_graph_dependency_hashes_from(
         }
     }
     Ok(result)
+}
+
+/// The identity a compiled graph folds in for one catalog asset it names.
+///
+/// A plant family answers with what it declares rather than with its file bytes: cooking accepts
+/// the sources it observed into the authored document, so the raw bytes move underneath a
+/// generation the same cook publishes.
+fn asset_dependency_hash(
+    source: GraphDependencySource,
+    asset_type: AssetType,
+    bytes: &[u8],
+) -> std::result::Result<[u8; 32], saffron_vegetation::Error> {
+    if asset_type == AssetType::Plant {
+        return read_plant_asset(bytes)
+            .and_then(|family| family.declared_identity())
+            .map_err(|error| saffron_vegetation::Error::GraphDocument {
+                path: dependency_path(source),
+                reason: error.to_string(),
+            });
+    }
+    Ok(vegetation_content_hash(bytes))
 }
 
 fn collect_graph_families(unit: &CompiledGraphUnit, families: &mut BTreeSet<u64>) {

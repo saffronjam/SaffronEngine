@@ -105,7 +105,7 @@ pub(crate) fn plant_fixture(id: Uuid, name: &str) -> PlantFamilyAsset {
         phenotypes: vec![saffron_vegetation::PlantPhenotype {
             id: 0,
             role: saffron_vegetation::PhenotypeRole::Healthy,
-            season_window: None,
+            response: saffron_vegetation::PhenotypeResponse::default(),
             variation: 0,
             material_remap: Vec::new(),
             active_parts: Vec::new(),

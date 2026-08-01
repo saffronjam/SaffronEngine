@@ -115,7 +115,7 @@ pub fn vegetation_export_closure(
             &store.path(VegetationArtifactKind::Manifest, hash),
             &mut files,
         )?;
-        let baseline = take(&state_root, &state.baseline_path(hash), &mut state_files)?;
+        let baseline = take(&state_root, &state.baseline_path(map), &mut state_files)?;
         let mut missing = 0;
         let mut macro_plants = 0_u64;
         let mut facets: BTreeMap<u16, (u64, u64)> = BTreeMap::new();

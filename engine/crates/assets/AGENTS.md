@@ -47,6 +47,12 @@ crate's public surface is unchanged by where an item lives.
   `EDITOR_CAMERA_MATERIAL_ID` is handled by a branch in `render_material.rs`. Seeding a reserved id
   into `material_by_uuid` as a side effect of some other work means any wholesale cache clear
   permanently loses it, and the sibling mesh cache still hitting hides the failure.
+- **CPU coverage has exactly one phase.** `CanonicalCpuCoverage` classifies at
+  `CANONICAL_COVERAGE_PHASE`, never at the renderer's per-frame TAA phase. A surface-field answer
+  reaches cooked vegetation bytes, and `SurfaceProviderDescriptor::revision` does not cover the
+  coverage record — so a phase that moved per frame would change published bytes while every cook
+  key stayed identical, which no cache check can catch. The raster path advances its own phase
+  (`gpu_scene_upload`, `instancing.rs`); that one is unrelated to this one.
 - **`scan_assets` skips the `.cache/` subtree.** The filesystem is the source of truth for the
   catalog; `assets/.cache/catalog.json` is a fast path, not a second truth. Do not add a scan path
   that walks into it.
@@ -79,9 +85,12 @@ crate's public surface is unchanged by where an item lives.
   **Repair deletes rather than rewrites** — the bytes are the only copy, and the cooker's cache-miss
   path is what reproduces them. Verification never touches `state_files`: a baseline is the only copy
   of something no cook reproduces, so "delete the corrupt one" is the wrong repair for it.
-- **A baseline is keyed by its manifest, one per generation.** A second baseline for the same
-  generation is an ambiguity nothing resolves. A baseline that does not decode against its
-  generation is a hard error at publish and at bind, not a warning.
+- **A baseline is keyed by its authored map, one per map**, and names inside itself the generation it
+  was reduced against. Keying the file by the generation instead orphans it on the next recook — a new
+  identity finds no baseline, and the world comes up bare with every delta still on disk. Publishing
+  validates that the snapshot decodes against the generation it claims; binding compares that claim to
+  the bound generation and rebases when they differ (`VegetationState::rebase`), never silently
+  starting empty.
 - **Authored vegetation is excluded from a packaged `assets/`.** A player never reads a `.splant`,
   `.sbiome`, or `.svegmap`; it binds by identity through the artifact store. `.svegcell` and
   `.splantc` are never catalog assets and cannot be imported or edited.

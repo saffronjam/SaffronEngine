@@ -1,6 +1,7 @@
 //! The decode mirrors of the `.splantc` section writers.
 
 use saffron_core::Uuid;
+use saffron_spatial::UnitInterval;
 use saffron_vegetation::PlantSourceSelector;
 
 use crate::{Error, Result};
@@ -196,8 +197,8 @@ pub(crate) struct PlantPhenotypeRow {
     pub id: u32,
     /// Semantic role.
     pub role: saffron_vegetation::PhenotypeRole,
-    /// Authored seasonal window in per-mille of the year, wrapping through 1000.
-    pub season_window: Option<(u16, u16)>,
+    /// Intrinsic expression curve over season, health, and moisture.
+    pub response: saffron_vegetation::PhenotypeResponse,
     /// The variation the phenotype renders.
     pub variation: u32,
     /// Material slot remap `(from, to)`.
@@ -209,7 +210,7 @@ pub(crate) struct PlantPhenotypeRow {
 /// masks) and are skipped.
 pub(crate) fn decode_phenotype_section(bytes: &[u8]) -> Result<Vec<PlantPhenotypeRow>> {
     let mut reader = SectionReader::new(bytes);
-    reader.expect_domain(b"saffron-anima/splantc/phenotypes/v1")?;
+    reader.expect_domain(b"saffron-anima/splantc/phenotypes/v2")?;
     let count = reader.read_length()?;
     let mut rows = Vec::with_capacity(count);
     for _ in 0..count {
@@ -230,19 +231,7 @@ pub(crate) fn decode_phenotype_section(bytes: &[u8]) -> Result<Vec<PlantPhenotyp
                 )));
             }
         };
-        let season_window = match reader.read_u8()? {
-            0 => None,
-            1 => {
-                let start = u16::from_le_bytes(reader.take(2)?.try_into().expect("two bytes"));
-                let end = u16::from_le_bytes(reader.take(2)?.try_into().expect("two bytes"));
-                Some((start, end))
-            }
-            other => {
-                return Err(Error::Io(format!(
-                    "compiled plant phenotype window flag {other} is unknown"
-                )));
-            }
-        };
+        let response = decode_phenotype_response(&mut reader)?;
         let variation = reader.read_u32()?;
         let remap_count = reader.read_length()?;
         let mut material_remap = Vec::with_capacity(remap_count);
@@ -256,12 +245,56 @@ pub(crate) fn decode_phenotype_section(bytes: &[u8]) -> Result<Vec<PlantPhenotyp
         rows.push(PlantPhenotypeRow {
             id,
             role,
-            season_window,
+            response,
             variation,
             material_remap,
         });
     }
     Ok(rows)
+}
+
+/// Decodes one phenotype's intrinsic expression curve — the decode mirror of
+/// `append_phenotype_response`.
+fn decode_phenotype_response(
+    reader: &mut SectionReader<'_>,
+) -> Result<saffron_vegetation::PhenotypeResponse> {
+    let flag = |reader: &mut SectionReader<'_>| -> Result<bool> {
+        match reader.read_u8()? {
+            0 => Ok(false),
+            1 => Ok(true),
+            other => Err(Error::Io(format!(
+                "compiled plant phenotype band flag {other} is unknown"
+            ))),
+        }
+    };
+    let u16le = |reader: &mut SectionReader<'_>| -> Result<u16> {
+        Ok(u16::from_le_bytes(
+            reader.take(2)?.try_into().expect("two bytes"),
+        ))
+    };
+    let season_window = if flag(reader)? {
+        Some((u16le(reader)?, u16le(reader)?))
+    } else {
+        None
+    };
+    let mut band = || -> Result<Option<(UnitInterval, UnitInterval)>> {
+        if flag(reader)? {
+            Ok(Some((
+                UnitInterval::from_bits(u16le(reader)?),
+                UnitInterval::from_bits(u16le(reader)?),
+            )))
+        } else {
+            Ok(None)
+        }
+    };
+    let health_band = band()?;
+    let moisture_band = band()?;
+    Ok(saffron_vegetation::PhenotypeResponse {
+        season_window,
+        health_band,
+        moisture_band,
+        ramp_mille: u16le(reader)?,
+    })
 }
 
 /// Decodes one MaterialsCoverage-section payload into its material rows and the packed atlas's

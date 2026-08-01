@@ -795,8 +795,8 @@ fn derive_seed_namespace(world: Uuid, map: Uuid, domain: u128) -> u128 {
 #[cfg(test)]
 mod tests {
     use super::super::test_support::{
-        AUTHORED_LAYER, Scratch, cell_artifact_hashes, cook_request, edit_field_chunk, run_cook,
-        save_populated_map,
+        AUTHORED_LAYER, Scratch, cell_artifact_hashes, cook_request, declare_unobserved_graft,
+        edit_field_chunk, run_cook, save_populated_map,
     };
     use super::*;
     use crate::AssetServer;
@@ -833,19 +833,38 @@ mod tests {
         })
     }
 
-    /// Editing one bounded authored field re-keys exactly the cells whose halo-expanded read bounds
-    /// reach it. The far cell's bytes are untouched, so its content-addressed artifact is still
-    /// there and the cook reports it as a hit.
-    #[test]
-    fn editing_one_bounded_field_invalidates_only_its_region_and_declared_halo() {
-        let scratch = Scratch::new("bounded-field-scope");
+    /// The three cells one bounded-field edit is measured over: the cell owning the edited chunk,
+    /// its neighbour across one 64 m boundary, and one further out again.
+    fn scope_cells() -> [WorldCellKey; 3] {
+        [
+            WorldCellKey::base(0, 0, 0),
+            WorldCellKey::base(1, 0, 0),
+            WorldCellKey::base(2, 0, 0),
+        ]
+    }
+
+    fn per_cell(values: [bool; 3]) -> BTreeMap<WorldCellKey, bool> {
+        scope_cells().into_iter().zip(values).collect()
+    }
+
+    /// What one bounded-field edit reached, per cell of [`scope_cells`].
+    struct EditScope {
+        /// Whether the cell's cook node names the edited chunk.
+        named: BTreeMap<WorldCellKey, bool>,
+        /// Whether the cell's artifact identity moved.
+        republished: BTreeMap<WorldCellKey, bool>,
+        /// What the recook reported for the cell.
+        hits: BTreeMap<WorldCellKey, bool>,
+    }
+
+    /// Cooks the three-cell world, overwrites the bounded field chunk the first cell owns, recooks,
+    /// and reports what the edit reached at `halo_metres` of declared placement influence.
+    fn field_edit_scope(tag: &str, halo_metres: i32) -> EditScope {
+        let scratch = Scratch::new(tag);
         let mut assets = AssetServer::new(scratch.path().join("assets"));
-        let edited = WorldCellKey::base(0, 0, 0);
-        let adjacent = WorldCellKey::base(1, 0, 0);
-        let distant = WorldCellKey::base(2, 0, 0);
-        let cells = vec![edited, adjacent, distant];
-        // A one-metre halo reaches across exactly one cell boundary at this level.
-        let populated = save_populated_map(&mut assets, &cells, 1).unwrap();
+        let cells = scope_cells().to_vec();
+        let edited = cells[0];
+        let populated = save_populated_map(&mut assets, &cells, halo_metres).unwrap();
         let world = Uuid(101);
         let cancellation = GraphCancellationToken::default();
 
@@ -858,7 +877,7 @@ mod tests {
         .unwrap();
         assert!(
             first.manifest.cells.iter().all(|cell| cell.macro_count > 0),
-            "the scope below is measured over populated cells"
+            "the scope is measured over populated cells"
         );
         let before = cell_artifact_hashes(&first);
 
@@ -870,7 +889,7 @@ mod tests {
                 world,
                 populated.map,
                 Some(first.manifest_identity),
-                cells,
+                cells.clone(),
                 2,
             ),
             &cancellation,
@@ -878,20 +897,50 @@ mod tests {
         )
         .unwrap();
         let after = cell_artifact_hashes(&second);
+        EditScope {
+            named: cells
+                .iter()
+                .map(|cell| {
+                    (
+                        *cell,
+                        depends_on_field_chunk(&second.cook_graph, *cell, edited),
+                    )
+                })
+                .collect(),
+            republished: cells
+                .iter()
+                .map(|cell| (*cell, before[cell] != after[cell]))
+                .collect(),
+            hits: cells
+                .iter()
+                .map(|cell| {
+                    (
+                        *cell,
+                        cache_hit(&events, *cell).expect("every cook cell reports completion"),
+                    )
+                })
+                .collect(),
+        }
+    }
 
-        // The mechanism: the dependency region is the halo-expanded read bounds, so the adjacent
-        // cell names the edited chunk and the far cell does not.
-        assert!(depends_on_field_chunk(&second.cook_graph, edited, edited));
-        assert!(depends_on_field_chunk(&second.cook_graph, adjacent, edited));
-        assert!(!depends_on_field_chunk(&second.cook_graph, distant, edited));
+    /// Editing one bounded authored field re-keys exactly the cells whose read bounds reach it, and
+    /// the graph's declared halo is what decides how far that is. Everything outside keeps its
+    /// bytes, so its content-addressed artifact is still in the store and the cook reports it as a
+    /// hit.
+    #[test]
+    fn editing_one_bounded_field_invalidates_only_its_region_and_declared_halo() {
+        // No declared influence: a cell reads its own bounds, so the region is the owning cell.
+        let bounded = field_edit_scope("bounded-field-scope", 0);
+        assert_eq!(bounded.named, per_cell([true, false, false]));
+        assert_eq!(bounded.republished, per_cell([true, false, false]));
+        assert_eq!(bounded.hits, per_cell([false, true, true]));
 
-        // The consequence: only that region republished.
-        assert_ne!(before[&edited], after[&edited]);
-        assert_ne!(before[&adjacent], after[&adjacent]);
-        assert_eq!(before[&distant], after[&distant]);
-        assert_eq!(cache_hit(&events, edited), Some(false));
-        assert_eq!(cache_hit(&events, adjacent), Some(false));
-        assert_eq!(cache_hit(&events, distant), Some(true));
+        // One metre of declared influence expands every cell's read bounds across one 64 m boundary
+        // and no further, so the region grows by exactly the adjacent cell.
+        let haloed = field_edit_scope("haloed-field-scope", 1);
+        assert_eq!(haloed.named, per_cell([true, true, false]));
+        assert_eq!(haloed.republished, per_cell([true, true, false]));
+        assert_eq!(haloed.hits, per_cell([false, false, true]));
     }
 
     #[test]
@@ -981,6 +1030,68 @@ mod tests {
         // One compiled family plus two cells, every one satisfied by bytes already in the store.
         assert_eq!(repeated.statistics.cache_hits, 3);
         assert_eq!(repeated.statistics.cache_misses, 0);
+    }
+
+    /// A cook reads the external sources a family declares and writes what it observed back into
+    /// the authored document, in the same operation that publishes the generation. The generation
+    /// it publishes must be the one that authored state cooks to, or nothing that binds to a
+    /// generation identity — a persistent-state baseline above all — survives the next cook.
+    #[test]
+    fn a_cook_that_accepts_a_source_observation_reproduces_its_own_generation() {
+        let scratch = Scratch::new("accepted-observation");
+        let mut assets = AssetServer::new(scratch.path().join("assets"));
+        let cell = WorldCellKey::base(0, 0, 0);
+        let populated = save_populated_map(&mut assets, &[cell], 0).unwrap();
+        declare_unobserved_graft(&mut assets, populated.plant).unwrap();
+        let authored = |assets: &AssetServer| {
+            let entry = assets
+                .catalog
+                .find(populated.plant)
+                .expect("family")
+                .clone();
+            std::fs::read(assets.root.join(&entry.path)).expect("authored family bytes")
+        };
+        let declared = authored(&assets);
+        let world = Uuid(404);
+        let cancellation = GraphCancellationToken::default();
+
+        let first = run_cook(
+            &mut assets,
+            cook_request(world, populated.map, None, vec![cell], 1),
+            &cancellation,
+            |_| {},
+        )
+        .unwrap();
+        let accepted = authored(&assets);
+        assert_ne!(
+            accepted, declared,
+            "the cook accepted the observation it read, which is what re-keys the recook"
+        );
+        assert!(
+            first.manifest.cells.iter().all(|cell| cell.macro_count > 0),
+            "identity is only worth comparing over a populated generation"
+        );
+
+        let repeated = run_cook(
+            &mut assets,
+            cook_request(
+                world,
+                populated.map,
+                Some(first.manifest_identity),
+                vec![cell],
+                1,
+            ),
+            &cancellation,
+            |_| {},
+        )
+        .unwrap();
+        assert_eq!(authored(&assets), accepted, "nothing was left to accept");
+        assert_eq!(repeated.manifest_identity, first.manifest_identity);
+        assert_eq!(
+            cell_artifact_hashes(&repeated),
+            cell_artifact_hashes(&first),
+            "the cell the baseline layers over is the same artifact"
+        );
     }
 
     #[test]

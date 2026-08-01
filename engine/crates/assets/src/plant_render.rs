@@ -56,8 +56,8 @@ pub struct PlantPhenotypeRender {
     pub id: u32,
     /// Semantic role.
     pub role: saffron_vegetation::PhenotypeRole,
-    /// Authored seasonal window in per-mille of the year, wrapping through 1000.
-    pub season_window: Option<(u16, u16)>,
+    /// Intrinsic expression curve over season, health, and moisture.
+    pub response: saffron_vegetation::PhenotypeResponse,
     /// The variation the phenotype renders.
     pub variation: u32,
     /// Material slot remap `(from, to)`.
@@ -184,7 +184,7 @@ impl crate::AssetServer {
                 .map(|row| PlantPhenotypeRender {
                     id: row.id,
                     role: row.role,
-                    season_window: row.season_window,
+                    response: row.response,
                     variation: row.variation,
                     material_remap: row.material_remap.into(),
                 })

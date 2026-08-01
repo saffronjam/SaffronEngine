@@ -6,12 +6,17 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use saffron_core::Uuid;
+use saffron_geometry::glam::{Vec2, Vec3};
+use saffron_geometry::{Mesh, Submesh, Vertex, compute_tangents, save_mesh_to_buffer};
+use saffron_scene::{AssetEntry, AssetType};
 use saffron_spatial::{DecisionScalar, WorldBounds, WorldCellKey};
 use saffron_vegetation::{
     BIOME_GRAPH_VERSION, BIOME_INTERFACE_VERSION, BIOME_NODE_VERSION, BiomeGraphDocument,
     ContentHash, GraphAuthority, GraphCancellationToken, GraphDependencySource, GraphDomain,
     GraphEdge, GraphInterfaceOutput, GraphNodeDefinition, GraphOperator, GraphParameterValue,
-    GraphSink, LocalBiomeInstance, NodeSpatialPolicy,
+    GraphSink, LocalBiomeInstance, NodeSpatialPolicy, PlantFamilySource, PlantImportSettings,
+    PlantSourceLocator, PlantSourceReference, PlantSourceRole, PlantSourceSelector,
+    SourceProvenance,
 };
 
 use super::{
@@ -23,7 +28,7 @@ use crate::vegetation::test_support::{
     layer_fixture, map_fixture, plant_fixture,
 };
 use crate::vegetation::{save_biome_asset, save_plant_family_asset, save_vegetation_map_asset};
-use crate::{AssetServer, CookProjectView, MaterialAsset, Result, save_material_asset};
+use crate::{AssetServer, CookProjectView, Error, MaterialAsset, Result, save_material_asset};
 
 static SCRATCH_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
@@ -130,6 +135,72 @@ pub(crate) fn save_populated_map(
     chunks.extend(cells.iter().map(|cell| chunk_fixture(map, *cell, 1, 0)));
     commit_chunks(assets, map, chunks);
     Ok(PopulatedMap { map, plant, biome })
+}
+
+/// Gives `family` one graft over an external mesh file whose declared observation is stale — the
+/// shape every freshly imported family has until a cook reads the file and accepts what it saw.
+pub(crate) fn declare_unobserved_graft(assets: &mut AssetServer, family: Uuid) -> Result<()> {
+    let relative = "meshes/hero.smesh";
+    let path = assets.root.join(relative);
+    std::fs::create_dir_all(path.parent().expect("source parent"))
+        .map_err(|error| Error::Io(error.to_string()))?;
+    let mut mesh = Mesh {
+        vertices: vec![
+            Vertex {
+                position: Vec3::new(-0.5, 0.0, 0.0),
+                normal: Vec3::Z,
+                uv0: Vec2::new(0.0, 0.0),
+                ..Vertex::default()
+            },
+            Vertex {
+                position: Vec3::new(0.5, 0.0, 0.0),
+                normal: Vec3::Z,
+                uv0: Vec2::new(1.0, 0.0),
+                ..Vertex::default()
+            },
+            Vertex {
+                position: Vec3::new(0.0, 1.0, 0.0),
+                normal: Vec3::Z,
+                uv0: Vec2::new(0.5, 1.0),
+                ..Vertex::default()
+            },
+        ],
+        indices: vec![0, 1, 2],
+        submeshes: vec![Submesh {
+            first_index: 0,
+            index_count: 3,
+            vertex_offset: 0,
+            material_slot: 0,
+        }],
+    };
+    compute_tangents(&mut mesh);
+    std::fs::write(&path, save_mesh_to_buffer(&mesh, &[], None)?)
+        .map_err(|error| Error::Io(error.to_string()))?;
+    let hero = Uuid(9_001);
+    assets.catalog.put(AssetEntry {
+        id: hero,
+        name: "hero".to_owned(),
+        asset_type: AssetType::Mesh,
+        path: relative.to_owned(),
+        ..AssetEntry::default()
+    });
+    let mut asset = crate::load_plant_family_asset(assets, family)?;
+    let PlantFamilySource::Native { grafts, .. } = &mut asset.source else {
+        panic!("the fixture family is native");
+    };
+    grafts.push(PlantSourceReference {
+        id: 77,
+        locator: PlantSourceLocator::Asset(hero),
+        role: PlantSourceRole::Geometry,
+        selector: PlantSourceSelector::Element {
+            id: u128::from(hero.value()),
+            path: "hero".to_owned(),
+        },
+        content_hash: [0xAB; 32],
+        settings: PlantImportSettings::default(),
+        provenance: SourceProvenance::default(),
+    });
+    crate::update_plant_family_asset(assets, family, &asset)
 }
 
 /// Overwrites the bounded field chunk `cell` owns with a new value, which re-keys that one chunk.

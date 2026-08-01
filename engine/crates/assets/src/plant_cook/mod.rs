@@ -556,8 +556,8 @@ fn calculate_plant_cook_key(
 }
 
 // The section writers encode these exact versions, so a bump upstream must revisit them here.
-const _: () = assert!(PLANT_ASSET_VERSION == 5);
-const _: () = assert!(PLANT_COMPILED_ARTIFACT_VERSION == 5);
+const _: () = assert!(PLANT_ASSET_VERSION == 7);
+const _: () = assert!(PLANT_COMPILED_ARTIFACT_VERSION == 6);
 
 #[cfg(test)]
 mod tests {
@@ -838,8 +838,6 @@ mod tests {
                 .collect()
         };
         let plant_bytes = from_hex(json["plantHex"].as_str().unwrap());
-        let trunk = from_hex(json["trunkObjHex"].as_str().unwrap());
-        let trunk_path = json["trunkObjPath"].as_str().unwrap();
 
         let root = std::env::temp_dir().join(format!(
             "saffron-fixture-probe-{}-{file}",
@@ -848,13 +846,10 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(root.join("assets")).unwrap();
         let mut assets = AssetServer::new(root.join("assets"));
-        let full = assets.root.join(trunk_path);
-        std::fs::create_dir_all(full.parent().unwrap()).unwrap();
-        std::fs::write(&full, &trunk).unwrap();
-        if let (Some(mtl_hex), Some(mtl_path)) =
-            (json["trunkMtlHex"].as_str(), json["trunkMtlPath"].as_str())
-        {
-            std::fs::write(assets.root.join(mtl_path), from_hex(mtl_hex)).unwrap();
+        for source in json["sources"].as_array().unwrap() {
+            let full = assets.root.join(source["path"].as_str().unwrap());
+            std::fs::create_dir_all(full.parent().unwrap()).unwrap();
+            std::fs::write(&full, from_hex(source["hex"].as_str().unwrap())).unwrap();
         }
         let family = saffron_vegetation::read_plant_asset(&plant_bytes).expect("fixture plant");
         let id = crate::save_plant_family_asset(&mut assets, family, "E2E birch", "plants")
