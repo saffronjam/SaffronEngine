@@ -2928,6 +2928,7 @@ dependencies = [
  "saffron-physics-sys",
  "saffron-scene",
  "saffron-spatial",
+ "saffron-wind",
  "thiserror 2.0.18",
  "tracing",
 ]
@@ -4400,6 +4401,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "atomic-write-file",
+ "image",
  "saffron-core",
  "saffron-geometry",
  "saffron-protocol",

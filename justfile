@@ -184,6 +184,13 @@ editor:
     RECIPE=editor; {{reenter}}
     cd "{{editor}}" && bun run build
 
+# repeat the contract run N times (default 20), counting device losses and watchdog hang reports
+stress-schema RUNS="20": engine
+    #!/usr/bin/env bash
+    set -euo pipefail
+    RECIPE=stress-schema; {{reenter}}
+    "{{repo}}/tools/ci/stress-schema.sh" "{{RUNS}}"
+
 # control-schema contract test (live `sa` control output vs schemas/control)
 schema: engine
     #!/usr/bin/env bash
@@ -255,6 +262,36 @@ compute-conformance:
     cargo run -p xtask -- shaders
     {{gpu_driver}}
     cargo run -p saffron-vegetation-gpu --example compute_conformance
+
+# record the Phase 1 foliage baseline on this machine's GPU: `just bench-foliage-phase1 benchmarks/foliage-veg/phase-1-<device>.json`
+bench-foliage-phase1 OUT:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    RECIPE=bench-foliage-phase1; {{reenter}}
+    cd "{{engine}}"
+    cargo build --bin saffron-host
+    cargo run -p xtask -- shaders
+    {{gpu_driver}}
+    export SAFFRON_ANIMA_BIN="{{engine_bin}}"
+    cd "{{repo}}" && bun tools/bench-foliage-phase1/measure.ts > "{{OUT}}"
+    echo "wrote {{OUT}}"
+
+# grade a fresh Phase 1 measurement against the record captured on this device (gate step 8)
+bench-foliage-check:
+    #!/usr/bin/env bash
+    set -uo pipefail
+    RECIPE=bench-foliage-check; {{reenter}}
+    cd "{{engine}}"
+    cargo build --bin saffron-host || exit 1
+    cargo run -p xtask -- shaders || exit 1
+    {{gpu_driver}}
+    export SAFFRON_ANIMA_BIN="{{engine_bin}}"
+    cd "{{repo}}"
+    bun tools/bench-foliage-phase1/check.ts
+    status=$?
+    # Hardware with no record of its own defers; only a graded breach fails.
+    [ "$status" -eq 2 ] && exit 0
+    exit "$status"
 
 # start the editor: build the engine host + the CEF shell, verify CEF's staged runtime, start Vite,
 # then launch the shell pointed at it (the shell spawns the host as a child).

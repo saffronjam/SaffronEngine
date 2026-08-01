@@ -21,6 +21,13 @@ MoltenVK). The engine keeps the API *shape* that works — an `App`/`Layer` life
   reason to compromise on the right design. Surface the correct option as the recommendation and
   build it; mention a lesser fallback only if explicitly asked. (Scope/phasing may still be
   discussed, but the destination is always the correct modern design.)
+- **DO NOT ASK PERMISSION TO DO THE RIGHT THING — BUILD IT.** Once the correct design is identified,
+  implement it. Size, protocol churn, a wire/format change, a broken caller, a rewritten test, or a
+  large blast radius are **not** grounds to stop and ask; they are the work. "Should I do X or the
+  smaller Y?" where X is correct is a question that must not be asked — do X. Report what you built
+  and what it broke, after it is built and green. Ask only when the *requirement* is genuinely
+  ambiguous (two designs are equally correct and the choice is a matter of product intent), never
+  when the only open question is whether the correct change is too much work.
 - **NO LEGACY. NO COMPAT SHIMS. EVER.** This is a clean-slate codebase (`main` is an intentional orphan
   fresh start — there is nothing on disk, in the field, or downstream to be backward-compatible with).
   There is exactly **one** way to do each thing, and one code path for it. When a change would break an
@@ -207,7 +214,7 @@ saffron-geometry    → {saffron-core, saffron-material}
 saffron-scene       → {saffron-core, saffron-json, saffron-spatial, saffron-wind}   hecs-backed ECS
 saffron-animation   → {saffron-core, saffron-geometry, saffron-scene}
 saffron-physics-sys → (cxx-built vendored Jolt 5.3.0)
-saffron-physics     → {saffron-core, saffron-spatial, saffron-geometry, saffron-scene, saffron-animation, saffron-physics-sys}
+saffron-physics     → {saffron-core, saffron-spatial, saffron-geometry, saffron-scene, saffron-animation, saffron-physics-sys, saffron-wind}
 saffron-script      → {saffron-core, saffron-spatial, saffron-scene}      Luau via mlua (vendored)
 saffron-vegetation  → {saffron-core, saffron-json, saffron-material, saffron-geometry, saffron-spatial}
 saffron-rendering   → {saffron-core, saffron-window, saffron-geometry, saffron-material, saffron-spatial, saffron-wind}   ash + vk-mem
@@ -352,8 +359,9 @@ a feature — follow and update a matching plan rather than starting cold.
   GPU binning, counted-indirect executor draws with BDA vertex pulling for every raster pass, a GPU
   radix-sorted transparent pass, and a displacement amplification arena displaced instances draw
   from through the same binned cut); a second
-  `VK_EXT_mesh_shader` executor over the same binned cut, selected by `SAFFRON_MESH_EXECUTOR=1` on a
-  device that offers a mesh stage and held to image parity by `tests/e2e/mesh-executor-parity.test.ts`;
+  `VK_EXT_mesh_shader` executor over the same binned cut, taken wherever the device's mesh feature
+  bits and per-workgroup output limits qualify (`set-mesh-executor` switches a running host between
+  the two) and held to image parity by `tests/e2e/mesh-executor-parity.test.ts`;
   and vegetation as a deterministic world system (below).
 - **Vegetation** is the largest single subsystem and spans nine directories, each with its own
   `AGENTS.md`. Three authored asset types — `.splant` plant families, `.sbiome` placement/ecology
