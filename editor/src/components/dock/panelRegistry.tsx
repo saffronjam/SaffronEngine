@@ -17,6 +17,7 @@ import {
 import { BiomeGraphPanel } from "../../panels/BiomeGraphPanel";
 import { InspectorPanel } from "../../panels/InspectorPanel";
 import { EnvironmentPanel } from "../../panels/EnvironmentPanel";
+import { WindDebugPanel } from "../../panels/WindDebugPanel";
 import { RenderPanel } from "../../panels/RenderPanel";
 import { PostProcessPanel } from "../../panels/PostProcessPanel";
 import { RenderStatsPanel } from "../../panels/RenderStatsPanel";
@@ -70,6 +71,13 @@ export const SCENE_PANEL_REGISTRY: Record<SceneDockPanelId, DockPanelDef> = {
     closable: false,
     renderer: "onlyWhenVisible",
     component: EnvironmentPanel,
+  },
+  windDebug: {
+    id: "windDebug",
+    title: "Wind Debug",
+    closable: true,
+    renderer: "onlyWhenVisible",
+    component: WindDebugPanel,
   },
   render: {
     id: "render",
