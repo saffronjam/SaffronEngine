@@ -616,7 +616,8 @@ public GpuSceneInstanceGpuRecord gpuSceneLoadInstance(GpuSceneAddressBlock addre
 // One wind-deformed instance's prepass output: the full sway displacement at the instance's
 // bounds top for the current and previous frame times, the reciprocal of the local bounds-top
 // height (so a vertex derives its root-anchored weight without loading the prototype), and the
-// world-space cull slack covering both sways.
+// world-space cull slack — the whole-instance total plus the per-term magnitudes a box scales
+// by its own height weight.
 public struct GpuWindInstanceRecord
 {
     public float3 swayCurrent;
@@ -629,11 +630,12 @@ public struct GpuWindInstanceRecord
     // reactive-coverage pass marks the instance instead.
     public float interactionReset;
     public float3 interactionPrevious;
-    public float reserved1;
+    public float swaySlack;
     public float4 branchQuadrature;
     public float branchAmplitude;
     public float flutterAmplitude;
-    public float2 reserved2;
+    public float interactionSlack;
+    public float reserved1;
 };
 
 public static const uint GPU_WIND_INSTANCE_RECORD_SIZE = 96u;
@@ -708,6 +710,43 @@ public float3 gpuSceneWindDeform(
         }
     }
     return offset;
+}
+
+// The world-space cull slack a box needs, given the greatest instance-local height any of its
+// corners reaches. Each deformation term enters at the weight `gpuSceneWindDeform` applies to
+// it, so a box near the root asks for almost nothing while the crown asks for the full sway —
+// the whole-instance total would give both the crown's. Any term dropped here culls geometry
+// the frame can still see, so the two functions have to move together.
+public float gpuSceneWindBoxSlack(
+    GpuSceneAddressBlock addresses,
+    GpuSceneInstanceGpuRecord instance,
+    uint slot,
+    float topLocalY,
+    bool assembly,
+    GpuAssemblyUseRecord use)
+{
+    if ((instance.flags & GPU_SCENE_INSTANCE_FLAG_WIND) == 0u || addresses.windRecords == 0)
+    {
+        return 0.0;
+    }
+    GpuWindInstanceRecord* recordPtr = (GpuWindInstanceRecord*)(
+        addresses.windRecords + uint64_t(slot) * GPU_WIND_INSTANCE_RECORD_SIZE);
+    GpuWindInstanceRecord record = *recordPtr;
+    float weight = clamp(topLocalY * record.heightScale, 0.0, 1.0);
+    float slack = record.swaySlack * (weight * weight) + record.interactionSlack * weight;
+    uint semantic = assembly ? use.reserved0 : 0u;
+    bool moving = semantic >= 1u && semantic <= 6u && semantic != 2u;
+    if (moving)
+    {
+        // The branch term's lever is clamped at 4 and scaled by 0.25, so the amplitude alone
+        // bounds it whatever the box's extent about the pivot.
+        slack += record.branchAmplitude;
+        if (semantic >= 3u)
+        {
+            slack += record.flutterAmplitude * weight;
+        }
+    }
+    return slack;
 }
 
 public GpuScenePrototypeGpuRecord gpuSceneLoadPrototype(GpuSceneAddressBlock addresses, uint slot)
@@ -800,19 +839,23 @@ public uint gpuSceneDeformationParameter(GpuSceneAddressBlock addresses, uint el
 // Bytes of one amplified micro-vertex in the displacement arena: position, normal, uv, tangent.
 public static const uint GPU_DISPLACED_VERTEX_SIZE = 48u;
 
-// The row a displaced instance owns in the frame's amplification arena, paired with the
-// instance slot the traversal walks. Sorted by slot so the lookup is a binary search.
+// One displaced instance's entry in the frame's amplification arena: the row it owns, the
+// instance slot the traversal walks, and the local-space bound of its relief. Sorted by slot
+// so the lookup is a binary search.
 public struct GpuDisplacedRow
 {
     public uint slot;
     public uint row;
+    public float localAmplitude;
+    public uint reserved;
 };
 
-// The amplification row for `slot`, or false when the instance is not displaced this frame.
+// The amplification entry for `slot`, or false when the instance is not displaced this frame.
 // The rows are sorted by slot, which is what makes one comparison per step sound.
-public bool gpuSceneDisplacedRow(GpuSceneAddressBlock addresses, uint slot, out uint row)
+public bool gpuSceneDisplacedRow(
+    GpuSceneAddressBlock addresses, uint slot, out GpuDisplacedRow entry)
 {
-    row = 0u;
+    entry = {};
     if (addresses.displacedRows == 0)
     {
         return false;
@@ -823,13 +866,13 @@ public bool gpuSceneDisplacedRow(GpuSceneAddressBlock addresses, uint slot, out 
     while (low < high)
     {
         uint mid = (low + high) / 2u;
-        let entry = rows[mid];
-        if (entry.slot == slot)
+        let candidate = rows[mid];
+        if (candidate.slot == slot)
         {
-            row = entry.row;
+            entry = candidate;
             return true;
         }
-        if (entry.slot < slot)
+        if (candidate.slot < slot)
         {
             low = mid + 1u;
         }
@@ -888,7 +931,7 @@ public GpuPageRecord gpuSceneResidentPage(GpuSceneAddressBlock addresses, GpuHan
 }
 
 public static const uint GPU_PAGE_NODE_RECORD_SIZE = 96u;
-public static const uint GPU_PAGE_CLUSTER_RECORD_SIZE = 48u;
+public static const uint GPU_PAGE_CLUSTER_RECORD_SIZE = 80u;
 public static const uint GPU_PAGE_VOXEL_VERTEX_SIZE = 16u;
 public static const uint GPU_PAGE_PAYLOAD_FLAG_GUARANTEED_ROOT = 1u;
 
@@ -928,6 +971,10 @@ public struct GpuPageClusterRecord
     public uint appearanceTotal;
     public float3 boundsMax;
     public uint cone;
+    public float3 deformedMin;
+    public uint reserved0;
+    public float3 deformedMax;
+    public uint reserved1;
 };
 
 public struct GpuPageVoxelVertex
@@ -1079,15 +1126,33 @@ public struct GpuSceneCandidateSurface
 // `firstSubmesh` is the geometry's submesh element for geometry index 0. A plain mesh builds one
 // geometry per submesh from element zero; an assembly prototype builds one per submesh of ITS span,
 // so the span's start is what rebases the candidate's geometry index onto the family's table.
+//
+// A cluster-composed structure reports a cluster ordinal as its geometry index and a cluster-local
+// primitive index over a cache-optimized triangle permutation, so neither addresses the shared
+// index stream; `clusterCount` selects the resolution tables instead.
 public struct GpuRayInstanceRecord
 {
     public uint instanceSlot;
     public uint firstSubmesh;
+    public uint clusterCount;
     public uint reserved0;
-    public uint reserved1;
+    public uint64_t clusterRecords;
+    public uint64_t clusterCorners;
 };
 
-public static const uint GPU_RAY_INSTANCE_RECORD_SIZE = 16u;
+public static const uint GPU_RAY_INSTANCE_RECORD_SIZE = 32u;
+
+// One cluster's candidate resolution: the prototype-relative submesh its triangles came from and
+// its run in the structure's corner stream (three geometry-local vertex indices per triangle).
+public struct GpuClusterResolutionRecord
+{
+    public uint submeshElement;
+    public uint firstCorner;
+    public uint triangleCount;
+    public uint reserved0;
+};
+
+public static const uint GPU_CLUSTER_RESOLUTION_RECORD_SIZE = 16u;
 
 // The instance slot of a ray instance with no mirrored identity: its candidates commit without
 // record resolution.
@@ -1098,8 +1163,10 @@ public GpuRayInstanceRecord gpuSceneRayInstance(GpuSceneAddressBlock addresses, 
     GpuRayInstanceRecord record;
     record.instanceSlot = GPU_RAY_INSTANCE_UNMIRRORED;
     record.firstSubmesh = 0u;
+    record.clusterCount = 0u;
     record.reserved0 = 0u;
-    record.reserved1 = 0u;
+    record.clusterRecords = 0;
+    record.clusterCorners = 0;
     if (addresses.rayInstances == 0 || index >= addresses.rayInstanceCount)
     {
         return record;
@@ -1111,8 +1178,7 @@ public GpuRayInstanceRecord gpuSceneRayInstance(GpuSceneAddressBlock addresses, 
 
 public GpuSceneCandidateSurface gpuSceneResolveCandidate(
     GpuSceneAddressBlock addresses,
-    uint instanceSlot,
-    uint firstSubmesh,
+    GpuRayInstanceRecord identity,
     uint geometryIndex,
     uint primitive,
     float2 barycentrics)
@@ -1124,44 +1190,80 @@ public GpuSceneCandidateSurface gpuSceneResolveCandidate(
     surface.canonicalProbability = false;
     surface.baseColorAlpha = 1.0;
 
-    if (instanceSlot >= addresses.instanceCapacity)
+    if (identity.instanceSlot >= addresses.instanceCapacity)
     {
         return surface;
     }
-    let header = gpuSceneSlotHeader(addresses.instances, GPU_SCENE_INSTANCE_SLOT_STRIDE, instanceSlot);
+    let header =
+        gpuSceneSlotHeader(addresses.instances, GPU_SCENE_INSTANCE_SLOT_STRIDE, identity.instanceSlot);
     if (header.occupied == 0u)
     {
         return surface;
     }
-    let instance = gpuSceneLoadInstance(addresses, instanceSlot);
+    let instance = gpuSceneLoadInstance(addresses, identity.instanceSlot);
     let prototype = gpuSceneLoadPrototype(addresses, instance.prototype.index);
     let geometry = gpuSceneResidentGeometry(addresses, prototype.geometry);
 
-    // The candidate's geometry names its submesh exactly: the build lays one geometry per submesh,
-    // in submesh order, so `firstSubmesh + geometryIndex` is the record and the primitive is
-    // relative to that submesh's own index slice. Searching the table for a containing range
-    // instead would resolve the wrong submesh for every geometry after the first, since a
-    // per-geometry primitive index is not a position in the shared stream.
-    uint submeshElement = firstSubmesh + geometryIndex;
-    if (submeshElement >= geometry.submeshes.count)
+    uint submeshElement;
+    uint i0;
+    uint i1;
+    uint i2;
+    if (identity.clusterCount > 0u)
     {
-        return surface;
+        // A cluster build: the geometry index is the cluster's ordinal and the primitive is a
+        // triangle within that cluster, so the corner stream the build recorded is the only thing
+        // that names the three vertices.
+        if (geometryIndex >= identity.clusterCount || identity.clusterCorners == 0)
+        {
+            return surface;
+        }
+        GpuClusterResolutionRecord* clusterPtr = (GpuClusterResolutionRecord*)(
+            identity.clusterRecords + uint64_t(geometryIndex) * GPU_CLUSTER_RESOLUTION_RECORD_SIZE);
+        GpuClusterResolutionRecord cluster = *clusterPtr;
+        if (primitive >= cluster.triangleCount)
+        {
+            return surface;
+        }
+        submeshElement = identity.firstSubmesh + cluster.submeshElement;
+        if (submeshElement >= geometry.submeshes.count)
+        {
+            return surface;
+        }
+        uint* corners = (uint*)identity.clusterCorners;
+        uint corner = cluster.firstCorner + primitive * 3u;
+        i0 = corners[corner];
+        i1 = corners[corner + 1u];
+        i2 = corners[corner + 2u];
+    }
+    else
+    {
+        // A triangle build: the candidate's geometry names its submesh exactly, since the build
+        // lays one geometry per submesh in submesh order, and the primitive is relative to that
+        // submesh's own index slice. Searching the table for a containing range instead would
+        // resolve the wrong submesh for every geometry after the first, since a per-geometry
+        // primitive index is not a position in the shared stream.
+        submeshElement = identity.firstSubmesh + geometryIndex;
+        if (submeshElement >= geometry.submeshes.count)
+        {
+            return surface;
+        }
+        let slice = gpuSceneSubmeshRecord(addresses, geometry.submeshes.first + submeshElement);
+        if (primitive * 3u + 2u >= slice.indexCount)
+        {
+            return surface;
+        }
+        uint firstIndex = slice.firstIndex + primitive * 3u;
+        if (firstIndex + 2u >= geometry.indices.count / 4u)
+        {
+            return surface;
+        }
+        uint64_t indexBase = addresses.indices + geometry.indices.first;
+        uint* indexData = (uint*)indexBase;
+        i0 = indexData[firstIndex];
+        i1 = indexData[firstIndex + 1u];
+        i2 = indexData[firstIndex + 2u];
     }
     let submesh = gpuSceneSubmeshRecord(addresses, geometry.submeshes.first + submeshElement);
-    if (primitive * 3u + 2u >= submesh.indexCount)
-    {
-        return surface;
-    }
-    uint firstIndex = submesh.firstIndex + primitive * 3u;
-    if (firstIndex + 2u >= geometry.indices.count / 4u)
-    {
-        return surface;
-    }
-    uint64_t indexBase = addresses.indices + geometry.indices.first;
-    uint* indexData = (uint*)indexBase;
-    uint i0 = indexData[firstIndex];
-    uint i1 = indexData[firstIndex + 1u];
-    uint i2 = indexData[firstIndex + 2u];
     uint materialSlot = submesh.materialSlot;
 
     // Object-space position + UV interpolated exactly as the raster path's inputs.
@@ -1219,13 +1321,8 @@ public bool gpuSceneRayCandidateCovered(
     float2 barycentrics)
 {
     let identity = gpuSceneRayInstance(addresses, rayInstance);
-    let surface = gpuSceneResolveCandidate(
-        addresses,
-        identity.instanceSlot,
-        identity.firstSubmesh,
-        geometryIndex,
-        primitive,
-        barycentrics);
+    let surface =
+        gpuSceneResolveCandidate(addresses, identity, geometryIndex, primitive, barycentrics);
     if (!surface.valid)
     {
         return true;

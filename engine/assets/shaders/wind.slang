@@ -13,6 +13,9 @@ static const float WIND_BASE_WAVELENGTH_M = 61.0;
 static const float WIND_TURBULENCE_ADVECTION = 0.7;
 // The spatial wavelength of a gust front along the mean direction, in metres.
 static const float WIND_GUST_FRONT_WAVELENGTH_M = 190.0;
+// The greatest turbulence octave count evaluated, matching `saffron_wind::MAX_TURBULENCE_OCTAVES`.
+// A profile above it must sample identically on both sides of the mirror.
+public static const uint WIND_MAX_TURBULENCE_OCTAVES = 8u;
 
 // One fixed per-octave phase derived from the seed (matches the CPU hash exactly).
 float windOctavePhase(uint seed, uint octave, uint lane)
@@ -67,7 +70,8 @@ public float3 sampleWindVelocity(
         position.x - meanDir.x * meanSpeed * WIND_TURBULENCE_ADVECTION * time,
         position.y,
         position.z - meanDir.y * meanSpeed * WIND_TURBULENCE_ADVECTION * time);
-    for (uint octave = 0; octave < octaves; octave++)
+    uint octaveCount = min(octaves, WIND_MAX_TURBULENCE_OCTAVES);
+    for (uint octave = 0; octave < octaveCount; octave++)
     {
         float frequency = WIND_TAU / (WIND_BASE_WAVELENGTH_M / float(1u << octave));
         float px = windOctavePhase(seed, octave, 0);

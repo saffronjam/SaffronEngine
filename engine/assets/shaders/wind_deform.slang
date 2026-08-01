@@ -48,7 +48,7 @@ void computeMain(uint3 tid: SV_DispatchThreadID)
     {
         *out = GpuWindInstanceRecord(
             float3(0.0), 0.0, float3(0.0), 0.0, float3(0.0), 0.0, float3(0.0), 0.0,
-            float4(0.0), 0.0, 0.0, float2(0.0));
+            float4(0.0), 0.0, 0.0, 0.0, 0.0);
         return;
     }
     let instance = gpuSceneLoadInstance(addresses, slot);
@@ -56,7 +56,7 @@ void computeMain(uint3 tid: SV_DispatchThreadID)
     {
         *out = GpuWindInstanceRecord(
             float3(0.0), 0.0, float3(0.0), 0.0, float3(0.0), 0.0, float3(0.0), 0.0,
-            float4(0.0), 0.0, 0.0, float2(0.0));
+            float4(0.0), 0.0, 0.0, 0.0, 0.0);
         return;
     }
 
@@ -140,9 +140,11 @@ void computeMain(uint3 tid: SV_DispatchThreadID)
         cos(branchOmega * pc.timeCurrent),
         sin(branchOmega * pc.timePrevious),
         cos(branchOmega * pc.timePrevious));
-    float inflation = max(length(swayCurrent), length(swayPrevious))
-        + max(length(interaction), length(interactionPrevious))
-        + branchAmplitude + flutterAmplitude;
+    // The per-term magnitudes travel beside the total: the cull weighs each by the height
+    // weight the vertex path applies to that term, which the summed total cannot express.
+    float swaySlack = max(length(swayCurrent), length(swayPrevious));
+    float interactionSlack = max(length(interaction), length(interactionPrevious));
+    float inflation = swaySlack + interactionSlack + branchAmplitude + flutterAmplitude;
     *out = GpuWindInstanceRecord(
         swayCurrent,
         heightScale,
@@ -151,9 +153,10 @@ void computeMain(uint3 tid: SV_DispatchThreadID)
         interaction,
         interactionReset,
         interactionPrevious,
-        0.0,
+        swaySlack,
         branchQuadrature,
         branchAmplitude,
         flutterAmplitude,
-        float2(0.0));
+        interactionSlack,
+        0.0);
 }

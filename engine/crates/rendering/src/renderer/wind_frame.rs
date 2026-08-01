@@ -52,6 +52,7 @@ impl Renderer {
                 crate::GPU_INTERACTION_FIELD_BYTES,
                 vk::BufferUsageFlags::STORAGE_BUFFER
                     | vk::BufferUsageFlags::TRANSFER_DST
+                    | vk::BufferUsageFlags::TRANSFER_SRC
                     | vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS,
                 &vk_mem::AllocationCreateInfo {
                     usage: vk_mem::MemoryUsage::AutoPreferDevice,
