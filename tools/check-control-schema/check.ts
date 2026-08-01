@@ -8,7 +8,7 @@ import { tmpdir } from "node:os";
 import { join, dirname, isAbsolute } from "node:path";
 import { fileURLToPath } from "node:url";
 import net from "node:net";
-import { BoundedTextLog, drainHostStream, withHostLog } from "./harness-utils.ts";
+import { BoundedTextLog, HostFaultWatch, drainHostStream, withHostLog } from "./harness-utils.ts";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const REPO = join(HERE, "..", "..");
@@ -46,6 +46,7 @@ const manifest = JSON.parse(readFileSync(MANIFEST, "utf8")) as Manifest;
 const generatedSchemas = openrpc.components.schemas as Record<string, unknown>;
 const envelopeSchema = JSON.parse(readFileSync(join(SCHEMA_DIR, "envelope.schema.json"), "utf8"));
 const hostLog = new BoundedTextLog(HOST_LOG_CAPACITY);
+const hostFaults = new HostFaultWatch();
 let callTimedOut = false;
 
 function typeOk(v: unknown, t: string): boolean {
@@ -438,6 +439,8 @@ async function paramsForFixture(
       return { speed: 0, gust: 0 };
     case "interaction-impulse":
       return { positionM: [0, 0], radiusM: 2, strength: 3 };
+    case "interaction-field-coarse":
+      return { cascade: 0, resolution: 8 };
     case "wind-sample-origin":
       return { positionM: [0, 1, 0] };
     case "surface-ray-down":
@@ -580,7 +583,10 @@ async function runContract(): Promise<number> {
     stdout: "pipe",
     stderr: "pipe",
   });
-  const logDrains = [drainHostStream(proc.stdout, hostLog), drainHostStream(proc.stderr, hostLog)];
+  const logDrains = [
+    drainHostStream(proc.stdout, hostLog, hostFaults),
+    drainHostStream(proc.stderr, hostLog, hostFaults),
+  ];
 
   try {
     let up = false;
@@ -837,6 +843,16 @@ async function runContract(): Promise<number> {
       errors.push("string-failure-fixture: generated envelope accepted the retired string shape");
     } else {
       checked.push("string failure shape -> rejected by generated envelope schema");
+    }
+
+    // A run whose host lost the device or reported a wedged submission answered its commands from
+    // a renderer that was already failing, so the results below cannot be trusted.
+    const faults = hostFaults.report();
+    for (const fault of faults) {
+      errors.push(`host GPU fault: ${fault}`);
+    }
+    if (faults.length === 0) {
+      checked.push("host log free of device-loss and hang reports");
     }
 
     for (const item of checked) {

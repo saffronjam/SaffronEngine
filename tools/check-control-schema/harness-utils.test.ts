@@ -1,5 +1,5 @@
 import { expect, test } from "bun:test";
-import { BoundedTextLog, drainHostStream, withHostLog } from "./harness-utils.ts";
+import { BoundedTextLog, HostFaultWatch, drainHostStream, withHostLog } from "./harness-utils.ts";
 
 test("bounded log retains only the newest output", () => {
   const log = new BoundedTextLog(8);
@@ -33,4 +33,43 @@ test("failure formatting attaches one useful host tail", () => {
 
   expect(formatted).toContain("timeout calling ping\n\nhost log tail:\nrenderer stalled");
   expect(withHostLog(formatted, log, 64)).toBe(formatted);
+});
+
+test("the fault watch keeps device-loss and hang lines whole across chunk splits", async () => {
+  const encoder = new TextEncoder();
+  const stream = new ReadableStream<Uint8Array>({
+    start(controller) {
+      controller.enqueue(
+        encoder.encode("frame 12 ok\nERROR vulkan: wait_for_fences (begin) -> ERR"),
+      );
+      controller.enqueue(encoder.encode("OR_DEVICE_LOST\nGPU submission 'frame 167' has been in "));
+      controller.enqueue(
+        encoder.encode("flight 3s — a hang, not a slow frame\ntrailing without newline"),
+      );
+      controller.close();
+    },
+  });
+  const faults = new HostFaultWatch();
+
+  await drainHostStream(stream, new BoundedTextLog(1024), faults);
+
+  expect(faults.report()).toEqual([
+    "ERROR vulkan: wait_for_fences (begin) -> ERROR_DEVICE_LOST",
+    "GPU submission 'frame 167' has been in flight 3s — a hang, not a slow frame",
+  ]);
+});
+
+test("the fault watch stays silent on a clean host log", async () => {
+  const encoder = new TextEncoder();
+  const stream = new ReadableStream<Uint8Array>({
+    start(controller) {
+      controller.enqueue(encoder.encode("vulkan ready — gpu 'llvmpipe' (cpu)\nframe 1 ok\n"));
+      controller.close();
+    },
+  });
+  const faults = new HostFaultWatch();
+
+  await drainHostStream(stream, new BoundedTextLog(1024), faults);
+
+  expect(faults.report()).toEqual([]);
 });
