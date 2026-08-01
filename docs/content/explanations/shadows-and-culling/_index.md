@@ -12,7 +12,7 @@ Shadows and culling are the two visibility computations a forward renderer perfo
 
 | Page | Covers | Code |
 |---|---|---|
-| `virtual-shadow-maps` | the page atlas, residency, receiver demand, page raster | `vsm.rs` · `VsmResidency`; `renderer.rs` · `add_vsm_page_passes` |
+| `virtual-shadow-maps` | the page atlas, residency, mover invalidation, receiver demand, page raster | `vsm.rs` · `VsmResidency`, `directional_page_span`; `renderer.rs` · `add_vsm_page_passes` |
 | `directional-shadows` | camera-snapped clip levels, fine-to-coarse sampling | `vsm.rs` · `VsmDirectionalSpace`; `lighting_common.slang` · `vsmSampleDirectional` |
 | `spot-light-shadows` | one shadowed spot's projective page space | `lighting.rs` · `set_spot_shadow`; `lighting_common.slang` · `vsmSampleSpot` |
 | `point-light-cube-shadows` | six face spaces behind the cube major-axis mapping | `lighting.rs` · `point_shadow_face_matrices`; `lighting_common.slang` · `vsmSamplePoint` |

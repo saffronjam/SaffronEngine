@@ -75,6 +75,8 @@ The fractional factor also drives a geomorph. Boundary points blend between floo
 
 The arena is addressed through the frame's GPU-scene address block, and every displaced instance owns a row in a slot-sorted row table published there. A view that consumes the arena walks the hierarchy as usual until it reaches an instance holding a row; that instance emits one draw record whose representation is `GPU_REPRESENTATION_DISPLACED_MICRO` and whose content index is the row. There is no cut to descend — the amplification already covers the whole base mesh in one packed slice.
 
+The row also carries the relief's local-space bound, and the [visibility cull](../hierarchical-visibility/) adds it to the instance's cooked bounds sphere. The cooked sphere describes the base surface, so without that term relief reaching outside it is frustum-culled or HZB-occluded at the screen edge — the instance disappears exactly where its displacement is most visible.
+
 `scene-bucket-scatter` builds that record's command from the row's draw seed: the seed's index count, first index, and vertex offset, with the record index in `firstInstance`. The record's `psoBin` names the displaced representation, so it lands in its own draw bucket and the pass binds the arena's index stream for that bucket in place of the pages arena. Each executor vertex path reads the micro-vertex at `SV_VulkanVertexID` through the arena address; its position and normal are already displaced.
 
 The index values the emit kernel writes are relative to the row's reserved vertex slice, and the draw's `vertexOffset` supplies the base — which is why the vertex entries read the Vulkan vertex index rather than Slang's D3D-flavoured `SV_VertexID`, since that one subtracts the base back out and every row past the first would fetch the previous row's vertices. The mesh executor adds the same base by hand, because a mesh stage pulls indices itself and no fixed-function stage applies the offset for it.
@@ -87,7 +89,7 @@ The emit kernel also writes the previous-frame vertex stream. It evaluates the c
 
 An RT-consumed displaced instance runs a second factor, scan, and emit chain. `TESS_RT_COARSEN = 2` doubles the micro-edge target and divides the factor cap by two. The result remains displaced and edge-welded, but it contains fewer triangles than the raster surface.
 
-`Rt::plan_tessellated_blas_builds` performs a full `MODE_BUILD` each frame because the generated topology can change. The acceleration structure is sized for the coarse chain's worst case and reused while that bound stays unchanged. The index reservation is cleared before emission, so unused tail triangles are degenerate and can remain in the worst-case build range without a GPU count readback.
+`Rt::plan_generated_blas_builds` performs a full `MODE_BUILD` each frame because the generated topology can change. The acceleration structure is sized for the coarse chain's worst case and reused while that bound stays unchanged. The index reservation is cleared before emission, so unused tail triangles are degenerate and can remain in the worst-case build range without a GPU count readback.
 
 ## Synchronization
 
@@ -117,7 +119,7 @@ This selects a 128 factor cap, a minimum factor of 1, and a six-pixel micro-edge
 | Pass recording | `engine/crates/rendering/src/renderer/` | `Renderer::record_tess_prep` |
 | Arena addressing and the displaced record | `engine/assets/shaders/global_gpu_data.slang`, `engine/assets/shaders/scene_traversal.slang` | `gpuSceneDisplacedRow`, `gpuSceneDisplacedVertex`, `emitDisplacedRecord` |
 | Displaced command and bucket bind | `engine/assets/shaders/scene_bin_scatter.slang`, `engine/crates/rendering/src/scene_pass.rs` | `gpuSceneDisplacedDraw`, `bucket_index_buffer` |
-| Ray-tracing build | `engine/crates/rendering/src/rt/` | `TessellatedBlas`, `Rt::plan_tessellated_blas_builds` |
+| Ray-tracing build | `engine/crates/rendering/src/rt/` | `TessellatedBlas`, `Rt::plan_generated_blas_builds` |
 | Material feature | `engine/crates/rendering/src/instancing.rs` | `FEATURE_DISPLACE`, `resolve_material_params` |
 | Control commands | `engine/crates/control/src/commands_render/` | `set-displacement`, `set-tessellation-quality` |
 

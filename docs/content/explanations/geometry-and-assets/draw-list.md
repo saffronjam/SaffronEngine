@@ -71,12 +71,29 @@ flowchart TD
 
 ## Transparency
 
-Alpha-blended records sort on the GPU: a keys kernel collects `(flipped view-depth, record)`
-pairs, a stable 4-pass LSD radix sort orders them, and a reorder kernel writes one
-full-length back-to-front command slice per live blend bucket — a pair belonging to another
-bucket masks to a zero draw, so each blend PSO replays the whole global order. The scene's
+Alpha-blended records sort on the GPU: a keys kernel collects `(key, record)` pairs, a
+stable LSD radix sort orders them, and a reorder kernel writes one full-length
+back-to-front command slice per live blend bucket — a pair belonging to another bucket
+masks to a zero draw, so each blend PSO replays the whole global order. The scene's
 translucent scope draws each slice with its bucket's blend PSO (depth-test on, depth-write
 off), counted by the transparent counter word.
+
+The sorted slices live in the same command arena as the binner's bucket slices, past them,
+and carry both executors' arguments at every slot exactly as the scatter writes them: the
+indexed command and the mesh-task dispatch covering the same draw. One arena and one
+`sliceBase` push therefore serve both scopes, so the translucent scope reaches the sorted cut
+through whichever stage the frame's [executor](../../frame-and-render-graph/hierarchical-visibility/)
+is — the alternative, a stream only one executor can consume, would make transparency the one
+raster family that silently changes shape with the device.
+
+The sort key is lexicographic over four words — cluster, page, instance slot, flipped
+view-space depth — run least significant first, four 8-bit radix passes each, with the keys
+kernel rewriting the pair's key word between levels. Depth alone is not a total order: an
+instance's records all carry its origin depth, and two instances can share one exactly.
+Ordering those ties by the record's own identity is what makes the emitted order a function
+of the record set instead of a function of the order the traversal's atomic append happened
+to produce, so a record entering or leaving the stream never reshuffles the rest and equal
+keys hold their relative order from frame to frame.
 
 ## Deformation and displacement
 
@@ -103,7 +120,7 @@ The frame's counters derive from the visibility readback: `drawCalls` is the emi
 count, `instances` the cull survivors, `triangles` the traversal's per-record index counts
 over three, `batches` the live bucket count. Two more report what preparation cost:
 `instanceUploadBytes` is the GPU-scene table bytes staged this frame, and
-`sceneGatherEntities` the instances the driver derived facts for. Both read zero on a steady
+`sceneGatherEntities` the instances the driver visited. Both read zero on a steady
 scene of any size, which is the measurable form of "preparation scales with changes":
 
 ```sh

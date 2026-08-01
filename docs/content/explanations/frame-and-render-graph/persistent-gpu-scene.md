@@ -137,7 +137,7 @@ once per wind-flagged instance and writes a `GpuWindInstanceRecord` — the sway
 the instance's bounds top for the current and the previous frame's time, plus a
 cull slack — into a per-world buffer the address block exposes as `windRecords`.
 
-Raster vertex paths apply the stored sway through `gpuSceneWindSway`, scaled by a
+Raster vertex paths apply the stored sway through `gpuSceneWindDeform`, scaled by a
 squared root-anchored height weight; the motion pass applies the previous words;
 the visibility cull inflates the instance sphere by the slack. The field is a pure
 function of position and time, so the previous sway is recomputed exactly instead

@@ -29,6 +29,13 @@ sphere (the prototype's local sphere through the instance transform) projects as
 eight-corner box; anything crossing the near plane passes conservatively. Frustum-culled
 instances clear their history word and stop.
 
+Two runtime terms widen that sphere before it is tested, because both move geometry the
+cook never saw. A wind-deformed instance adds the prepass record's world-space sway slack.
+A [displaced](../compute-displacement/) instance adds its row's local relief bound — a
+scalar height reaches one local unit of amplitude along the normal, a vector map reaches
+the amplitude's cube half-diagonal — because the cooked sphere describes the *undisplaced*
+surface, and relief poking outside it would otherwise be culled at the screen edge.
+
 Instances visible last frame test their PREVIOUS transform's bounds against the previous
 pyramid — an occluded one moves to a retest list instead of dying. New or history-invalid
 instances bypass the stale pyramid. After the current pyramid builds, the retest pass
@@ -76,7 +83,7 @@ Nodes on the cut emit one semantic `GpuDrawRecord` per triangle cluster (or one 
 voxel brick), with the material resolved through the instance's sparse overrides and the
 prototype defaults.
 
-## The node cull
+## The swept-bounds cull
 
 Instance classification tests one sphere for a whole prototype, which is the coarsest
 bound available: a plant that clips the frustum edge passes as a unit, and every node
@@ -85,17 +92,34 @@ repeats the frustum test per node, on the node's swept world bounds, and a rejec
 takes its whole subtree with it. Under an assembly the test runs once per use, so a plant
 can have one part rejected while its siblings draw.
 
+The same test then runs again at cluster granularity, on each surviving node's individual
+triangle clusters. A node's bounds close over its whole subtree and so are as wide as the
+family; a cluster's are the part's own, which is the granularity at which one branch
+leaves the frame while the trunk beside it draws. Both granularities share one function,
+so widening the box or changing the slack moves them together.
+
 Two properties make descending on one node's bounds safe. The cooker closes each node's
 bounds over its subtree, because simplification derives a coarse parent's bounds from the
 simplified geometry and can shrink them inside the children's silhouette; an artifact
 where a child escapes its parent is rejected at validation. The box the cull uses is the
-*deformed* one, the cooked swept extent, widened by the wind prepass's world-space sway
-slack — the same term the instance sphere adds, since runtime wind is not cooked.
+*deformed* one, the cooked swept extent, widened by the wind prepass's world-space slack,
+since runtime wind is not cooked.
 
-Counter words 16 and 17 report rejections and reached nodes. `SAFFRON_NODE_CULL=off`
-walks every node instead; the cull is a pure reduction over geometry the frame cannot
-see, so both hosts render the same image, which `tests/e2e/node-cull-parity.test.ts`
-measures across a sweep of poses.
+That slack is the box's own, not the whole instance's. The vertex path scales sway by the
+square of a vertex's root-anchored height weight and the interaction push by the weight
+itself, so a cluster at a tree's foot barely moves while its crown carries the full
+displacement. The cull reads each box's greatest instance-local height, derives the same
+weight, and widens by each term at that weight — a branch mode only where an assembly use
+declares a moving structural semantic, flutter only for a leaf one. Handing every box the
+whole instance's slack would give a metre of margin to geometry that moves a centimetre,
+and undo the tightness the per-cluster boxes bought. The instance sphere, which has no
+local box to weigh, keeps the whole-instance total.
+
+Counter words 16 and 17 report node rejections and reached nodes, and word 23 the cluster
+rejections underneath them. `SAFFRON_NODE_CULL=off` walks every node and emits every
+cluster instead; the cull is a pure reduction over geometry the frame cannot see, so both
+hosts render the same image, which `tests/e2e/node-cull-parity.test.ts` measures across a
+sweep of poses.
 
 ## Representation crossfade
 
@@ -129,10 +153,15 @@ over zero-filled no-op commands.
 
 ### The mesh executor
 
-A second executor reaches the same records through `VK_EXT_mesh_shader`. It is opt-in:
-`SAFFRON_MESH_EXECUTOR=1` selects it, and only on a device that offers a mesh stage, which
-MoltenVK does not. The indexed executor is what a frame runs otherwise, at full quality rather
-than as a reduced fallback.
+A second executor reaches the same records through `VK_EXT_mesh_shader`. A device takes it when
+its mesh feature bits and per-workgroup output limits qualify: `meshShader` enabled, and enough
+invocations, output vertices, output primitives, and dispatch width for the 62 triangles one
+workgroup emits. MoltenVK has no mesh stage, and a driver may advertise the extension for the task
+stage alone, so the limits are checked one at a time rather than through the extension. The indexed
+executor is what a frame runs otherwise, at full quality rather than as a reduced fallback.
+`set-mesh-executor` switches a running host between the two — reading it back through
+`render-stats` is how the parity suite proves both were exercised — and asking for the mesh stage
+on a device that does not qualify leaves the indexed path in force.
 
 What keeps the two honest is that the mesh path consumes the binner's command stream **as data
 rather than as draw arguments**. Workgroup and draw are recovered from `SV_DrawIndex` and the
@@ -140,10 +169,12 @@ group id, so the cluster cut is shared rather than independently selected — a 
 mean one executor ignored records the binner emitted, which is a different bug from the two
 disagreeing about geometry.
 
-The scatter writes each draw's `VkDrawMeshTasksIndirectCommandEXT` beside its indexed command,
-sizing the group count from that draw's own index count. That matters because the stream carries
-three representations whose bounds differ (triangle clusters, micro blades, aggregate voxels), and
-a group count sized for clusters would silently drop the others.
+Every kernel that fills a command slot writes that draw's `VkDrawMeshTasksIndirectCommandEXT`
+beside its indexed command — the scatter for the binner's bucket slices, the transparent reorder
+for the sorted ones — sizing the group count from that draw's own index count. That matters
+because the stream carries three representations whose bounds differ (triangle clusters, micro
+blades, aggregate voxels), and a group count sized for clusters would silently drop the others.
+A masked slot's zero index count yields zero groups, which is how it dispatches nothing.
 
 One workgroup emits 62 triangles. The cap is the 256-vertex output limit rather than the
 primitive one: a cluster carries no local vertex table, only a flat index range, so three
@@ -203,8 +234,9 @@ the triangles read as a comb — and it is invisible until you can read the numb
 | The reach view | `visibility.rs`, `scene_visibility.slang`, `global_sdf.rs`, `renderer.rs` | `SCENE_VISIBILITY_PASS_REACH`, `SCENE_VISIBILITY_COUNTER_CULLED_REACH`, `gi_occluder_bounds`, `Renderer::gi_view` |
 | Per-view tuning | `visibility.rs`, `renderer.rs` | `SceneViewClass`, `TraversalTuning`, `Renderer::traversal_tuning` |
 | Hierarchy traversal | `scene_traversal.slang` | `add_traversal_pass`, `SceneTraversalPush`, `GpuDrawRecord` |
-| The node cull | `scene_traversal.slang`, `virtual_hierarchy.rs` | `nodeCulled`, `close_subtree_bounds`, `SCENE_VISIBILITY_COUNTER_CULLED_NODES` |
-| The mesh executor | `mesh.slang`, `visibility/executor.rs`, `pipelines/build.rs`, `scene_pass.rs` | `meshMainExecutor`, `record_executor_bucket_draw_mesh`, `PsoKey::mesh_shader`, `SAFFRON_MESH_EXECUTOR` |
+| The swept-bounds cull | `scene_traversal.slang`, `virtual_hierarchy/cook.rs`, `page_payload.rs` | `sweptBoxCulled`, `nodeCulled`, `close_subtree_bounds`, `GpuPageClusterRecord`, `SCENE_VISIBILITY_COUNTER_CULLED_NODES`, `SCENE_VISIBILITY_COUNTER_CULLED_CLUSTERS` |
+| Height-weighted wind slack | `global_gpu_data.slang`, `wind_deform.slang`, `visibility/tests/traversal.rs` | `gpuSceneWindBoxSlack`, `GpuWindInstanceRecord::sway_slack`, `a_cluster_takes_the_wind_slack_its_own_height_earns` |
+| The mesh executor | `mesh.slang`, `visibility/executor.rs`, `pipelines/build.rs`, `scene_pass.rs` | `meshMainExecutor`, `record_executor_bucket_draw_mesh`, `PsoKey::mesh_shader`, `mesh_executor_supported` |
 | Binning and the executor draws | `scene_bin_count.slang`, `scene_bin_seed.slang`, `scene_bin_scatter.slang`, `scene_pass.rs` | `add_binning_passes`, `record_executor_buckets`, `record_executor_depth_family`, `ExecutorDrawInputs` |
 | Survivor chain | `visibility.rs`, `hzb.rs` | `add_survivor_snapshot_pass`, `add_bucket_count_clear_pass`, `HzbPyramid::add_rebuild_passes` |
 | Frame integration | `renderer.rs` | `Renderer::page_demand_view`, the cull/retest/traversal blocks in `record_scene_graph` |

@@ -28,7 +28,7 @@ pub struct Material {
 
 ## Cache selection
 
-`request_executor_mesh_pipeline` converts the selector and frame state into a typed `PsoKey`. The key contains the shader name, unlit mode, vertex path (the executor and skinned axes), wireframe mode, blend mode, alpha-to-coverage mode, and sample count. Two requests with equal keys receive the same `Arc<Pipeline>`.
+`request_executor_mesh_pipeline` converts the selector and frame state into a typed `PsoKey`. The key contains the shader name, unlit mode, geometry stage (the `mesh_shader` axis), wireframe mode, blend mode, alpha-to-coverage mode, and sample count. Two requests with equal keys receive the same `Arc<Pipeline>`.
 
 ```mermaid
 flowchart LR
@@ -80,10 +80,10 @@ A steady frame normally reports zero newly created pipelines. A nonzero value id
 |---|---|---|
 | Pipeline selector | `gpu_types.rs` | `Material` |
 | Resolved surface data | `draw_list.rs` | `SubmeshMaterial` |
-| Bucket enumeration and decoding | `visibility.rs` | `ExecutorBucket`, `build_executor_buckets`, `bucket_material` |
+| Bucket enumeration and decoding | `visibility/` | `ExecutorBucket`, `build_executor_buckets`, `bucket_material` |
 | Per-bucket draw recording | `scene_pass.rs` | `record_executor_buckets`, `record_executor_depth_family` |
-| Cache key and construction | `pipelines.rs` | `PsoKey`, `request_executor_mesh_pipeline`, `build_mesh_pipeline_with_module` |
-| Cache reset and counters | `pipelines.rs` | `set_sample_count`, `pipeline_count`, `pipelines_created` |
+| Cache key and construction | `pipelines/` | `PsoKey`, `request_executor_mesh_pipeline`, `build_mesh_pipeline_with_module` |
+| Cache reset and counters | `pipelines/` | `set_sample_count`, `pipeline_count`, `pipelines_created` |
 
 ## Related
 

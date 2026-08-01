@@ -129,7 +129,7 @@ translucent, and thin-sheet materials.
 | Ordinary mesh artifact | `geometry/src/smesh.rs` | `save_mesh_to_buffer`, `load_mesh_hierarchy_from_bytes` |
 | Plant-family adapter | `vegetation/src/virtual_hierarchy.rs` | `plant_hierarchy_input`, `plant_hierarchy_material` |
 | Device-free comparison | `geometry/src/hierarchy_reference.rs` | `compare_triangle_voxel_transitions`, `TriangleVoxelReferenceComparison` |
-| Plant artifact assembly | `assets/src/plant_cook.rs` | `build_plant_sections`, `validate_complete_plant_artifact` |
+| Plant artifact assembly | `assets/src/plant_cook/publish.rs` | `build_plant_sections`, `validate_complete_plant_artifact` |
 | Artifact store validation | `assets/src/vegetation_store.rs` | `validate_plant_artifact` |
 | Global arenas and handles | `rendering/src/global_gpu_data.rs` | `GlobalGpuData`, `GlobalGpuArena`, `GpuHandle`, `ResidentGpuTable` |
 | Upload and draw ABI | `rendering/src/global_gpu_data.rs` | `FrameUploadRing`, `GpuBufferUpload`, `GpuDrawRecord`, `GpuPsoBin` |

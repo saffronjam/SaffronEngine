@@ -55,10 +55,19 @@ Demand is priority-scored, never distance alone. The CPU prioritizer scores the
 refinement frontier (unloaded pages whose parent is resident) by projected transition
 error: the page's cooked error total (Q15.16) scaled to pixels through the view's
 projection and the nearest instance distance, reduced for instances outside the frustum
-and outside the reach of any gather, and boosted for instances that moved this frame. It
-walks placed vegetation alongside scene instances: plants never enter the ECS, and they
-are where most of the paged geometry actually is, so a prioritizer that skipped them would
-be scoring the smaller half of the scene.
+and outside the reach of any gather. It walks placed vegetation alongside scene instances:
+plants never enter the ECS, and they are where most of the paged geometry actually is, so a
+prioritizer that skipped them would be scoring the smaller half of the scene.
+
+Two terms make the score a request rather than a report. The **distance is the closest
+approach over a half-second horizon**, not the frame's standing distance: the eye's smoothed
+velocity and each instance's own `previous`→`current` travel both lead half a second, and the
+nearer of the two readings wins. A payload takes several frames to arrive, so a page scored only
+where things stand is asked for once the camera is already on it, and a page scored only where
+things will be would abandon what is in front of the viewer now. The **payload source** multiplies
+the result: a cooked hierarchy is already in memory, while an artifact page is a file read plus an
+envelope decode on the stream worker, so the slower source is asked for further out to land at the
+same time.
 
 A worked example: a page with a 0.02 m transition error on an instance 10 m away under a
 1080-pixel viewport at 60° vertical field of view projects to `0.02 × 935 / 10 ≈ 1.9`

@@ -95,8 +95,8 @@ Static regions remain black. Restore the normal viewport with `sa set-view-mode 
 | Format, push, and draw recording | `engine/crates/rendering/src/aa.rs`, `engine/crates/rendering/src/scene_pass.rs` | `MOTION_FORMAT`, `MotionPush`, `record_executor_depth_family` |
 | Graph pass and gates | `engine/crates/rendering/src/renderer/` | `add_motion_pass`, `want_motion`, `motion_depth_resource` |
 | Per-view targets and camera history | `engine/crates/rendering/src/view_target/` | `motion`, `motion_depth`, `prev_view_proj`, `store_prev_view_proj` |
-| Object and deformation history | `engine/crates/rendering/src/instancing.rs`, `engine/crates/rendering/src/skinning/`, `engine/crates/rendering/src/renderer/` | `DeformationWork`, `submit_gpu_scene_deformations`, `Skinning::prev_model`, `Skinning::prev_deformed_buffer` |
-| Tessellation history | `engine/crates/rendering/src/renderer/`, `engine/crates/rendering/src/tessellation.rs`, `engine/crates/rendering/src/draw_list.rs` | `prev_factors`, `Tessellation::factor_layout_matches`, `TessDraw::prev_vertex_buffer` |
+| Object and deformation history | `engine/crates/rendering/src/instancing.rs`, `engine/crates/rendering/src/skinning/`, `engine/crates/rendering/src/renderer/` | `DeformationWork`, `submit_gpu_scene_deformations`, `Skinning::prev_deformed_buffer` |
+| Displacement history | `engine/crates/rendering/src/renderer/`, `engine/crates/rendering/src/tessellation.rs` | `prev_factors`, `Tessellation::factor_layout_matches`, `DisplacedFrameAddresses::prev_vertices` |
 | Temporal consumers | `engine/assets/shaders/taa.slang`, `engine/assets/shaders/ssgi_accum.slang`, `engine/assets/shaders/dfao_accum.slang`, `engine/assets/shaders/restir_reuse.slang` | `DilatedMotion`, `histUv`, `motion` |
 | Debug visualization | `engine/assets/shaders/motion_visualize.slang`, `engine/crates/rendering/src/renderer/` | `computeMain`, `add_motion_visualize_pass` |
 

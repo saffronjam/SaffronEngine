@@ -77,7 +77,7 @@ by the frames-in-flight depth — a slot reports its last use):
 | `instances` | instances the visibility cull kept |
 | `triangles` | triangles the emitted records rasterize |
 | `sceneGatherMs` | CPU time spent deriving the frame's deformation work and ray instances |
-| `sceneGatherEntities` | instances that derivation touched (zero on a steady scene, whatever its size) |
+| `sceneGatherEntities` | instances that derivation visited, counted before it resolves anything (zero on a steady scene, whatever its size) |
 | `instanceUploadBytes` | GPU-scene table bytes staged this frame ((near-)zero when idle) |
 | `retainedMeshCpuBytes` | mirrored-mesh host bytes retained for exact surface queries |
 | `shadowDrawCalls` | counted-indirect draws recorded across the frame's virtual-shadow pages |
@@ -86,7 +86,15 @@ by the frames-in-flight depth — a slot reports its last use):
 | `descriptorBinds` | descriptor-set binds recorded in the scene pass |
 | `commandBuffers` | submitted primaries: prefix, graph batches, and tail |
 | `queueSubmits` | matching `vkQueueSubmit2` calls |
+| `asyncComputeQueue` | whether the device exposes an independent compute queue family |
+| `asyncComputeBatches` | command buffers this frame's plan submitted on that queue |
 | `pipelinesCreated` | PSOs compiled this frame |
+
+`asyncComputeBatches` is where the async lane becomes observable. It counts what the frame plan
+actually placed on the independent compute queue, so it falls to zero both when no pass asks for
+the lane and when the graph declines a request it cannot derive an ownership transfer for. On a
+device reporting `asyncComputeQueue: false` the same passes run on graphics and the count is
+always zero.
 
 `pipelinesCreated` is the signature of a PSO-compile hitch: non-zero on a steady-state frame means
 a shader was built mid-frame, and it feeds the `pso-compile` alarm. The executor path binds
@@ -94,11 +102,26 @@ descriptor sets per pass rather than per draw, so `descriptorBinds` stays flat a
 grows, and `instanceUploadBytes` stays at (near-)zero on a steady scene — render preparation
 scales with changes, not with instance count.
 
+`sceneGatherEntities` is the CPU half of that same claim, and it counts a visit rather than a
+result on purpose: a gather that walked every instance and found nothing to deform would
+otherwise report zero cost. Its terms are the mirrored set whenever the reach cut is re-derived
+plus every deformation candidate the frame resolves, so the displaced and morphing sets are
+maintained incrementally rather than filtered out of the instance map each frame.
+
 `render-stats` also carries `vramUsageBytes` / `vramBudgetBytes`, and `PerfConfig` carries warn and
-crit fractions for grading them. The renderer reports both as zero, the value every consumer treats
-as budget-unknown: the HUD gauge and the `vram` alarm stay idle at a zero budget. The device
-enables [`VK_EXT_memory_budget`](https://docs.vulkan.org/spec/latest/chapters/memory.html) when the
-driver offers it; no telemetry path reads its per-heap budgets.
+crit fractions for grading them. Both are resampled every frame from the allocator's per-heap
+budgets and summed over the heaps the device flags `DEVICE_LOCAL` — so a discrete adapter reports
+its video memory and a unified-memory adapter reports system memory, which on each is the pool the
+renderer competes for. The sample is taken ahead of the post-load warm-up gate, because occupancy
+is a level rather than a distribution and a cold frame's reading is still true.
+
+Where the driver offers
+[`VK_EXT_memory_budget`](https://docs.vulkan.org/spec/latest/chapters/memory.html) the figures are
+the driver's, so they include memory this allocator never handed out — swapchain images, pipelines,
+descriptor heaps, and anything else sharing the adapter. Where it does not, the allocator falls back
+to its own block totals against a fraction of each heap's size. Neither path can report a zero
+budget on a running renderer, so the HUD gauge and the `vram` alarm always have a scale to grade
+against.
 
 ## Frame history
 
@@ -182,6 +205,14 @@ ERROR rendering  device loss checkpoint: 'wind-deform' reached TOP_OF_PIPE
 ERROR rendering  device fault address: READ_INVALID at 0xf744246000 (precision 0x1000)
 ```
 
+Each watchdog report asks for those diagnostics too, so a hang names its pass from the watchdog's
+own thread rather than only from whichever thread the loss surfaces on. Both queries read valid
+data only while the device is in the lost state, so the report asks again every second and prints
+the checkpoint lines the moment the answer is yes; until then it is the submission name and the age
+alone. The watchdog reaches the device weakly and takes the queue's external-synchronization lock
+without blocking on it — a wedged `vkDeviceWaitIdle` holds that lock for the length of the hang,
+which is exactly when the report has to come out.
+
 ## Modes and capability
 
 `profiler.set-mode {off | timestamps | pipeline-stats}` selects the depth. `timestamps` allocates
@@ -212,7 +243,7 @@ sa profiler.set-mode timestamps
 # mode=timestamps  timestamps=yes  pipeline-stats=yes
 
 sa render-stats
-# cpu=2.41ms  gpu=3.87ms  wait=1.02ms  fps=144  draws=12  tris=48720  binds=3  pso+=0
+# cpu=2.41ms  gpu=3.87ms  wait=1.02ms  fps=144  draws=12  tris=48720  binds=3  pso+=0  vram=1223/6860MiB
 
 sa pass-timings
 #   depth-prepass                     0.412 ms
@@ -243,8 +274,9 @@ recorded.
 | Profiler state, pools, modes, read-back | `profiler.rs` | `GpuProfiler`, `ProfilerMode`, `RgTimestamps`, `ScopeRecord`, `PassTiming`, `MAX_PROFILED_SCOPES`, `allocate_pools`, `set_mode`, `frame_recorder`, `readback`, `frame_span_ms` |
 | Per-pass and nested scopes | `render_graph.rs`, `nested_scopes.rs` | `record_submission_plan_profiled`, `ProfileRecorders`, `NestedScopeRecorder` |
 | Draw-path counters | `draw_list.rs` | `RenderStats` |
-| Hang watchdog | `watchdog.rs`, `upload.rs`, `renderer.rs` | `watch`, `InFlight`, `with_one_off_commands`, `begin_offscreen_frame` |
-| Device-loss diagnostics | `checkpoints.rs`, `device.rs`, `render_graph.rs` | `Checkpoints`, `DeviceFault`, `Device::log_device_loss_checkpoints`, `Error::is_device_loss` |
+| Device-local memory sample | `resources/`, `device/` | `VramUsage`, `DeviceResources::vram_usage`, `create_allocator` |
+| Hang watchdog | `watchdog.rs`, `upload.rs`, `renderer.rs` | `watch`, `InFlight`, `attach_device`, `with_one_off_commands`, `begin_offscreen_frame` |
+| Device-loss diagnostics | `checkpoints.rs`, `device.rs`, `upload.rs`, `render_graph.rs` | `Checkpoints`, `DeviceFault`, `Device::log_hang_diagnostics`, `Device::log_device_loss_checkpoints`, `GpuQueue::reports_device_lost`, `Error::is_device_loss` |
 | Frame ring, percentiles, stutter, config | `frame_history.rs` | `FrameHistory`, `FrameSample`, `FrameHistoryStats`, `PerfConfig`, `FRAME_HISTORY_CAPACITY` |
 | HUD grading | `editor/src/lib/perfThresholds.ts` | `frameTimeStatus`, `vramStatus` |
 | Wire surface | `protocol/src/dto.rs`, `control/src/commands_render.rs` | `RenderStatsDto`, `RenderPassTimingsDto`, `FrameHistoryDto`, `PerfConfigDto`, `profiler.set-mode`, `pass-timings`, `frame-history`, `get-perf-config`, `set-perf-config` |
