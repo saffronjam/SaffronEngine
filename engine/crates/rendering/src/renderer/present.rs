@@ -67,6 +67,9 @@ impl Renderer {
         // the only thing that orders it. The fence is created signaled, so the first cycle's wait
         // returns immediately; `present_active_view_to_swapchain` resets it before resubmit.
 
+        // Close a slot a previous frame left armed before any of that: the acquire binds this
+        // frame's ring index into the present transaction, and closing advances the ring.
+        self.finish_unsubmitted_frame()?;
         let present_fence = self
             .present_sync
             .as_ref()

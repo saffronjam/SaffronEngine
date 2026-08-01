@@ -32,9 +32,13 @@ pub struct RenderStatsFull {
     pub rt_instances: u32,
     /// TLAS instances placed through the aggregate-representation structure.
     pub rt_aggregate_instances: u32,
-    /// Device-local VRAM usage in bytes (`0` until profiled).
+    /// TLAS instances whose identity record names a live GPU-scene slot, so a non-opaque
+    /// candidate on them runs through the canonical coverage classifier. The rest commit
+    /// unconditionally, which is conservative but not coverage agreement.
+    pub rt_resolvable_instances: u32,
+    /// Device-local VRAM occupancy in bytes, from the driver's heap budgets.
     pub vram_usage_bytes: u64,
-    /// Device-local VRAM budget in bytes (`0` until profiled).
+    /// Device-local VRAM budget in bytes, from the same heaps.
     pub vram_budget_bytes: u64,
     /// Whether the device is a software rasterizer.
     pub software_gpu: bool,
@@ -93,6 +97,7 @@ impl Renderer {
             cpu_wait_ms: self.cpu_wait_ms,
             rt_instances: self.rt.frame_instance_count(),
             rt_aggregate_instances: self.rt.aggregate_instance_count(),
+            rt_resolvable_instances: self.rt.resolvable_instance_count(),
             vram_usage_bytes: self.vram_usage_bytes,
             vram_budget_bytes: self.vram_budget_bytes,
             software_gpu: self.software_gpu,
@@ -190,6 +195,11 @@ impl Renderer {
     pub fn finalize_frame_telemetry(&mut self, busy_ms: f32, wait_ms: f32, dt_sec: f32) {
         let now_ns = cpu_now_ns();
         self.last_frame_ns = now_ns;
+        // Sampled ahead of the warm-up gate: memory occupancy is a level, not a distribution, so
+        // the cold frames after a project load report the truth rather than a stale zero.
+        let vram = self.device.resources().vram_usage();
+        self.vram_usage_bytes = vram.usage_bytes;
+        self.vram_budget_bytes = vram.budget_bytes;
         // Warm-up frames after a project load (PSO compiles, acceleration-structure builds) are
         // not representative, so they stay out of the headline, the history, and the detectors.
         if self.telemetry_warmup > 0 {

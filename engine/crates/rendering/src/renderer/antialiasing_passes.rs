@@ -346,6 +346,7 @@ impl Renderer {
                 .access(commands_res, RgUsage::IndirectCommandRead)
                 .access(counters_res, RgUsage::IndirectCountRead)
                 .access(bucket_counts_res, RgUsage::IndirectCountRead);
+            pass = access_displaced_arena(graph, pass, self.displaced_frame, false);
         }
         graph.add_pass(pass);
         Some(reactive_res)

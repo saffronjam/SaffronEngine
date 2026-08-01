@@ -442,10 +442,11 @@ fn light_validation_rejects_non_finite_payloads() {
     );
 }
 
-/// A moved instance reports one swept box per cooked hierarchy page, each tight around that
-/// page's own extent, rather than one box over the whole prototype.
+/// A moved instance reports one swept box per cooked leaf page — one cluster or brick each —
+/// tight around that cluster's own extent over BOTH poses, rather than one box over the whole
+/// prototype.
 #[test]
-fn moved_bounds_are_reported_per_hierarchy_page() {
+fn moved_bounds_are_reported_per_leaf_cluster() {
     let mut scene = PersistentGpuScene::new(GpuSceneUploadLimits::default()).unwrap();
     let GpuSceneSharedDeltaResult::MaterialCreated(material) = scene
         .apply_shared_delta(GpuSceneSharedDelta::CreateMaterial(self::material(1)))
@@ -481,8 +482,15 @@ fn moved_bounds_are_reported_per_hierarchy_page() {
     };
     scene.create_world(GpuSceneWorldId(1)).unwrap();
     let mut instance = self::instance(prototype_handle);
-    instance.transform =
-        GpuSceneTransform::Dynamic(GpuSceneDynamicTransform::stationary(Mat4::IDENTITY).unwrap());
+    // Three metres along X between the two poses: a page's box has to cover where the content
+    // was and where it is, because both frames' shadow pages have to re-render.
+    instance.transform = GpuSceneTransform::Dynamic(
+        GpuSceneDynamicTransform::new(
+            Mat4::from_translation(Vec3::new(3.0, 0.0, 0.0)),
+            Mat4::IDENTITY,
+        )
+        .unwrap(),
+    );
     scene
         .apply_world_delta(
             GpuSceneWorldId(1),
@@ -493,17 +501,17 @@ fn moved_bounds_are_reported_per_hierarchy_page() {
     let (moved, overflow) = scene.take_moved_bounds();
     assert!(!overflow, "one instance is far below the cap");
     assert_eq!(moved.len(), 2, "one swept box per cooked page");
-    let mut spans: Vec<f32> = moved.iter().map(|(min, max)| max[0] - min[0]).collect();
-    spans.sort_by(f32::total_cmp);
-    for span in &spans {
-        assert!(
-            *span < 2.0,
-            "each box stays within its own page, not the prototype's 12 m reach: {span}"
-        );
+    // Exactly the union of each page's two poses, in the prototype's cooked page order: 1 m of
+    // page plus 3 m of travel along X from that page's own rest position, and the page's own 1 m
+    // across the axes it did not move on. Positionally, so a swap that put the canopy's box where
+    // the trunk's belongs is a failure — a box over one pose measures 1 m along X and a box over
+    // the prototype's 12 m reach measures far more, so this pins the sweep and the split alike.
+    let expected: [([f32; 3], [f32; 3]); 2] = [
+        ([-0.5, -0.5, -0.5], [3.5, 0.5, 0.5]),
+        ([9.5, -0.5, -0.5], [13.5, 0.5, 0.5]),
+    ];
+    for (page, ((min, max), (want_min, want_max))) in moved.iter().zip(expected).enumerate() {
+        assert_eq!(*min, want_min, "page {page} sweeps from its own rest pose");
+        assert_eq!(*max, want_max, "page {page} sweeps to its own moved pose");
     }
-    let lows: Vec<f32> = moved.iter().map(|(min, _)| min[0]).collect();
-    assert!(
-        lows.iter().any(|low| *low < 0.0) && lows.iter().any(|low| *low > 9.0),
-        "the two pages land at their own positions: {lows:?}"
-    );
 }

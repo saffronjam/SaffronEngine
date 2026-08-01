@@ -13,6 +13,7 @@ impl Renderer {
     /// Propagates any [`Error`] from device, swapchain, or frame-ring creation.
     pub fn new(surface_source: &SurfaceSource<'_>, width: u32, height: u32) -> Result<Self> {
         let device = Arc::new(Device::new(surface_source)?);
+        crate::watchdog::attach_device(&device);
         let mut swapchain = match surface_source {
             SurfaceSource::Window(_) => Some(Swapchain::new(&device, width, height)?),
             SurfaceSource::Offscreen => None,
@@ -77,6 +78,7 @@ impl Renderer {
             crate::Aa,
             Arc<crate::GpuTexture>,
             Arc<crate::GpuSdf>,
+            Arc<crate::GpuSdf>,
             crate::resources::DefaultHeightMinMax,
             Arc<crate::GpuLut>,
             crate::vsm::VsmGpu,
@@ -95,6 +97,9 @@ impl Renderer {
             // empty-space field, because sampling an unbound slot faults on lavapipe and is UB
             // on real hardware. A per-mesh SDF overwrites its own slot as its `GpuMesh` is built.
             let default_sdf = uploader.upload_default_sdf(&descriptors)?;
+            // The unit-box brick the micro-field slab occluders are backed by; claimed once, so
+            // every slab an occluder pass emits names the same bindless slot.
+            let slab_sdf = uploader.upload_unit_box_sdf(&descriptors)?;
             // The per-height min/max pyramid array (binding 4) is partially bound; seed every slot
             // with a 1×1 `(0, 0)` default for the same reason.
             let default_height_minmax = uploader.upload_default_height_minmax(&descriptors)?;
@@ -299,6 +304,7 @@ impl Renderer {
                 aa,
                 default_white,
                 default_sdf,
+                slab_sdf,
                 default_height_minmax,
                 default_lut,
                 vsm_gpu,
@@ -337,6 +343,7 @@ impl Renderer {
             aa,
             default_white,
             default_sdf,
+            slab_sdf,
             default_height_minmax,
             default_lut,
             vsm_gpu,
@@ -456,8 +463,9 @@ impl Renderer {
         ddgi.bind_gdf_albedo(&global_sdf);
 
         let mut renderer = Self {
-            mesh_executor: device.capabilities.mesh_shader
-                && std::env::var("SAFFRON_MESH_EXECUTOR").as_deref() == Ok("1"),
+            selection_sources: [const { None }; crate::VIEW_COUNT],
+            selection_targets: None,
+            mesh_executor: crate::mesh_executor_supported(&device.capabilities),
             sdf_instances_dropped: 0,
             sdf_instances_culled: 0,
             rt_instances_culled: 0,
@@ -505,7 +513,8 @@ impl Renderer {
             moon_intensity: 0.0,
             show_grid: false,
             present_viewport_only: false,
-            frame_begun: false,
+            slot_fence_armed: false,
+            pending_compute_signal: None,
             view_mode: ViewMode::Lit,
             skinning_enabled: true,
             displacement_enabled: true,
@@ -534,6 +543,8 @@ impl Renderer {
             overlay,
             submissions: Vec::new(),
             frame_deformation: FrameDeformation::default(),
+            rt_deform_jobs: Vec::new(),
+            micro_rt_tiles: Vec::new(),
             render_quality: RenderQuality::default(),
             budget_controller: BudgetController::new(),
             pending_render_scale: None,
@@ -628,6 +639,7 @@ impl Renderer {
             bindless_free_list,
             default_white,
             default_sdf,
+            slab_sdf,
             default_height_minmax,
             capture_next_window_path: None,
             frames,

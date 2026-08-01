@@ -46,6 +46,10 @@ impl Renderer {
             }
             self.global_sdf.advance_frame();
         }
+        if let Some(cull) = gdf.cull_state {
+            self.global_sdf
+                .set_cull_buffer_state(cull.frame, graph.external_buffer_state(cull.slot));
+        }
 
         // Read back the froxel fog volumes' resolved exit layouts and advance the ping-pong write
         // index: the just-written volume becomes next frame's reprojection history.

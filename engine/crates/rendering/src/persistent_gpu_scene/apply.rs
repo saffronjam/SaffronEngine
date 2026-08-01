@@ -189,14 +189,14 @@ impl PersistentGpuScene {
         Ok(result)
     }
 
-    /// One instance's swept world boxes: its prototype's cooked per-page swept bounds pushed
-    /// through the transform, one box per page, appended to `sink`.
+    /// One instance's swept world boxes: its prototype's cooked leaf-page swept bounds — one
+    /// triangle cluster or aggregate brick each — pushed through the transform, appended to `sink`.
     ///
-    /// Per page rather than per instance because the consumer dirties a page grid: a single box
+    /// Per cluster rather than per instance because the consumer dirties a page grid: a single box
     /// over a tall sparse canopy covers many times the footprint its clusters occupy, and every
     /// extra cell it touches is a shadow page re-rendered for geometry that is not there. Both
     /// matrices of a dynamic transform contribute, so the boxes sweep the frame's motion, and the
-    /// page bounds are the cook's DEFORMED extent, so they already cover the deformation the
+    /// cluster bounds are the cook's DEFORMED extent, so they already cover the deformation the
     /// payload can reach. A prototype that cooked no hierarchy falls back to its bounding sphere,
     /// which is all such a mesh has.
     fn instance_moved_bounds(

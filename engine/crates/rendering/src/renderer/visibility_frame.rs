@@ -205,14 +205,15 @@ impl Renderer {
                     lists.records(frame),
                     u64::from(lists.record_capacity()) * size_of::<crate::GpuDrawRecord>() as u64,
                 );
-                // Binding 5 is the same binned command stream the indexed draw consumes as
-                // arguments; the mesh executor reads it as data to recover its draw from
-                // `SV_DrawIndex`. Bound unconditionally — an unwritten binding is a validation error.
+                // Binding 5 is the same command arena the indexed draws consume as arguments —
+                // the binner's bucket slices and the sorted transparent slices both — which the
+                // mesh executor reads as data to recover its draw from `SV_DrawIndex`. Bound
+                // unconditionally: an unwritten binding is a validation error.
                 self.descriptors.write_storage_buffer(
                     self.instancing.instance_set(frame),
                     5,
                     lists.commands(frame),
-                    u64::from(lists.record_capacity()) * 20,
+                    u64::from(lists.command_slots()) * 20,
                 );
                 // The kernels look records up in the bucket table, so it publishes
                 // before the binning passes execute.
@@ -425,6 +426,59 @@ impl Renderer {
                                             bytemuck::bytes_of(&push),
                                         );
                                         raw_scatter.cmd_dispatch(cmd, groups, 1, 1);
+                                    }
+                                }),
+                        );
+                    }
+                    // The slab occluders for the resident micro fields, appended into the same
+                    // region through the same meta counter. A reconstructed blade has no CPU
+                    // instance for the reach walk to classify, so its aggregate is derived from
+                    // the tile directory instead — one occluder per resident tile.
+                    if let (Some(micro_pso), Some((directory_offset, directory_count))) =
+                        (&psos.gi_micro, self.micro_field_directory)
+                    {
+                        let instances_res = graph.import_buffer(self.sdf_instances.handle(), None);
+                        let meta_res = graph.import_buffer(self.sdf_meta.handle(), None);
+                        let raw_micro = self.device.raw().clone();
+                        let pipeline = Arc::clone(micro_pso);
+                        let set = self.global_sdf.scatter_set(frame);
+                        let push = self.gi_occluder_micro_push(
+                            (demand.gi_min, demand.gi_max),
+                            directory_offset,
+                            directory_count,
+                        );
+                        let groups = directory_count
+                            .clamp(1, crate::SCENE_MICRO_DIRECTORY_CAPACITY)
+                            .div_ceil(64);
+                        graph.add_pass(
+                            RgPass::compute("gi-occluder-micro")
+                                .access(instances_res, RgUsage::StorageWriteCompute)
+                                .access(meta_res, RgUsage::StorageReadWriteCompute)
+                                .body(move |cmd, _scopes| {
+                                    // SAFETY: the ash seam. PSO/set valid this frame;
+                                    // the push spans the declared range.
+                                    unsafe {
+                                        raw_micro.cmd_bind_pipeline(
+                                            cmd,
+                                            vk::PipelineBindPoint::COMPUTE,
+                                            pipeline.handle(),
+                                        );
+                                        raw_micro.cmd_bind_descriptor_sets(
+                                            cmd,
+                                            vk::PipelineBindPoint::COMPUTE,
+                                            pipeline.layout(),
+                                            0,
+                                            &[set],
+                                            &[],
+                                        );
+                                        raw_micro.cmd_push_constants(
+                                            cmd,
+                                            pipeline.layout(),
+                                            vk::ShaderStageFlags::COMPUTE,
+                                            0,
+                                            bytemuck::bytes_of(&push),
+                                        );
+                                        raw_micro.cmd_dispatch(cmd, groups, 1, 1);
                                     }
                                 }),
                         );

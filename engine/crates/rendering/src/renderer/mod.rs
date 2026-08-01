@@ -62,10 +62,12 @@ mod graph_util;
 mod graph_writeback;
 mod init;
 mod lighting;
+mod micro_rt;
 mod present;
 mod raytracing;
 mod scene_graph;
 mod screen_space_passes;
+mod selection_pick;
 mod settings;
 mod telemetry;
 mod tessellation_prep;
@@ -87,6 +89,7 @@ use tessellation_prep::access_displaced_arena;
 
 pub(crate) use fog_passes::FogParams;
 pub use fog_passes::FogRenderSettings;
+pub use lighting::InteractionFieldCapture;
 pub use telemetry::RenderStatsFull;
 pub use view::{VIEW_COUNT, ViewId, ViewMode};
 
@@ -119,9 +122,7 @@ struct FramePipelines {
     ssgi_blur: Option<Arc<crate::Pipeline>>,
     ssgi_accum: Option<Arc<crate::Pipeline>>,
     gi_resolve: Option<Arc<crate::Pipeline>>,
-    dfao: Option<Arc<crate::Pipeline>>,
-    dfao_blur: Option<Arc<crate::Pipeline>>,
-    dfao_accum: Option<Arc<crate::Pipeline>>,
+    dfao: Option<DfaoPipelines>,
     /// This frame's DFAO trace push (camera inverses + frame index; bumped at resolve time).
     dfao_push: crate::DfaoPush,
     specocc: Option<Arc<crate::Pipeline>>,
@@ -178,7 +179,13 @@ struct SceneFramePsos {
     transparent_sort: (PsoSlot, PsoSlot, PsoSlot, PsoSlot, PsoSlot),
     wind_deform: PsoSlot,
     wind_interact: PsoSlot,
+    /// Ray-geometry materialization for wind-deformed instances.
+    rt_deform: PsoSlot,
     gi_scatter: PsoSlot,
+    /// Aggregate slab occluders for the resident micro vegetation fields.
+    gi_micro: PsoSlot,
+    /// Ray-geometry materialization for the reconstructed micro blades.
+    micro_rt: PsoSlot,
 }
 
 /// The per-world wind and interaction resources one frame publishes, plus the GPU-scene address
@@ -213,6 +220,16 @@ struct DdgiPipelines {
     border: Arc<crate::Pipeline>,
 }
 
+/// The three DFAO compute PSOs, resolved together — a partial set skips the whole chain. The
+/// accumulator is part of the chain rather than a polish stage: the trace rotates its cone ring
+/// every frame, so only the EMA is a stable sky-visibility term, and it is the map the
+/// indirect-diffuse resolve samples.
+struct DfaoPipelines {
+    trace: Arc<crate::Pipeline>,
+    blur: Arc<crate::Pipeline>,
+    accum: Arc<crate::Pipeline>,
+}
+
 /// One level of the transient bloom mip pyramid: graph resource, image view, and dispatch extent.
 struct BloomMip {
     res: RgResource,
@@ -236,6 +253,16 @@ struct GdfResult {
     occupancy_slots: [Option<usize>; crate::GDF_CASCADES as usize],
     albedo: Option<RgResource>,
     albedo_slot: Option<usize>,
+    /// The cull-list buffer's cross-frame state slot and the frame slot it belongs to, read back
+    /// so the next frame's build can be placed on the async-compute lane again.
+    cull_state: Option<GdfCullState>,
+}
+
+/// Where one frame's cull-list buffer state is written back to.
+#[derive(Clone, Copy)]
+struct GdfCullState {
+    slot: usize,
+    frame: usize,
 }
 
 /// External layout slots for persistent cloud shape fields and per-view temporal products.
@@ -359,13 +386,19 @@ struct WindDeformRecords {
 /// Drop order is load-bearing: the explicit [`Drop`] idles the device, then destroys the
 /// device-borrowing sub-state; the `device` field drops last by declaration order.
 pub struct Renderer {
-    /// Routes the shaded executor through `VK_EXT_mesh_shader` instead of the indexed path, from
-    /// `SAFFRON_MESH_EXECUTOR=1` and only where the device supports a mesh stage.
+    /// Per-view binned-cut state the last frame left behind, replayed by the selection pick.
+    selection_sources: [Option<selection_pick::SelectionSource>; crate::VIEW_COUNT],
+    /// The one-texel pick targets, allocated on the first pick and reused after.
+    selection_targets: Option<selection_pick::SelectionTargets>,
+    /// Routes the shaded executor through `VK_EXT_mesh_shader` instead of the indexed path,
+    /// wherever the device's mesh feature bits and output limits qualify
+    /// ([`crate::mesh_executor_supported`]).
     mesh_executor: bool,
     /// Whether reconstructed micro-blade field passes run. On unless `SAFFRON_MICRO_FIELD=off`.
     micro_field_enabled: bool,
-    /// Whether the traversal rejects a hierarchy node whose swept world bounds leave the view,
-    /// dropping its subtree with it. On unless `SAFFRON_NODE_CULL=off`; read once at construction.
+    /// Whether the traversal rejects a hierarchy node whose swept world bounds leave the view —
+    /// dropping its subtree with it — and each surviving node's clusters on their own swept
+    /// bounds. On unless `SAFFRON_NODE_CULL=off`; read once at construction.
     node_cull: bool,
     /// Pins the hierarchy cut instead of letting projected error choose it, keyed by
     /// [`crate::SceneViewClass::ordinal`] so pinning one class does not drag the others with it.
@@ -457,9 +490,18 @@ pub struct Renderer {
     /// swapchain, with no ui pass.
     present_viewport_only: bool,
 
-    /// Set by [`Renderer::begin_offscreen_frame`] once the frame slot's fence is waited + reset, so
-    /// [`Renderer::render_scene_offscreen`] does not re-wait the unsignaled fence and deadlock.
-    frame_begun: bool,
+    /// Whether the current frame slot's in-flight fence is reset and no submit has been made that
+    /// signals it. Set by [`Renderer::begin_offscreen_frame`], cleared only by a submit that owns
+    /// the fence's signal operation, so [`Renderer::render_scene_offscreen`] never re-waits an
+    /// unsignaled fence and [`Renderer::finish_unsubmitted_frame`] can close the slot from any
+    /// early return between the two.
+    slot_fence_armed: bool,
+
+    /// The last async-compute timeline point the current slot actually submitted, cleared with
+    /// [`Renderer::slot_fence_armed`]. A slot closed after a partial submit must not signal its
+    /// fence before that compute work completes — the fence is what gates resetting the pools it
+    /// still reads.
+    pending_compute_signal: Option<crate::frame::FrameTimelinePoint>,
 
     /// The debug render-output mode; drives the wireframe PSO permutation + the debug channel.
     view_mode: ViewMode,
@@ -492,9 +534,9 @@ pub struct Renderer {
     gpu_frame_ms: f32,
     /// The last frame's fence-wait time (ms); `0` until recorded.
     cpu_wait_ms: f32,
-    /// Device-local VRAM usage in bytes; `0` until the profiler reads the VMA budget.
+    /// Device-local VRAM occupancy in bytes, resampled from the driver's heap budgets each frame.
     vram_usage_bytes: u64,
-    /// Device-local VRAM budget in bytes; `0` until profiled.
+    /// Device-local VRAM budget in bytes, from the same sample.
     vram_budget_bytes: u64,
 
     /// The shared frame-budget / green-amber-red threshold config.
@@ -519,6 +561,12 @@ pub struct Renderer {
 
     submissions: Vec<RenderFn>,
     frame_deformation: FrameDeformation,
+    /// This frame's ray-geometry materialization dispatches: one per placed use whose wind
+    /// deformation is written into the deformed arena for its bottom-level structure.
+    rt_deform_jobs: Vec<crate::RtDeformPush>,
+    /// This frame's materialized micro-field tiles: the generated blade geometry each one's
+    /// per-frame bottom-level structure is rebuilt from.
+    micro_rt_tiles: Vec<crate::MicroRtTile>,
     stats: RenderStats,
 
     /// The active render-quality tier + resolved screen-space GI parameters.
@@ -698,6 +746,10 @@ pub struct Renderer {
     /// as far from any surface, and is held here so the seeded views stay valid.
     default_sdf: Arc<crate::GpuSdf>,
 
+    /// The unit-box brick every aggregate slab occluder is backed by, so a device-reconstructed
+    /// vegetation field reaches the distance field as a real brick-backed occluder.
+    slab_sdf: Arc<crate::GpuSdf>,
+
     /// The 1×1 `(0, 0)` min/max pyramid seeded into every slot of the bindless
     /// `heightMinMaxTextures` array; held here so the seeded view stays valid.
     default_height_minmax: crate::resources::DefaultHeightMinMax,
@@ -805,8 +857,23 @@ impl Renderer {
         self.device.capabilities.mesh_shader
     }
 
+    /// Whether the device exposes an independent compute queue family, which is what lets the
+    /// render graph place an async-compute pass on its own lane.
+    pub fn async_compute_queue_supported(&self) -> bool {
+        self.device.compute_queue_family.is_some()
+    }
+
     /// Whether the shaded executor is running through the mesh stage this frame.
     pub fn mesh_executor_active(&self) -> bool {
+        self.mesh_executor
+    }
+
+    /// Routes the shaded executor through the mesh stage or the indexed path.
+    ///
+    /// Returns the executor actually in force: a device that does not qualify stays on the
+    /// indexed path, so a caller cannot select a stage the device cannot run.
+    pub fn set_mesh_executor(&mut self, mesh: bool) -> bool {
+        self.mesh_executor = mesh && crate::mesh_executor_supported(&self.device.capabilities);
         self.mesh_executor
     }
 

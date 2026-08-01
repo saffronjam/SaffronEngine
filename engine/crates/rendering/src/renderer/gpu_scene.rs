@@ -107,6 +107,7 @@ impl Renderer {
             view_proj: inv_projection.inverse() * view,
             gi_min,
             gi_max,
+            frame_seconds: self.frame_ms / 1000.0,
         }
     }
 
@@ -194,6 +195,21 @@ impl Renderer {
             view_proj,
             ..FrameDeformation::default()
         };
+        // Planned before the wiring, so the arena is sized once for skinning, morph, and the
+        // materialized wind slices together: growing it afterwards would replace the buffer the
+        // wiring has already written into the skin and morph descriptor sets.
+        let rt_plan = params.rt_skinned.then(|| {
+            crate::plan_wind_deformation(
+                self.rt.scene_instances(),
+                &self.rt_cut_view(),
+                self.scene_wind.speed,
+                gather.deformed_cursor,
+            )
+        });
+        let rt_plan = rt_plan.flatten();
+        if let Some(plan) = &rt_plan {
+            gather.deformed_cursor = plan.high_water;
+        }
         self.instancing.wire_gathered_deformations(
             &mut self.skinning,
             frame,
@@ -202,9 +218,56 @@ impl Renderer {
             prev_joints,
             &mut list,
         )?;
+        self.rt_deform_jobs.clear();
+        if let Some(plan) = rt_plan {
+            self.adopt_rt_deformation(frame, plan, &mut list)?;
+        }
         list.valid = true;
         self.frame_deformation = list;
         Ok(())
+    }
+
+    /// Adopts the frame's wind materialization: sizes the arena for the slices, resolves each
+    /// dispatch's addresses, and hands the deforming instances to the refit path.
+    ///
+    /// The materialized instances leave the captured static scene: a plant placed in both would
+    /// appear twice, once swaying and once at rest.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`crate::Error`] if the deformed arena cannot grow to hold the plan.
+    fn adopt_rt_deformation(
+        &mut self,
+        frame: usize,
+        mut plan: crate::RtDeformPlan,
+        list: &mut FrameDeformation,
+    ) -> Result<()> {
+        // A no-op whenever skinning or morph already sized the arena to the plan's high-water; the
+        // create for a frame whose only deformation is materialized wind.
+        self.skinning
+            .ensure_deformed_buffers(frame, plan.high_water)?;
+        let Some(deformed) = self.skinning.deformed_buffer(frame) else {
+            return Ok(());
+        };
+        crate::resolve_job_addresses(&mut plan, &self.device, deformed);
+        self.rt
+            .set_rt_scene(std::sync::Arc::from(std::mem::take(&mut plan.statics)));
+        list.deformed_rt_instances.extend(plan.instances);
+        self.rt_deform_jobs = plan.jobs;
+        Ok(())
+    }
+
+    /// The camera cut parameters ray-representation selection projects through — the same eye,
+    /// projection scale, threshold, and override the raster traversal's refine test uses.
+    pub(super) fn rt_cut_view(&self) -> crate::RtCutView {
+        let demand = self.page_demand_view();
+        let tuning = self.traversal_tuning(crate::SceneViewClass::Camera);
+        crate::RtCutView {
+            eye: demand.eye.to_array(),
+            proj_scale: demand.proj_scale,
+            error_threshold_px: tuning.error_threshold_px,
+            representation_override: tuning.representation_override,
+        }
     }
 
     /// Records the retained-mesh host-byte figure the mirror reports (render stats).

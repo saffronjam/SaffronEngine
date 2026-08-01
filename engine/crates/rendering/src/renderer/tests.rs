@@ -1234,3 +1234,111 @@ fn displaced_instance_tessellation_frame_is_validation_clean() {
         after.saturating_sub(before)
     );
 }
+
+/// Waits `fence` for at most `timeout_ns` and reports whether it signalled. Bounded on purpose: a
+/// slot fence nothing will ever signal must fail a test rather than hang it.
+fn fence_signalled(device: &Device, fence: vk::Fence, timeout_ns: u64) -> bool {
+    // SAFETY: the ash seam. The fence belongs to this device and outlives the wait.
+    unsafe { device.raw().wait_for_fences(&[fence], true, timeout_ns) }.is_ok()
+}
+
+/// Long enough for a real frame to complete on a software rasterizer.
+const FENCE_WAIT_NS: u64 = 10_000_000_000;
+
+/// `begin_offscreen_frame` resets the slot's fence, and from there until something signals it the
+/// slot is unusable — every early return in between depends on the close being decided by that
+/// fence state alone. Closing an armed slot signals it and moves the ring on.
+#[test]
+fn closing_an_armed_slot_signals_its_fence_and_advances_the_ring() {
+    let mut renderer = match Renderer::new(&SurfaceSource::Offscreen, 64, 64) {
+        Ok(renderer) => renderer,
+        Err(err) => {
+            eprintln!("skipping: no Vulkan device obtainable ({err})");
+            return;
+        }
+    };
+    let device = renderer.device_arc();
+
+    renderer
+        .begin_offscreen_frame()
+        .expect("begin_offscreen_frame");
+    let armed_fence = renderer.frames.in_flight();
+    let armed_slot = renderer.frames.index();
+    assert!(
+        renderer.slot_fence_armed,
+        "the begin arms the slot whose fence it reset"
+    );
+    assert!(
+        !fence_signalled(&device, armed_fence, 100_000_000),
+        "an armed slot's fence is reset and unsignalled until something submits for it"
+    );
+
+    renderer
+        .finish_unsubmitted_frame()
+        .expect("closing the armed slot");
+
+    assert!(
+        !renderer.slot_fence_armed,
+        "the closed slot is no longer armed"
+    );
+    assert_ne!(
+        renderer.frames.index(),
+        armed_slot,
+        "the ring advances past the slot it closed"
+    );
+    assert!(
+        fence_signalled(&device, armed_fence, FENCE_WAIT_NS),
+        "the closing submit signals the fence the begin reset"
+    );
+    renderer.device().wait_idle().expect("idle before teardown");
+}
+
+/// A frame's slot fence gets exactly one signal and the ring advances past it exactly once —
+/// whether the frame reached its tail submit or returned early somewhere between the begin and
+/// that submit. The recovery must not depend on the frame having succeeded, so the render result
+/// is reported rather than asserted.
+#[test]
+fn a_frame_closes_its_slot_whether_or_not_it_reached_the_tail_submit() {
+    use saffron_geometry::glam::{Mat4, Vec3};
+
+    let mut renderer = match Renderer::new(&SurfaceSource::Offscreen, 64, 64) {
+        Ok(renderer) => renderer,
+        Err(err) => {
+            eprintln!("skipping: no Vulkan device obtainable ({err})");
+            return;
+        }
+    };
+    let device = renderer.device_arc();
+
+    renderer.submit_sky(&SkyRenderSettings::default());
+    renderer
+        .set_scene_lighting(&SceneLighting::default())
+        .expect("set_scene_lighting");
+    let proj = Mat4::perspective_rh(60.0_f32.to_radians(), 1.0, 0.1, 100.0);
+    let view = Mat4::look_at_rh(Vec3::new(0.0, 1.0, 4.0), Vec3::ZERO, Vec3::Y);
+    renderer
+        .submit_gpu_scene_deformations(proj * view, &[], &[])
+        .expect("submit_gpu_scene_deformations");
+
+    renderer
+        .begin_offscreen_frame()
+        .expect("begin_offscreen_frame");
+    let frame_fence = renderer.frames.in_flight();
+    let frame_slot = renderer.frames.index();
+    let rendered = renderer.render_scene_offscreen();
+    renderer
+        .finish_unsubmitted_frame()
+        .expect("closing whatever the frame left behind");
+
+    assert!(
+        fence_signalled(&device, frame_fence, FENCE_WAIT_NS),
+        "the frame's slot fence must be signalled once the frame is closed (render result: \
+         {rendered:?})"
+    );
+    assert_eq!(
+        renderer.frames.index(),
+        (frame_slot + 1) % crate::frame::MAX_FRAMES_IN_FLIGHT,
+        "the ring advances past the frame's slot exactly once (render result: {rendered:?})"
+    );
+    renderer.device().wait_idle().expect("idle before teardown");
+}

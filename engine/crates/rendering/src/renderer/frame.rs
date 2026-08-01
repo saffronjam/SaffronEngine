@@ -16,14 +16,17 @@ impl Renderer {
 
     /// Begins the offscreen frame: waits + resets the current slot's in-flight fence and resets
     /// its command pool, so the slot is idle before any per-frame state reset (notably the layers'
-    /// deformation submit, which resets the per-frame skinning descriptor pool). Sets
-    /// [`Renderer::frame_begun`] so the following [`Renderer::render_scene_offscreen`] does not
-    /// re-wait the now-unsignaled fence.
+    /// deformation submit, which resets the per-frame skinning descriptor pool). Arms
+    /// [`Renderer::slot_fence_armed`] so the following [`Renderer::render_scene_offscreen`] does
+    /// not re-wait the now-unsignaled fence.
     ///
     /// # Errors
     ///
     /// Returns [`Error::Vk`] for any failing fence/pool call.
     pub fn begin_offscreen_frame(&mut self) -> Result<()> {
+        // An armed slot's fence is reset and unsignaled, so the wait below would never return.
+        // Close that slot first — the ring then begins on the next one.
+        self.finish_unsubmitted_frame()?;
         let raw = self.device.raw();
         let in_flight = self.frames.in_flight();
         // The wait is unbounded, so a frame whose GPU work never completes blocks here forever.
@@ -75,30 +78,46 @@ impl Renderer {
             unsafe { raw.reset_fences(&[in_flight]) },
             "reset_fences (begin)",
         )?;
+        // Armed the instant the fence is reset, ahead of the pool reset that can still fail: from
+        // here until a submit signals it, only this flag makes the slot recoverable.
+        self.slot_fence_armed = true;
         self.frames.reset_command_pools(&self.device)?;
-        self.frame_begun = true;
         Ok(())
     }
 
-    /// Closes a frame that [`Renderer::begin_offscreen_frame`] opened but nothing submitted, by
-    /// signalling the slot's in-flight fence with an empty submit.
+    /// Closes an armed frame slot — one whose in-flight fence [`Renderer::begin_offscreen_frame`]
+    /// reset but no submit signalled — with an empty submit, and advances the ring.
     ///
-    /// `begin_offscreen_frame` resets the slot fence, so the slot is usable again only once
-    /// something signals it. A layer that draws nothing that frame never reaches
-    /// `render_scene_offscreen`, and the next frame would then wait a fence that can never
-    /// signal. The loop calls this at the end of every frame so the invariant holds regardless of
-    /// what a layer chose to draw.
+    /// The slot is usable again only once something signals its fence, so every way out of the
+    /// armed window routes through here: a layer that draws nothing never reaches
+    /// `render_scene_offscreen`, and a frame that fails anywhere between the begin and the tail
+    /// submit returns early with the fence still reset. The loop calls this at the end of every
+    /// frame and `begin_offscreen_frame` calls it before it waits, so the next wait is always on a
+    /// fence something will signal.
     ///
     /// # Errors
     ///
-    /// Returns [`Error::Vk`] if the empty submit fails.
+    /// Returns [`Error::Vk`] if the empty submit fails; the slot stays armed for a later retry.
     pub fn finish_unsubmitted_frame(&mut self) -> Result<()> {
-        if !self.frame_begun {
+        if !self.slot_fence_armed {
             return Ok(());
         }
-        self.frame_begun = false;
         let fence = self.frames.in_flight();
-        let submit = vk::SubmitInfo2::default();
+        // A frame that failed part-way through its submit sequence can still have async-compute
+        // work reading this slot's pools, and the fence is what gates resetting them — so the
+        // closing signal waits the last compute point the slot actually submitted. The point is
+        // recorded only after its own submit succeeded, so it is always signalled.
+        let waits: Vec<vk::SemaphoreSubmitInfo<'_>> = self
+            .pending_compute_signal
+            .iter()
+            .map(|point| {
+                vk::SemaphoreSubmitInfo::default()
+                    .semaphore(point.semaphore)
+                    .value(point.value)
+                    .stage_mask(vk::PipelineStageFlags2::ALL_COMMANDS)
+            })
+            .collect();
+        let submit = vk::SubmitInfo2::default().wait_semaphore_infos(&waits);
         let submits = [submit];
         self.device.graphics_queue.submit2(
             self.device.raw(),
@@ -106,6 +125,8 @@ impl Renderer {
             fence,
             "queue_submit2 (empty frame)",
         )?;
+        self.slot_fence_armed = false;
+        self.pending_compute_signal = None;
         self.frames.advance();
         Ok(())
     }
@@ -147,12 +168,11 @@ impl Renderer {
         }
 
         // Wait + reset this slot's fence and command pool. The run loop calls
-        // [`Renderer::begin_offscreen_frame`] in `begin_frame`, and the `frame_begun` latch skips
+        // [`Renderer::begin_offscreen_frame`] in `begin_frame`, and an already-armed slot skips
         // the re-wait here; a standalone caller still gets a self-contained begin.
-        if !self.frame_begun {
+        if !self.slot_fence_armed {
             self.begin_offscreen_frame()?;
         }
-        self.frame_begun = false;
         let raw = self.device.raw().clone();
         let frame = self.frames.index();
         let command_buffer = self.frames.command_buffer();
@@ -285,16 +305,6 @@ impl Renderer {
         } else {
             None
         };
-        // DFAO: the trace PSO (three-set) + the shared bilateral-upsample PSO (the ssgi-blur PSO,
-        // bound with the DFAO blur set). Resolved when sky occlusion is active this frame.
-        let (dfao, dfao_blur) = if want_dfao {
-            (
-                self.pipelines.request_dfao(compute2),
-                self.pipelines.request_ssgi_blur(compute3),
-            )
-        } else {
-            (None, None)
-        };
         // Bump the monotonic DFAO frame index (rotating the cone ring) here, where
         // `&mut self.ssao` is live; the `&self` graph build reads the snapshot below.
         let dfao_push = self.ssao.next_dfao_push();
@@ -408,13 +418,25 @@ impl Renderer {
         } else {
             None
         };
-        // The DFAO temporal accumulator uses a clamp-free `dfao_accum` PSO: a neighborhood clamp
-        // would re-inject the per-frame cone-rotation variance and never converge. Specular
-        // occlusion is spatial-only (its view-dependent term must not be reprojected by surface
-        // motion), so it has no accumulator.
-        let dfao_accum = if want_dfao && have_motion_targets {
-            self.pipelines
-                .request_dfao_accum(self.descriptors.taa_set_layout())
+        // DFAO: the three-set trace, the shared bilateral upsample (the ssgi-blur PSO bound with
+        // the DFAO blur set), and the clamp-free `dfao_accum` accumulator, resolved together — a
+        // partial set skips the whole chain, since the map every consumer samples is the
+        // accumulated one. A neighborhood clamp there would re-inject the per-frame cone-rotation
+        // variance and never converge; specular occlusion is spatial-only (its view-dependent term
+        // must not be reprojected by surface motion), so it has no accumulator. The accumulator
+        // reprojects through the motion target, so the chain also requires motion.
+        let dfao = if want_dfao && motion.is_some() {
+            let trace = self.pipelines.request_dfao(compute2);
+            let blur = self.pipelines.request_ssgi_blur(compute3);
+            let accum = self
+                .pipelines
+                .request_dfao_accum(self.descriptors.taa_set_layout());
+            match (trace, blur, accum) {
+                (Some(trace), Some(blur), Some(accum)) => {
+                    Some(DfaoPipelines { trace, blur, accum })
+                }
+                _ => None,
+            }
         } else {
             None
         };
@@ -573,8 +595,6 @@ impl Renderer {
             ssgi_accum,
             gi_resolve,
             dfao,
-            dfao_blur,
-            dfao_accum,
             dfao_push,
             specocc,
             specocc_blur,
@@ -672,7 +692,6 @@ impl Renderer {
         }
         self.stats.command_buffers = queue_submits;
         self.stats.queue_submits = queue_submits;
-        self.frames.advance();
         Ok(())
     }
 
@@ -723,6 +742,11 @@ impl Renderer {
                     context: "queue_submit2 (render-graph batch)",
                 },
             )?;
+            // Recorded after the submit succeeded: a slot closed before the tail waits this point
+            // so its fence cannot signal while the compute batch still reads the slot's pools.
+            if batch.queue == RgQueueAssignment::AsyncCompute {
+                self.pending_compute_signal = Some(point);
+            }
             batch_points.push(point);
         }
 
@@ -755,6 +779,11 @@ impl Renderer {
                 context: "queue_submit2 (scene tail)",
             },
         )?;
+        // The tail owns this slot's fence signal and waits the last async-compute point, so the
+        // slot needs no closing submit and the ring moves on.
+        self.slot_fence_armed = false;
+        self.pending_compute_signal = None;
+        self.frames.advance();
         if present_signal.is_some()
             && let Some(present_sync) = self.present_sync.as_mut()
         {

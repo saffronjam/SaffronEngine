@@ -170,6 +170,12 @@ impl Renderer {
         let gi_scatter = self
             .pipelines
             .request_gi_occluder_scatter(self.global_sdf.scatter_layout());
+        let gi_micro = self
+            .pipelines
+            .request_gi_occluder_micro(self.global_sdf.scatter_layout());
+        let micro_rt = self
+            .pipelines
+            .request_micro_rt_deform(self.scene_visibility.micro_layout());
         let transparent_sort = (
             self.pipelines
                 .request_transparent_keys(self.scene_visibility.transparent_keys_layout()),
@@ -182,13 +188,19 @@ impl Renderer {
             self.pipelines
                 .request_transparent_reorder(self.scene_visibility.transparent_reorder_layout()),
         );
+        let rt_deform = self
+            .pipelines
+            .request_rt_deform(self.scene_visibility.layout());
         let psos = SceneFramePsos {
             visibility: visibility_psos,
             micro_field,
             transparent_sort,
             wind_deform,
             wind_interact,
+            rt_deform,
             gi_scatter,
+            gi_micro,
+            micro_rt,
         };
         let visibility =
             self.record_visibility_passes(&mut graph, frame, &frame_res, &psos, micro_template)?;
@@ -220,6 +232,7 @@ impl Renderer {
                 })
                 .collect();
         self.stats.batches = executor_draws.len() as u32;
+        self.capture_selection_source(&executor_draws, executor_inputs, instance_set, extent);
         // Fold the executor buckets into the shadow draw-call stat: one recorded
         // counted-indirect draw per non-blend bucket per shadow pass this frame.
         let non_blend_buckets = executor_draws
@@ -282,7 +295,11 @@ impl Renderer {
             && !self.frame_deformation.morph_dispatches.is_empty()
             && self.skinning.deformed_buffer(frame).is_some()
             && self.skinning.prev_deformed_buffer(frame).is_some();
-        let do_deform = do_skin || do_morph;
+        // Ray-geometry materialization writes the same arena, so it joins the deform scope even
+        // when nothing skins or morphs: a windy plant with no skinned instance in the scene is the
+        // common case, and its structure is the only consumer of the slice.
+        let do_rt_deform = psos.rt_deform.is_some() && !self.rt_deform_jobs.is_empty();
+        let do_deform = do_skin || do_morph || do_rt_deform;
         let deformed_handle = if do_deform {
             self.skinning.deformed_buffer(frame)
         } else {
@@ -359,10 +376,43 @@ impl Renderer {
                 graph.add_pass(pass);
             }
 
+            if do_rt_deform {
+                let rt_deform = Arc::clone(psos.rt_deform.as_ref().expect("rt-deform PSO"));
+                let raw_body = raw.clone();
+                let jobs = self.rt_deform_jobs.clone();
+                let set = self.views[self.active_view.index()]
+                    .visibility_view
+                    .as_ref()
+                    .map_or(vk::DescriptorSet::null(), |view| view.cull_set(frame));
+                if set != vk::DescriptorSet::null() {
+                    graph.add_pass(
+                        RgPass::compute("rt-deform")
+                            .access(deformed, RgUsage::StorageWriteCompute)
+                            // The displacement comes from the wind prepass's records, so this
+                            // declares the read that orders it after them. Without it the graph is
+                            // free to schedule the materialization first and build structures from
+                            // last frame's sway.
+                            .access(frame_res.records, RgUsage::ShaderDeviceAddressRead)
+                            .body(move |cmd, _scopes: &mut NestedScopeRecorder| {
+                                crate::record_rt_deform(&raw_body, cmd, &rt_deform, set, &jobs);
+                            }),
+                    );
+                }
+            }
+
             (Some(deformed), Some(prev_deformed))
         } else {
             (None, None)
         };
+
+        // The reconstructed micro blades' ray geometry, materialized into its own transient arena
+        // before the structures that build from it.
+        let micro_rt_res = self.record_micro_rt_prep(
+            &mut graph,
+            frame,
+            psos.micro_rt.as_ref(),
+            frame_res.interaction_field,
+        );
 
         // RT: build the per-frame TLAS over the scene's mesh instances (a compute-kind pass; the
         // recorded plan self-manages the AS-build → fragment ray-query barrier). Skinned instances
@@ -374,23 +424,16 @@ impl Renderer {
         // Representation selection projects through the camera view's own cut parameters,
         // so the ray representation swaps to the aggregate exactly where the raster
         // traversal draws it.
-        let rt_cut_view = {
-            let demand = self.page_demand_view();
-            let tuning = self.traversal_tuning(crate::SceneViewClass::Camera);
-            crate::RtCutView {
-                eye: demand.eye.to_array(),
-                proj_scale: demand.proj_scale,
-                error_threshold_px: tuning.error_threshold_px,
-                representation_override: tuning.representation_override,
-            }
-        };
+        let rt_cut_view = self.rt_cut_view();
+        let micro_rt_tiles = std::mem::take(&mut self.micro_rt_tiles);
         if self.rt.build_pending()
-            && self.rt.has_instances(&deformed_rt)
+            && self.rt.has_instances(&deformed_rt, &micro_rt_tiles)
             && let Some(plan) = self.rt.prepare_tlas_build(
                 &self.device,
                 frame,
                 &deformed_rt,
                 deformed_handle,
+                &micro_rt_tiles,
                 rt_cut_view,
             )
         {
@@ -412,8 +455,16 @@ impl Renderer {
                     .access(vb_rt, RgUsage::AccelStructBuildRead)
                     .access(ib_rt, RgUsage::AccelStructBuildRead);
             }
+            // The materialized micro blades' structures build over the arena the
+            // `micro-rt-deform` pass wrote, for the same reason.
+            if let Some((vb_micro, ib_micro)) = micro_rt_res {
+                tlas_pass = tlas_pass
+                    .access(vb_micro, RgUsage::AccelStructBuildRead)
+                    .access(ib_micro, RgUsage::AccelStructBuildRead);
+            }
             graph.add_pass(tlas_pass);
         }
+        self.micro_rt_tiles = micro_rt_tiles;
 
         // Virtual-shadow pages: each dirty page rasterizes into its atlas tile behind its space's
         // own cull/bin chain; the scene pass then declares the atlas `SampledRead`.
@@ -834,10 +885,6 @@ impl Renderer {
         let scene_pages_buffer = self.global_gpu_data.pages.buffer();
         let scene_draw_count_supported = self.device.capabilities.draw_indirect_count;
         let scene_draws = executor_draws.clone();
-        let scene_transparent_commands = self.views[self.active_view.index()]
-            .visibility_view
-            .as_ref()
-            .map(|lists| lists.transparent_commands(frame));
         let mut scene = RgPass::graphics("scene", extent)
             .color(color_att)
             .depth_attachment(depth_att)
@@ -868,9 +915,7 @@ impl Renderer {
                 // bucket, the GPU-sorted back-to-front command slice with that bucket's blend PSO
                 // (depth-write off, same attachments — no separate pass).
                 scopes.scope("scene-translucent", |cmd| {
-                    if let (Some(inputs), Some(transparent_commands)) =
-                        (executor_inputs, scene_transparent_commands)
-                    {
+                    if let Some(inputs) = executor_inputs {
                         crate::record_executor_transparent_stream(
                             &raw_for_body,
                             cmd,
@@ -878,9 +923,9 @@ impl Renderer {
                             scene_sets,
                             inputs,
                             scene_pages_buffer,
-                            transparent_commands,
                             scene_draw_count_supported,
                             &scene_draws,
+                            scene_mesh_dispatch.as_ref(),
                         );
                     }
                 });
@@ -891,15 +936,13 @@ impl Renderer {
             let commands_res = graph.import_buffer(inputs.commands, None);
             let counters_res = graph.import_buffer(inputs.counters, None);
             let bucket_counts_res = graph.import_buffer(inputs.bucket_counts, None);
+            let mesh_args_res = graph.import_buffer(inputs.mesh_args, None);
             scene = scene
                 .access(pages_res, RgUsage::IndexInputRead)
                 .access(commands_res, RgUsage::IndirectCommandRead)
+                .access(mesh_args_res, RgUsage::IndirectCommandRead)
                 .access(counters_res, RgUsage::IndirectCountRead)
                 .access(bucket_counts_res, RgUsage::IndirectCountRead);
-            if let Some(transparent_commands) = scene_transparent_commands {
-                let transparent_res = graph.import_buffer(transparent_commands, None);
-                scene = scene.access(transparent_res, RgUsage::IndirectCommandRead);
-            }
         }
         // The scene fragment samples the AO / contact / SSGI maps via set 4; declare the reads so
         // the graph transitions each from GENERAL (compute write) to ShaderReadOnly before it.
@@ -1106,11 +1149,13 @@ impl Renderer {
                             });
                         let pages_res = graph.import_buffer(survivor_pages, None);
                         let commands_res = graph.import_buffer(inputs.commands, None);
+                        let mesh_args_res = graph.import_buffer(inputs.mesh_args, None);
                         let counters_res = graph.import_buffer(inputs.counters, None);
                         let bucket_counts_res = graph.import_buffer(inputs.bucket_counts, None);
                         survivor_pass = survivor_pass
                             .access(pages_res, RgUsage::IndexInputRead)
                             .access(commands_res, RgUsage::IndirectCommandRead)
+                            .access(mesh_args_res, RgUsage::IndirectCommandRead)
                             .access(counters_res, RgUsage::IndirectCountRead)
                             .access(bucket_counts_res, RgUsage::IndirectCountRead);
                         if let Some(deformed) = deformed_res {
@@ -1314,6 +1359,7 @@ impl Renderer {
         self.add_grid_overlay_passes(&mut graph, &pipelines, color, overlay_depth);
 
         let plan = graph.submission_plan(self.device.render_graph_queue_families());
+        self.stats.async_compute_batches = plan.compute_batch_count() as u32;
         let commands = self.frames.prepare_graph_commands(
             &self.device,
             plan.graphics_batch_count(),
