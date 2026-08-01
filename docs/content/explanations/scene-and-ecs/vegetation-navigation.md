@@ -35,9 +35,14 @@ where one is neutral.
 ## Dirty regions
 
 Rebuild cost belongs to the consumer, so the seam tells it exactly what changed rather than making
-it diff. A cell whose generation or promoted-plant set moves marks the bounds of every contribution
-it retired and every one it published. Overlapping regions coalesce into one box as they arrive,
-which keeps a busy frame from producing hundreds of adjacent rebuild requests.
+it diff, and it tells it at the granularity of what actually moved.
+
+A republished generation retires the whole cell — every row it carried may have moved — and marks
+the bounds of every contribution it dropped and every one it publishes in its place. A promotion or
+demotion moves only the cell's bulk-suppression revision, and then only the plants whose suppression
+flipped are re-derived: promoting one tree hands back that tree's ground, and every other plant in
+the cell keeps the exact declaration it already published. Overlapping regions coalesce into one box
+as they arrive, which keeps a busy frame from producing hundreds of adjacent rebuild requests.
 
 Draining transfers ownership: `vegetation-nav-contributions` with `drainDirty` clears the regions,
 so exactly one consumer rebuilds each. Reading without it peeks.
@@ -58,6 +63,7 @@ Reading the overlay against the plants on screen answers whether the seam agrees
 | What | File | Symbols |
 |---|---|---|
 | Publication and dirty tracking | `runtime/src/vegetation_navigation.rs` | `VegetationNavigationSeam`, `derive_contributions`, `take_dirty_regions` |
+| Per-plant re-derivation | `runtime/src/vegetation_navigation.rs` | `NavCell::resuppress` |
 | Contribution vocabulary | `runtime/src/vegetation_navigation.rs` | `NavigationContribution`, `NavigationContributionKind` |
 | Cooked per-plant rows | `vegetation/src/cell_facet.rs` | `VegetationNavigationContribution` |
 | Authored proxies | `vegetation/src/asset.rs` | `PlantNavigationProxy` |

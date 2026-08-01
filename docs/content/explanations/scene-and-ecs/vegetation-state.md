@@ -40,9 +40,12 @@ complete section directory against the manifest. It decodes only the requested f
 persistent cell delta, builds the macro bounds index, and returns a private generation.
 
 `GenerationSlot::try_publish` swaps that complete value only while the token remains current. A
-source update, cancellation, or newer load invalidates the token, so late work returns without
-changing the published cell. Existing `Arc` snapshots keep the prior generation alive until their
-readers release them.
+change in what the cell is asked for, a confirmed mutation, a cancellation, or a newer load
+invalidates the token, so late work returns without changing the published cell. Travel does not: a
+load decodes immutable artifact bytes, so a source that moves while still claiming the cell leaves
+the in-flight load answering exactly the question that was asked. A world that staged against every
+source update instead could never bring a cell resident under a viewpoint moving faster than one
+decodes. Existing `Arc` snapshots keep the prior generation alive until their readers release them.
 
 This trace shows a handle crossing a state change:
 
@@ -175,6 +178,12 @@ sa vegetation-drain-events
 #   high=8  oldest=1  overflowed=no  (2 events)
 ```
 
+Scripts are one such consumer, and the play session drives their cursor for them: it drains the
+ring each simulation step and calls `on_vegetation_event(self, event)` on every instance that
+declares it, before `on_update` and in commit order. The handler's table names the kind in the
+same vocabulary this command prints. See
+[script components and runtime](../../scripting/script-components-and-runtime/).
+
 Cosmetic response stays out of this stream. Bend prediction lives in the GPU interaction field and
 is never persisted; only confirmed crush, clear, and damage state becomes a `DisturbanceMask` or a
 plant delta, and only those emit a transition.
@@ -230,9 +239,25 @@ Snapshot and save containers carry format magic, a schema identity, payload leng
 and a final commit marker. Their decoders reject truncation, trailing data, corrupt payloads,
 non-canonical ordering, and bytes that do not reproduce under canonical encoding.
 
-`EditorJournalEnvelope` keeps gesture preimages and inverse operations separate from runtime save
-state. `NetworkMutationEnvelope` adds transport sequence and an optional authoritative snapshot.
-Both reuse the same mutation records instead of defining another state transition model.
+`EditorJournalEnvelope` is the editor's undo unit. `capture` reads the preimage of every address a
+gesture is about to touch and derives one atomic inverse transaction from it: a plant inverts to
+`PlantDeltaRestore`, which installs its whole prior delta or removes it outright, and a field or
+disturbance tile inverts to the prior patch or to a clear. The inverse is absolute rather than
+incremental, which is why it commutes and why an incremental override that can raise a value but
+never clear one is not enough to undo. `vegetation-mutate` names its gesture and replies with that
+inverse; applying an inverse yields the inverse of *that*, so the editor toggles one list of records
+for undo and redo and never reconstructs a preimage of its own.
+
+`NetworkMutationEnvelope` adds a transport sequence and an optional authoritative snapshot.
+`VegetationWorld::receive_network_envelope` drops a sequence at or below the last accepted one,
+installs a carried snapshot for a join or a correction, and reduces the sequenced operations through
+the same confirmed path an authored mutation takes.
+
+The three envelopes differ in retention, not in vocabulary. A save keeps a snapshot plus a tail it
+may fold away at any time; a journal entry keeps both directions verbatim for as long as the gesture
+sits on an undo stack, and never reaches durable storage; a network stream keeps a sequence window
+it may drop once acknowledged. All three reuse the same mutation records rather than defining
+another state transition model.
 
 Biological age advances through monotonic `ecology_tick` values. Phenology remains a separate closed
 value, so changing scene calendar appearance does not reverse age or mortality. Weather and wind do
@@ -245,15 +270,18 @@ not alter persistent placement unless a mutation writes durable state.
 | Plant IDs and collision audit | `vegetation/src/identity.rs` | `PlantId`, `ProceduralPlantIdentity`, `PlantIdCollisionTable` |
 | Point schema and lifecycle | `vegetation/src/point.rs` | `PlantPointColumns`, `POINT_SCHEMA_COLUMNS`, `PlantLifecycle` |
 | Layer algebra and provenance | `vegetation/src/layer.rs` | `VegetationLayer`, `VegetationLayerOperator`, `ProvenanceTable` |
-| Persistent reducer and envelopes | `vegetation/src/mutation.rs` | `VegetationState`, `VegetationMutation`, `reduce_mutations` |
-| Typed transitions and delivery | `vegetation/src/mutation.rs`, `runtime_world.rs` | `VegetationTransitionKind`, `VegetationEvent`, `drain_events` |
+| Persistent reducer and envelopes | `vegetation/src/mutation/` | `VegetationState`, `VegetationMutation`, `reduce_mutations`, `SaveStateEnvelope` |
+| Gesture inverse and its wire reply | `vegetation/src/mutation/journal.rs`, `control/src/commands_vegetation_runtime/convert.rs` | `EditorJournalEnvelope::capture`, `PlantDeltaRestore`, `vegetation-mutate` |
+| Sequenced network delivery | `vegetation/src/runtime_world/state.rs` | `NetworkMutationEnvelope`, `receive_network_envelope` |
+| Typed transitions and delivery | `vegetation/src/mutation/`, `runtime_world/` | `VegetationTransitionKind`, `VegetationEvent`, `drain_events` |
+| Script-side delivery | `runtime/src/session.rs`, `script/src/runtime.rs` | `drain_vegetation_events`, `dispatch_vegetation_event`, `VegetationEventInfo` |
 | Biological clock and checkpoints | `vegetation/src/ecology.rs` | `EcologyClock`, `EcologyState`, `EcologyCellSummary`, `checkpoint_identity` |
-| Combustible state a fire system reads | `vegetation/src/runtime_world.rs` | `combustion_sample`, `VegetationCombustionSample`, `PlantFlags::IGNITED` |
-| Runtime generations and queries | `vegetation/src/runtime_world.rs` | `VegetationWorld`, `VegetationCellGeneration`, `VegetationPlantHandle` |
-| Strict snapshot codecs | `vegetation/src/state_codec.rs` | `VegetationState::from_canonical_bytes`, `SaveStateEnvelope::from_canonical_bytes` |
+| Combustible state a fire system reads | `vegetation/src/runtime_world/` | `combustion_sample`, `VegetationCombustionSample`, `PlantFlags::IGNITED` |
+| Runtime generations and queries | `vegetation/src/runtime_world/` | `VegetationWorld`, `VegetationCellGeneration`, `VegetationPlantHandle` |
+| Strict snapshot codecs | `vegetation/src/state_codec/` | `VegetationState::from_canonical_bytes`, `SaveStateEnvelope::from_canonical_bytes` |
 | Facet demand and publication | `spatial/src/residency.rs` | `ResidencyManager`, `GenerationToken`, `GenerationSlot` |
 | Scene singleton | `scene/src/component.rs`, `scene.rs` | `VegetationField`, `Scene::add_component` |
-| Generated wire DTOs | `protocol/src/vegetation_dto.rs`, `xtask/src/protocol/ts.rs` | `PlantId`, `VegetationMutationDto`, `emit_sa_types` |
+| Generated wire DTOs | `protocol/src/vegetation_dto/`, `xtask/src/protocol/ts.rs` | `PlantId`, `VegetationMutationDto`, `emit_sa_types` |
 
 ## Related
 

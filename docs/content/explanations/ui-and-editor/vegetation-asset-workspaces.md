@@ -38,9 +38,23 @@ The domain facts above them differ. A plant shows source kind, semantic parts, p
 
 A native family's structure is a result. Parts, dimensions, spines, phenotypes, and proxies all come out of growing the graph, so the Plant Graph panel edits the graph document and the variation list and reads everything else back.
 
-The readout is the growth summary: axes, elements, shells, grafts, vertices, triangles, parts, the grown height in metres, how many manual edits applied, and the graph's content hash. Below it come the variations, any [orphaned edits](../../geometry-and-assets/botanical-graph/) whose target is absent from the grown structure, the first axes with base radius and point count, and the validation diagnostics split into errors and warnings.
+The panel's upper half is the [botanical graph](../../geometry-and-assets/botanical-graph/) on the same node canvas the material and biome editors use. One card per operator, pins typed by the domain they carry — spines, frames, shells, elements — and a right-click palette that adds any operator but the family sink, which a document already carries exactly one of. A connection whose two pins name different domains is refused at the canvas with the pin names, rather than travelling to the engine to come back as a validation code. The document stores no layout, so columns fall out of each node's longest path from a source and a dragged card keeps its place for the session.
 
-Adding a variation advances the seed so the new entry is a different individual rather than the same one twice. Each edit is one semantic operation recorded through `plant-graph-set`, and its inverse is the previous document replayed through that same write. The write sends the graph and the family's own grafts and nothing derived, so no second truth about geometry reaches the engine.
+Below it, three tabs share the selection the canvas and the tree hold:
+
+| Tab | What it edits |
+|---|---|
+| Node | The selected operator's own parameters — trunk length, radius, taper, and segments; branch length and radius ratios, declination, and jitter; phyllotaxis pattern, count, span, and divergence; tropism kind, strength, stimulus, and obstacle plane; prune rule and threshold; root depth, spread, and count; shell sides and material slot; instance element, size, and roll jitter; and drawn control points. A module call shows its call site and points at the Family tab, which owns the binding |
+| Structure | The grown structure as a tree — axes nested under the axis they grew from, placed elements under the axis carrying their frame — and the manual edit over whichever row is picked: move, scale, turn, trim, remove, or graft a hero mesh |
+| Family | Variations, module calls, the growth summary, orphaned edits, and validation diagnostics |
+
+Picking a structure row is the semantic selection every manual edit addresses. An edit names *that* element's identity, which is derived from ancestry, so it survives a parameter change that moves the element rather than being reassigned to whatever grew seventh. A row carrying an edit shows a dot, and the growth summary reports how many edits applied; those whose target is absent from the grown structure surface as orphans instead.
+
+The growth summary is axes, elements, shells, grafts, vertices, triangles, parts, the grown height in metres, applied edits, and the graph's content hash. Adding a variation advances the seed so the new entry is a different individual rather than the same one twice.
+
+A [module call](../../geometry-and-assets/botanical-graph/) is added by choosing the `.splant` preset it grows, not by dropping a bare node: the engine checks a call site and its binding against each other, so one gesture mints the call GUID, the `moduleCall` node, and the reference that says which module, which of its variations, and at what scale. Removing one takes both back out. The palette therefore offers every operator except the family sink and the module call.
+
+Every write is `plant-graph-set` and nothing else, carrying the graph, the family's own grafts, and its module bindings — never `variations`, `phenotypes`, or the proxy lists, which would be a second truth about geometry the engine is about to re-derive. One recorded edit is one semantic operation and its inverse is the previous document replayed through that same write. A parameter scrub is one edit rather than one per keystroke: the field edits a local document immediately and the write goes out once the typing stops, so a regrow does not run per character and the socket carries one request at a time.
 
 An imported family has no botanical graph. The panel says so in place, because that is a fact about the asset rather than an operation that failed.
 
@@ -93,7 +107,13 @@ Blue noise poisson (gpu) · 4.2 ms · 18342 out · slang-compute
 | Panel bodies bound to the preview context | `editor/src/panels/assetEditorPanels.tsx` | `VegetationSummaryPanel`, `AssetPreviewPanel`, `useAssetPreview` |
 | Summary sections | `editor/src/panels/VegetationAssetWorkspace.tsx` | `VegetationAssetWorkspace`, `ValidationSection`, `ProvenanceSection`, `DependenciesSection`, `CookStatisticsSection` |
 | Summary formatting helpers | `editor/src/panels/vegetationAssetDetails.ts` | `describeVegetationDependency`, `formatVegetationBytes`, `formatVegetationCacheRate` |
-| Structure, variations, and validation | `editor/src/panels/PlantGraphPanel.tsx` | `PlantGraphPanel`, `apply`, `addVariation`, `setAge` |
+| Panel shell, write path, and burst recording | `editor/src/panels/PlantGraphPanel/index.tsx` | `PlantGraphPanel`, `write`, `commit`, `apply`, `scrub` |
+| Botanical graph on the node canvas | `editor/src/panels/PlantGraphPanel/GraphEditor.tsx` | `GraphEditor`, `CANVAS_SCHEMA`, `columns`, `edgeId` |
+| Operator parameter editors | `editor/src/panels/PlantGraphPanel/OperatorInspector.tsx` | `OperatorInspector`, `ScaledField`, `VectorField` |
+| Structure tree and manual edits | `editor/src/panels/PlantGraphPanel/StructureTree.tsx` | `StructureTree`, `buildStructure`, `StructureRow` |
+| Canonical document edits | `editor/src/panels/PlantGraphPanel/document.ts` | `withOperator`, `withAddedNode`, `withEdge`, `withEdit`, `pinsAgree` |
+| Operator vocabulary and defaults | `editor/src/panels/PlantGraphPanel/botanicalSchema.ts` | `BOTANICAL_OPERATORS`, `BOTANICAL_PALETTE`, `defaultOperator` |
+| Module call sites and their bindings | `editor/src/panels/PlantGraphPanel/ModuleBindings.tsx`, `editor/src/panels/PlantGraphPanel/document.ts` | `ModuleBindings`, `withModuleCall`, `withoutModuleCall`, `withModuleBinding` |
 | Coverage atlas | `editor/src/panels/PlantAtlasPanel.tsx` | `PlantAtlasPanel` |
 | Cut and appearance error | `editor/src/panels/PlantHierarchyPanel.tsx` | `PlantHierarchyPanel`, `CUTS`, `errorUnits` |
 | Season and lifecycle | `editor/src/panels/PlantSeasonPanel.tsx` | `PlantSeasonPanel`, `LIFECYCLES`, `MARKS` |

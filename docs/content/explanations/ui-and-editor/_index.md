@@ -59,7 +59,7 @@ The [Zustand](https://zustand.docs.pmnd.rs/) store holds editor-facing state. It
 | [Physics panel](physics-panel/) | Live body diagnostics, contacts, and ragdoll controls | `PhysicsPanel`, `physics-state`, `drain-contacts` |
 | [Script logs panel](script-logs-panel/) | Script log draining, filtering, and entity navigation | `ScriptLogsPanel`, `drain-script-logs` |
 | [Vegetation mode](vegetation-mode/) | Tool palette, brush strokes, layer transactions, cook and review | `VegetationPanel`, `commitStroke`, `VEGETATION_TOOLS` |
-| [Vegetation asset workspaces](vegetation-asset-workspaces/) | Plant and biome authoring panels around the asset preview | `AssetEditorWorkspace`, `PlantGraphPanel`, `BiomeGraphPanel` |
+| [Vegetation asset workspaces](vegetation-asset-workspaces/) | Plant and biome authoring panels around the asset preview | `AssetEditorWorkspace`, `PlantGraphPanel`, `GraphEditor`, `StructureTree`, `BiomeGraphPanel` |
 | [Ecology and telemetry panels](ecology-and-telemetry-panels/) | Biological clock transport, stage times, and vegetation budgets | `EcologyTimelinePanel`, `VegetationTelemetryPanel` |
 
 ## In the code

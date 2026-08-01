@@ -59,6 +59,25 @@ between targets would move a branch. Stochastic choices draw from a counter-base
 by (graph, node, element, channel), one channel per decision, so adding a node cannot perturb an
 unrelated one's variation.
 
+## A tropism reads a stimulus
+
+Three tropisms bend an axis, and each answers to something different. Gravitropism carries its own
+direction — straight down — and is the droop of a loaded branch. Phototropism turns the axis along an
+authored light direction, so a plant under a low winter sun leans differently from one under an
+overhead one. Thigmotropism turns it off an obstacle plane's outward normal, and it is the only one
+whose strength varies point by point: the response is full against the plane and falls linearly to
+nothing one axis length clear of it, so a limb that never approaches the wall grows straight.
+
+```text
+tropism { kind: thigmotropism, strength: 0.6,
+          stimulus: (0, 0, 1),   # the wall's outward normal
+          planeOffset: -1.0 }    # the wall sits one metre back along it
+```
+
+The bend accumulates quadratically with distance travelled from the base, so the tip moves most and
+the base not at all, and it is measured from how far along the axis a point sits rather than from its
+current height — otherwise a second tropism would lift a branch the first one had already drooped.
+
 ## Variations are individuals
 
 A document declares the individuals it grows, and each becomes a family variation the runtime
@@ -136,7 +155,7 @@ orphaned at all: lengthen the trunk and every leaf offset still lands.
 ```sh
 sa plant-elements '{"plant":"Silver birch"}'
 #   axis  3149…  trunk    base=(0.00, 0.00, 0.00)  r=0.150  points=7
-#   elem  8821…  leaf     at=(0.02, 2.41, 0.11)    size=0.100  slot=1
+#   elem  8821…  leaf     at=(0.02, 2.41, 0.11)    size=0.100  slot=1  axis=3149…
 
 sa plant-graph-set '{"plant":"Silver birch","graph":{…,"edits":[…]}}'
 #   axes=4  frames=1  shells=4  elements=1  verts=140  tris=104  parts=3  height=2.00m  edits=2
@@ -144,7 +163,10 @@ sa plant-graph-set '{"plant":"Silver birch","graph":{…,"edits":[…]}}'
 ```
 
 `plant-elements` is the selection surface: it lists every axis and placed element with the identity an
-edit targets. Edits ride the graph document itself, so `plant-graph-set` is the one write path, and
+edit targets. Each axis names its parent and each placement names the axis carrying its frame, so a
+tree of the grown plant reads straight off the report — the starter graph hangs its leaves on trunk
+frames no axis ever grew from, and there is nothing in the axis list alone to recover that link from.
+Edits ride the graph document itself, so `plant-graph-set` is the one write path, and
 the layer is part of the graph's content identity — a document that differs only by a hand offset is a
 different plant.
 
@@ -269,7 +291,9 @@ point.
 
 Both directions of the binding are checked when the family is written. A call whose GUID names no
 reference would resolve to nothing; a reference with no call is a binding an author edits expecting
-an effect it cannot have.
+an effect it cannot have. Because the check runs across both, the graph and the module table cross
+in one write and one recorded edit: `plant-graph-set` carries the bindings beside the document, and
+adding or removing a call site moves the node and its reference together.
 
 Growing states which it is at every call site. A path that grew a module-calling graph without its
 modules would report a plant missing its presets and call it a success, so there is no default —
@@ -300,12 +324,12 @@ is refused rather than silently binding slot zero twice.
 | Type system and document | `vegetation/src/botanical.rs` | `BotanicalDomain`, `BotanicalOperator`, `BotanicalGraphDocument`, `validate` |
 | Growing | `vegetation/src/botanical.rs` | `grow`, `BotanicalGrowth`, `BotanicalAssembly`, `BotanicalElementId` |
 | Module calls | `vegetation/src/botanical.rs`, `vegetation/src/asset.rs` | `BotanicalModuleResolver`, `NoBotanicalModules`, `PlantFamilyRole`, `PlantModuleReference` |
-| Module resolution | `assets/src/plant_cook.rs` | `PlantModules`, `PlantModules::for_family` |
+| Module resolution | `assets/src/plant_cook/mod.rs` | `PlantModules`, `PlantModules::for_family` |
 | Variations and appearances | `vegetation/src/botanical_compile.rs` | `native_variations`, `native_phenotypes`, `widest_family_structure` |
 | Derived proxies | `vegetation/src/botanical_compile.rs` | `derive_family_proxies`, `MAX_DERIVED_COLLISION_PROXIES` |
 | Manual edit layer | `vegetation/src/botanical_edit.rs` | `BotanicalManualEdit`, `apply_manual_edits`, `BotanicalEditOrphan` |
 | Graft placement | `vegetation/src/botanical_compile.rs` | `place_graft`, `BotanicalGraft` |
-| Graft source resolution | `assets/src/plant_cook.rs` | `resolve_native_plant_input`, `resolve_plant_source` |
+| Graft source resolution | `assets/src/plant_cook/sources.rs` | `resolve_native_plant_input`, `resolve_plant_source` |
 | Generating the family | `vegetation/src/botanical_compile.rs` | `normalize_botanical_geometry`, `derive_family_structure`, `native_plant_family` |
 | Shared compile path | `vegetation/src/plant_compile.rs` | `compile_plant_family`, `NormalizedPlantFamily` |
 | Control surface | `control/src/commands_asset.rs` | `plant-create`, `plant-elements`, `plant-graph`, `plant-graph-set`, `plant-phenotypes` |

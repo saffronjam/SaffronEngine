@@ -128,7 +128,7 @@ The editor compares these values before issuing heavier list and inspection requ
 | Active-scene and version state | `engine/crates/sceneedit/src/context.rs` | `SceneEditContext::active_scene`, `SceneEditContext::set_selection` |
 | Registry-backed component behavior | `engine/crates/scene/src/registry.rs` | `ComponentRegistry`, `ComponentTraits` |
 | Hierarchy-safe structural edits | `engine/crates/scene/src/hierarchy.rs` | `Scene::set_parent`, `Scene::relink_hierarchy` |
-| Surface picking and framing bounds | `engine/crates/assets/src/render_scene/` | `pick_entity`, `model_render_aabb` |
+| Surface queries and framing bounds | `engine/crates/assets/src/render_scene/` | `query_scene_surface_ray`, `model_render_aabb` |
 | Protocol shapes | `engine/crates/protocol/src/dto/` | `EntitySelector`, `SetTransformParams`, `SelectionResult` |
 | Environment profiles | `engine/crates/assets/src/environment_profile.rs` | `builtin_environment_profiles`, `save_environment_profile`, `load_environment_profile` |
 

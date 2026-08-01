@@ -120,11 +120,12 @@ plants, which is a different question from a physics cast: they report plants th
 collision body at all.
 
 ```lua
-local hit = sa.vegetation_raycast(px, py, pz, dx, dy, dz, 8.0)
-if hit.hit and hit.interaction_policy == "harvestable" then
+local hit = sa.vegetation_raycast(px, py, pz, dx, dy, dz, 8.0, {
+    lifecycles = { "mature", "senescent" },
+    policies = { "harvestable" },
+})
+if hit.hit then
     sa.vegetation_harvest(hit.plant, 4)
-elseif hit.hit then
-    sa.vegetation_damage(hit.plant, 0.25)
 end
 ```
 
@@ -133,11 +134,39 @@ its `lifecycle` and `interaction_policy` names, and `health`. A miss is `{ hit =
 shape the physics casts return. `sa.vegetation_in_radius` returns an array ordered nearest first,
 capped by its optional limit.
 
+Each query takes an optional trailing filter table with `families`, `tags`, `lifecycles`, and
+`policies` lists — the same closed vocabulary `vegetation-runtime-query` uses, so a script and an
+`sa` call ask the same question. An omitted or empty list accepts everything in that dimension.
+Ids may be written as strings or numbers. A name the engine cannot resolve answers as a miss
+rather than widening the question, so a typo hides plants instead of surfacing ones the script
+excluded.
+
 `sa.vegetation_damage` and `sa.vegetation_harvest` reduce a typed mutation through the one
 vegetation reducer and return whether it committed. The header is minted from the plant's owner
 cell and that cell's current revision, so the revision doubles as the optimistic precondition and
 two identical calls both commit rather than one being mistaken for a replay. Each committed
 mutation emits a [typed transition](../../scene-and-ecs/vegetation-state/) any consumer can read.
+
+## Vegetation events
+
+A script receives those transitions by declaring `on_vegetation_event(self, event)`. Every
+committed transition is delivered once, to every instance that declares the handler, in commit
+order and in the same tick the reducer committed it — before `on_update`, so a handler and the
+update that follows agree about the world.
+
+```lua
+function Warden:on_vegetation_event(event)
+    if event.kind == "damaged" and event.health < 0.2 then
+        sa.log("plant " .. event.plant .. " is about to die")
+    end
+end
+```
+
+The event table carries `seq`, `kind`, the `plant` identity when the transition names one, and the
+owning `cell`. Kind-specific values ride beside them and are simply absent when the kind does not
+carry one: `lifecycle` and `previous_lifecycle`, `phenotype`, `amount`, `health`, `moisture`,
+`fuel`, and `categories`. The kind names are the ones
+[`vegetation-drain-events`](../../../reference/control-commands/) reports.
 
 ## Messages, tasks, and callbacks
 

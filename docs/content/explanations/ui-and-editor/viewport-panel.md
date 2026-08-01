@@ -53,6 +53,8 @@ The engine window receives no direct pointer events, so the panel maps DOM coord
 
 Unpressed movement streams `gizmo-pointer hover` through a separate 16 ms coalescer. The engine tests editor billboards before mesh bounds, then returns the selected UUID. See [Gizmo](../gizmo/) and [Selection](../selection/) for those engine-side paths.
 
+A press that [Vegetation mode](../vegetation-mode/) claims owns the whole gesture instead: no `gizmo-pointer` stream, no transform snapshot, and the release commits whatever the tool captured.
+
 ## Editor camera and gameplay keys
 
 Holding the right mouse button asks the shell to lock and hide the cursor. CEF windowless rendering does not supply usable DOM motion while the native grab is active, so the shell emits relative `fly-look` events. The panel accumulates those deltas and the configured fly-key state, then sends `fly-input` at most every 16 ms. Releasing the button, pressing Escape, losing focus, or unmounting ends the grab and sends an inactive state.
@@ -71,7 +73,7 @@ Drop sends one final preview position followed by `phase: "commit"`; leaving the
 
 | What | File | Symbols |
 |---|---|---|
-| Scene host, input, and model drop | `editor/src/panels/ViewportPanel.tsx` | `ViewportPanel`, `eventToUv`, `DRAG_THRESHOLD_PX`, `FLY_STREAM_MS` |
+| Scene host, input, and model drop | `editor/src/panels/ViewportPanel/` | `ViewportPanel`, `eventToUv`, `DRAG_THRESHOLD_PX`, `FLY_STREAM_MS` |
 | Two-tier per-view geometry | `editor/src/lib/useSubsurfaceBounds.ts` | `useSubsurfaceBounds`, `computeBounds`, `liveSync`, `scheduleEndCommit` |
 | View selection and parking policy | `editor/src/app/App.tsx` | `activeRenderView`, `sceneParked`, `assetParked` |
 | Shell command bridge | `editor/shell/src/commands.rs` | `set_viewport_bounds`, `set_viewport_parked` |
@@ -85,3 +87,4 @@ Drop sends one final preview position followed by `phase: "commit"`; leaving the
 - [Asset pickers and drag-and-drop](../asset-pickers-and-drag-drop/) - asset payloads and drop targets
 - [Editor camera](../editor-camera/) - fly controls, smoothing, and persistence
 - [Play mode](../play-mode/) - primary-camera handover and gameplay input lifetime
+- [Vegetation mode](../vegetation-mode/) - the tool palette that pre-empts a viewport press

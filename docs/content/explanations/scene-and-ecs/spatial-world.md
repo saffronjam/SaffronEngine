@@ -86,6 +86,15 @@ radii, priority, and stable ID determine claims. Cleanup radii cannot be smaller
 which gives each source explicit hysteresis. Multiple sources add references to the same facet-cell
 pair instead of taking ownership away from one another.
 
+The velocity is measured, not declared. A viewpoint carries no rigidbody to read one from, so
+`SourceMotion` differences successive observed positions over the frame interval and reports a
+smoothed estimate; the claim cube then centres on the position the source will occupy at the end of
+its prediction horizon rather than the one it occupies now. Both the editor viewport and the
+player's view camera feed it, so a source travelling at speed loads what is ahead of it instead of
+faulting on arrival. The estimate is exponentially smoothed, because one long frame would otherwise
+double the apparent speed and drag the claim centre a cell ahead and back, and a jump too large to
+be travel restarts it at rest rather than reporting a teleport as speed.
+
 Async work carries `GenerationToken { cell, source_revision, generation }`. Beginning or cancelling a
 generation invalidates older tickets. `GenerationSlot` publishes one complete `Arc` under a lock, so
 readers see the complete old value or complete new value. The deterministic priority queue changes

@@ -28,6 +28,14 @@ Manual imported-source targets remain attached to stable element and submesh sel
 selector produces a typed conflict and blocks publication. Changed source observations become
 authored recipe state only when their staged generation commits.
 
+That write-back is why a family's *declared* identity — everything it authors, with the observed hash
+of each external source left out — is what a graph folds in when it names the family. A cook accepts
+what it observed and publishes a generation in the same operation, so a graph keyed on the
+observation would key the generation on bytes that same cook replaced, and the next cook of untouched
+sources would land somewhere else. What the file itself holds still reaches every artifact: the
+family's own cook node depends on the source bytes directly, and a cell depends on the compiled
+family's output.
+
 ## Staging and commit
 
 A cook has one publication route. A worker receives a `CookProjectView` containing project paths and
@@ -38,8 +46,10 @@ manifest.
 
 Every worker read records an `AuthoredInputGuard`: canonical path, byte offset, byte length, and
 content hash. Surface providers contribute immutable descriptors with stable identities and
-revisions. The worker checks cancellation between plant, global-stage, and cell work and before it
-returns `StagedVegetationCook` to the control thread.
+revisions, and they answer masked coverage at one canonical phase; a provider revision does not
+cover the raster path's per-frame dither, so an answer that followed it would change cooked bytes
+while every cook key stayed the same. The worker checks cancellation between plant, global-stage,
+and cell work and before it returns `StagedVegetationCook` to the control thread.
 
 The control thread captures the live surface descriptors and calls `commit_staged_vegetation_cook`.
 Commit takes the project-wide authored lock before the map generation lock, recovers any transaction
@@ -218,14 +228,20 @@ The closure comes from the manifest, not from a directory scan. A scan would cop
 project ever cooked, superseded generations included, which is how a package quietly grows to several
 times the size of the world it ships.
 
-A generation may also ship a starting state. `vegetation-state-baseline` publishes the runtime's
-current persistent state as that generation's baseline, behind the same promoted-plant flush a save
-takes, and the runtime imports it when it binds the generation — so a shipped world boots into what the
-author saw rather than into an untouched one. The baseline is keyed by the manifest it belongs to,
-because a generation has exactly one starting state, and one that does not decode against that
-generation is a hard error rather than a silent skip. It travels from the durable state root into the
-package's own state root, so a player that clears its artifact cache still boots into the authored
-starting state.
+A world may also ship a starting state. `vegetation-state-baseline` publishes the runtime's current
+persistent state as the map's baseline, behind the same promoted-plant flush a save takes, and the
+runtime imports it when it binds — so a shipped world boots into what the author saw rather than into
+an untouched one. The baseline is keyed by the authored map and names inside itself the generation it
+was reduced against; one per map, because a map has one accumulated world. It travels from the durable
+state root into the package's own state root, so a player that clears its artifact cache still boots
+into the authored starting state.
+
+Keying it by the map rather than by the generation is what lets it survive a recook. A cook that
+accepts an authored source observation, or an authored edit, publishes a different generation
+identity; state keyed to the old one would be orphaned on disk while the world came up bare. The
+runtime instead rebases what it holds onto the incoming base — the identity moves, every delta
+crosses — because a plant is addressed by an identity derived from authoring ancestry rather than by
+the cook that placed it. A delta the new base has no ground for is inert rather than dropped.
 
 Every packaged plant source whose provenance requires attribution gets a line in the package's
 `ATTRIBUTION.txt`. A licence obligation that lives only in the editor is one the shipped product
@@ -248,7 +264,7 @@ store rather than through the catalog.
 | What | File | Symbols |
 |---|---|---|
 | Cook identities and dependency graph | `vegetation/src/cook.rs` | `CookGraph`, `CookNodeRecord`, `CookDependency` |
-| Sectioned artifact formats and ranged reads | `vegetation/src/artifact.rs` | `VegetationCellArtifactReader`, `VegetationCellSectionKind`, `PlantCompiledArtifactIndex` |
+| Sectioned artifact formats and ranged reads | `vegetation/src/artifact/cell.rs` · `plant.rs` | `VegetationCellArtifactReader`, `VegetationCellSectionKind`, `PlantCompiledArtifactIndex` |
 | Complete base manifest | `vegetation/src/manifest.rs` | `VegetationBaseManifest`, `VegetationManifestCell` |
 | Plant source normalization | `vegetation/src/plant_compile.rs` | `compile_plant_family`, `PlantCompileOutput` |
 | Portable triangle/voxel hierarchy | `vegetation/src/virtual_hierarchy.rs` | `cook_portable_virtual_hierarchy`, `validate_portable_virtual_hierarchy` |

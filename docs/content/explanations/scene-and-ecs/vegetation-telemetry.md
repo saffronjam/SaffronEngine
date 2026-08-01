@@ -31,7 +31,8 @@ exponential average — one multiply per stage, no history to walk.
 sa vegetation-telemetry
 #   last     residency=0.42ms  promotion=0.00ms  collision=0.11ms  nav=0.03ms  ecology=0.18ms  total=0.74ms
 #   average  residency=0.39ms  promotion=0.01ms  collision=0.09ms  nav=0.04ms  ecology=0.06ms  total=0.59ms
-#   syncs=1284  queries=17 (hits 402)  mutations=3 (612 bytes)  snapshots=1 (48210 bytes)  ecologyTicks=96
+#   syncs=1284  queries=17 (hits 402, cells 34, nodes 511, rows 1980)  mutations=3 (612 bytes)
+#   snapshots=1 (48210 bytes)  ecologyTicks=96
 #   bodies=142  navContributions=88  promoted=1
 #   cook live=0  submitted=9  completed=8  cancelled=1  superseded=0  failed=0
 ```
@@ -41,8 +42,8 @@ sa vegetation-telemetry
 The work counters accumulate from the moment a world is bound and reset when a different one binds.
 Each is incremented where the work happens, so the count cannot drift from the work:
 
-- a query records itself and how many plants it returned, because the hit count is what makes a query
-  expensive;
+- a query records itself, the plants it matched, and the traversal it paid for them — the resident
+  generations it walked, the bounds-hierarchy nodes it tested, and the macro rows it tested exactly;
 - a mutation records the exact canonical bytes the reducer hashed, not the JSON the wire carried;
 - a snapshot records the bytes it produced;
 - an ecology tick records itself as it executes, whether the world clock earned it or an explicit
@@ -50,6 +51,17 @@ Each is incremented where the work happens, so the count cannot drift from the w
 
 Resident bytes by facet, collision bodies, navigation contributions, and promoted plants come from the
 authorities that already track them, so the telemetry command adds no bookkeeping of its own.
+
+## Why the traversal terms are reported at all
+
+Cosmetic grass outnumbers macro plants by orders of magnitude, and the whole design rests on it never
+reaching the CPU: micro vegetation is a quantized density field, so a cell that reconstructs fifty
+thousand blades occupies the same bytes as one that reconstructs fifty, and the bounds hierarchy the
+queries walk is built over macro rows alone. Hit counts alone cannot show that holding — a query that
+scanned every blade and discarded the result returns exactly the same plants. The node and row counts
+are the terms that would move, so they are the ones reported, and
+`cpu_bytes_and_query_work_track_macro_rows_never_micro_blade_count` holds two worlds identical but for
+a sixty-thousand-fold difference in blade density to the same resident bytes and the same traversal.
 
 The cook queue reports the same way: submitted, completed, cancelled, superseded, failed, live, and
 summed acceptance-to-terminal latency. A tally on the poll the manager already walks its jobs in counts

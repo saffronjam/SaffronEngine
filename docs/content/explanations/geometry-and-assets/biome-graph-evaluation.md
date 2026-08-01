@@ -97,6 +97,13 @@ driver UUID against the deterministic corpus. Evidence also binds the exact Slan
 transitive source closure, compiler flags, and loaded SPIR-V bytes. An `EquivalentGpu` node runs on
 Slang only when the vegetation crate has executed and verified the corpus for that complete identity.
 
+Evidence is minted per operator, so the corpus drives every branch an operator can take rather than
+one representative path: each combine operation, the constant and scaled ramp, curves of one and of
+several points, and both terminal forms. A record checked into `benchmarks/foliage-veg/` certifies
+one corpus, and a test holds every record to the corpus, ABI, and shader input the tree currently
+ships — a record left behind after the corpus moves fails rather than continuing to license the GPU
+path.
+
 `xtask shaders` writes `shader-artifacts.generated.json` beside the SPIR-V files. Runtime loading
 checks the manifest record, source hashes, compile-input hash, and artifact hash before Vulkan module
 creation. A missing or stale record is a shader-load error.

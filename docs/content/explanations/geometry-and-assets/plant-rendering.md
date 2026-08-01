@@ -45,11 +45,8 @@ its ray-traced shape is per-use instancing, not the concatenated prototype strea
 Each instance selects one authored `(variation, phenotype)` combination. The
 phenotype it renders derives from typed state, never from an active mesh: a dead or
 stump lifecycle takes the family's `Dead`-role phenotype, a senescent lifecycle the
-`Senescent` role, and a healthy plant the first phenotype whose seasonal window
-contains the calendar's phase — the cooked phenotype is the fallback throughout.
-`season_phase_mille` folds the date and hemisphere into a per-mille year phase, and
-seasonal roles (`Flowering`, `Fruiting`, `Senescent`) carry authored or role-default
-windows in the `.splant` phenotype rows.
+`Senescent` role, and every other plant the phenotype whose intrinsic curves express
+most strongly — the cooked phenotype is the fallback throughout.
 
 The resolved pair then matches the family's combination masks (exact pair match,
 then the phenotype alone, then the first authored combination). A plain scene
@@ -131,6 +128,12 @@ Placement, height, and facing derive from a hash of the tile's reconstruction se
 texel coordinates — camera travel changes residency, never established placement. Blade
 records join the same semantic record stream the traversal emits, ahead of binning.
 
+Those coordinates come back out of a linear index, so the pack order is a contract rather
+than a detail. A tile's samples run Z fastest and X slowest — `(x * dims.y + y) * dims.z + z`
+— which is the order the cooker writes density in and the order every reader rebuilds
+coordinates with. On a cube grid the opposite convention is a symmetric relabel that looks
+right; on any other shape it transposes the field.
+
 Each directory entry also carries the tile's predicted budget: the blade count a fully
 visible frame would reconstruct, summed from the same density derivation at pack time.
 `gpu-scene-stats` reports the directory total as `microPredicted`; the per-frame
@@ -168,18 +171,35 @@ The executor vertex paths then rebase the vertex fetch to the placed prototype's
 the instance transform. Memory stays flat: uses expand at traversal time, never in the
 geometry or page payloads.
 
-## Scrubbing the year
+## Phenology: what a plant looks like now
 
-Which appearance a plant renders comes from typed lifecycle state and the seasonal phase, never from
-inspecting an active mesh. Lifecycle wins: dead and stump take the dead role, senescent takes the
-senescent role, and only a healthy plant falls through to the first phenotype whose window contains
-the current phase. The cooked phenotype is the fallback throughout.
+Which appearance a plant renders comes from typed lifecycle state and the plant's own persistent
+condition, never from inspecting an active mesh. Lifecycle wins outright: dead and stump take the
+dead role, senescent takes the senescent role. Everything else is a weight.
 
-`plant-season-phenotype` answers that question for a point in the year, and the Season panel in the
-Plant workspace scrubs it and binds the answer to the live preview. It calls the same resolver the
-renderer does rather than reimplementing the rule — a preview that resolved the season its own way
-would be showing an appearance the scene never picks, which is exactly the kind of error a timeline
-hides.
+Each phenotype carries an intrinsic response curve — a season window in per-mille of the year that
+wraps through the new year, a health band, and a moisture band, each a trapezoid with a ramp at
+every edge that is interior to its own domain. Full health is the end of its scale and so is a hard
+edge; a mid-season date is not, and softening it is what makes a tree turn over a fortnight instead
+of overnight. Declared curves multiply, so a family can author fruit that only sets on a
+well-watered plant. The strongest phenotype above the activation threshold wins, and authoring order
+breaks a tie.
+
+Roles carry defaults so a family that authors nothing still behaves: `Flowering`, `Fruiting`, and
+`Senescent` get calendar windows, `Damaged` a low-health band, and `Wet` a high-moisture band. The
+four remaining roles declare no curve at all — they are reached by lifecycle or as the cooked
+default, never derived — and their weight is reported as absent rather than as zero, which is a
+different statement.
+
+`season_phase_mille` folds the calendar date and the hemisphere into the per-mille year phase the
+season curve reads. Health and moisture come from the plant's persistent runtime state, the same
+values a damage event or a weather system writes.
+
+`plant-season-phenotype` answers the whole question for a set of conditions, and reports every
+phenotype's weight beside the winner — a resolved id alone cannot say why it won. The Season panel
+in the Plant workspace scrubs it and binds the answer to the live preview. It calls the same
+resolver the renderer does rather than reimplementing the rule: a preview that resolved conditions
+its own way would be showing an appearance the scene never picks.
 
 The phenotype and its variation bind together, because a phenotype draws a specific variation and
 applying one without the other shows a combination the family never declares.
@@ -187,6 +207,7 @@ applying one without the other shows a combination the family never declares.
 ```sh
 sa plant-season-phenotype '{"plant":"Silver birch","seasonMille":700}'
 sa plant-season-phenotype '{"plant":"Silver birch","seasonMille":700,"lifecycle":"dead"}'
+sa -o json plant-season-phenotype '{"plant":"Silver birch","seasonMille":200,"healthMille":150}' | jq .weights
 ```
 
 ## One atlas per family
@@ -227,12 +248,12 @@ not a failure.
 
 | What | File | Symbols |
 |---|---|---|
-| Season → appearance | `vegetation/src/season.rs`, `control/src/commands_asset.rs` | `resolve_rendered_phenotype`, `plant-season-phenotype` |
+| Phenology → appearance | `vegetation/src/season.rs`, `control/src/commands_asset/commands_plant.rs` | `PhenotypeResponse`, `PhenologyState`, `phenotype_weight_mille`, `resolve_rendered_phenotype`, `plant-season-phenotype` |
 | Family atlas + coverage mips | `assets/src/atlas.rs`, `coverage.rs` | `generate_family_atlas`, `pack_atlas`, `FamilyAtlas`, `AtlasLayout`, `CoverageMip` |
 | Atlas texture container | `vegetation/src/artifact/texture.rs`, `assets/src/plant_cook/sections.rs` | `PlantTextureContainer`, `PlantTextureFormat`, `write_plant_texture_container`, `texture_container_section` |
 | Atlas inspection | `assets/src/plant_render.rs`, `control/src/commands_asset.rs` | `plant_family_atlas_image`, `PlantAtlasImage`, `plant-atlas` |
 | Family load, decode, and flatten | `assets/src/plant_render.rs` | `load_plant_family`, `PlantFamilyRender` |
-| Section decode mirrors | `assets/src/plant_cook.rs` | `decode_mesh_section`, `decode_plant_material_document` |
+| Section decode mirrors | `assets/src/plant_cook/decode.rs` · `materials.rs` | `decode_mesh_section`, `decode_plant_material_document` |
 | Assembly-part table build | `rendering/src/upload.rs` | `assembly_from_hierarchy`, `MeshAssembly` |
 | Macro snapshot adapter | `assets/src/gpu_scene_mirror.rs` | `sync_vegetation` |
 | Field-tile packing + directory | `assets/src/gpu_scene_mirror.rs` | `pack_field_tiles`, `rebuild_field_directory` |

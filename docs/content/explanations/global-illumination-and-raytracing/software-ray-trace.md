@@ -147,7 +147,7 @@ second moments used for Chebyshev visibility.
 | Probe world position (toroidal) | `ddgi_trace.slang` | `probeWorldPos`, `wrapMod` |
 | Round-robin constants | `rendering/src/ddgi/` | `DDGI_PROBE_BUDGET`, `DDGI_PROBE_CYCLE`, `Ddgi::trace_push` |
 | Trace graph pass | `rendering/src/renderer/gi_passes.rs` | `Renderer::add_ddgi_passes` |
-| Occluder list production | `gi_occluder_scatter.slang` | `computeMain`, `GiOccluderScatterPush` |
+| Occluder list production | `gi_occluder_scatter.slang`, `gi_occluder_micro.slang` | `computeMain`, `GiOccluderScatterPush`, `GiOccluderMicroPush` |
 | Occluder-list pressure | `rendering/src/renderer/` | `MAX_SDF_INSTANCES`, `sdf_instances_dropped` |
 | Occupancy parity | `material/src/lib.rs`, `assets/src/render_material.rs` | `parity_occupancy`, `aggregate_transmittance`, `AGGREGATE_EXTINCTION_PER_METER`, `derive_parity_occupancy` |
 | Updated-tile filter | `ddgi_blend_irradiance.slang`, `ddgi_blend_distance.slang` | `probeTraced` |

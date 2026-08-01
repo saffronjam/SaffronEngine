@@ -5,86 +5,81 @@ weight = 7
 
 # Picking
 
-Picking maps a viewport coordinate to the visible scene object beneath it. Anima tests editor billboards first, then sends one world-space ray through the shared [surface-field contract](../spatial-world/). A hit selects the nearest object; a miss clears the selection.
+Picking maps a viewport coordinate to the visible object beneath it. Anima tests editor billboards first, then replays the frame's own drawn geometry into a one-texel selection target and reads the identity back. A hit selects the nearest object; a miss clears the selection.
 
-Surface testing uses two levels of rejection. A world-space bounding box removes distant entities cheaply. Static meshes then descend a cached mesh-local [bounding-volume hierarchy](https://pbr-book.org/4ed/Primitives_and_Intersection_Acceleration/Bounding_Volume_Hierarchies) to the few triangles crossed by the ray. This keeps selection accurate at a mesh silhouette without testing every triangle on every click.
+The point of resolving on the GPU is agreement: the answer comes from the same binned cut, the same vertex path, and the same coverage test that produced the image on screen. A click on a leaf that the alpha cutout removed selects whatever stands behind it, a plant deformed by wind selects where the wind put it, and geometry that only the GPU knows how to build — reconstructed grass blades, amplified displacement, aggregate voxels — is selectable without a CPU counterpart for any of it.
 
-## Viewport ray
+## The selection pass
 
-The `pick` command receives viewport UV coordinates with `(0, 0)` at the top left. It converts them to normalized device coordinates as `(u * 2 - 1, v * 2 - 1)`, preserving the rendered image's downward-positive Y direction.
+`pick` receives viewport UV coordinates with `(0, 0)` at the top left. It converts them to a pixel in the view's render extent and hands that to `Renderer::pick_selection_id`.
 
-`viewport_ray` builds the same projection used for drawing, including Vulkan's Y flip. It unprojects the point at depth `0` and depth `1`, then normalizes the vector between them.
+The renderer keeps, per view, what the last frame's graph left behind: the executor draw buckets, the indirect command stream and its counts, the descriptor set the records live in, and the camera they were binned for. A pick replays that state through one selection pipeline into three one-texel attachments — a `R32G32B32A32_UINT` identity, and world position and normal as floats — plus a private depth so the nearest surface wins.
+
+One texel is enough because the viewport is translated rather than shrunk:
 
 ```rust
-let ndc = Vec2::new(u * 2.0 - 1.0, v * 2.0 - 1.0);
-let ray = viewport_ray((width, height), &camera, ndc);
+let viewport = vk::Viewport {
+    x: -(pixel.0 as f32),
+    y: -(pixel.1 as f32),
+    width: source.extent.width as f32,
+    height: source.extent.height as f32,
+    min_depth: 0.0,
+    max_depth: 1.0,
+};
 ```
 
-The projection and depth convention must match the rendered frame. Omitting the Y flip would test a vertically mirrored screen position.
+The scale is unchanged, so screen-space derivatives — and the stochastic coverage threshold they feed — are the ones the full-resolution frame used. Only the picked pixel lands inside the render area; everything else is scissored away. The work is one out-of-band submit on a click, never a per-frame cost, and the targets are 48 bytes.
+
+The fragment writes the emitting draw record's representation, its GPU-scene instance slot, its content index, and its assembly use, after repeating the depth prepass's coverage test exactly.
+
+## Resolving an identity
+
+A GPU-scene slot is a device address, not an identity, and it never reaches the wire. The host translates it through the scene mirror, which is keyed by identity in both directions:
+
+| Record | Mirror answer | `PickResult.kind` |
+|---|---|---|
+| Instance mirrored from an entity | `MirrorInstanceIdentity::Entity` | `mesh` |
+| Instance mirrored from a resident plant | `MirrorInstanceIdentity::Plant` — cell plus `PlantId` | `vegetation` |
+| Micro-blade record, or a micro field anchor | `MirrorInstanceIdentity::MicroField` | `micro-vegetation` |
+
+A micro blade is regenerated from its field every frame and is deliberately identity-less: the result carries a world position for paint feedback and nothing that could be mistaken for a saved object.
+
+The control command performs one final ownership step: if the picked entity belongs to an expanded `ModelInstance` subtree, it selects the model root. The hierarchy therefore treats an imported model as one editor object even when the click landed on a nested mesh node.
 
 ## Editor billboards
 
-Point lights, spot lights, and cameras can be visible in the editor without a mesh. `pick_billboard` projects their world positions to viewport pixels and tests a 26-pixel square centered on each glyph. Mesh-bearing entities stay on the surface-pick path.
+Point lights, spot lights, and cameras can be visible in the editor without a mesh. They are overlay glyphs, so no draw record exists for them and the selection target cannot answer for them. `pick_billboard` projects their world positions to viewport pixels and tests a 26-pixel square centred on each glyph, before the selection replay runs.
 
-A billboard hit wins before any mesh test. This makes small editor controls selectable even when geometry lies behind their icon.
+A billboard hit therefore wins over geometry, which is what makes a small editor control clickable with a wall behind it.
 
-## Static meshes
+## The surface ray beside it
 
-For each entity with `Transform` and `Mesh`, the shared query follows this path:
+Picking no longer casts a CPU ray, but the [surface-field contract](../spatial-world/) it used to go through is still the engine's way of asking *where a ray meets the world* rather than *what is drawn at a pixel*. `query_scene_surface_ray` walks each mesh provider's cached bounding-volume hierarchy — CPU-skinning a skinned mesh through its current joint palette first — and returns an exact world position, tangent frame, UV, and stable triangle attachment.
 
-1. Ignore entities tagged `PreviewGhost`, so a placement preview cannot become its own target.
-2. Resolve the mesh and its CPU positions and indices through `AssetServer`.
-3. Transform the eight local bounds corners and test the resulting world-space axis-aligned box.
-4. Build or reuse the mesh's cached `MeshBvh`.
-
-The surviving entity becomes a provider and enters the shared narrow phase:
-
-1. Construct a `StaticMeshSurfaceProvider` with the entity's stable provider ID and content revision.
-2. Transform the world ray into mesh-local space and call `MeshBvh::raycast_hit`.
-3. Return the exact world position, geometric tangent frame, UV, weighted material tag, stable triangle attachment, and provider revision.
-4. Compare metric world distance and then stable provider ID with other hits.
-
-The cache is keyed by mesh asset ID, so entities sharing one mesh also share one hierarchy. Empty or degenerate triangle data produces no hierarchy and cannot be picked.
-
-## Skinned meshes
-
-Skinned geometry cannot use the rest-pose hierarchy for an exact surface hit. The shared query rebuilds the current joint palette, applies each vertex's four joint weights on the CPU, and tests the deformed world-space triangles.
-
-A conservative broad phase transforms the bind-pose bounds through every joint and unions the results. Only a ray that crosses this box pays for CPU skinning and triangle intersection. The deformation matches `skin.slang`, so selection follows the pose shown in the viewport without a GPU readback. Capabilities explicitly mark the result as non-authoritative: it has no stable attachment, nearest query, or quantized field tile.
-
-## Vegetation
-
-The same viewport ray also queries the [vegetation world](../../geometry-and-assets/plant-rendering/). `VegetationWorld::query_ray` walks each resident cell's macro BVH and returns plants by stable `PlantId`, resolved through the CPU cell snapshot — never a GPU slot index. The nearest macro plant competes with the entity surface hit by metric distance.
-
-Micro vegetation has no per-blade identity, so a micro hit is paint feedback rather than selection. `query_micro_ray` intersects the ray with each resident cell's floor plane and accepts the crossing only where the landing texel of a micro field tile carries nonzero density. The result is a world-space position; it loses distance ties to entity surfaces and macro plants.
-
-## Selection result
-
-`query_scene_surface_ray` returns a `SceneSurfaceHit` containing the mesh entity, complete `SurfaceHit`, and provider capabilities. `pick_scene_surface` builds the viewport ray and consumes that query; `pick_entity` reduces the result to an entity or `Entity::NULL`. Picking does not own a second triangle-intersection path.
-
-The control command performs one final ownership step: if the surface belongs to an expanded `ModelInstance` subtree, it selects the model root. The hierarchy therefore treats an imported model as one editor object even when the ray struck a nested mesh node.
+That is the query behind the `query-surface-ray` command and behind asset placement, where a drop needs a point on a surface with no pixel involved. It answers about geometry the frame may never have drawn, which is exactly why it is not the picking path.
 
 | Click target | `PickResult.kind` | Selection |
 |---|---|---|
 | Light or camera glyph | `billboard` | Glyph entity |
-| Static or skinned surface | `mesh` | Model root, or hit entity outside a model |
+| Any drawn surface | `mesh` | Model root, or the hit entity outside a model |
 | Macro plant | `vegetation` | None; the result carries the stable `plant` id |
-| Micro field ground | `micro-vegetation` | None; the result carries the world `position` |
-| Empty viewport | absent | Cleared |
+| Micro blade | `micro-vegetation` | None; the result carries the world `position` |
+| Nothing drawn there | absent | Cleared |
 
 ## Source map
 
 | What | File | Symbols |
 |---|---|---|
-| Ray construction and shared scene query | `engine/crates/assets/src/render_scene/` | `viewport_ray`, `query_scene_surface_ray`, `pick_scene_surface`, `pick_entity` |
-| Static mesh surface adapter | `engine/crates/assets/src/mesh_surface.rs` | `StaticMeshSurfaceProvider`, `SurfaceField` |
-| Static-mesh hierarchy cache | `engine/crates/assets/src/load/` | `AssetServer::mesh_pick_bvh` |
-| Bounds and intersection math | `engine/crates/geometry/src/picking.rs` | `MeshBvh`, `raycast_hit`, `nearest_hit_transformed`, `ray_triangle_coordinates` |
-| Joint palette | `engine/crates/scene/src/hierarchy.rs` | `Scene::joint_matrices` |
-| Billboard priority and selection | `engine/crates/control/src/commands_scene/` | `pick_billboard`, `pick` |
+| Pick command and billboard priority | `engine/crates/control/src/commands_scene/spatial.rs` | `pick`, `pick_billboard` |
+| Selection replay and readback | `engine/crates/rendering/src/renderer/selection_pick.rs` | `Renderer::pick_selection_id`, `capture_selection_source` |
+| Readback decoding | `engine/crates/rendering/src/selection.rs` | `SelectionHit`, `SelectionReadback` |
+| Selection pipeline | `engine/crates/rendering/src/pipelines/` | `Pipelines::request_selection_id`, `build_selection_id` |
+| Identity fragment | `engine/assets/shaders/mesh.slang` | `selectionIdFragment`, `SelectionOutput` |
+| Slot-to-identity translation | `engine/crates/assets/src/gpu_scene_mirror/mod.rs` | `GpuSceneMirror::identify_instance_slot`, `MirrorInstanceIdentity` |
+| Surface ray for placement and queries | `engine/crates/assets/src/render_scene/` | `query_scene_surface_ray`, `pick_scene_surface`, `viewport_ray` |
 
 ## Related
 
 - [Transforms](../transform-and-matrices/)
 - [Selection](../../ui-and-editor/selection/)
-- [Editor camera](../../ui-and-editor/editor-camera/)
+- [Plant rendering](../../geometry-and-assets/plant-rendering/)

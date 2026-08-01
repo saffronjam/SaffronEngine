@@ -11,7 +11,7 @@ Vegetation mode is the editor's planting surface: a tool palette, a brush, and a
 
 The Vegetation panel opens from the Editing group of the Tools menu and docks into the right dock. The mode's scope is that panel's presence in the Scene dock tree. With it open the floating viewport toolbar appears, the digit keys select tools, and a viewport press routes to the active tool; with it closed the same keys and presses fall through to plain selection and gizmo work.
 
-Every route also requires the Edit play state, so a running or paused [play session](../play-mode/) reaches none of them and the toolbar hides.
+Select, Lasso, and Promote author nothing, so they stay live through a [play session](../play-mode/). Every other tool writes the map and stands down while the world runs: the palette disables its button and the tooltip says why.
 
 The panel and the toolbar read one shared tool vocabulary, so a tool has the same icon, label, and key wherever it appears. Keys are commands in the `vegetation` scope and rebind like any other in [editor settings](../editor-settings/).
 
@@ -31,11 +31,11 @@ The panel and the toolbar read one shared tool vocabulary, so a tool has the sam
 | Pin | `Shift+2` |
 | Promote | `Shift+3` |
 
-A press in the viewport routes by the active tool. Select picks and moves a plant; Paint, Erase, and Reapply run brush strokes; Single plants one anchor; Pin marks the clicked plant. A press with any other tool falls through to the ordinary selection pick and gizmo stream.
+A press in the viewport routes by the active tool. Paint, Erase, Density, Reapply, and Exclude rasterize a brush stroke; Lasso traces a ring on the ground; Volume drags a box. A click with Single, Fill, Pin, Promote, or Spline runs that tool's one-shot gesture, and a click with Select ray-picks like an ordinary viewport press.
 
 ## The brush
 
-Every tool except Select, Lasso, and Pin is a brush tool, so the panel shows the brush section for it and the toolbar prints radius, falloff, and spacing beside the tool row. The toolbar keeps those numbers on screen while the pointer works in the viewport.
+Every brush tool reads the radius: the five stroke tools stamp at it, Spline sweeps its influence at it, and Volume raises its box by it. The rest of the brush narrows by tool. Falloff reaches the stroke tools and Volume, which take a soft edge from it, but not Spline, whose influence carries no edge profile. Spacing, projection, and the slope limit reach only the stroke tools, because only they sample along a pointer path. The panel and the toolbar readout both show exactly the dimensions the active tool consumes, so no control on screen feeds nothing.
 
 | Parameter | Range | Effect |
 |---|---|---|
@@ -43,7 +43,9 @@ Every tool except Select, Lasso, and Pin is a brush tool, so the panel shows the
 | Falloff | 0–1 | Fraction of the radius that fades out; 0 paints a hard disk |
 | Spacing | 0.1–16 m | Distance the pointer travels before the next stamp lands |
 | Projection | View ray, straight down | Where a sample lands: the camera ray's hit, or a downward cast above it |
-| Max slope | 0–90° | Drops paint and erase samples on ground steeper than this; 90° keeps every sample |
+| Max slope | 0–90° | Drops authored stroke samples on ground steeper than this; 90° keeps every one |
+
+Density and Fill carry a target density from 0 to 1 as well: the level a Density stroke drives its texels to, and the level a Fill lays across a cell. Pointer pressure scales every stamp, so a pen's light pass writes less than a firm one.
 
 `]` and `[` scale the radius by 1.25 within the same bounds, so resizing mid-stroke needs no trip to the panel.
 
@@ -53,11 +55,11 @@ The Species section lists the project's plant assets with a filter box and a thu
 
 ## Painting is a chunk transaction
 
-A press with Paint or Erase and an armed layer owns the whole gesture. Each pointer move picks the ground under the cursor, applies the projection and the slope limit, and appends a stamp once the pointer has travelled the spacing distance. One pick is in flight at a time and extra samples drop, so a fast drag cannot pile round-trips into the serialized control bridge.
+A press with a stroke tool and an armed layer owns the whole gesture. Each pointer move picks the ground under the cursor, applies the projection and the slope limit, and appends a stamp once the pointer has travelled the spacing distance. One pick is in flight at a time and extra samples drop, so a fast drag cannot pile round-trips into the serialized control bridge.
 
 ```mermaid
 flowchart TD
-    A[Press with Paint or Erase] --> B[Stamp at the press point]
+    A[Press with a stroke tool] --> B[Stamp at the press point]
     B --> C{Pointer event}
     C -->|Move past the spacing| D[Pick ground, apply slope limit, append stamp]
     D --> C
@@ -69,31 +71,47 @@ flowchart TD
 
 The release reads every chunk the stamps reach, seeds a grid per cell from the existing tile for that layer and channel, splats the stamps, and commits the replacements as one optimistic transaction. The commit carries the generation the read returned plus a bumped revision per chunk, so the engine rejects it if another authored edit landed first instead of letting it overwrite. A cells-scoped cook then makes the stroke visible.
 
+How a stamp lands depends on the tool. Paint and Erase accumulate a signed weight, Density drives each texel toward the target level, and Exclude writes the layer's signed-blocker slot rather than its field slot.
+
 A fresh painted tile is a 64×1×64 grid over a level-zero cell: 64 metres of cell edge at one texel per metre, one collapsed vertical slab, and 256 quantum steps spanning zero to full density. Positions cross the wire as integer ticks at 4096 per metre, which is what keeps a painted stroke reproducible across machines.
 
 Undo captures the pre-stroke payloads and the keys the stroke created. Replaying re-reads current revisions first, so the pair stays valid after later edits to the same cells; a chunk the stroke created is removed rather than zeroed. Reapply records no undo entry: it recooks the cells a stroke covered without touching authored data, which refreshes a region after its inputs changed elsewhere.
 
 ## Layers
 
-The panel polls the bound map from `vegetation-runtime-status` and its ordered layers from `vegetation-asset-summary` every two seconds, so stroke commits and recooks keep the badges honest. Clicking a row arms it as the stroke target. A density or scalar-field operator gives the row a field channel; a row with any other operator is selectable but takes no strokes, and a locked row takes none either.
+The panel polls the bound map from `vegetation-runtime-status` and its ordered layers from `vegetation-asset-summary` every two seconds, so stroke commits and recooks keep the badges honest.
 
-Mute, solo, lock, and reorder each commit through `vegetation-map-layer-commit` as one transaction against the generation just read, and each records its inverse. Solo mutes every other row in that single transaction and restores the mute states captured at click time. A reorder swaps the `order` of two neighbours, which makes the swap its own inverse.
+Clicking a row arms it as the edit target. A density or scalar-field operator gives the row a field channel, and a blocker operator gives it the signed-blocker slot Exclude writes. A volume or spline row takes an analytic shape instead of tiles, and a locked row takes no edit at all.
+
+Mute, solo, lock, and reorder each commit through `vegetation-map-layer-commit` as one transaction against the generation just read, and each records its inverse. Solo mutes every other row in that single transaction, and a second solo on the same row unmutes all.
+
+Reordering by drag or by a row's up and down buttons moves the row to an index and renumbers the run it passed through. The inverse replays the order set captured before the move, so an undo restores the whole run rather than one swap.
 
 An amber dot marks a layer whose authored edits no cook has consumed. It reads the engine's own dirty set rather than a local guess about what changed.
 
 ## Placing plants one at a time
 
-Three tools and one shortcut work on individual plants instead of density fields. Each records one undoable edit whose inverse is a typed mutation, never a rewrite of cooked bytes.
+Five tools and one shortcut work on individual plants instead of density fields. Each gesture that changes a plant records one undoable edit whose inverse is a typed mutation, never a rewrite of cooked bytes.
 
 | Gesture | Mutation | Inverse |
 |---|---|---|
 | Single, click ground | Anchor addition at the picked point | Tombstone, then regrow |
-| Select, click | Selects the picked macro plant | None (selection is transient) |
-| Select, drag the selected plant | Transform override streamed per sample | Override restoring the captured transform |
-| `Delete` with a plant selected | Tombstone | Regrow at the inspected lifecycle and phenotype |
+| A plain click on a plant | Selects that macro plant | None (the selection is transient) |
+| Lasso, trace a ring | Selects every plant rooted inside it | None |
+| Select, drag the one selected plant | Transform override streamed per sample | Override restoring the captured transform |
+| `Delete` | One tombstone per selected plant | Regrow each at its inspected lifecycle and phenotype |
 | Pin, click a plant | Pin row in the layer's anchor-override chunk | The opposite toggle |
+| Promote, click a plant | Promotion to a transient entity view | Demotion |
 
 An anchor mints an explicit-namespace [`PlantId`](../../scene-and-ecs/vegetation-state/): the high two bits of its first byte are set to `01`, and the reducer rejects any other namespace for an authored point. A drag preserves the plant's orientation and scale, so moving it never quietly re-rolls its placement. A pin protects a plant across recooks, so hand-placed work survives a rule change upstream.
+
+A lasso tests where each plant is rooted rather than what its ring covers on screen, so foliage leaning in from outside does not join the selection. A `Delete` over a multi-plant selection is one edit, so one undo brings the whole set back.
+
+## Analytic shapes
+
+A volume or spline layer holds one shape rather than a grid of texels, so its gesture rewrites the layer's operator instead of a tile. Volume drags two ground corners into a box raised by the brush radius, with the falloff as its soft edge. Spline collects picked ground points, `Enter` commits the polyline at the brush radius, and `Escape` drops the points; the toolbar counts what the gesture has collected.
+
+Each shape commits through `vegetation-map-layer-commit` against the generation just read, then recooks the cells its bounds reach. The include or exclude sense the layer carries is kept, because that is an authored decision about the layer rather than about one drag. The inverse restores the layer's prior operator and bounds.
 
 ## Estimate, cook, and review
 
@@ -113,15 +131,17 @@ The bottom section reads `vegetation-render-stats` at 1 Hz and reports what is o
 
 | What | File | Symbols |
 |---|---|---|
-| Panel, layer transactions, cook and population sections | `editor/src/panels/VegetationPanel.tsx` | `VegetationPanel`, `useVegetationMap`, `commitLayersPatch`, `soloLayer`, `moveLayer` |
-| Tool vocabulary shared by panel, toolbar, and shortcuts | `editor/src/panels/vegetationTools.ts` | `VEGETATION_TOOLS`, `isBrushTool` |
+| Panel, layer transactions, cook and population sections | `editor/src/panels/VegetationPanel.tsx` | `VegetationPanel`, `useVegetationMap`, `commitLayersPatch`, `soloLayer`, `reorderLayer` |
+| Tool vocabulary shared by panel, toolbar, and shortcuts | `editor/src/panels/vegetationTools.ts` | `VEGETATION_TOOLS`, `isBrushTool`, `isStrokeTool`, `isRuntimeTool` |
 | Floating viewport toolbar | `editor/src/panels/VegetationViewportToolbar.tsx` | `VegetationViewportToolbar` |
-| Stroke rasterization and chunk transactions | `editor/src/panels/vegetationPainting.ts` | `commitStroke`, `recookRegion`, `togglePin`, `splat`, `strokeBounds` |
+| Stroke rasterization and chunk transactions | `editor/src/panels/vegetationPainting.ts` | `commitStroke`, `commitFill`, `recookRegion`, `togglePin`, `splat`, `strokeBounds` |
+| Analytic shape transactions | `editor/src/panels/vegetationShapes.ts` | `commitVolume`, `commitSpline`, `boundsAround` |
 | Anchor and mutation records | `editor/src/panels/vegetationPlanting.ts` | `anchorRecord`, `worldToCell`, `freshExplicitPlantId` |
-| Pointer routing and stroke capture | `editor/src/panels/ViewportPanel/index.tsx` | `strokeMode`, `sampleStroke`, `samplePlantDrag`, `finishPress` |
-| Gesture commits | `editor/src/panels/ViewportPanel/viewportVegetation.ts` | `plantAt`, `strokeCommit`, `reapplyCommit`, `pinAt` |
+| Which gesture a press begins, and how it samples | `editor/src/panels/ViewportPanel/vegetationPress.ts` | `beginVegetationPress`, `moveVegetationPress`, `finishVegetationPress`, `clickVegetationTool`, `sampleStroke` |
+| Pointer routing and the plant drag | `editor/src/panels/ViewportPanel/index.tsx` | `samplePlantDrag`, `finishPress`, `runPick` |
+| Gesture commits | `editor/src/panels/ViewportPanel/viewportVegetation.ts` | `plantAt`, `strokeCommit`, `reapplyCommit`, `pinAt`, `fillAt`, `promoteAt`, `lassoSelect` |
 | Mode state and brush shape | `editor/src/state/store/slices/vegetation.ts`, `editor/src/state/store/types.ts` | `createVegetationSlice`, `VegetationBrush`, `VegetationPaintTarget` |
-| Scoped shortcuts | `editor/src/app/useVegetationShortcuts.ts` | `useVegetationShortcuts`, `deleteSelectedPlant` |
+| Scoped shortcuts | `editor/src/app/useVegetationShortcuts.ts` | `useVegetationShortcuts`, `deleteSelectedPlants` |
 | Typed commands | `editor/src/control/client/vegetation.ts` | `vegetationMapChunkRead`, `vegetationMapChunkCommit`, `vegetationCook`, `vegetationMutate` |
 
 ## Related
