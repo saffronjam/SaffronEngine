@@ -18,6 +18,8 @@ pub(crate) fn render_stats_dto(renderer: &dyn ControlRenderer) -> RenderStatsDto
         instance_upload_bytes: stats.draw.instance_upload_bytes,
         retained_mesh_cpu_bytes: stats.draw.retained_mesh_cpu_bytes,
         shadow_draw_calls: stats.draw.shadow_draw_calls as i32,
+        async_compute_queue: renderer.async_compute_queue_supported(),
+        async_compute_batches: stats.draw.async_compute_batches,
         vsm: VsmStatsDto {
             requested: stats.vsm.requested as i32,
             hits: stats.vsm.hits as i32,
@@ -29,6 +31,7 @@ pub(crate) fn render_stats_dto(renderer: &dyn ControlRenderer) -> RenderStatsDto
         },
         rt_instances: stats.rt_instances as i32,
         rt_aggregate_instances: stats.rt_aggregate_instances as i32,
+        rt_resolvable_instances: stats.rt_resolvable_instances as i32,
         frame_ms: stats.frame_ms,
         fps: stats.fps,
         gpu_ms: stats.gpu_ms,
@@ -75,6 +78,7 @@ pub(crate) fn render_stats_dto(renderer: &dyn ControlRenderer) -> RenderStatsDto
         blas_count: renderer.rt_blas_count() as i32,
         skinned_blas_count: renderer.rt_skinned_blas_count() as i32,
         tessellated_blas_count: renderer.rt_tessellated_blas_count() as i32,
+        wind_deformed_instances: renderer.rt_wind_deformed() as i32,
         cluster_as_supported: renderer.cluster_as_supported(),
         cluster_blas_count: renderer.rt_cluster_blas_count() as i32,
         clas_count: renderer.rt_clas_count() as i32,
@@ -87,6 +91,10 @@ pub(crate) fn render_stats_dto(renderer: &dyn ControlRenderer) -> RenderStatsDto
         omm_opaque: renderer.rt_omm_classes().0.to_string(),
         omm_transparent: renderer.rt_omm_classes().1.to_string(),
         omm_unknown: renderer.rt_omm_classes().2.to_string(),
+        omm_derived_micromaps: renderer.rt_omm_derived().0 as i32,
+        omm_derived_opaque: renderer.rt_omm_derived().1.to_string(),
+        omm_derived_transparent: renderer.rt_omm_derived().2.to_string(),
+        omm_derived_unknown: renderer.rt_omm_derived().3.to_string(),
         blas_bytes: renderer.rt_blas_bytes().to_string(),
         blas_built_bytes: renderer.rt_blas_built_bytes().to_string(),
         tlas_bytes: renderer.rt_tlas_bytes().to_string(),
@@ -196,6 +204,46 @@ pub(crate) fn register_stats(reg: &mut CommandRegistry) {
         },
     );
 
+    reg.register::<
+        saffron_protocol::WindInteractionFieldParams,
+        saffron_protocol::WindInteractionFieldResult,
+    >(
+        "wind-interaction-field",
+        "wind-interaction-field {cascade?, resolution?} — one whole cascade of the world interaction field, reduced to a grid",
+        |ctx, params| {
+            let resolution = params.resolution.unwrap_or(32);
+            if !(1..=256).contains(&resolution) {
+                return Err(crate::Error::Command(
+                    "resolution must be within 1..=256".into(),
+                ));
+            }
+            if params.cascade >= saffron_rendering::GPU_INTERACTION_CASCADES {
+                return Err(crate::Error::Command(format!(
+                    "cascade must be below {}",
+                    saffron_rendering::GPU_INTERACTION_CASCADES
+                )));
+            }
+            let capture = ctx
+                .renderer
+                .capture_interaction_field(params.cascade, resolution)
+                .map_err(crate::Error::Command)?
+                .ok_or_else(|| {
+                    crate::Error::Command("no frame has created the interaction field yet".into())
+                })?;
+            Ok(saffron_protocol::WindInteractionFieldResult {
+                cascade: capture.cascade,
+                texel_meters: capture.texel_meters,
+                center_texel: capture.center_texel,
+                generation: capture.generation,
+                resolution: capture.resolution,
+                cells: capture.cells,
+                live_texels: capture.live_texels,
+                peak_displacement_m: capture.peak_displacement_m,
+                peak_velocity_mps: capture.peak_velocity_mps,
+            })
+        },
+    );
+
     reg.register::<EmptyParams, saffron_protocol::VegetationRenderStatsDto>(
         "vegetation-render-stats",
         "per-family and per-cell vegetation render population plus page faults",
@@ -277,6 +325,8 @@ pub(crate) fn register_stats(reg: &mut CommandRegistry) {
                             [saffron_rendering::SCENE_VISIBILITY_COUNTER_VISITED_NODES],
                         culled_nodes: words
                             [saffron_rendering::SCENE_VISIBILITY_COUNTER_CULLED_NODES],
+                        culled_clusters: words
+                            [saffron_rendering::SCENE_VISIBILITY_COUNTER_CULLED_CLUSTERS],
                         gi_reach_visible: gi[saffron_rendering::SCENE_VISIBILITY_COUNTER_VISIBLE],
                         gi_reach_culled: gi
                             [saffron_rendering::SCENE_VISIBILITY_COUNTER_CULLED_REACH],

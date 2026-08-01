@@ -40,6 +40,25 @@ fn set_hierarchy_cut_pins_reads_and_returns_to_auto() {
     assert_eq!(auto["result"]["cut"], json!("auto"));
 }
 
+/// `set-mesh-executor` switches the executor, reads it back without changing it, and reports
+/// whether the device qualifies — the pair the parity suite drives one host through.
+#[test]
+fn set_mesh_executor_switches_reads_and_reports_support() {
+    let mut stub = StubRenderer::default();
+    let read = run(&mut stub, "set-mesh-executor", json!({}));
+    assert_eq!(read["result"]["enabled"], json!(false));
+    assert_eq!(read["result"]["supported"], json!(true));
+
+    let enabled = run(&mut stub, "set-mesh-executor", json!({ "enabled": true }));
+    assert_eq!(enabled["result"]["enabled"], json!(true));
+    // An omitted field is a question, not an instruction.
+    let again = run(&mut stub, "set-mesh-executor", json!({}));
+    assert_eq!(again["result"]["enabled"], json!(true));
+
+    let disabled = run(&mut stub, "set-mesh-executor", json!({ "enabled": false }));
+    assert_eq!(disabled["result"]["enabled"], json!(false));
+}
+
 #[test]
 fn set_aa_msaa4_returns_applied_samples() {
     let mut stub = StubRenderer::default();

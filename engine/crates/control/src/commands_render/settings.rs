@@ -369,6 +369,22 @@ pub(crate) fn register_toggles(reg: &mut CommandRegistry) {
         },
     );
 
+    reg.register::<saffron_protocol::SetMeshExecutorParams, saffron_protocol::MeshExecutorResult>(
+        "set-mesh-executor",
+        "set-mesh-executor [true|false] — route the shaded executor through the mesh stage \
+         (omit to read)",
+        |ctx, params| {
+            let enabled = match params.enabled {
+                Some(enabled) => ctx.renderer.set_mesh_executor(enabled),
+                None => ctx.renderer.mesh_executor_active(),
+            };
+            Ok(saffron_protocol::MeshExecutorResult {
+                enabled,
+                supported: ctx.renderer.mesh_executor_supported(),
+            })
+        },
+    );
+
     reg.register::<saffron_protocol::VsmPageBudgetParams, saffron_protocol::VsmPageBudgetResult>(
         "vsm-page-budget",
         "vsm-page-budget {pages} — shadow pages a frame may render (omit to read)",
