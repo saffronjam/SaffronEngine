@@ -19,7 +19,6 @@ import { spawnSync } from "node:child_process";
 import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
-import type { EntityRef, ExportAppResult } from "@saffron/protocol";
 import type { Engine } from "./harness.ts";
 import { Cleaner, bootEngine, captureViewport, prepareScene, trackEntity } from "./test-utils.ts";
 import { decodeRgb8Png, meanAbsoluteDifference } from "./image.ts";
@@ -64,11 +63,11 @@ beforeAll(async () => {
   await prepareScene(engine, { width: WIDTH, height: HEIGHT, camera: EDITOR_CAMERA });
 
   // Something to render, and a scene camera for the player to render it through.
-  trackEntity(cleaner, engine, await engine.call<EntityRef>("add-entity", { preset: "plane" }));
+  trackEntity(cleaner, engine, await engine.call("add-entity", { preset: "plane" }));
   const cube = trackEntity(
     cleaner,
     engine,
-    await engine.call<EntityRef>("add-entity", { preset: "cube" }),
+    await engine.call("add-entity", { preset: "cube" }),
   );
   await engine.call("set-component", {
     entity: cube.id,
@@ -82,7 +81,7 @@ beforeAll(async () => {
   const camera = trackEntity(
     cleaner,
     engine,
-    await engine.call<EntityRef>("add-entity", { preset: "camera" }),
+    await engine.call("add-entity", { preset: "camera" }),
   );
   await engine.call("set-component", {
     entity: camera.id,
@@ -101,7 +100,7 @@ beforeAll(async () => {
   // before the package is staged — otherwise the player boots the starter scene and the
   // comparison is between two pictures of nothing.
   await engine.call("save-project", {});
-  const exported = await engine.call<ExportAppResult>("export-app", {
+  const exported = await engine.call("export-app", {
     outputDir: join(output, "Parity"),
     app: { title: "Parity", width: WIDTH, height: HEIGHT, vsync: false, fullscreen: false },
   });

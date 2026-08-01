@@ -10,10 +10,6 @@ import {
   attachScripts,
   bootScriptEngine,
   stopIfPlaying,
-  type Inspect,
-  type PlayState,
-  type Ref,
-  type ScriptStatus,
 } from "./script-utils.ts";
 
 // Declared fields: defaults live in the .lua; the scene stores only overrides. `weird` is
@@ -40,10 +36,6 @@ return Turret
 `,
 };
 
-interface ScriptSchema {
-  fields: { name: string; type: string; defaultValue: unknown }[];
-}
-
 const cleaner = new Cleaner();
 let engine: Engine;
 let srcDir: string;
@@ -61,7 +53,7 @@ afterAll(async () => {
 });
 
 test("get-script-schema reads declared fields with inferred types, sorted by name", async () => {
-  const schema = await engine.call<ScriptSchema>("get-script-schema", { path: "turret.lua" });
+  const schema = await engine.call("get-script-schema", { path: "turret.lua" });
   expect(schema.fields).toEqual([
     { name: "enabled", type: "bool", defaultValue: true },
     { name: "label", type: "string", defaultValue: "idle" },
@@ -76,23 +68,25 @@ test("get-script-schema reads declared fields with inferred types, sorted by nam
 });
 
 test("declared defaults drive the script; an override on the slot wins", async () => {
-  const cube = await engine.call<Ref>("add-entity", { args: ["cube"] });
+  const cube = await engine.call("add-entity", { args: ["cube"] });
   await attachScripts(engine, cube.id, ["turret.lua"]);
 
   // No overrides: the turret moves at the declared default (speed = 2).
   await engine.call("play");
   await engine.settle(400);
-  expect((await engine.call<PlayState>("get-play-state")).state).toBe("playing");
-  const defaultRun = await engine.call<Inspect>("inspect", { entity: cube.id });
-  const defaultX = defaultRun.components.Transform.translation.x;
+  expect((await engine.call("get-play-state")).state).toBe("playing");
+  const defaultRun = await engine.call("inspect", { entity: cube.id });
+  const defaultX = defaultRun.components.Transform!.translation.x;
   expect(defaultX).toBeGreaterThan(0.4);
   await engine.call("stop");
 
   // Override speed and label on the authored slot; the next session reads them.
-  const written = await engine.call<{ scriptPath: string; overrides: Record<string, unknown> }>(
-    "set-script-override",
-    { entity: cube.id, slot: 0, name: "speed", value: 10 },
-  );
+  const written = await engine.call("set-script-override", {
+    entity: cube.id,
+    slot: 0,
+    name: "speed",
+    value: 10,
+  });
   expect(written.overrides).toEqual({ speed: 10 });
   await engine.call("set-script-override", {
     entity: cube.id,
@@ -103,15 +97,15 @@ test("declared defaults drive the script; an override on the slot wins", async (
 
   await engine.call("play");
   await engine.settle(400);
-  expect((await engine.call<PlayState>("get-play-state")).state).toBe("playing");
-  const overriddenX = (await engine.call<Inspect>("inspect", { entity: cube.id })).components
-    .Transform.translation.x;
+  expect((await engine.call("get-play-state")).state).toBe("playing");
+  const overriddenX = (await engine.call("inspect", { entity: cube.id })).components
+    .Transform!.translation.x;
   await engine.call("stop");
   expect(overriddenX).toBeGreaterThan(defaultX * 2); // 5x the rate, generous margin
 
   // A null value clears the override; a stale key (renamed/removed field) is ignored at
   // injection, never an error.
-  const cleared = await engine.call<{ overrides: Record<string, unknown> }>("set-script-override", {
+  const cleared = await engine.call("set-script-override", {
     entity: cube.id,
     slot: 0,
     name: "speed",
@@ -126,7 +120,7 @@ test("declared defaults drive the script; an override on the slot wins", async (
   });
   await engine.call("play");
   await engine.settle();
-  expect((await engine.call<PlayState>("get-play-state")).state).toBe("playing");
+  expect((await engine.call("get-play-state")).state).toBe("playing");
   await engine.call("stop");
   await engine.call("destroy-entity", { entity: cube.id });
 });
@@ -141,13 +135,13 @@ test("a new project scaffolds src/ with a runnable starter script", async () => 
   // The starter is immediately demonstrable: attach, play, and it orbits the authored spot in the
   // x/y plane. The angle depends on wall-clock timing, but the orbit invariant does not: the cube
   // stays `radius` from the circle's center (one radius left of the authored position) at all times.
-  const cube = await engine.call<Ref>("add-entity", { args: ["cube"] });
+  const cube = await engine.call("add-entity", { args: ["cube"] });
   await attachScripts(engine, cube.id, ["example.lua"]);
   await engine.call("play");
   await engine.settle(400);
-  expect((await engine.call<PlayState>("get-play-state")).state).toBe("playing");
-  const during = await engine.call<Inspect>("inspect", { entity: cube.id });
-  const p = during.components.Transform.translation;
+  expect((await engine.call("get-play-state")).state).toBe("playing");
+  const during = await engine.call("inspect", { entity: cube.id });
+  const p = during.components.Transform!.translation;
   expect(p.y).toBeGreaterThan(0.05); // ~sin(0.4s * speed) * radius, well off the start
   const radius = Math.hypot(p.x - -2, p.y - 0); // center = authored (0,0) - (radius, 0)
   expect(radius).toBeCloseTo(2, 1);
@@ -156,7 +150,7 @@ test("a new project scaffolds src/ with a runnable starter script", async () => 
 });
 
 test("create-script writes a runnable class-table boilerplate and rejects duplicates", async () => {
-  const created = await engine.call<{ path: string }>("create-script", { name: "spawner" });
+  const created = await engine.call("create-script", { name: "spawner" });
   expect(created.path).toBe("spawner.lua"); // .lua appended
   const text = readFileSync(join(srcDir, "spawner.lua"), "utf8");
   expect(text).toContain("local Spawner = {}");
@@ -167,12 +161,12 @@ test("create-script writes a runnable class-table boilerplate and rejects duplic
   await expect(engine.call("create-script", { name: "../escape" })).rejects.toThrow(/invalid/);
 
   // The boilerplate is valid as written: attach + play stays clean.
-  const cube = await engine.call<Ref>("add-entity", { args: ["cube"] });
+  const cube = await engine.call("add-entity", { args: ["cube"] });
   await attachScripts(engine, cube.id, ["spawner.lua"]);
   await engine.call("play");
   await engine.settle();
-  expect((await engine.call<ScriptStatus>("get-script-status")).instances).toBe(1);
-  expect((await engine.call<PlayState>("get-play-state")).state).toBe("playing");
+  expect((await engine.call("get-script-status")).instances).toBe(1);
+  expect((await engine.call("get-play-state")).state).toBe("playing");
   await engine.call("stop");
   await engine.call("destroy-entity", { entity: cube.id });
 });

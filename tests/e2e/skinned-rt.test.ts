@@ -5,7 +5,6 @@
 import { afterAll, beforeAll, expect, test } from "bun:test";
 import { join } from "node:path";
 import { Engine, REPO } from "./harness.ts";
-import type { RenderStats } from "@saffron/protocol";
 import { bootEngine, captureViewport, Cleaner, prepareScene } from "./test-utils.ts";
 
 let engine: Engine;
@@ -18,7 +17,7 @@ const cleaner = new Cleaner();
 beforeAll(async () => {
   engine = await bootEngine(cleaner, { SAFFRON_SCRATCH_PROJECT: "1" });
   await prepareScene(engine, { camera: { yaw: 0, pitch: 0 } });
-  rtSupported = (await engine.call<RenderStats>("render-stats")).rtSupported;
+  rtSupported = (await engine.call("render-stats")).rtSupported;
   rtToggleOk = await engine
     .call("set-rt-shadows", { enabled: true })
     .then(() => true)

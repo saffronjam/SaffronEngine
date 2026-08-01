@@ -15,34 +15,13 @@ const suiteCleaner = new Cleaner();
 
 const FIXTURE = join(REPO, "tests", "e2e", "fixtures", "two-materials.gltf");
 
-interface Vec3 {
-  x: number;
-  y: number;
-  z: number;
-}
-interface FitResult {
-  entity: string;
-  shape: string;
-  halfExtents: Vec3;
-  offset: Vec3;
-}
-interface PhysicsState {
-  active: boolean;
-  bodyCount: number;
-  dynamicCount: number;
-}
-interface ModelInfo {
-  id: string;
-  subAssets: { id: string; name: string; type: string }[];
-}
-
 const worldY = async (entity: string): Promise<number> =>
-  (await engine.call<{ translation: Vec3 }>("get-world-transform", { entity })).translation.y;
+  (await engine.call("get-world-transform", { entity })).translation.y;
 
 const FLOOR_TOP = 0.1;
 
 async function spawn(name: string): Promise<string> {
-  const id = (await engine.call<{ id: string }>("create-entity", { name })).id;
+  const id = (await engine.call("create-entity", { name })).id;
   return trackEntity(caseCleaner, engine, id);
 }
 async function setCollider(entity: string, field: string, value: unknown): Promise<void> {
@@ -58,9 +37,9 @@ async function makeFloor(): Promise<string> {
 
 beforeAll(async () => {
   engine = await bootEngine(suiteCleaner, { SAFFRON_SCRATCH_PROJECT: "1" });
-  const model = await engine.call<{ id: string }>("import-model", { path: FIXTURE });
+  const model = await engine.call("import-model", { path: FIXTURE });
   await engine.settle();
-  const info = await engine.call<ModelInfo>("model-info", { asset: model.id });
+  const info = await engine.call("model-info", { asset: model.id });
   meshSub = info.subAssets.find((s) => s.type === "mesh")!.id;
 });
 afterEach(async () => {
@@ -82,18 +61,18 @@ test("auto-fit sizes the shape the collider holds (box -> sphere -> capsule)", a
   });
   await engine.call("add-component", { entity: e, component: "Collider" }); // auto-fits a box
 
-  const box = await engine.call<FitResult>("fit-collider", { entity: e });
+  const box = await engine.call("fit-collider", { entity: e });
   expect(box.shape).toBe("box");
   const h = box.halfExtents;
   // The fixture has volume in at least its planar axes; the shape relationships below are the point.
   expect(Math.max(h.x, h.y, h.z)).toBeGreaterThan(0);
 
   await setCollider(e, "shape", "sphere");
-  const sphere = await engine.call<FitResult>("fit-collider", { entity: e });
+  const sphere = await engine.call("fit-collider", { entity: e });
   expect(sphere.halfExtents.x).toBeCloseTo(Math.max(h.x, h.y, h.z), 3);
 
   await setCollider(e, "shape", "capsule");
-  const capsule = await engine.call<FitResult>("fit-collider", { entity: e });
+  const capsule = await engine.call("fit-collider", { entity: e });
   const radius = Math.max(h.x, h.z);
   expect(capsule.halfExtents.x).toBeCloseTo(radius, 3);
   expect(capsule.halfExtents.y).toBeCloseTo(Math.max(0, h.y - radius), 3);
@@ -126,7 +105,7 @@ test("a convex hull cooked from the .smesh falls and rests above the floor", asy
 
   await engine.call("play");
   await engine.settle(300);
-  expect((await engine.call<PhysicsState>("physics-state")).dynamicCount).toBe(1); // hull cooked + dynamic
+  expect((await engine.call("physics-state")).dynamicCount).toBe(1); // hull cooked + dynamic
   await engine.settle(2200);
   const y = await worldY(hull);
   expect(y).toBeGreaterThan(-0.5); // rested above the floor, did not tunnel away
@@ -144,7 +123,7 @@ test("a Mesh collider on a Dynamic body is rejected (the body is skipped)", asyn
 
   await engine.call("play");
   await engine.settle(300);
-  const state = await engine.call<PhysicsState>("physics-state");
+  const state = await engine.call("physics-state");
   // The mesh-on-dynamic body is skipped: only the static floor body exists, nothing dynamic.
   expect(state.dynamicCount).toBe(0);
   expect(state.bodyCount).toBe(1);

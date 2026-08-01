@@ -5,7 +5,6 @@
 import { afterAll, beforeAll, expect, test } from "bun:test";
 import { Engine } from "./harness.ts";
 import { prepareScene } from "./test-utils.ts";
-import type { EntityRef, EnvironmentDto, InspectResult } from "@saffron/protocol";
 
 let engine: Engine;
 beforeAll(async () => {
@@ -17,7 +16,7 @@ afterAll(async () => {
 });
 
 test("set-wind merges the extended deterministic parameters and validates ranges", async () => {
-  const env = await engine.call<EnvironmentDto>("set-wind", {
+  const env = await engine.call("set-wind", {
     speed: 14,
     json: {
       turbulenceOctaves: 4,
@@ -36,7 +35,7 @@ test("set-wind merges the extended deterministic parameters and validates ranges
   expect(env.wind.heightExponent).toBeCloseTo(0.25);
   expect(env.wind.seed).toBe(9);
 
-  const read = await engine.call<EnvironmentDto>("get-environment");
+  const read = await engine.call("get-environment");
   expect(read.wind.turbulenceOctaves).toBe(4);
 
   await expect(
@@ -48,14 +47,14 @@ test("set-wind merges the extended deterministic parameters and validates ranges
 });
 
 test("a WindSource component round-trips through the registry", async () => {
-  const entity = await engine.call<EntityRef>("create-entity", { name: "Breeze" });
+  const entity = await engine.call("create-entity", { name: "Breeze" });
   await engine.call("add-component", { entity: entity.id, component: "WindSource" });
   await engine.call("set-component", {
     entity: entity.id,
     component: "WindSource",
     json: { kind: "vortex", strength: 7.5, radius: 33, falloff: 0.25, enabled: true },
   });
-  const info = await engine.call<InspectResult>("inspect", { entity: entity.id });
+  const info = await engine.call("inspect", { entity: entity.id });
   const source = info.components.WindSource!;
   expect(source.kind).toBe("vortex");
   expect(source.strength).toBeCloseTo(7.5);
@@ -70,18 +69,13 @@ test("a WindSource component round-trips through the registry", async () => {
 test("sample-wind composes the global field with placed sources deterministically", async () => {
   // A calm global profile isolates the local source's contribution.
   await engine.call("set-wind", { speed: 0 });
-  interface WindSample {
-    velocityMps: [number, number, number];
-    gustFront: number;
-    timeS: number;
-  }
-  const calm = await engine.call<WindSample>("sample-wind", {
+  const calm = await engine.call("sample-wind", {
     positionM: [210, 1, 200],
     timeS: 3,
   });
   expect(calm.velocityMps).toEqual([0, 0, 0]);
 
-  const source = await engine.call<EntityRef>("create-entity", { name: "Gust" });
+  const source = await engine.call("create-entity", { name: "Gust" });
   await engine.call("add-component", { entity: source.id, component: "WindSource" });
   await engine.call("set-component", {
     entity: source.id,
@@ -92,22 +86,22 @@ test("sample-wind composes the global field with placed sources deterministicall
   await engine.settle(100);
 
   // Ten metres east of a point source: the radial contribution points +X.
-  const sampled = await engine.call<WindSample>("sample-wind", {
+  const sampled = await engine.call("sample-wind", {
     positionM: [210, 1, 200],
     timeS: 3,
   });
   expect(sampled.velocityMps[0]).toBeCloseTo(6, 1);
   expect(Math.abs(sampled.velocityMps[2])).toBeLessThan(1e-3);
-  const again = await engine.call<WindSample>("sample-wind", {
+  const again = await engine.call("sample-wind", {
     positionM: [210, 1, 200],
     timeS: 3,
   });
   expect(again.velocityMps).toEqual(sampled.velocityMps);
 
   // The engine clock is monotonic: two clockless samples never step backwards.
-  const first = await engine.call<WindSample>("sample-wind", { positionM: [0, 1, 0] });
+  const first = await engine.call("sample-wind", { positionM: [0, 1, 0] });
   await engine.settle(100);
-  const second = await engine.call<WindSample>("sample-wind", { positionM: [0, 1, 0] });
+  const second = await engine.call("sample-wind", { positionM: [0, 1, 0] });
   expect(second.timeS).toBeGreaterThanOrEqual(first.timeS);
 
   await engine.call("destroy-entity", { entity: source.id });
@@ -115,7 +109,7 @@ test("sample-wind composes the global field with placed sources deterministicall
 });
 
 test("emit-interaction-impulse stages a field push and validates ranges", async () => {
-  const accepted = await engine.call<{ accepted: boolean }>("emit-interaction-impulse", {
+  const accepted = await engine.call("emit-interaction-impulse", {
     positionM: [0, 0],
     radiusM: 2,
     strength: 3,
@@ -125,7 +119,7 @@ test("emit-interaction-impulse stages a field push and validates ranges", async 
   expect(accepted.accepted).toBe(true);
 
   // A directionless impulse pushes radially and is equally accepted.
-  const radial = await engine.call<{ accepted: boolean }>("emit-interaction-impulse", {
+  const radial = await engine.call("emit-interaction-impulse", {
     positionM: [4, -2],
     radiusM: 1,
     strength: 1,
@@ -144,12 +138,12 @@ test("emit-interaction-impulse stages a field push and validates ranges", async 
 });
 
 test("the wind-vector overlay flag round-trips", async () => {
-  const set = await engine.call<{ windVectors: boolean }>("set-debug-overlays", {
+  const set = await engine.call("set-debug-overlays", {
     windVectors: true,
   });
   expect(set.windVectors).toBe(true);
   await engine.settle(100);
-  const read = await engine.call<{ windVectors: boolean }>("get-debug-overlays");
+  const read = await engine.call("get-debug-overlays");
   expect(read.windVectors).toBe(true);
   await engine.call("set-debug-overlays", { windVectors: false });
 });

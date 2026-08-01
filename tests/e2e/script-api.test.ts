@@ -12,9 +12,6 @@ import {
   attachScripts,
   bootScriptEngine,
   stopIfPlaying,
-  type Inspect,
-  type PlayState,
-  type Ref,
 } from "./script-utils.ts";
 
 const SCRIPTS = {
@@ -180,38 +177,38 @@ afterAll(async () => {
 });
 
 test("component snapshots, name(), and the rotation/scale setters work from Lua", async () => {
-  const cube = await engine.call<Ref>("add-entity", { args: ["cube"] });
+  const cube = await engine.call("add-entity", { args: ["cube"] });
   await engine.call("rename-entity", { entity: cube.id, name: "Reader Cube" });
   await engine.call("set-transform", { entity: cube.id, translation: { x: 1, y: 2, z: 3 } });
   await attachScripts(engine, cube.id, ["reader.lua"]);
 
   await engine.call("play");
   await engine.settle();
-  expect((await engine.call<PlayState>("get-play-state")).state).toBe("playing");
+  expect((await engine.call("get-play-state")).state).toBe("playing");
 
-  const during = await engine.call<Inspect>("inspect", { entity: cube.id });
-  expect(during.components.Transform.translation).toEqual({ x: 6, y: 50, z: 3 });
-  expect(during.components.Transform.rotation.x).toBeCloseTo(0.5);
-  expect(during.components.Transform.scale).toEqual({ x: 2, y: 2, z: 2 });
+  const during = await engine.call("inspect", { entity: cube.id });
+  expect(during.components.Transform!.translation).toEqual({ x: 6, y: 50, z: 3 });
+  expect(during.components.Transform!.rotation.x).toBeCloseTo(0.5);
+  expect(during.components.Transform!.scale).toEqual({ x: 2, y: 2, z: 2 });
 
   await engine.call("stop");
-  const after = await engine.call<Inspect>("inspect", { entity: cube.id });
-  expect(after.components.Transform.translation).toEqual({ x: 1, y: 2, z: 3 });
-  expect(after.components.Transform.scale).toEqual({ x: 1, y: 1, z: 1 });
+  const after = await engine.call("inspect", { entity: cube.id });
+  expect(after.components.Transform!.translation).toEqual({ x: 1, y: 2, z: 3 });
+  expect(after.components.Transform!.scale).toEqual({ x: 1, y: 1, z: 1 });
   await engine.call("destroy-entity", { entity: cube.id });
 });
 
 test("a script writes components generically and the structural gate refuses cache-backed ones", async () => {
-  const cube = await engine.call<Ref>("add-entity", { args: ["cube"] });
+  const cube = await engine.call("add-entity", { args: ["cube"] });
   await attachScripts(engine, cube.id, ["writer.lua"]);
 
   await engine.call("play");
   await engine.settle();
-  expect((await engine.call<PlayState>("get-play-state")).state).toBe("playing");
+  expect((await engine.call("get-play-state")).state).toBe("playing");
 
-  const during = await engine.call<Inspect>("inspect", { entity: cube.id });
+  const during = await engine.call("inspect", { entity: cube.id });
   expect(during.components.PointLight).toBeDefined();
-  expect(during.components.PointLight.intensity).toBeCloseTo(5);
+  expect(during.components.PointLight!.intensity).toBeCloseTo(5);
   // The structural gate held: no Rigidbody/Collider was added.
   expect(during.components.Rigidbody).toBeUndefined();
   expect(during.components.Collider).toBeUndefined();
@@ -221,78 +218,78 @@ test("a script writes components generically and the structural gate refuses cac
 });
 
 test("sa.Vec3 operators, math, and write-through fields work", async () => {
-  const cube = await engine.call<Ref>("add-entity", { args: ["cube"] });
+  const cube = await engine.call("add-entity", { args: ["cube"] });
   await attachScripts(engine, cube.id, ["vectest.lua"]);
 
   await engine.call("play");
   await engine.settle();
-  expect((await engine.call<PlayState>("get-play-state")).state).toBe("playing");
-  const during = await engine.call<Inspect>("inspect", { entity: cube.id });
-  expect(during.components.Transform.translation.x).toBeCloseTo(7); // p.x = 7 wrote through the userdata
+  expect((await engine.call("get-play-state")).state).toBe("playing");
+  const during = await engine.call("inspect", { entity: cube.id });
+  expect(during.components.Transform!.translation.x).toBeCloseTo(7); // p.x = 7 wrote through the userdata
 
   await engine.call("stop");
   await engine.call("destroy-entity", { entity: cube.id });
 });
 
 test("a script spawns + reparents entities (gone on stop); deferred destroy stays valid for the handler", async () => {
-  const before = (await engine.call<{ entities: Ref[] }>("list-entities")).entities.length;
-  const driver = await engine.call<Ref>("add-entity", { args: ["empty"] });
+  const before = (await engine.call("list-entities")).entities.length;
+  const driver = await engine.call("add-entity", { args: ["empty"] });
   await attachScripts(engine, driver.id, ["life.lua"]);
 
   await engine.call("play");
   await engine.settle();
-  expect((await engine.call<PlayState>("get-play-state")).state).toBe("playing");
-  const during = (await engine.call<{ entities: Ref[] }>("list-entities")).entities;
+  expect((await engine.call("get-play-state")).state).toBe("playing");
+  const during = (await engine.call("list-entities")).entities;
   expect(during.some((e) => e.name === "Alpha")).toBe(true);
   expect(during.some((e) => e.name === "Beta")).toBe(true);
 
   await engine.call("stop");
   // The play duplicate (with the spawns) is discarded — back to the authored count.
-  const after = (await engine.call<{ entities: Ref[] }>("list-entities")).entities;
+  const after = (await engine.call("list-entities")).entities;
   expect(after.some((e) => e.name === "Alpha")).toBe(false);
   expect(after.length).toBe(before + 1); // only the authored driver remains
   await engine.call("destroy-entity", { entity: driver.id });
 
-  const driver2 = await engine.call<Ref>("add-entity", { args: ["empty"] });
+  const driver2 = await engine.call("add-entity", { args: ["empty"] });
   await attachScripts(engine, driver2.id, ["destroyer.lua"]);
   await engine.call("play");
   await engine.settle();
-  expect((await engine.call<PlayState>("get-play-state")).state).toBe("playing");
+  expect((await engine.call("get-play-state")).state).toBe("playing");
   await engine.call("stop");
   await engine.call("destroy-entity", { entity: driver2.id });
 });
 
 test("the coroutine scheduler delays a task; sa.wait in a bare on_update is ignored", async () => {
-  const cube = await engine.call<Ref>("add-entity", { args: ["cube"] });
+  const cube = await engine.call("add-entity", { args: ["cube"] });
   await engine.call("set-transform", { entity: cube.id, translation: { x: 1, y: 0, z: 0 } });
   await attachScripts(engine, cube.id, ["waiter.lua"]);
 
   await engine.call("play");
   await engine.settle(80); // < 0.5s of accumulated dt (even a clamped first step is 0.33)
-  const early = await engine.call<Inspect>("inspect", { entity: cube.id });
-  expect(early.components.Transform.translation.x).toBeCloseTo(1); // the task has NOT fired yet
-  expect((await engine.call<PlayState>("get-play-state")).state).toBe("playing"); // bare sa.wait didn't crash
+  const early = await engine.call("inspect", { entity: cube.id });
+  expect(early.components.Transform!.translation.x).toBeCloseTo(1); // the task has NOT fired yet
+  expect((await engine.call("get-play-state")).state).toBe("playing"); // bare sa.wait didn't crash
 
   await engine.settle(900); // now well past 0.5s
-  const late = await engine.call<Inspect>("inspect", { entity: cube.id });
-  expect(late.components.Transform.translation.x).toBeCloseTo(42); // the task resumed and acted
+  const late = await engine.call("inspect", { entity: cube.id });
+  expect(late.components.Transform!.translation.x).toBeCloseTo(42); // the task resumed and acted
 
   await engine.call("stop");
   await engine.call("destroy-entity", { entity: cube.id });
 });
 
 test("broadcast reaches a handler; a faulting message handler is contained, others still run", async () => {
-  const receiver = await engine.call<Ref>("add-entity", { args: ["cube"] });
+  const receiver = await engine.call("add-entity", { args: ["cube"] });
   await attachScripts(engine, receiver.id, ["receiver.lua"]);
-  const sender = await engine.call<Ref>("add-entity", { args: ["empty"] });
+  const sender = await engine.call("add-entity", { args: ["empty"] });
   await attachScripts(engine, sender.id, ["sender.lua"]);
 
   await engine.call("play");
   await engine.settle();
   // The boom handler errored (logged, contained) — play keeps playing — and ping still delivered.
-  expect((await engine.call<PlayState>("get-play-state")).state).toBe("playing");
-  const during = await engine.call<Inspect>("inspect", { entity: receiver.id });
-  expect(during.components.Transform.translation.x).toBeCloseTo(7); // ping payload moved the receiver
+  expect((await engine.call("get-play-state")).state).toBe("playing");
+  const during = await engine.call("inspect", { entity: receiver.id });
+  expect(during.components.Transform!.translation.x).toBeCloseTo(7); // ping payload moved the receiver
 
   await engine.call("stop");
   await engine.call("destroy-entity", { entity: receiver.id });
@@ -300,11 +297,11 @@ test("broadcast reaches a handler; a faulting message handler is contained, othe
 });
 
 test("key edges (is_key_pressed) fire once per press; mouse position + buttons reach Lua", async () => {
-  const cube = await engine.call<Ref>("add-entity", { args: ["cube"] });
+  const cube = await engine.call("add-entity", { args: ["cube"] });
   await attachScripts(engine, cube.id, ["edges.lua"]);
 
   const translationX = async (entity: string) =>
-    (await engine.call<Inspect>("inspect", { entity })).components.Transform.translation.x;
+    (await engine.call("inspect", { entity })).components.Transform!.translation.x;
 
   await engine.call("script-input", { keys: [] });
   await engine.call("play");
@@ -321,12 +318,12 @@ test("key edges (is_key_pressed) fire once per press; mouse position + buttons r
   await engine.call("script-input", { keys: [] });
   await engine.call("destroy-entity", { entity: cube.id });
 
-  const mouse = await engine.call<Ref>("add-entity", { args: ["cube"] });
+  const mouse = await engine.call("add-entity", { args: ["cube"] });
   await attachScripts(engine, mouse.id, ["mouse.lua"]);
   await engine.call("script-input", { keys: [], mouseX: 3, mouseY: 4, mouseButtons: ["left"] });
   await engine.call("play");
   await engine.settle(150);
-  const t = (await engine.call<Inspect>("inspect", { entity: mouse.id })).components.Transform
+  const t = (await engine.call("inspect", { entity: mouse.id })).components.Transform!
     .translation;
   expect(t.x).toBeCloseTo(3);
   expect(t.y).toBeCloseTo(4);
@@ -337,44 +334,44 @@ test("key edges (is_key_pressed) fire once per press; mouse position + buttons r
 });
 
 test("a script reaches another entity by name and moves it", async () => {
-  const target = await engine.call<Ref>("add-entity", { args: ["cube"] });
+  const target = await engine.call("add-entity", { args: ["cube"] });
   await engine.call("rename-entity", { entity: target.id, name: "Target" });
-  const driver = await engine.call<Ref>("add-entity", { args: ["empty"] });
+  const driver = await engine.call("add-entity", { args: ["empty"] });
   await attachScripts(engine, driver.id, ["chaser.lua"]);
 
   await engine.call("play");
   await engine.settle(400);
-  expect((await engine.call<PlayState>("get-play-state")).state).toBe("playing");
-  const during = await engine.call<Inspect>("inspect", { entity: target.id });
-  expect(during.components.Transform.translation.z).toBeGreaterThan(0.05); // chased +Z by ~0.4s of dt
+  expect((await engine.call("get-play-state")).state).toBe("playing");
+  const during = await engine.call("inspect", { entity: target.id });
+  expect(during.components.Transform!.translation.z).toBeGreaterThan(0.05); // chased +Z by ~0.4s of dt
 
   await engine.call("stop");
-  const after = await engine.call<Inspect>("inspect", { entity: target.id });
-  expect(after.components.Transform.translation.z).toBe(0);
+  const after = await engine.call("inspect", { entity: target.id });
+  expect(after.components.Transform!.translation.z).toBe(0);
   await engine.call("destroy-entity", { entity: target.id });
   await engine.call("destroy-entity", { entity: driver.id });
 });
 
 test("a script moves the primary camera through its transform", async () => {
-  const entities = (await engine.call<{ entities: Ref[] }>("list-entities")).entities;
+  const entities = (await engine.call("list-entities")).entities;
   const inspected = await Promise.all(
-    entities.map((entity) => engine.call<Inspect>("inspect", { entity: entity.id })),
+    entities.map((entity) => engine.call("inspect", { entity: entity.id })),
   );
   const camera = inspected.find((entity) => entity.components.Camera?.primary === true);
   expect(camera).toBeDefined();
-  const authored = camera!.components.Transform.translation;
-  const driver = await engine.call<Ref>("add-entity", { args: ["empty"] });
+  const authored = camera!.components.Transform!.translation;
+  const driver = await engine.call("add-entity", { args: ["empty"] });
   await attachScripts(engine, driver.id, ["camera.lua"]);
 
   await engine.call("play");
   await engine.settle();
-  expect((await engine.call<PlayState>("get-play-state")).state).toBe("playing");
-  const during = await engine.call<Inspect>("inspect", { entity: camera!.id });
-  expect(during.components.Transform.translation).toEqual({ x: 0, y: 5, z: 10 });
+  expect((await engine.call("get-play-state")).state).toBe("playing");
+  const during = await engine.call("inspect", { entity: camera!.id });
+  expect(during.components.Transform!.translation).toEqual({ x: 0, y: 5, z: 10 });
 
   await engine.call("stop");
-  const after = await engine.call<Inspect>("inspect", { entity: camera!.id });
-  expect(after.components.Transform.translation).toEqual(authored);
+  const after = await engine.call("inspect", { entity: camera!.id });
+  expect(after.components.Transform!.translation).toEqual(authored);
   await engine.call("destroy-entity", { entity: driver.id });
 });
 

@@ -8,9 +8,6 @@ import {
   attachScripts,
   bootScriptEngine,
   stopIfPlaying,
-  type Inspect,
-  type PlayState,
-  type Ref,
 } from "./script-utils.ts";
 
 const SCRIPTS = {
@@ -53,7 +50,7 @@ afterAll(async () => {
 
 test("physics bindings: impulse pushes a body, move_character walks, spherecast hits", async () => {
   // A static floor for everyone to interact with.
-  const floor = await engine.call<Ref>("add-entity", { args: ["empty"] });
+  const floor = await engine.call("add-entity", { args: ["empty"] });
   await engine.call("set-transform", { entity: floor.id, translation: { x: 0, y: 0, z: 0 } });
   await engine.call("add-component", { entity: floor.id, component: "Collider" });
   await engine.call("set-component-field", {
@@ -64,14 +61,14 @@ test("physics bindings: impulse pushes a body, move_character walks, spherecast 
   });
 
   // A dynamic box pushed +Z by an impulse from Lua.
-  const box = await engine.call<Ref>("add-entity", { args: ["empty"] });
+  const box = await engine.call("add-entity", { args: ["empty"] });
   await engine.call("set-transform", { entity: box.id, translation: { x: 0, y: 2, z: 0 } });
   await engine.call("add-component", { entity: box.id, component: "Collider" });
   await engine.call("add-component", { entity: box.id, component: "Rigidbody" });
   await attachScripts(engine, box.id, ["pusher.lua"]);
 
   // A capsule character walked +X by move_character from Lua.
-  const character = await engine.call<Ref>("add-entity", { args: ["empty"] });
+  const character = await engine.call("add-entity", { args: ["empty"] });
   await engine.call("set-transform", { entity: character.id, translation: { x: 0, y: 1, z: 5 } });
   await engine.call("add-component", { entity: character.id, component: "Collider" });
   await engine.call("set-component-field", {
@@ -84,15 +81,15 @@ test("physics bindings: impulse pushes a body, move_character walks, spherecast 
   await attachScripts(engine, character.id, ["walker.lua"]);
 
   // A probe that spherecasts down onto the floor.
-  const probe = await engine.call<Ref>("add-entity", { args: ["empty"] });
+  const probe = await engine.call("add-entity", { args: ["empty"] });
   await attachScripts(engine, probe.id, ["caster.lua"]);
 
   await engine.call("play");
   await engine.settle(900);
-  expect((await engine.call<PlayState>("get-play-state")).state).toBe("playing");
+  expect((await engine.call("get-play-state")).state).toBe("playing");
 
   const translation = async (entity: string) =>
-    (await engine.call<Inspect>("inspect", { entity })).components.Transform.translation;
+    (await engine.call("inspect", { entity })).components.Transform!.translation;
   expect((await translation(box.id)).z).toBeGreaterThan(0.5); // the impulse pushed it +Z
   expect((await translation(character.id)).x).toBeGreaterThan(0.3); // move_character walked it +X
   expect((await translation(probe.id)).x).toBeCloseTo(1); // spherecast hit the floor

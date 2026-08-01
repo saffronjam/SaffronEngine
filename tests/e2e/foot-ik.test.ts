@@ -15,12 +15,8 @@ let rigId = "";
 let ankleId = "";
 const FIXTURE = join(REPO, "tests", "e2e", "fixtures", "leg.gltf");
 
-interface Inspect {
-  components: { SkinnedMesh?: { bones: string[] } };
-}
-
 const worldY = async (entity: string): Promise<number> =>
-  (await engine.call<{ translation: { y: number } }>("get-world-transform", { entity })).translation.y;
+  (await engine.call("get-world-transform", { entity })).translation.y;
 
 beforeAll(async () => {
   engine = await Engine.boot({ SAFFRON_SCRATCH_PROJECT: "1" });
@@ -30,10 +26,10 @@ beforeAll(async () => {
   // SkinnedMesh/AnimationPlayer/FootIk components live on a mesh descendant. Find that descendant
   // and read its bone list — the generic set-component[-field] commands operate on the exact entity,
   // so they must target the rig descendant, not the root.
-  const list = (await engine.call<{ entities: { id: string }[] }>("list-entities")).entities;
+  const list = (await engine.call("list-entities")).entities;
   let bones: string[] = [];
   for (const e of list) {
-    const skin = (await engine.call<Inspect>("inspect", { entity: e.id })).components.SkinnedMesh;
+    const skin = (await engine.call("inspect", { entity: e.id })).components.SkinnedMesh;
     if (skin) {
       rigId = e.id;
       bones = skin.bones;
