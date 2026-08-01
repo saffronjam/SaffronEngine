@@ -7,8 +7,8 @@ use saffron_spatial::{DecisionScalar, UnitInterval};
 use super::*;
 use crate::{
     AlphaClassification, CoverageSource, ImportedPlantFamilyRecipe, InteractionPolicy,
-    MaterialSurface, MechanicalResponse, PLANT_ASSET_VERSION, PhenotypeRole, PlantDimensions,
-    PlantFamilySource, PlantImportSettings, PlantManualSemanticTarget, PlantPart,
+    MaterialSurface, MechanicalResponse, PLANT_ASSET_VERSION, PhenotypeResponse, PhenotypeRole,
+    PlantDimensions, PlantFamilySource, PlantImportSettings, PlantManualSemanticTarget, PlantPart,
     PlantPartSemantic, PlantPhenotype, PlantPivot, PlantSemanticDestination, PlantSourceLocator,
     PlantSourceReference, PlantSourceRole, PlantSourceSelector, PlantVariation, SourceAxis,
     SourceHandedness, SourceProvenance,
@@ -102,7 +102,7 @@ fn asset() -> PlantFamilyAsset {
         phenotypes: vec![PlantPhenotype {
             id: 0,
             role: PhenotypeRole::Healthy,
-            season_window: None,
+            response: PhenotypeResponse::default(),
             variation: 0,
             material_remap: Vec::new(),
             active_parts: Vec::new(),

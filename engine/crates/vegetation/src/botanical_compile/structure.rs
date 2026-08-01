@@ -4,9 +4,9 @@ use saffron_spatial::{DecisionScalar, UnitInterval};
 
 use crate::{
     BotanicalAssembly, BotanicalAxis, BotanicalElement, BotanicalElementId, BotanicalGraphDocument,
-    Error, PhenotypeRole, PlantCollisionProxy, PlantCollisionShape, PlantDimensions,
-    PlantNavigationProxy, PlantPart, PlantPhenotype, PlantVariation, Result, StructuralSpine,
-    native_variation_source_id, turn_sin_cos,
+    Error, PhenotypeResponse, PhenotypeRole, PlantCollisionProxy, PlantCollisionShape,
+    PlantDimensions, PlantNavigationProxy, PlantPart, PlantPhenotype, PlantVariation, Result,
+    StructuralSpine, native_variation_source_id, turn_sin_cos,
 };
 
 /// Collision proxies one grown plant may derive; a proxy per twig would be a body-per-branch
@@ -257,7 +257,7 @@ pub fn native_phenotypes(grown: &[BotanicalAssembly]) -> Vec<PlantPhenotype> {
             phenotypes.push(PlantPhenotype {
                 id: next,
                 role,
-                season_window: None,
+                response: PhenotypeResponse::default(),
                 variation: index as u32,
                 material_remap: Vec::new(),
                 active_parts,

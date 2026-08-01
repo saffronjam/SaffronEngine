@@ -3,7 +3,7 @@ use saffron_spatial::{DecisionCurve, DecisionScalar, UnitInterval};
 use crate::{Error, PlantPartSemantic, Result};
 
 /// Current botanical operator schema version.
-pub const BOTANICAL_NODE_VERSION: u32 = 1;
+pub const BOTANICAL_NODE_VERSION: u32 = 2;
 
 /// Segment ceiling per axis.
 pub const MAX_SEGMENTS: u32 = 64;
@@ -166,11 +166,12 @@ impl TryFrom<u32> for PhyllotaxisPattern {
 /// Which way a tropism bends an axis.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TropismKind {
-    /// Toward light: upward, away from the shading crown.
+    /// Toward the light: the axis turns to follow the operator's light direction.
     Phototropism,
     /// With gravity: the droop of a loaded branch.
     Gravitropism,
-    /// Away from an obstacle plane.
+    /// Away from an obstacle plane: the axis turns off the plane's outward normal, hardest where
+    /// it is closest to the plane.
     Thigmotropism,
 }
 
@@ -296,12 +297,19 @@ pub enum BotanicalOperator {
         /// Turn between successive attachments, as a signed normalized half-turn.
         divergence: UnitInterval,
     },
-    /// Bends axes toward or away from a direction.
+    /// Bends axes toward the light, with gravity, or off an obstacle plane.
     Tropism {
         /// Which way it bends.
         kind: TropismKind,
         /// How strongly, accumulated along the axis.
         strength: UnitInterval,
+        /// The light direction for `Phototropism` and the obstacle plane's outward normal for
+        /// `Thigmotropism`, in family-local metres. Only its direction is read — the magnitude
+        /// normalizes away. `Gravitropism` carries its own direction and ignores this one.
+        stimulus: [DecisionScalar; 3],
+        /// Signed distance from the family origin to the obstacle plane, along `stimulus`, in
+        /// metres. Only `Thigmotropism` reads it.
+        plane_offset: DecisionScalar,
     },
     /// Removes axes by rule.
     Prune {
@@ -511,7 +519,16 @@ pub(super) fn validate_operator(operator: &BotanicalOperator) -> Result<()> {
                 return Err(field("moduleCall.callGuid"));
             }
         }
-        BotanicalOperator::Family | BotanicalOperator::Tropism { .. } => {}
+        BotanicalOperator::Tropism { kind, stimulus, .. } => {
+            // A zero stimulus names neither a light direction nor a plane, so the bend would have
+            // no axis to follow; gravity supplies its own and does not read it.
+            if !matches!(kind, TropismKind::Gravitropism)
+                && stimulus.iter().all(|component| component.bits() == 0)
+            {
+                return Err(field("tropism.stimulus"));
+            }
+        }
+        BotanicalOperator::Family => {}
     }
     Ok(())
 }

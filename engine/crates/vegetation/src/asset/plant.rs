@@ -4,7 +4,7 @@ use saffron_spatial::{DecisionScalar, FieldChannel, UnitInterval};
 use crate::{Error, InteractionPolicy, Result};
 
 /// Current `.splant` document version.
-pub const PLANT_ASSET_VERSION: u32 = 5;
+pub const PLANT_ASSET_VERSION: u32 = 7;
 
 /// The deepest module chain any family may declare.
 pub const MAX_PLANT_MODULE_RECURSION: u16 = 8;
@@ -327,15 +327,34 @@ pub enum PhenotypeRole {
     Wet,
 }
 
+/// The intrinsic expression curve of one phenotype: the trapezoids over the seasonal
+/// phase, plant health, and plant moisture whose product is the phenotype's weight.
+///
+/// Each band is a `(low, high)` interval the phenotype expresses inside, ramping over
+/// `ramp_mille` at every edge that is interior to its domain. An absent band is not a
+/// constraint; a role whose defaults supply none is never derived, only cooked or
+/// selected by lifecycle.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct PhenotypeResponse {
+    /// Seasonal window `(start, end)` in per-mille of the year, wrapping through 1000;
+    /// `None` derives the role's default window.
+    pub season_window: Option<(u16, u16)>,
+    /// Health band the phenotype expresses in; `None` derives the role's default.
+    pub health_band: Option<(UnitInterval, UnitInterval)>,
+    /// Moisture band the phenotype expresses in; `None` derives the role's default.
+    pub moisture_band: Option<(UnitInterval, UnitInterval)>,
+    /// Edge ramp width in per-mille of each band's own domain; zero is a hard threshold.
+    pub ramp_mille: u16,
+}
+
 /// One plant phenotype/life-state variant.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PlantPhenotype {
     /// Stable family-local phenotype identity.
     pub id: u32,
     pub role: PhenotypeRole,
-    /// Seasonal window `(start, end)` in per-mille of the year in which a seasonal
-    /// role shows, wrapping through 1000; `None` derives the role's default window.
-    pub season_window: Option<(u16, u16)>,
+    /// Intrinsic expression curve over season, health, and moisture.
+    pub response: PhenotypeResponse,
     /// Family variation available to the phenotype.
     pub variation: u32,
     /// Material slot remap `(from, to)`.
@@ -510,4 +529,34 @@ pub struct PlantFamilyAsset {
     pub modules: Vec<PlantModuleReference>,
     /// How deep the module chain below this family may reach.
     pub module_recursion_limit: u16,
+}
+
+impl PlantFamilyAsset {
+    /// Identity of everything this family declares except the observed content hash of each
+    /// external source it names.
+    ///
+    /// A cook reads those sources, records what it observed back into the authored document, and
+    /// publishes a generation in the same operation. Keying a consumer on the observation would
+    /// mean the published generation is keyed on bytes the cook itself replaced, so no recook could
+    /// reproduce it. The observed bytes still reach every artifact through the family's own
+    /// source-file dependencies.
+    ///
+    /// # Errors
+    ///
+    /// A vegetation error when the family does not encode.
+    pub fn declared_identity(&self) -> Result<[u8; 32]> {
+        let mut declared = self.clone();
+        let sources = match &mut declared.source {
+            PlantFamilySource::Imported(recipe) => &mut recipe.sources,
+            PlantFamilySource::Native { grafts, .. } => grafts,
+        };
+        // One fixed pattern rather than zero: a zero observation is not a valid declaration, and
+        // the canonical encoder validates what it writes.
+        for source in sources.iter_mut() {
+            source.content_hash = [0xFF; 32];
+        }
+        let mut preimage = b"saffron-anima/plant-family-declaration/v1\0".to_vec();
+        preimage.extend_from_slice(&crate::write_plant_asset(&declared)?);
+        Ok(crate::vegetation_content_hash(&preimage))
+    }
 }

@@ -1,7 +1,7 @@
 //! The `.splant` plant-family document.
 
 use super::enums::*;
-use super::stream::{Reader, Writer, invalid_enum};
+use super::stream::{Reader, Writer};
 use crate::hash::sha256;
 use crate::*;
 
@@ -10,7 +10,7 @@ const PLANT_MAGIC: &[u8; 8] = b"SPLANT01";
 /// SHA-256 identity of the `.splant` binary field vocabulary.
 #[must_use]
 pub fn plant_asset_schema_hash() -> [u8; 32] {
-    sha256(b"saffron-anima/splant/schema/v5/typed-locators+per-source-provenance+role+selector+coordinate-policy+semantic-targets+family-tags+parts+dimensions+materials+spines+mechanics+variations+phenotypes+collision+navigation+interaction+habitat+ecology+botanical+family-role+modules")
+    sha256(b"saffron-anima/splant/schema/v6/typed-locators+per-source-provenance+role+selector+coordinate-policy+semantic-targets+family-tags+parts+dimensions+materials+spines+mechanics+variations+phenotype-response+collision+navigation+interaction+habitat+ecology+botanical+family-role+modules")
 }
 
 /// Writes one plant family to canonical `.splant` bytes.
@@ -59,14 +59,7 @@ pub fn write_plant_asset(asset: &PlantFamilyAsset) -> Result<Vec<u8>> {
     writer.vec(&asset.phenotypes, |writer, phenotype| {
         writer.u32(phenotype.id);
         writer.u8(phenotype_role_tag(phenotype.role));
-        match phenotype.season_window {
-            Some((start, end)) => {
-                writer.u8(1);
-                writer.u16(start);
-                writer.u16(end);
-            }
-            None => writer.u8(0),
-        }
+        write_phenotype_response(writer, phenotype.response)?;
         writer.u32(phenotype.variation);
         writer.vec(&phenotype.material_remap, |writer, (from, to)| {
             writer.u32(*from);
@@ -168,11 +161,7 @@ pub fn read_plant_asset(bytes: &[u8]) -> Result<PlantFamilyAsset> {
             Ok(PlantPhenotype {
                 id: reader.u32()?,
                 role: phenotype_role(reader.u8()?)?,
-                season_window: match reader.u8()? {
-                    0 => None,
-                    1 => Some((reader.u16()?, reader.u16()?)),
-                    _ => return Err(invalid_enum(".splant", "phenotypes.seasonWindow")),
-                },
+                response: read_phenotype_response(reader)?,
                 variation: reader.u32()?,
                 material_remap: reader.vec(|reader| Ok((reader.u32()?, reader.u32()?)))?,
                 active_parts: reader.vec(Reader::u128)?,
@@ -457,10 +446,17 @@ fn write_botanical_operator(
                 writer.unit(*value);
             }
         }
-        Op::Tropism { kind, strength } => {
+        Op::Tropism {
+            kind,
+            strength,
+            stimulus,
+            plane_offset,
+        } => {
             writer.u8(3);
             writer.u32(kind.tag());
             writer.unit(*strength);
+            writer.fixed3(*stimulus);
+            writer.fixed(*plane_offset);
         }
         Op::Prune {
             rule,
@@ -602,6 +598,8 @@ fn read_botanical_operator(reader: &mut Reader<'_>) -> Result<crate::BotanicalOp
         3 => Op::Tropism {
             kind: crate::TropismKind::try_from(reader.u32()?)?,
             strength: reader.unit()?,
+            stimulus: reader.fixed3()?,
+            plane_offset: reader.fixed()?,
         },
         4 => Op::Prune {
             rule: crate::PruneRule::try_from(reader.u32()?)?,
@@ -871,6 +869,35 @@ fn write_mechanics(writer: &mut Writer, value: MechanicalResponse) {
     writer.fixed(value.break_threshold);
 }
 
+fn write_phenotype_response(writer: &mut Writer, value: PhenotypeResponse) -> Result<()> {
+    writer.option(value.season_window, |writer, (start, end)| {
+        writer.u16(start);
+        writer.u16(end);
+        Ok(())
+    })?;
+    writer.option(value.health_band, |writer, (low, high)| {
+        writer.unit(low);
+        writer.unit(high);
+        Ok(())
+    })?;
+    writer.option(value.moisture_band, |writer, (low, high)| {
+        writer.unit(low);
+        writer.unit(high);
+        Ok(())
+    })?;
+    writer.u16(value.ramp_mille);
+    Ok(())
+}
+
+fn read_phenotype_response(reader: &mut Reader<'_>) -> Result<PhenotypeResponse> {
+    Ok(PhenotypeResponse {
+        season_window: reader.option(|reader| Ok((reader.u16()?, reader.u16()?)))?,
+        health_band: reader.option(|reader| Ok((reader.unit()?, reader.unit()?)))?,
+        moisture_band: reader.option(|reader| Ok((reader.unit()?, reader.unit()?)))?,
+        ramp_mille: reader.u16()?,
+    })
+}
+
 fn read_mechanics(reader: &mut Reader<'_>) -> Result<MechanicalResponse> {
     Ok(MechanicalResponse {
         stiffness: reader.fixed()?,
@@ -939,7 +966,7 @@ mod tests {
             phenotypes: vec![PlantPhenotype {
                 id: 0,
                 role: PhenotypeRole::Healthy,
-                season_window: None,
+                response: PhenotypeResponse::default(),
                 variation: 0,
                 material_remap: Vec::new(),
                 active_parts: Vec::new(),
@@ -954,6 +981,82 @@ mod tests {
             }),
             ecology: crate::PlantEcologyDeclaration::default(),
         }
+    }
+
+    /// What a consumer of a family keys on: everything the family declares, minus the observation
+    /// a cook refreshes. A cook accepts the hash it read and publishes a generation in the same
+    /// operation, so a consumer keyed on the observation cannot be reproduced by recooking the
+    /// authored state that cook left behind.
+    #[test]
+    fn declared_identity_covers_authoring_and_not_the_observed_source_hash() {
+        let mut asset = plant();
+        let PlantFamilySource::Native { grafts, .. } = &mut asset.source else {
+            panic!("the fixture family is native");
+        };
+        grafts.push(PlantSourceReference {
+            id: 77,
+            locator: PlantSourceLocator::Asset(Uuid(9_001)),
+            role: PlantSourceRole::Geometry,
+            selector: PlantSourceSelector::Element {
+                id: 9_001,
+                path: "hero".to_owned(),
+            },
+            content_hash: [0xAB; 32],
+            settings: PlantImportSettings::default(),
+            provenance: crate::SourceProvenance::default(),
+        });
+        let declared = asset.declared_identity().unwrap();
+
+        let mut observed = asset.clone();
+        let PlantFamilySource::Native { grafts, .. } = &mut observed.source else {
+            panic!("the fixture family is native");
+        };
+        grafts[0].content_hash = [0x17; 32];
+        assert_eq!(observed.declared_identity().unwrap(), declared);
+        assert_ne!(
+            write_plant_asset(&observed).unwrap(),
+            write_plant_asset(&asset).unwrap(),
+            "the document itself did move, which is what the identity must ignore"
+        );
+
+        // Everything else about the source is authoring, and re-keys.
+        let mut retargeted = asset.clone();
+        let PlantFamilySource::Native { grafts, .. } = &mut retargeted.source else {
+            panic!("the fixture family is native");
+        };
+        grafts[0].locator = PlantSourceLocator::Asset(Uuid(9_002));
+        assert_ne!(retargeted.declared_identity().unwrap(), declared);
+
+        let mut renamed = asset.clone();
+        renamed.name = "Elm".to_owned();
+        assert_ne!(renamed.declared_identity().unwrap(), declared);
+
+        // An imported family declares its sources the same way, and every declaration the identity
+        // stands in for has to be one the canonical encoder accepts.
+        let PlantFamilySource::Native { grafts, .. } = &asset.source else {
+            panic!("the fixture family is native");
+        };
+        let mut sources = grafts.clone();
+        sources[0].provenance = crate::SourceProvenance {
+            source: "test".to_owned(),
+            source_uri: "file://hero".to_owned(),
+            license_id: "CC0-1.0".to_owned(),
+            license_uri: "https://creativecommons.org/publicdomain/zero/1.0/".to_owned(),
+            ..crate::SourceProvenance::default()
+        };
+        let mut imported = asset.clone();
+        imported.source = PlantFamilySource::Imported(ImportedPlantFamilyRecipe {
+            semantic_targets: vec![PlantManualSemanticTarget {
+                id: 1,
+                source: 77,
+                selector: sources[0].selector.clone(),
+                destination: PlantSemanticDestination::Part(12),
+            }],
+            sources,
+        });
+        imported.variations[0].sources = vec![77];
+        imported.parts[0].sources = vec![77];
+        imported.declared_identity().unwrap();
     }
 
     #[test]

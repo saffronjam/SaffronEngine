@@ -16,7 +16,7 @@ concepts: what breaks, and what must move together.
 
 ## Layout
 
-Thirty-three modules, all declared private in `lib.rs`. Fifteen are directory modules whose
+Thirty-four modules, all declared private in `lib.rs`. Sixteen are directory modules whose
 `mod.rs` fixes the module's public surface; the other eighteen are single files.
 
 | Cluster | Modules |
@@ -28,6 +28,7 @@ Thirty-three modules, all declared private in `lib.rs`. Fifteen are directory mo
 | Plant normalization | `plant_compile/` (format-erased imported families), `virtual_hierarchy.rs` (adapters onto `saffron-geometry`) |
 | Derived artifacts | `artifact/` (`.svegcell` / `.splantc` containers plus the KTX2 texture payload in `texture.rs`), `cell_facet.rs` (the typed facet payloads inside a `.svegcell`), `manifest.rs` (the immutable world manifest), `cook/` (`ContentHash`, `CookVersionSet`, the cook graph), `cook_work.rs` (the distributed work-item manifest) |
 | Runtime + persistence | `runtime_world/` (`VegetationWorld`, generations, residency, queries), `mutation/` (typed persistent mutations), `state_codec/` (state + save containers) |
+| Network session | `network/` (base-manifest handshake, per-cell facet interest, checkpoint fingerprints, late join) |
 | Ecology | `ecology.rs` (the clock and state), `ecology_region.rs` (dependency-region closure plus the `CellSpatialIndex` grid the closure and halo lookup query), `ecology_tick/` (`advance_cell`, the pure rules), `season.rs` |
 | Interchange | `interchange.rs` (Houdini/JSON points), `interchange_usd.rs` (USDA `PointInstancer` text form) |
 | Identity | `identity.rs` (`derive_procedural_plant_id`, collision table), `hash.rs` (the one SHA-256) |
@@ -47,7 +48,7 @@ fixtures. `tests/operator_coverage/` is the only integration test — one `main.
   `vegetation_cooker/` and `plant_cook/` drive cooking). The crate re-exports
   `saffron_material::*` rather than restating surface, coverage, thin-sheet, or opacity-micromap
   vocabulary — `saffron-material` owns that, and a second definition here is a second truth.
-- **`lib.rs` glob-re-exports 27 of the 33 modules, so `pub` publishes instantly and silently.** A new
+- **`lib.rs` glob-re-exports 28 of the 34 modules, so `pub` publishes instantly and silently.** A new
   helper marked `pub` becomes crate API the moment you save, with no `lib.rs` edit to review. New
   internals are `pub(crate)`. `binary`, `canonical`, `memory`, and `state_codec` are internal in
   full (`state_codec` publishes only inherent impls on already-exported types); `error`, `hash`, and
@@ -62,11 +63,15 @@ fixtures. `tests/operator_coverage/` is the only integration test — one `main.
   `season.rs` reads one `f32` latitude, for a hemisphere sign test only — it never reaches
   arithmetic. No other module contains a float at all, and **no lint enforces this** —
   `clippy::float_arithmetic` is off — so it holds only if you keep it.
-- **Trigonometry is an integer table, never libm.** `turn_sin_cos` in `botanical/shape.rs` is a
-  17-entry quarter-turn table, and its doc comment is the reason: "A table rather than `f64`: an
-  authored plant must grow the same on every target, and a libm difference of one bit would move a
-  branch." `botanical/grow.rs`, `botanical_compile/`, and `botanical_edit/` all call it. Nothing
-  here calls `f64::sin`.
+- **Trigonometry is integer, never libm, and there are two routines.** `turn_sin_cos` in
+  `botanical/shape.rs` is a 17-entry quarter-turn table, and its doc comment is the reason: "A table
+  rather than `f64`: an authored plant must grow the same on every target, and a libm difference of
+  one bit would move a branch." `botanical/grow.rs`, `botanical_compile/`, and `botanical_edit/` all
+  call it. `cordic_sin_cos` in `evaluator/math.rs` is a 16-iteration Q30 CORDIC feeding
+  `yaw_quaternion_q15` (the cooked orientation column) and the random-direction path in
+  `evaluator/generate.rs`. Both are swept and pinned by digest — `turn_table_sweep_is_byte_pinned`,
+  `cordic_sweep_is_byte_pinned`, `cooked_yaw_orientation_sweep_is_byte_pinned` — so a target that
+  answers one bit differently fails rather than cooks. Nothing here calls `f64::sin`.
 - **Every map is a `BTreeMap`/`BTreeSet`.** `grep -rn "HashMap\|HashSet" engine/crates/vegetation/src`
   returns nothing, and must keep returning nothing — iteration order reaches published bytes. There
   is no `rand::` and no `SystemTime` either. `Instant::now()` appears only in deadline and
@@ -83,13 +88,23 @@ fixtures. `tests/operator_coverage/` is the only integration test — one `main.
   cell bytes, family — appended in that order at those widths. Reordering, rewidening, or bumping a
   node's semantic revision when its meaning did not change re-keys plants that should have been
   stable. The golden digest is pinned in `identity.rs`; if it moves, you changed identity.
+- **Every packed tile grid linearizes with Z fastest and X slowest**: `(x * dims[1] + y) * dims[2] + z`,
+  written by `evaluator/math.rs::tile_index` and inverted by `tile_sample_position`. It governs the
+  authored `AuthoredFieldTile::values` payload *and* the cooked `MicroFieldTile::density` payload,
+  which `saffron-assets` copies to the GPU verbatim. Three readers decode it and all three must
+  agree: `EvaluationFieldTile::sample_index`, `runtime_world/query.rs::query_micro_ray`, and
+  `microTexel` in `engine/assets/shaders/scene_micro_common.slang`. Square dimensions turn a
+  transposed decode into a symmetric relabel that no square-dims fixture can see, so a test that
+  pins this order uses non-square dimensions
+  (`micro_density_texels_linearize_with_z_fastest`,
+  `micro_ray_reads_a_non_square_tile_in_the_canonical_texel_order`).
 - **Thirty-six domain-separated hash preimages exist**, each a `saffron-anima/…/vN` string next to
   the encoder it protects. A domain string, a field order, and a field width are all part of the
   contract. Version the string in the same change as the encoder.
 - **A format change moves four things together:** the writer, the reader, the version constant, and
   the schema-hash domain string. The codec tests corrupt the version byte and the first schema byte
   precisely to prove both are load-bearing. Magic strings do not carry the version (`SPLANT01` holds
-  `PLANT_ASSET_VERSION = 5`) — except `SVEGMAN4` and `SVCGPH04`, where the digit is part of the
+  `PLANT_ASSET_VERSION = 7`) — except `SVEGMAN4` and `SVCGPH04`, where the digit is part of the
   magic and both move at once.
 - **No migrations, ever.** A noncurrent graph, node, asset, artifact, or state version is rejected
   with a typed error. There is no best-effort reinterpretation of an unknown or corrupt section.
@@ -99,13 +114,24 @@ fixtures. `tests/operator_coverage/` is the only integration test — one `main.
   content size on, and long-distance matching off; a section stores `Zstd` only when it is actually
   smaller, otherwise `Raw`. Changing a knob — or the zstd version — changes every artifact hash.
   Sections are written sorted by kind and duplicates are a hard error.
+- **Simulation ownership is runtime-only state, like bulk suppression.** `plant_authority` and
+  `authority_epoch` on `VegetationWorld` record who last claimed *where a plant is* or *whether it
+  exists*; `claims_simulation_ownership` in `runtime_world/state.rs` is the closed list of mutations
+  that claim, and everything else is biology. Neither is persisted and neither survives
+  `replace_persistent_state`, which clears the map and bumps the epoch — that is how a save load, a
+  snapshot import, and a network join are all noticed by one test.
+- **The promotion write-back's velocity reaches readers through the generation, not the delta.**
+  `CellPersistentOverlay::from_state` lifts each plant's `promotion_origin` velocity into the
+  published generation so `VegetationPlantSnapshot` carries it; a build path that skips the overlay
+  publishes a cell whose plants have silently come to rest.
 - **`mutation_tag` is a fixed discriminant table.** Persisted ordering is
   `(cell bytes, mutation_tag, plant id, idempotency key)`, so reordering the `VegetationMutation`
   variants without preserving their tags reorders every persisted tail. Add new variants at the end
   with new tags.
 - **`CookVersionSet::current()` participates in every cook identity.** Bump `numeric` when
-  `DecisionScalar`, `UnitInterval`, `div_round_ties_even`, or `turn_sin_cos` semantics change; bump
-  `evaluator` when evaluation results change; `validate()` rejects a zero in any field.
+  `DecisionScalar`, `UnitInterval`, `div_round_ties_even`, `turn_sin_cos`, or `cordic_sin_cos`
+  semantics change; bump `evaluator` when evaluation results change; `validate()` rejects a zero in
+  any field.
 - **`ECOLOGY_SIMULATION_VERSION` mismatch is a hard error, never a silent re-simulation.** Its doc
   comment carries the trigger: bump it whenever a rule, a coefficient, an evaluation order, or a
   numeric convention changes. State simulated under old rules must not quietly advance under new
@@ -129,6 +155,13 @@ fixtures. `tests/operator_coverage/` is the only integration test — one `main.
 - **The point schema hash covers every column.** `point_schema_hash` folds each of the 25
   `POINT_SCHEMA_COLUMNS` by id, element type, and name. Adding, removing, renaming, retyping, or
   reordering a column invalidates every `.svegcell` macro-point section and every persisted point.
+- **CPU cost tracks macro rows, never micro blade count.** `MacroBvh` is built over macro row bounds
+  alone and the micro field is a quantized tile, so a cell reconstructing fifty thousand blades costs
+  the same bytes and the same traversal as one reconstructing fifty. Every `runtime_world/query.rs`
+  entry point drains its traversal into `VegetationQueryCost`, which is what makes that testable —
+  a query that walked the tiles and discarded them returns identical plants and would otherwise go
+  unnoticed. `cpu_bytes_and_query_work_track_macro_rows_never_micro_blade_count` compares two worlds
+  that differ only in density.
 - **`cell_facet.rs` has no direct tests.** It is covered only through an evaluator test that decodes
   the canonical encoder output. Know that before changing a facet decoder.
 - **`saffron-wind` is the determinism exception, and it is not a dependency here.** That crate is
@@ -142,7 +175,10 @@ Authored documents live in the project and are versioned by the user. Derived ar
 content-addressed store at `<project>/cache/vegetation/`, beside `assets/` rather than inside it,
 and are disposable: deleting the cache loses no authored and no persistent runtime state. That holds
 because persistent state has a separate durable root, `<project>/state/vegetation/` — the `.svegstate`
-baseline a generation ships is the one derived-looking file no cook reproduces.
+baseline a map ships is the one derived-looking file no cook reproduces. It binds to one generation
+and a recook publishes another, so it rebases onto the incoming base rather than being dropped
+(`VegetationState::rebase`): the identity moves, every delta crosses, and a delta the new base has no
+ground for is inert rather than deleted.
 
 | Extension | Magic | Version const | Owner |
 |---|---|---|---|
@@ -185,7 +221,7 @@ with `complete()`, so trailing bytes are an error. Lengths are `u64` in `binary.
 | layer / chunk | An ordered element of the map algebra; a sparse addressable piece of a `.svegmap` so one stroke rewrites only what it touched. |
 | provenance | The interned lineage handle from map through layer, graph, node, and candidate to the plant. |
 | generation | A published immutable cell payload. Any change republishes with a new id; consumers diff by id. |
-| manifest / baseline | The immutable world identity that saves bind to; the initial persistent state keyed by that manifest, one per generation. |
+| manifest / baseline | The immutable world identity that saves bind to; the persistent state a map boots into, one per map, naming the generation it was reduced against. |
 | region | The transitive dependency closure an ecology tick needs resident before it may run. |
 
 ## What this system is not

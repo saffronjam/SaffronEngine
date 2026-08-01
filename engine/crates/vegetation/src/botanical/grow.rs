@@ -356,10 +356,15 @@ fn grow_nodes(
                 }
                 frames_out.insert(guid, frames);
             }
-            BotanicalOperator::Tropism { kind, strength } => {
+            BotanicalOperator::Tropism {
+                kind,
+                strength,
+                stimulus,
+                plane_offset,
+            } => {
                 let mut axes = input_axes("axes");
                 for axis in &mut axes {
-                    bend(axis, *kind, *strength);
+                    bend(axis, *kind, *strength, *stimulus, *plane_offset);
                 }
                 axes_out.insert(guid, axes);
             }
@@ -727,6 +732,8 @@ mod tests {
             BotanicalOperator::Tropism {
                 kind: TropismKind::Gravitropism,
                 strength: UnitInterval::from_bits(40_000),
+                stimulus: [DecisionScalar::from_bits(0); 3],
+                plane_offset: DecisionScalar::from_bits(0),
             },
         ));
         // Branches droop, then feed the same frames and shells.

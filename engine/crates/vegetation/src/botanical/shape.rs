@@ -147,25 +147,54 @@ pub(super) fn sample_axis(
     Ok((position, direction, radius))
 }
 
-/// Bends an axis, accumulating along its length so the tip moves most and the base not at all.
-/// The displacement is measured from how far along the axis a point sits, never from its current
-/// height — otherwise an already-drooping branch would be *lifted* by gravity.
-pub(super) fn bend(axis: &mut BotanicalAxis, kind: TropismKind, strength: UnitInterval) {
+/// `direction` scaled to unit length in `UnitInterval` bits, or `None` when it is degenerate.
+fn unit_direction(direction: [i64; 3]) -> Option<[i64; 3]> {
+    let magnitude = isqrt(direction.iter().map(|lane| lane * lane).sum());
+    if magnitude == 0 {
+        return None;
+    }
+    let one = i64::from(UnitInterval::ONE.bits());
+    Some(std::array::from_fn(|lane| {
+        direction[lane] * one / magnitude
+    }))
+}
+
+/// Bends an axis toward its stimulus, accumulating along the length so the tip moves most and the
+/// base not at all. The displacement is measured from how far along the axis a point sits, never
+/// from its current height — otherwise an already-drooping branch would be *lifted* by gravity.
+///
+/// `stimulus` is the light direction for phototropism and the obstacle plane's outward normal for
+/// thigmotropism; gravitropism supplies its own downward direction. A thigmotropic bend also scales
+/// with each point's distance to the plane at `plane_offset`, fading to nothing one axis length
+/// clear of it, so a branch that never approaches the obstacle grows straight.
+pub(super) fn bend(
+    axis: &mut BotanicalAxis,
+    kind: TropismKind,
+    strength: UnitInterval,
+    stimulus: [DecisionScalar; 3],
+    plane_offset: DecisionScalar,
+) {
     if strength.bits() == 0 || axis.points.len() < 2 {
         return;
     }
-    let sign: i64 = match kind {
-        TropismKind::Phototropism => 1,
-        TropismKind::Gravitropism | TropismKind::Thigmotropism => -1,
-    };
     let one = i64::from(UnitInterval::ONE.bits());
+    let authored: [i64; 3] = match kind {
+        TropismKind::Gravitropism => [0, -one, 0],
+        TropismKind::Phototropism | TropismKind::Thigmotropism => {
+            std::array::from_fn(|lane| i64::from(stimulus[lane].bits()))
+        }
+    };
+    let Some(unit) = unit_direction(authored) else {
+        return;
+    };
+    let reach = i64::from(axis.length().bits()).max(1);
     let base = axis.points[0];
     let count = (axis.points.len() - 1) as i64;
     for (step, point) in axis.points.iter_mut().enumerate().skip(1) {
         let travelled = isqrt(
             (0..3)
                 .map(|lane| {
-                    let delta = i64::from(point[lane].bits() - base[lane].bits());
+                    let delta = i64::from(point[lane].bits()) - i64::from(base[lane].bits());
                     delta * delta
                 })
                 .sum(),
@@ -173,12 +202,29 @@ pub(super) fn bend(axis: &mut BotanicalAxis, kind: TropismKind, strength: UnitIn
         // Quadratic in distance travelled: a smooth arc rather than a kink at the base.
         let step = step as i64;
         let share = step * step * one / (count * count).max(1);
-        let displacement = i64::from(strength.bits()) * travelled / one * share / one;
-        point[1] = DecisionScalar::from_bits(
-            point[1]
-                .bits()
-                .saturating_add(i32::try_from(sign * displacement).unwrap_or(0)),
-        );
+        let mut displacement = i64::from(strength.bits()) * travelled / one * share / one;
+        if matches!(kind, TropismKind::Thigmotropism) {
+            let signed = (0..3)
+                .map(|lane| unit[lane] * i64::from(point[lane].bits()))
+                .sum::<i64>()
+                / one
+                - i64::from(plane_offset.bits());
+            // Inside the obstacle the response is full; outside it falls linearly to nothing.
+            let proximity = if signed <= 0 {
+                one
+            } else {
+                (one - signed * one / reach).max(0)
+            };
+            displacement = displacement * proximity / one;
+        }
+        for lane in 0..3 {
+            let delta = displacement * unit[lane] / one;
+            point[lane] = DecisionScalar::from_bits(
+                point[lane]
+                    .bits()
+                    .saturating_add(i32::try_from(delta).unwrap_or(0)),
+            );
+        }
     }
 }
 
@@ -228,6 +274,36 @@ mod tests {
     use super::super::grow::{BotanicalBudget, NoBotanicalModules, grow};
     use super::super::tests_support::birch;
     use super::*;
+    use crate::hash::sha256;
+
+    /// The turn table is a cross-target contract, so the whole sweep is pinned by digest rather
+    /// than compared against a tolerance: one differing bit moves a branch on some other machine.
+    #[test]
+    fn turn_table_sweep_is_byte_pinned() {
+        const QUARTER: i64 = 16_384;
+        assert_eq!(turn_sin_cos(0), (0, 65_534));
+        assert_eq!(turn_sin_cos(QUARTER), (65_534, 0));
+        assert_eq!(turn_sin_cos(2 * QUARTER), (0, -65_534));
+        assert_eq!(turn_sin_cos(-QUARTER), (-65_534, 0));
+
+        let mut bytes = Vec::new();
+        let mut turn = -4 * QUARTER;
+        while turn <= 4 * QUARTER {
+            let (sin, cos) = turn_sin_cos(turn);
+            bytes.extend_from_slice(&sin.to_be_bytes());
+            bytes.extend_from_slice(&cos.to_be_bytes());
+            turn += 37;
+        }
+        assert_eq!(bytes.len(), 56_688);
+        assert_eq!(
+            sha256(&bytes),
+            [
+                0xa1, 0x28, 0xcf, 0x5c, 0x46, 0xa7, 0xf4, 0x1b, 0x7e, 0xe8, 0x58, 0x94, 0xc5, 0xd9,
+                0x75, 0xf6, 0xf7, 0x6b, 0x24, 0x02, 0x53, 0x7e, 0x8c, 0x1a, 0x7d, 0x45, 0x7a, 0xef,
+                0x39, 0x8c, 0x69, 0x64,
+            ]
+        );
+    }
 
     /// Pruning removes axes by rule and keeps canonical order, so what survives cannot depend on
     /// the order the axes arrived in.
@@ -273,5 +349,95 @@ mod tests {
         assert!(high.iter().all(
             |axis| axis.base_height().bits() >= DecisionScalar::from_integer(4).unwrap().bits()
         ));
+    }
+
+    /// A horizontal axis of `length` metres running along +X from the origin.
+    fn horizontal_axis(length: i32) -> BotanicalAxis {
+        straight_axis(AxisSeed {
+            id: BotanicalElementId::root(1, 0),
+            parent: None,
+            element: BotanicalElement::Branch,
+            base: [DecisionScalar::from_bits(0); 3],
+            direction: [65_536, 0, 0],
+            length: DecisionScalar::from_integer(length).expect("finite length"),
+            base_radius: DecisionScalar::from_bits(6_553),
+            taper: &linear_taper(),
+            segments: 6,
+        })
+        .expect("a straight axis")
+    }
+
+    /// Each tropism reads its own stimulus: gravity pulls down, light pulls along the authored
+    /// direction, and contact pushes off the obstacle plane. No two of them agree.
+    #[test]
+    fn each_tropism_follows_its_own_stimulus() {
+        let strength = UnitInterval::from_bits(40_000);
+        let zero = [DecisionScalar::from_bits(0); 3];
+        let tip = |axis: &BotanicalAxis| axis.points.last().copied().expect("a tip");
+
+        let mut gravity = horizontal_axis(4);
+        bend(
+            &mut gravity,
+            TropismKind::Gravitropism,
+            strength,
+            zero,
+            DecisionScalar::from_bits(0),
+        );
+        assert!(tip(&gravity)[1].bits() < 0, "gravity pulls the tip down");
+
+        // Light coming from +Z: the tip leans that way and does not move vertically.
+        let mut light = horizontal_axis(4);
+        bend(
+            &mut light,
+            TropismKind::Phototropism,
+            strength,
+            [
+                DecisionScalar::from_bits(0),
+                DecisionScalar::from_bits(0),
+                DecisionScalar::from_integer(1).unwrap(),
+            ],
+            DecisionScalar::from_bits(0),
+        );
+        assert!(tip(&light)[2].bits() > 0, "the tip leans toward the light");
+        assert_eq!(tip(&light)[1].bits(), 0, "a +Z light lifts nothing");
+
+        // A wall facing +Z one metre away: contact pushes the axis off it.
+        let normal = [
+            DecisionScalar::from_bits(0),
+            DecisionScalar::from_bits(0),
+            DecisionScalar::from_integer(1).unwrap(),
+        ];
+        let mut contact = horizontal_axis(4);
+        bend(
+            &mut contact,
+            TropismKind::Thigmotropism,
+            strength,
+            normal,
+            DecisionScalar::from_integer(-1).unwrap(),
+        );
+        assert!(
+            tip(&contact)[2].bits() > 0,
+            "contact pushes away from the plane"
+        );
+        assert_ne!(
+            tip(&contact),
+            tip(&gravity),
+            "contact is not gravity by another name"
+        );
+
+        // The same wall pushed far out of reach: the axis grows straight.
+        let mut clear = horizontal_axis(4);
+        bend(
+            &mut clear,
+            TropismKind::Thigmotropism,
+            strength,
+            normal,
+            DecisionScalar::from_integer(-40).unwrap(),
+        );
+        assert_eq!(
+            tip(&clear),
+            tip(&horizontal_axis(4)),
+            "a plane out of reach bends nothing"
+        );
     }
 }

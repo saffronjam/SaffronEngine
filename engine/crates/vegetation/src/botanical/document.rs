@@ -179,7 +179,7 @@ impl BotanicalGraphDocument {
     /// Canonical bytes: the graph's exact identity, and the cache key its compiled family hangs on.
     #[must_use]
     pub fn canonical_bytes(&self) -> Vec<u8> {
-        let mut bytes = b"saffron-anima/botanical-graph/v1".to_vec();
+        let mut bytes = b"saffron-anima/botanical-graph/v2".to_vec();
         bytes.extend_from_slice(&(self.variations.len() as u64).to_be_bytes());
         for variation in &self.variations {
             bytes.extend_from_slice(&variation.seed.to_be_bytes());
@@ -430,9 +430,18 @@ fn push_operator(bytes: &mut Vec<u8>, operator: &BotanicalOperator) {
                 push_unit(bytes, *value);
             }
         }
-        BotanicalOperator::Tropism { kind, strength } => {
+        BotanicalOperator::Tropism {
+            kind,
+            strength,
+            stimulus,
+            plane_offset,
+        } => {
             bytes.extend_from_slice(&kind.tag().to_be_bytes());
             push_unit(bytes, *strength);
+            for component in stimulus {
+                push_scalar(bytes, *component);
+            }
+            push_scalar(bytes, *plane_offset);
         }
         BotanicalOperator::Prune {
             rule,
