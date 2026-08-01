@@ -478,25 +478,30 @@ pub const BINDINGS: &[Binding] = &[
         [
             ("ox": "number"), ("oy": "number"), ("oz": "number"),
             ("dx": "number"), ("dy": "number"), ("dz": "number"),
-            ("max_dist": "number"),
+            ("max_dist": "number"), ("filter": "any"),
         ],
         Some("PlantHit"),
-        "Closest macro plant whose bounds the ray enters (bounds-level, not a physics cast)."
+        "Closest macro plant whose bounds the ray enters, narrowed by an optional \
+         { families, tags, lifecycles, policies } filter (bounds-level, not a physics cast)."
     ),
     binding!(
         "vegetation_nearest", None, BindingKind::Free,
-        [("x": "number"), ("y": "number"), ("z": "number"), ("radius": "number")],
+        [
+            ("x": "number"), ("y": "number"), ("z": "number"),
+            ("radius": "number"), ("filter": "any"),
+        ],
         Some("PlantHit"),
-        "The macro plant nearest a point within `radius`."
+        "The macro plant nearest a point within `radius`, narrowed by an optional filter."
     ),
     binding!(
         "vegetation_in_radius", None, BindingKind::Free,
         [
             ("x": "number"), ("y": "number"), ("z": "number"),
-            ("radius": "number"), ("limit": "number"),
+            ("radius": "number"), ("limit": "number"), ("filter": "any"),
         ],
         Some("any"),
-        "Macro plants within `radius`, nearest first, capped at `limit` (default 64)."
+        "Macro plants within `radius`, nearest first, capped at `limit` (default 64), narrowed \
+         by an optional filter."
     ),
     binding!(
         "vegetation_damage", None, BindingKind::Free,
@@ -746,12 +751,24 @@ pub fn register_scene_globals(lua: &Lua) -> Result<()> {
     // reducer and reports whether it committed.
     let vegetation_raycast = lua
         .create_function(
-            |lua, (ox, oy, oz, dx, dy, dz, max_dist): (f32, f32, f32, f32, f32, f32, f32)| {
+            |lua,
+             (ox, oy, oz, dx, dy, dz, max_dist, filter): (
+                f32,
+                f32,
+                f32,
+                f32,
+                f32,
+                f32,
+                f32,
+                Option<Table>,
+            )| {
                 let origin = glam::Vec3::new(ox, oy, oz);
                 let dir = glam::Vec3::new(dx, dy, dz);
-                let hit =
-                    session::with_bridge(|bridge| bridge.vegetation_raycast(origin, dir, max_dist))
-                        .flatten();
+                let filter = plant_filter(filter.as_ref())?;
+                let hit = session::with_bridge(|bridge| {
+                    bridge.vegetation_raycast(origin, dir, max_dist, &filter)
+                })
+                .flatten();
                 plant_hit_table(lua, hit)
             },
         )
@@ -760,33 +777,48 @@ pub fn register_scene_globals(lua: &Lua) -> Result<()> {
         .map_err(runtime)?;
 
     let vegetation_nearest = lua
-        .create_function(|lua, (x, y, z, radius): (f32, f32, f32, f32)| {
-            let position = glam::Vec3::new(x, y, z);
-            let hit = session::with_bridge(|bridge| bridge.vegetation_nearest(position, radius))
+        .create_function(
+            |lua, (x, y, z, radius, filter): (f32, f32, f32, f32, Option<Table>)| {
+                let position = glam::Vec3::new(x, y, z);
+                let filter = plant_filter(filter.as_ref())?;
+                let hit = session::with_bridge(|bridge| {
+                    bridge.vegetation_nearest(position, radius, &filter)
+                })
                 .flatten();
-            plant_hit_table(lua, hit)
-        })
+                plant_hit_table(lua, hit)
+            },
+        )
         .map_err(runtime)?;
     sa.set("vegetation_nearest", vegetation_nearest)
         .map_err(runtime)?;
 
-    let vegetation_in_radius = lua
-        .create_function(
-            |lua, (x, y, z, radius, limit): (f32, f32, f32, f32, Option<u32>)| {
-                let position = glam::Vec3::new(x, y, z);
-                let limit = limit.unwrap_or(64) as usize;
-                let hits = session::with_bridge(|bridge| {
-                    bridge.vegetation_in_radius(position, radius, limit)
-                })
-                .unwrap_or_default();
-                let list = lua.create_table()?;
-                for (index, hit) in hits.into_iter().enumerate() {
-                    list.set(index + 1, plant_hit_table(lua, Some(hit))?)?;
-                }
-                Ok(list)
-            },
-        )
-        .map_err(runtime)?;
+    let vegetation_in_radius =
+        lua
+            .create_function(
+                |lua,
+                 (x, y, z, radius, limit, filter): (
+                    f32,
+                    f32,
+                    f32,
+                    f32,
+                    Option<u32>,
+                    Option<Table>,
+                )| {
+                    let position = glam::Vec3::new(x, y, z);
+                    let limit = limit.unwrap_or(64) as usize;
+                    let filter = plant_filter(filter.as_ref())?;
+                    let hits = session::with_bridge(|bridge| {
+                        bridge.vegetation_in_radius(position, radius, limit, &filter)
+                    })
+                    .unwrap_or_default();
+                    let list = lua.create_table()?;
+                    for (index, hit) in hits.into_iter().enumerate() {
+                        list.set(index + 1, plant_hit_table(lua, Some(hit))?)?;
+                    }
+                    Ok(list)
+                },
+            )
+            .map_err(runtime)?;
     sa.set("vegetation_in_radius", vegetation_in_radius)
         .map_err(runtime)?;
 
@@ -826,6 +858,86 @@ pub fn register_scene_globals(lua: &Lua) -> Result<()> {
     sa.set("log", log).map_err(runtime)?;
 
     Ok(())
+}
+
+/// Reads the optional `{ families, tags, lifecycles, policies }` filter table a vegetation query
+/// takes. Each field is a list; a number is accepted wherever a decimal-string id is, because a
+/// script that read a family id off a hit table has it as a Lua number.
+fn plant_filter(table: Option<&Table>) -> mlua::Result<crate::bridge::ScriptPlantFilter> {
+    let Some(table) = table else {
+        return Ok(crate::bridge::ScriptPlantFilter::default());
+    };
+    Ok(crate::bridge::ScriptPlantFilter {
+        families: filter_list(table, "families")?,
+        required_tags: filter_list(table, "tags")?,
+        lifecycles: filter_list(table, "lifecycles")?,
+        interaction_policies: filter_list(table, "policies")?,
+    })
+}
+
+fn filter_list(table: &Table, key: &str) -> mlua::Result<Vec<String>> {
+    let value: LuaValue = table.get(key)?;
+    let LuaValue::Table(list) = value else {
+        return Ok(Vec::new());
+    };
+    let mut values = Vec::new();
+    for entry in list.sequence_values::<LuaValue>() {
+        values.push(match entry? {
+            LuaValue::String(text) => text.to_str()?.to_owned(),
+            LuaValue::Integer(number) => number.to_string(),
+            LuaValue::Number(number) => (number as i64).to_string(),
+            other => {
+                return Err(mlua::Error::runtime(format!(
+                    "vegetation filter '{key}' takes strings or numbers, got {}",
+                    other.type_name()
+                )));
+            }
+        });
+    }
+    Ok(values)
+}
+
+/// Shapes one committed vegetation transition into the table `on_vegetation_event` receives.
+/// Absent fields are omitted rather than nil-valued, so a handler tests presence with `if`.
+pub(crate) fn vegetation_event_table(
+    lua: &Lua,
+    event: &crate::runtime::VegetationEventInfo,
+) -> mlua::Result<Table> {
+    let table = lua.create_table()?;
+    table.set("seq", event.seq)?;
+    table.set("kind", event.kind)?;
+    if let Some(plant) = &event.plant {
+        table.set("plant", plant.as_str())?;
+    }
+    let cell = lua.create_table()?;
+    cell.set("x", event.cell[0])?;
+    cell.set("y", event.cell[1])?;
+    cell.set("z", event.cell[2])?;
+    cell.set("level", event.cell_level)?;
+    table.set("cell", cell)?;
+    if let Some(lifecycle) = event.lifecycle {
+        table.set("lifecycle", lifecycle)?;
+    }
+    if let Some(lifecycle) = event.previous_lifecycle {
+        table.set("previous_lifecycle", lifecycle)?;
+    }
+    if let Some(phenotype) = event.phenotype {
+        table.set("phenotype", phenotype)?;
+    }
+    for (key, value) in [
+        ("amount", event.amount),
+        ("health", event.health),
+        ("moisture", event.moisture),
+        ("fuel", event.fuel),
+    ] {
+        if let Some(value) = value {
+            table.set(key, value)?;
+        }
+    }
+    if let Some(categories) = event.categories {
+        table.set("categories", categories)?;
+    }
+    Ok(table)
 }
 
 /// Shapes a [`ScriptRayHit`] POD into the `{hit, distance, point, normal, entity | plant}` Lua

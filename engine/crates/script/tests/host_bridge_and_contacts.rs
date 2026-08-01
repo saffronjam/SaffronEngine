@@ -16,8 +16,8 @@ use saffron_scene::{
     Transform, register_builtin_components,
 };
 use saffron_script::{
-    ContactInfo, ScriptHitTarget, ScriptHost, ScriptHostBridge, ScriptRagdollState, ScriptRayHit,
-    ScriptRunError,
+    ContactInfo, ScriptHitTarget, ScriptHost, ScriptHostBridge, ScriptPlantFilter, ScriptPlantHit,
+    ScriptRagdollState, ScriptRayHit, ScriptRunError, VegetationEventInfo,
 };
 
 /// Builds a [`ContactInfo`] for the tests' a/b uuids.
@@ -58,6 +58,34 @@ enum Call {
     SetRagdollBlend(Uuid, bool, f32),
     RagdollState(Uuid),
     LogSink(Uuid, String),
+    VegetationQuery(&'static str, ScriptPlantFilter),
+}
+
+/// The one plant the stub knows about: a mature, harvestable oak of family 7 carrying tag 42.
+/// A query answers with it only when the filter accepts it, so a filter that never left Lua
+/// changes the answer.
+const STUB_PLANT_FAMILY: &str = "7";
+const STUB_PLANT_TAG: &str = "42";
+
+fn stub_plant_matches(filter: &ScriptPlantFilter) -> bool {
+    let accepts = |allowed: &[String], value: &str| {
+        allowed.is_empty() || allowed.iter().any(|entry| entry == value)
+    };
+    accepts(&filter.families, STUB_PLANT_FAMILY)
+        && filter.required_tags.iter().all(|tag| tag == STUB_PLANT_TAG)
+        && accepts(&filter.lifecycles, "mature")
+        && accepts(&filter.interaction_policies, "harvestable")
+}
+
+fn stub_plant_hit() -> ScriptPlantHit {
+    ScriptPlantHit {
+        plant: "0123456789abcdef0123456789abcdef".to_owned(),
+        position: Vec3::new(1.0, 2.0, 3.0),
+        distance: 4.0,
+        lifecycle: "mature".to_owned(),
+        health: 1.0,
+        interaction_policy: "harvestable".to_owned(),
+    }
 }
 
 /// A recording stub bridge: returns fixed POD results and logs every call into a shared
@@ -150,16 +178,20 @@ impl ScriptHostBridge for RecordingBridge {
         _origin: Vec3,
         _dir: Vec3,
         _max_dist: f32,
-    ) -> Option<saffron_script::ScriptPlantHit> {
-        None
+        filter: &ScriptPlantFilter,
+    ) -> Option<ScriptPlantHit> {
+        self.record(Call::VegetationQuery("raycast", filter.clone()));
+        stub_plant_matches(filter).then(stub_plant_hit)
     }
 
     fn vegetation_nearest(
         &self,
         _position: Vec3,
         _radius: f32,
-    ) -> Option<saffron_script::ScriptPlantHit> {
-        None
+        filter: &ScriptPlantFilter,
+    ) -> Option<ScriptPlantHit> {
+        self.record(Call::VegetationQuery("nearest", filter.clone()));
+        stub_plant_matches(filter).then(stub_plant_hit)
     }
 
     fn vegetation_in_radius(
@@ -167,8 +199,14 @@ impl ScriptHostBridge for RecordingBridge {
         _position: Vec3,
         _radius: f32,
         _limit: usize,
-    ) -> Vec<saffron_script::ScriptPlantHit> {
-        Vec::new()
+        filter: &ScriptPlantFilter,
+    ) -> Vec<ScriptPlantHit> {
+        self.record(Call::VegetationQuery("in_radius", filter.clone()));
+        if stub_plant_matches(filter) {
+            vec![stub_plant_hit()]
+        } else {
+            Vec::new()
+        }
     }
 
     fn vegetation_damage(&self, _plant: &str, _amount: f32) -> bool {
@@ -529,4 +567,117 @@ fn failing_handler_returns_a_script_run_error() {
         contact(ub, ua, true, true, Vec3::ZERO, Vec3::ZERO),
     );
     assert!(again.is_none(), "the VM survives a faulting handler");
+}
+
+/// The `sa.vegetation_*` queries carry their filter across the POD seam, and the filter is what
+/// decides the answer: the same query with a lifecycle the plant does not carry answers as a miss.
+/// A filter that never left Lua would return the hit both times.
+#[test]
+fn vegetation_queries_carry_their_filter_across_the_bridge() {
+    let mut scene = Scene::new();
+    let entity = entity_with_script(&mut scene, "caller", "vegetation_caller.luau");
+    scene
+        .add_component(entity, Transform::default())
+        .expect("xf");
+
+    let bridge = RecordingBridge::shared(Uuid(0));
+    let mut host = ScriptHost::new();
+    host.install_bridge(bridge.clone());
+    host.start_scripts(&mut scene, registry(), &fixtures())
+        .expect("start");
+    assert!(
+        host.tick_scripts(&mut scene, registry(), None, 0.016)
+            .is_none()
+    );
+
+    scene
+        .with_component::<Transform, _>(entity, |transform| {
+            assert_eq!(
+                transform.translation,
+                Vec3::new(1.0, 1.0, 1.0),
+                "the accepting filter matched on all three queries"
+            );
+            assert_eq!(
+                transform.rotation,
+                Vec3::ZERO,
+                "the rejecting filter answered as a miss on all three"
+            );
+        })
+        .expect("transform");
+
+    let filters: Vec<(&'static str, ScriptPlantFilter)> = bridge
+        .calls()
+        .into_iter()
+        .filter_map(|call| match call {
+            Call::VegetationQuery(which, filter) => Some((which, filter)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(filters.len(), 6, "three queries, twice each");
+    assert_eq!(
+        filters[0].1,
+        ScriptPlantFilter {
+            families: vec!["7".to_owned()],
+            required_tags: vec!["42".to_owned()],
+            lifecycles: vec!["mature".to_owned()],
+            interaction_policies: vec!["harvestable".to_owned()],
+        },
+        "every list crossed the seam, numbers included"
+    );
+    assert_eq!(filters[3].1.lifecycles, vec!["dead".to_owned()]);
+}
+
+/// A committed vegetation transition reaches every instance declaring `on_vegetation_event`, with
+/// its typed payload shaped into the handler's table.
+#[test]
+fn vegetation_events_dispatch_to_every_instance() {
+    let mut scene = Scene::new();
+    let entity = entity_with_script(&mut scene, "caller", "vegetation_caller.luau");
+    scene
+        .add_component(entity, Transform::default())
+        .expect("xf");
+
+    let bridge = RecordingBridge::shared(Uuid(0));
+    let mut host = ScriptHost::new();
+    host.install_bridge(bridge.clone());
+    host.start_scripts(&mut scene, registry(), &fixtures())
+        .expect("start");
+
+    let event = VegetationEventInfo {
+        seq: 9,
+        kind: "damaged",
+        plant: Some("0123456789abcdef0123456789abcdef".to_owned()),
+        cell: [1, -2, 3],
+        cell_level: 0,
+        lifecycle: None,
+        previous_lifecycle: None,
+        phenotype: None,
+        amount: Some(0.25),
+        health: Some(0.75),
+        moisture: None,
+        fuel: None,
+        categories: None,
+    };
+    assert!(
+        host.dispatch_vegetation_event(&mut scene, registry(), &event)
+            .is_none()
+    );
+    assert!(
+        host.tick_scripts(&mut scene, registry(), None, 0.016)
+            .is_none()
+    );
+
+    scene
+        .with_component::<Transform, _>(entity, |transform| {
+            assert_eq!(transform.scale.x, 1.0, "the handler ran exactly once");
+            assert_eq!(transform.scale.y, 0.75, "the settled health crossed typed");
+        })
+        .expect("transform");
+    assert!(
+        bridge.calls().iter().any(|call| matches!(
+            call,
+            Call::LogSink(_, message) if message.starts_with("damaged 0123456789abcdef")
+        )),
+        "the handler saw the kind and the plant identity"
+    );
 }

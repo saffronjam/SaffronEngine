@@ -54,6 +54,27 @@ pub struct ScriptPlantHit {
     pub interaction_policy: String,
 }
 
+/// The closed filter a script-side vegetation query narrows by.
+///
+/// Every field is the text vocabulary the control plane and the `sa` CLI already use, so a script
+/// writes the same names an `sa vegetation-runtime-query` call does and `saffron-script` needs no
+/// vegetation dependency to carry them. An empty list accepts everything in that dimension; a
+/// value the host cannot resolve fails the whole query closed, because a filter silently dropped
+/// is a query that answers about plants the script excluded.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ScriptPlantFilter {
+    /// Allowed family uuids as decimal strings.
+    pub families: Vec<String>,
+    /// Family tag ids as decimal strings; every one listed must be present.
+    pub required_tags: Vec<String>,
+    /// Allowed lifecycle names (`seed`, `sprout`, `juvenile`, `mature`, `senescent`, `dead`,
+    /// `stump`, `removed`).
+    pub lifecycles: Vec<String>,
+    /// Allowed interaction-policy names (`decorative`, `interactive`, `harvestable`,
+    /// `structural`).
+    pub interaction_policies: Vec<String>,
+}
+
 /// The tagged owner of a struck body, mirrored from the physics world-hit target so
 /// `saffron-script` stays free of a physics dependency.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -130,18 +151,32 @@ pub trait ScriptHostBridge {
     fn ragdoll_state(&self, rig: Uuid) -> ScriptRagdollState;
 
     /// The closest macro plant along `origin + dir * max_dist` whose conservative bounds the ray
-    /// enters. Bounds-level, never a physics cast: it reports plants with no collision body too.
-    fn vegetation_raycast(&self, origin: Vec3, dir: Vec3, max_dist: f32) -> Option<ScriptPlantHit>;
+    /// enters and which `filter` accepts. Bounds-level, never a physics cast: it reports plants
+    /// with no collision body too.
+    fn vegetation_raycast(
+        &self,
+        origin: Vec3,
+        dir: Vec3,
+        max_dist: f32,
+        filter: &ScriptPlantFilter,
+    ) -> Option<ScriptPlantHit>;
 
-    /// The macro plant nearest `position` within `radius`.
-    fn vegetation_nearest(&self, position: Vec3, radius: f32) -> Option<ScriptPlantHit>;
+    /// The macro plant nearest `position` within `radius` that `filter` accepts.
+    fn vegetation_nearest(
+        &self,
+        position: Vec3,
+        radius: f32,
+        filter: &ScriptPlantFilter,
+    ) -> Option<ScriptPlantHit>;
 
-    /// Every macro plant within `radius` of `position`, nearest first, capped at `limit`.
+    /// Every macro plant within `radius` of `position` that `filter` accepts, nearest first,
+    /// capped at `limit`.
     fn vegetation_in_radius(
         &self,
         position: Vec3,
         radius: f32,
         limit: usize,
+        filter: &ScriptPlantFilter,
     ) -> Vec<ScriptPlantHit>;
 
     /// Apply `amount` of damage (0..1) to the plant, returning whether the mutation committed.
@@ -198,11 +233,17 @@ impl ScriptHostBridge for NoopBridge {
         _origin: Vec3,
         _dir: Vec3,
         _max_dist: f32,
+        _filter: &ScriptPlantFilter,
     ) -> Option<ScriptPlantHit> {
         None
     }
 
-    fn vegetation_nearest(&self, _position: Vec3, _radius: f32) -> Option<ScriptPlantHit> {
+    fn vegetation_nearest(
+        &self,
+        _position: Vec3,
+        _radius: f32,
+        _filter: &ScriptPlantFilter,
+    ) -> Option<ScriptPlantHit> {
         None
     }
 
@@ -211,6 +252,7 @@ impl ScriptHostBridge for NoopBridge {
         _position: Vec3,
         _radius: f32,
         _limit: usize,
+        _filter: &ScriptPlantFilter,
     ) -> Vec<ScriptPlantHit> {
         Vec::new()
     }

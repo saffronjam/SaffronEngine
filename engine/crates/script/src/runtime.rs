@@ -68,6 +68,45 @@ pub struct ContactInfo {
     pub normal: glam::Vec3,
 }
 
+/// One committed vegetation transition surfaced to scripts, the POD input to
+/// [`ScriptHost::dispatch_vegetation_event`].
+///
+/// The kind and the value names are the same text the control plane reports, so a script and an
+/// `sa vegetation-drain-events` call describe one transition identically. The host fills it from a
+/// drained `saffron-vegetation` transition — `saffron-script` carries no vegetation edge, so this
+/// is the plain shape the handler sees.
+#[derive(Clone, Debug, PartialEq)]
+pub struct VegetationEventInfo {
+    /// Monotonic sequence number within the bound world.
+    pub seq: u64,
+    /// The transition kind (`damaged`, `harvested`, `burned`, `removed`, `planted`, `regrew`,
+    /// `lifecycle-changed`, `ignited`, `extinguished`, `wetted`, `state-replaced`, `moved`,
+    /// `disturbed`).
+    pub kind: &'static str,
+    /// The plant the transition names as canonical hex, absent for a cell-wide change.
+    pub plant: Option<String>,
+    /// The cell whose persistent state changed, and its hierarchy level.
+    pub cell: [i64; 3],
+    /// The cell's hierarchy level (`0` is the base level).
+    pub cell_level: u8,
+    /// The lifecycle the transition settled at, when it names one.
+    pub lifecycle: Option<&'static str>,
+    /// The prior lifecycle a transition declared as its precondition, when it declared one.
+    pub previous_lifecycle: Option<&'static str>,
+    /// The species phenotype the transition settled at, when it names one.
+    pub phenotype: Option<u32>,
+    /// The damage the transition applied, in 0..1.
+    pub amount: Option<f32>,
+    /// The health it settled at, in 0..1.
+    pub health: Option<f32>,
+    /// The persistent moisture it settled at, in 0..1.
+    pub moisture: Option<f32>,
+    /// The combustible fuel it settled at, in 0..1.
+    pub fuel: Option<f32>,
+    /// Disturbance class bits for a `disturbed` transition.
+    pub categories: Option<u32>,
+}
+
 /// A contained per-instance failure from a start/tick call, traceback included.
 ///
 /// The first failing instance halts the loop and is returned; the VM and every instance
@@ -314,6 +353,77 @@ impl ScriptHost {
         self.dispatch_messages();
         drop(guard);
         failure
+    }
+
+    /// Dispatches one committed vegetation transition to every instance declaring
+    /// `on_vegetation_event(self, event)`.
+    ///
+    /// A vegetation transition names a plant, not an entity, so it broadcasts: a plant is world
+    /// state that any script may be watching, and the reducer commit is the one place a change
+    /// becomes observable. The event arrives as a table shaped by
+    /// [`VegetationEventInfo`]; the first failing handler halts the dispatch and is returned,
+    /// matching [`ScriptHost::tick_scripts`]. `None` when there is no VM, no instance, or no
+    /// handler.
+    ///
+    /// The host drains the transition ring before `on_update` each tick and drives this per event.
+    /// Structural ops flush and queued messages dispatch afterwards, exactly as a tick does.
+    pub fn dispatch_vegetation_event(
+        &mut self,
+        scene: &mut Scene,
+        registry: Arc<ComponentRegistry>,
+        event: &VegetationEventInfo,
+    ) -> Option<ScriptRunError> {
+        if self.vm.is_none() || self.instances.is_empty() {
+            return None;
+        }
+        let guard = session::enter_session(scene, registry, None);
+        session::set_bridge(Rc::clone(&self.bridge));
+        let mut failure = None;
+        for index in 0..self.instances.len() {
+            let instance = &self.instances[index];
+            session::set_sender(instance.entity_uuid);
+            if let Err(err) = self.call_vegetation_handler(&instance.self_ref, event) {
+                failure = Some(ScriptRunError {
+                    entity_uuid: instance.entity_uuid,
+                    script: instance.script_path.clone(),
+                    message: err.to_string(),
+                });
+                break;
+            }
+        }
+        session::set_sender(Uuid(0));
+        flush_structural_ops();
+        self.dispatch_messages();
+        drop(guard);
+        failure
+    }
+
+    /// Invokes `self:on_vegetation_event(event)` for one instance, resetting the per-call budget
+    /// first. An absent handler is a successful no-op.
+    fn call_vegetation_handler(
+        &self,
+        self_ref: &RegistryKey,
+        event: &VegetationEventInfo,
+    ) -> Result<()> {
+        let vm = self
+            .vm
+            .as_ref()
+            .expect("a VM is bound during vegetation dispatch");
+        let lua = vm.lua();
+        let self_table: Table = lua
+            .registry_value(self_ref)
+            .map_err(|e| Error::Runtime(e.to_string()))?;
+        let method: LuaValue = self_table
+            .get("on_vegetation_event")
+            .map_err(|e| vm.classify_run_error(&e))?;
+        let LuaValue::Function(method) = method else {
+            return Ok(());
+        };
+        vm.reset_budget();
+        let table = crate::bindings::vegetation_event_table(lua, event)
+            .map_err(|e| Error::Runtime(e.to_string()))?;
+        let result: mlua::Result<()> = method.call((self_table, table));
+        result.map_err(|e| vm.classify_run_error(&e))
     }
 
     /// Dispatches one direction of a contact transition: every instance whose

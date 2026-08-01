@@ -27,11 +27,12 @@ pub use bindings::{
     register_value_types,
 };
 pub use bridge::{
-    NoopBridge, ScriptHitTarget, ScriptHostBridge, ScriptPlantHit, ScriptRagdollState, ScriptRayHit,
+    NoopBridge, ScriptHitTarget, ScriptHostBridge, ScriptPlantFilter, ScriptPlantHit,
+    ScriptRagdollState, ScriptRayHit,
 };
 pub use entity::EntityHandle;
 pub use error::{Error, Result};
-pub use runtime::{ContactInfo, ScriptHost, ScriptRunError};
+pub use runtime::{ContactInfo, ScriptHost, ScriptRunError, VegetationEventInfo};
 pub use schema::{ScriptField, ScriptFieldType, read_script_schema};
 pub use session::{
     DeferredOps, ScopedSession, ScriptMessage, current_sender, defer_destroy, enter_session,
