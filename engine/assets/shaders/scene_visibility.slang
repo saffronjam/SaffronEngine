@@ -73,6 +73,14 @@ SphereBounds worldSphere(
     SphereBounds sphere;
     sphere.center = center;
     sphere.radius = localBounds.w * scale;
+    // A displaced instance's cooked sphere describes the UNDISPLACED surface, so it gains the
+    // frame's relief bound. Local units, like the sphere it inflates, because the amplitude
+    // rides the model matrix with the geometry.
+    GpuDisplacedRow displaced;
+    if (gpuSceneDisplacedRow(sceneAddresses, slot, displaced))
+    {
+        sphere.radius += displaced.localAmplitude * scale;
+    }
     // A wind-deformed instance's sphere gains the prepass record's world-space
     // sway slack (the maximum of the current and previous displacement).
     if ((instance.flags & GPU_SCENE_INSTANCE_FLAG_WIND) != 0u

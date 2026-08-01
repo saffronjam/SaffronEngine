@@ -599,16 +599,22 @@ impl SceneVisibilityView {
         words
     }
 
-    /// The frame slot's back-to-front transparent command stream (counter word 5 is
-    /// its draw count).
-    pub fn transparent_commands(&self, frame: usize) -> vk::Buffer {
-        self.frames[frame].transparent_commands.handle()
+    /// The command-arena slot one blend bucket's back-to-front slice starts at.
+    #[must_use]
+    pub fn transparent_slice_base(&self, group_slot: u32) -> u32 {
+        transparent_slice_base(self.record_capacity, group_slot)
     }
 
-    /// Records the transparent back-to-front sort for `frame`: key collection, four
-    /// stable LSD radix passes (histogram → scan → scatter, ping-ponging the pair
-    /// buffers), and the reverse-order command reorder into the transparent stream.
-    /// `view_row2` is the camera view matrix's third row (view-space depth).
+    /// Records the transparent back-to-front sort for `frame`: key collection, the LSD
+    /// radix levels (each a key stage plus four histogram → scan → scatter passes,
+    /// ping-ponging the pair buffers), and the reverse-order reorder into the command
+    /// arena's sorted slices — both executors' arguments per slot. `view_row2` is the
+    /// camera view matrix's third row (view-space depth).
+    ///
+    /// The levels run least significant first — cluster, page, instance slot, depth — so
+    /// the sorted order is lexicographic by (depth, instance, page, cluster) and therefore
+    /// a pure function of the record set rather than of the order the traversal's atomic
+    /// append happened to emit it in.
     pub fn add_transparent_sort_passes(
         &self,
         device: &Device,
@@ -629,20 +635,29 @@ impl SceneVisibilityView {
             graph.import_buffer(slot.pairs[1].handle(), None),
         ];
         let histograms_res = graph.import_buffer(slot.histograms.handle(), None);
-        let transparent_res = graph.import_buffer(slot.transparent_commands.handle(), None);
+        let records_res = graph.import_buffer(slot.records.handle(), None);
+        let commands_res = graph.import_buffer(slot.commands.handle(), None);
+        let mesh_args_res = graph.import_buffer(slot.mesh_args.handle(), None);
         let raw = device.raw().clone();
         let workgroups = self.record_capacity.div_ceil(SCENE_RADIX_WORKGROUP);
         let record_groups = self.record_capacity.div_ceil(64);
 
-        let mut keys_push = [0_u32; 8];
-        keys_push[..4].copy_from_slice(bytemuck::cast_slice(&view_row2));
-        keys_push[4] = self.record_capacity;
-        let pipeline = Arc::clone(pipelines.keys);
-        let set = slot.transparent_keys_set;
-        graph.add_pass(
-            RgPass::compute("transparent-keys")
+        for level in 0..TRANSPARENT_SORT_LEVELS {
+            let mut keys_push = [0_u32; 8];
+            keys_push[..4].copy_from_slice(bytemuck::cast_slice(&view_row2));
+            keys_push[4] = self.record_capacity;
+            keys_push[5] = level;
+            let pipeline = Arc::clone(pipelines.keys);
+            let set = slot.transparent_keys_set;
+            graph.add_pass(
+                RgPass::compute(if level == 0 {
+                    "transparent-keys"
+                } else {
+                    "transparent-rekey"
+                })
                 .access(counters_res, RgUsage::StorageReadWriteCompute)
-                .access(pairs_res[0], RgUsage::StorageWriteCompute)
+                .access(records_res, RgUsage::StorageReadCompute)
+                .access(pairs_res[0], RgUsage::StorageReadWriteCompute)
                 .body({
                     let raw = raw.clone();
                     move |cmd, _scopes: &mut NestedScopeRecorder| {
@@ -656,72 +671,75 @@ impl SceneVisibilityView {
                         );
                     }
                 }),
-        );
+            );
 
-        for pass in 0..4_u32 {
-            let direction = (pass % 2) as usize;
-            let shift_push = [pass * 8, self.record_capacity, workgroups, 0];
-            let pipeline = Arc::clone(pipelines.histogram);
-            let set = slot.radix_histogram_sets[direction];
-            graph.add_pass(
-                RgPass::compute("radix-histogram")
-                    .access(pairs_res[direction], RgUsage::StorageReadCompute)
-                    .access(histograms_res, RgUsage::StorageReadWriteCompute)
-                    .body({
-                        let raw = raw.clone();
-                        move |cmd, _scopes: &mut NestedScopeRecorder| {
-                            record_binning_dispatch(
-                                &raw,
-                                cmd,
-                                &pipeline,
-                                set,
-                                Some(bytemuck::cast_slice(&shift_push)),
-                                workgroups,
-                            );
-                        }
-                    }),
-            );
-            let pipeline = Arc::clone(pipelines.scan);
-            let set = slot.radix_scan_set;
-            let entries = workgroups * 256;
-            graph.add_pass(
-                RgPass::compute("radix-scan")
-                    .access(histograms_res, RgUsage::StorageReadWriteCompute)
-                    .body({
-                        let raw = raw.clone();
-                        move |cmd, _scopes: &mut NestedScopeRecorder| {
-                            record_binning_dispatch(
-                                &raw,
-                                cmd,
-                                &pipeline,
-                                set,
-                                Some(bytemuck::cast_slice(&[entries, workgroups, 0, 0])),
-                                1,
-                            );
-                        }
-                    }),
-            );
-            let pipeline = Arc::clone(pipelines.scatter);
-            let set = slot.radix_scatter_sets[direction];
-            graph.add_pass(
-                RgPass::compute("radix-scatter")
-                    .access(pairs_res[direction], RgUsage::StorageReadCompute)
-                    .access(pairs_res[direction ^ 1], RgUsage::StorageWriteCompute)
-                    .access(histograms_res, RgUsage::StorageReadCompute)
-                    .body({
-                        let raw = raw.clone();
-                        move |cmd, _scopes: &mut NestedScopeRecorder| {
-                            record_binning_dispatch(
-                                &raw,
-                                cmd,
-                                &pipeline,
-                                set,
-                                Some(bytemuck::cast_slice(&shift_push)),
-                                workgroups,
-                            );
-                        }
-                    }),
-            );
+            // An even pass count per level leaves the sorted pairs back in slot 0, which
+            // is the buffer the next level's key stage and the reorder both read.
+            for pass in 0..SCENE_RADIX_PASSES {
+                let direction = (pass % 2) as usize;
+                let shift_push = [pass * 8, self.record_capacity, workgroups, 0];
+                let pipeline = Arc::clone(pipelines.histogram);
+                let set = slot.radix_histogram_sets[direction];
+                graph.add_pass(
+                    RgPass::compute("radix-histogram")
+                        .access(pairs_res[direction], RgUsage::StorageReadCompute)
+                        .access(histograms_res, RgUsage::StorageReadWriteCompute)
+                        .body({
+                            let raw = raw.clone();
+                            move |cmd, _scopes: &mut NestedScopeRecorder| {
+                                record_binning_dispatch(
+                                    &raw,
+                                    cmd,
+                                    &pipeline,
+                                    set,
+                                    Some(bytemuck::cast_slice(&shift_push)),
+                                    workgroups,
+                                );
+                            }
+                        }),
+                );
+                let pipeline = Arc::clone(pipelines.scan);
+                let set = slot.radix_scan_set;
+                let entries = workgroups * 256;
+                graph.add_pass(
+                    RgPass::compute("radix-scan")
+                        .access(histograms_res, RgUsage::StorageReadWriteCompute)
+                        .body({
+                            let raw = raw.clone();
+                            move |cmd, _scopes: &mut NestedScopeRecorder| {
+                                record_binning_dispatch(
+                                    &raw,
+                                    cmd,
+                                    &pipeline,
+                                    set,
+                                    Some(bytemuck::cast_slice(&[entries, workgroups, 0, 0])),
+                                    1,
+                                );
+                            }
+                        }),
+                );
+                let pipeline = Arc::clone(pipelines.scatter);
+                let set = slot.radix_scatter_sets[direction];
+                graph.add_pass(
+                    RgPass::compute("radix-scatter")
+                        .access(pairs_res[direction], RgUsage::StorageReadCompute)
+                        .access(pairs_res[direction ^ 1], RgUsage::StorageWriteCompute)
+                        .access(histograms_res, RgUsage::StorageReadCompute)
+                        .body({
+                            let raw = raw.clone();
+                            move |cmd, _scopes: &mut NestedScopeRecorder| {
+                                record_binning_dispatch(
+                                    &raw,
+                                    cmd,
+                                    &pipeline,
+                                    set,
+                                    Some(bytemuck::cast_slice(&shift_push)),
+                                    workgroups,
+                                );
+                            }
+                        }),
+                );
+            }
         }
 
         // One reorder dispatch per live blend bucket: each writes that bucket's
@@ -731,14 +749,19 @@ impl SceneVisibilityView {
         let pipeline = Arc::clone(pipelines.reorder);
         let set = slot.transparent_reorder_set;
         let reorder_capacity = self.record_capacity;
-        let groups: Vec<u32> = blend_bucket_keys.to_vec();
+        let slice_bases: Vec<(u32, u32)> = blend_bucket_keys
+            .iter()
+            .enumerate()
+            .map(|(group_slot, key)| (*key, self.transparent_slice_base(group_slot as u32)))
+            .collect();
         graph.add_pass(
             RgPass::compute("transparent-reorder")
                 .access(pairs_res[0], RgUsage::StorageReadCompute)
                 .access(counters_res, RgUsage::StorageReadCompute)
-                .access(transparent_res, RgUsage::StorageWriteCompute)
+                .access(commands_res, RgUsage::StorageWriteCompute)
+                .access(mesh_args_res, RgUsage::StorageWriteCompute)
                 .body(move |cmd, _scopes: &mut NestedScopeRecorder| {
-                    for (group_slot, key) in groups.iter().enumerate() {
+                    for (key, slice_base) in &slice_bases {
                         record_binning_dispatch(
                             &raw,
                             cmd,
@@ -747,7 +770,7 @@ impl SceneVisibilityView {
                             Some(bytemuck::cast_slice(&[
                                 reorder_capacity,
                                 *key,
-                                group_slot as u32 * reorder_capacity,
+                                *slice_base,
                                 0,
                             ])),
                             record_groups,

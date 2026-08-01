@@ -13,9 +13,34 @@ pub const MESH_TASK_COMMAND_STRIDE: u64 = 12;
 /// inside the 256 every supported tier reports, and 2 x 62 covers a full 124-triangle cluster.
 pub const MESH_TRIANGLES_PER_GROUP: u32 = 62;
 
+/// Whether a device can run the shaded executor through its mesh stage.
+///
+/// Each term is a bit or limit the executor's own workgroup shape needs, not a blanket check on
+/// the extension: `meshShader` may be advertised while `maxMeshOutputVertices` sits below the
+/// 186 one group emits, and a driver may expose the extension for the task stage alone. The
+/// dispatch bound is the spec's guaranteed 65535 — the scatter derives `groupCountX` from a
+/// draw's index count, so a device below it cannot cover a large draw.
+#[must_use]
+pub fn mesh_executor_supported(capabilities: &crate::Capabilities) -> bool {
+    capabilities.mesh_shader
+        && capabilities.max_mesh_work_group_invocations >= MESH_TRIANGLES_PER_GROUP
+        && capabilities.max_mesh_output_vertices >= MESH_TRIANGLES_PER_GROUP * 3
+        && capabilities.max_mesh_output_primitives >= MESH_TRIANGLES_PER_GROUP
+        && capabilities.max_mesh_work_group_count[0] >= 65_535
+}
+
+/// The command-arena slot one blend bucket's back-to-front slice starts at. The binner's
+/// per-bucket slices occupy the first `record_capacity` slots and the sorted slices follow
+/// them, so one arena feeds both scopes and the mesh executor reads either through the same
+/// binding.
+#[must_use]
+pub fn transparent_slice_base(record_capacity: u32, group_slot: u32) -> u32 {
+    record_capacity * (1 + group_slot)
+}
+
 /// The five transparent-sort pipelines, borrowed for one record call.
 pub struct TransparentSortPipelines<'a> {
-    /// Key collection over the record stream.
+    /// Key collection over the record stream, and the per-level rekey over the pairs.
     pub keys: &'a Arc<crate::Pipeline>,
     /// Per-workgroup radix histograms.
     pub histogram: &'a Arc<crate::Pipeline>,
@@ -153,5 +178,64 @@ pub fn record_executor_bucket_draw_mesh(
                 MESH_TASK_COMMAND_STRIDE as u32,
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn qualifying() -> crate::Capabilities {
+        crate::Capabilities {
+            mesh_shader: true,
+            max_mesh_work_group_invocations: 128,
+            max_mesh_output_vertices: 256,
+            max_mesh_output_primitives: 256,
+            max_mesh_work_group_count: [65_535; 3],
+            ..crate::Capabilities::default()
+        }
+    }
+
+    #[test]
+    fn a_qualifying_device_runs_the_mesh_executor() {
+        assert!(mesh_executor_supported(&qualifying()));
+    }
+
+    #[test]
+    fn each_limit_the_workgroup_needs_disqualifies_on_its_own() {
+        type Disqualifier = (&'static str, fn(&mut crate::Capabilities));
+        let cases: [Disqualifier; 5] = [
+            ("meshShader", |caps| caps.mesh_shader = false),
+            ("invocations", |caps| {
+                caps.max_mesh_work_group_invocations = MESH_TRIANGLES_PER_GROUP - 1;
+            }),
+            ("output vertices", |caps| {
+                caps.max_mesh_output_vertices = MESH_TRIANGLES_PER_GROUP * 3 - 1;
+            }),
+            ("output primitives", |caps| {
+                caps.max_mesh_output_primitives = MESH_TRIANGLES_PER_GROUP - 1;
+            }),
+            ("dispatch bound", |caps| {
+                caps.max_mesh_work_group_count[0] = 65_534;
+            }),
+        ];
+        for (name, break_it) in cases {
+            let mut caps = qualifying();
+            break_it(&mut caps);
+            assert!(
+                !mesh_executor_supported(&caps),
+                "a device short on {name} must stay on the indexed path"
+            );
+        }
+    }
+
+    #[test]
+    fn the_task_stage_alone_does_not_qualify() {
+        let caps = crate::Capabilities {
+            mesh_shader: false,
+            task_shader: true,
+            ..qualifying()
+        };
+        assert!(!mesh_executor_supported(&caps));
     }
 }

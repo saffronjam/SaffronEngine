@@ -31,7 +31,8 @@ use crate::{Result, checked};
 pub use buckets::{ExecutorBucket, bucket_material, build_executor_buckets};
 pub use executor::{
     ExecutorBucketDraw, ExecutorDrawInputs, MESH_TASK_COMMAND_STRIDE, MESH_TRIANGLES_PER_GROUP,
-    TransparentSortPipelines, record_executor_bucket_draw, record_executor_bucket_draw_mesh,
+    TransparentSortPipelines, mesh_executor_supported, record_executor_bucket_draw,
+    record_executor_bucket_draw_mesh, transparent_slice_base,
 };
 pub use push::*;
 
@@ -103,6 +104,12 @@ pub const SCENE_VISIBILITY_COUNTER_INTERACTION_RESET: usize = 21;
 /// read, so no gather can be missing them.
 pub const SCENE_VISIBILITY_COUNTER_CULLED_REACH: usize = 22;
 
+/// Counter word: triangle clusters on a surviving node the traversal rejected on their own
+/// swept bounds. A node keeps its subtree, so this is the finer granularity underneath
+/// [`SCENE_VISIBILITY_COUNTER_CULLED_NODES`]: one assembly part leaves the view while its
+/// siblings draw.
+pub const SCENE_VISIBILITY_COUNTER_CULLED_CLUSTERS: usize = 23;
+
 /// Micro-blade candidates a frame slot can hold.
 pub const SCENE_MICRO_CANDIDATE_CAPACITY: u32 = 65_536;
 /// Overflow flag: the visible list filled.
@@ -128,6 +135,12 @@ pub const SCENE_TRANSPARENT_OVERFLOW: u32 = 8;
 pub const SCENE_VISIBILITY_COUNTER_TRIANGLES: usize = 8;
 /// Pair elements per radix workgroup.
 pub const SCENE_RADIX_WORKGROUP: u32 = 256;
+/// Eight-bit digit passes one radix level takes over a 32-bit key word.
+pub const SCENE_RADIX_PASSES: u32 = 4;
+/// Key words the transparent sort orders by, least significant first: cluster, page,
+/// instance slot, view depth. The lower three make the order a function of the record
+/// set rather than of the traversal's atomic emission order.
+pub const TRANSPARENT_SORT_LEVELS: u32 = 4;
 
 /// Device-shared visibility scaffolding: the set layout and the HZB sampler.
 pub struct SceneVisibility {
@@ -265,7 +278,7 @@ impl SceneVisibility {
         let radix_histogram_layout = make(&[sb, sb, sb], compute)?;
         let radix_scan_layout = make(&[sb], compute)?;
         let radix_scatter_layout = make(&[sb, sb, sb, sb], compute)?;
-        let transparent_reorder_layout = make(&[sb, sb, sb, sb, ub], compute)?;
+        let transparent_reorder_layout = make(&[sb, sb, sb, sb, ub, sb], compute)?;
         Ok(Self {
             resources: Arc::clone(device.resources()),
             sampler,
@@ -400,13 +413,15 @@ struct VisibilityFrame {
     bin_counts: Buffer,
     bin_cursors: Buffer,
     bucket_table: Buffer,
+    /// The executor command arena: the binner's per-bucket slices in the first
+    /// `record_capacity` slots, then one full-length sorted slice per blend bucket.
     commands: Buffer,
-    /// The mesh executor's per-command dispatch arguments, filled by the same scatter that
-    /// writes `commands`: one `VkDrawMeshTasksIndirectCommandEXT` per draw, at the same slot.
+    /// The mesh executor's per-command dispatch arguments, parallel to `commands`: one
+    /// `VkDrawMeshTasksIndirectCommandEXT` per draw, written at the same slot by whichever
+    /// kernel filled that slot.
     mesh_args: Buffer,
     pairs: [Buffer; 2],
     histograms: Buffer,
-    transparent_commands: Buffer,
     micro_scratch: Buffer,
     cull_set: vk::DescriptorSet,
     retest_set: vk::DescriptorSet,

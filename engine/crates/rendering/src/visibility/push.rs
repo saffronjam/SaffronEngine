@@ -35,8 +35,9 @@ pub struct SceneTraversalPush {
     /// Reaching the aggregate form by flying the camera out shrinks the subject at the same
     /// time, so the resulting image difference conflates the two.
     pub representation_override: u32,
-    /// Nonzero: reject a node whose swept world bounds leave [`Self::view_proj`],
-    /// dropping its subtree with it. Zero walks every node of every visible instance.
+    /// Nonzero: reject a node whose swept world bounds leave [`Self::view_proj`], dropping
+    /// its subtree with it, and reject a surviving node's individual triangle clusters on
+    /// their own swept bounds. Zero walks every node and emits every cluster.
     ///
     /// The cull is a pure reduction over provably out-of-view geometry, so a host with
     /// it off renders the identical frame — which is what
@@ -151,6 +152,43 @@ pub struct GiOccluderScatterPush {
 }
 
 const _: () = assert!(size_of::<GiOccluderScatterPush>() == 48);
+
+/// The micro-field slab-occluder push: the reach window, the unit-box brick every slab is backed
+/// by, and the resident-tile directory to walk.
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct GiOccluderMicroPush {
+    /// Minimum corner of the reach window; `w` unused.
+    pub reach_min: [f32; 4],
+    /// Maximum corner of the reach window; `w` unused.
+    pub reach_max: [f32; 4],
+    /// The unit-box brick's local lower corner; `w` unused.
+    pub local_min: [f32; 4],
+    /// Its local upper corner; `w` unused.
+    pub local_max: [f32; 4],
+    /// Fine voxel dims of the brick; `w` unused.
+    pub voxel_dims: [u32; 4],
+    /// Its brick-indirection dims; `w` unused.
+    pub indirection_dims: [u32; 4],
+    /// Its atlas tiling; `w` unused.
+    pub atlas_bricks: [u32; 4],
+    /// `x` = bindless SDF slot, `y` = the brick's max-encode distance (local), `z` = atlas mip
+    /// count, `w` unused.
+    pub field: [f32; 4],
+    /// Element capacity of the occluder output region.
+    pub capacity: u32,
+    /// Byte offset of the resident-tile directory within the fields arena.
+    pub directory_offset: u32,
+    /// Entries in that directory.
+    pub directory_count: u32,
+    /// Reserved ABI word.
+    pub reserved: u32,
+}
+
+const _: () = assert!(size_of::<GiOccluderMicroPush>() == 144);
+
+/// The micro-field slab-occluder push byte size for pipeline creation.
+pub const GI_OCCLUDER_MICRO_PUSH_SIZE: u32 = 144;
 
 /// How one view's hierarchy walk refines.
 #[derive(Clone, Copy, Debug, PartialEq)]

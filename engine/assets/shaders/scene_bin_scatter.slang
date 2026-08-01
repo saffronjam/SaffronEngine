@@ -15,18 +15,10 @@ import scene_bin_common;
 [[vk::binding(5, 0)]] StructuredBuffer<SceneBucketTable> bucketTable;
 [[vk::binding(6, 0)]] RWStructuredBuffer<DrawMeshTasksIndirectCommand> meshArgs;
 
-// The mesh executor's dispatch arguments for the same draw, written at the same slot. The
-// group count comes from this draw's own index count, so every representation is covered —
-// a factor sized for triangle clusters would silently drop micro-blade and voxel geometry,
-// whose index counts obey different bounds.
+// The mesh executor's dispatch arguments for the same draw, written at the same slot.
 void writeMeshArgs(uint slot, uint indexCount)
 {
-    DrawMeshTasksIndirectCommand args;
-    args.groupCountX = (indexCount / 3u + (MESH_TRIANGLES_PER_GROUP - 1u))
-        / MESH_TRIANGLES_PER_GROUP;
-    args.groupCountY = 1u;
-    args.groupCountZ = 1u;
-    meshArgs[slot] = args;
+    meshArgs[slot] = meshTaskArgs(indexCount);
 }
 
 struct Push

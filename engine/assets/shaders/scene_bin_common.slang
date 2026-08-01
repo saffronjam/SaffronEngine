@@ -31,6 +31,20 @@ public struct DrawMeshTasksIndirectCommand
     public uint groupCountZ;
 };
 
+// The dispatch arguments covering one draw's own index count. Deriving the group count from the
+// draw rather than from a per-representation constant is what covers triangle clusters, micro
+// blades, and aggregate voxels alike — their index counts obey different bounds. A zero-index
+// draw yields zero groups, which is how a masked slot dispatches nothing.
+public DrawMeshTasksIndirectCommand meshTaskArgs(uint indexCount)
+{
+    DrawMeshTasksIndirectCommand args;
+    args.groupCountX = (indexCount / 3u + (MESH_TRIANGLES_PER_GROUP - 1u))
+        / MESH_TRIANGLES_PER_GROUP;
+    args.groupCountY = 1u;
+    args.groupCountZ = 1u;
+    return args;
+}
+
 public struct SceneBucketTable
 {
     public uint liveCount;

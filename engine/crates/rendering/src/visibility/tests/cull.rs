@@ -19,62 +19,10 @@ fn cull_frustum_occlusion_and_retest_classify_instances() {
             PersistentGpuScene::new(GpuSceneUploadLimits::default()).expect("scene");
         gpu_scene.create_world(WORLD).expect("world");
 
-        let material = match gpu_scene
-            .apply_shared_delta(GpuSceneSharedDelta::CreateMaterial(
-                GpuSceneMaterialRecord {
-                    table: GpuHandle {
-                        index: 1,
-                        generation: 1,
-                    },
-                    source_revision: 1,
-                },
-            ))
-            .expect("material")
-        {
-            GpuSceneSharedDeltaResult::MaterialCreated(handle) => handle,
-            other => panic!("unexpected {other:?}"),
-        };
-        let page = match gpu_scene
-            .apply_shared_delta(GpuSceneSharedDelta::CreatePage(GpuScenePageRecord {
-                table: GpuHandle {
-                    index: 2,
-                    generation: 1,
-                },
-                parent: None,
-                source_generation: 1,
-                flags: crate::GPU_PAGE_FLAG_GUARANTEED_ROOT,
-            }))
-            .expect("page")
-        {
-            GpuSceneSharedDeltaResult::PageCreated(handle) => handle,
-            other => panic!("unexpected {other:?}"),
-        };
-        let prototype = match gpu_scene
-            .apply_shared_delta(GpuSceneSharedDelta::CreatePrototype(
-                GpuScenePrototypeRecord {
-                    geometry: GpuHandle {
-                        index: 3,
-                        generation: 1,
-                    },
-                    materials: std::sync::Arc::from([material]),
-                    deformation: None,
-                    sdfs: Vec::new().into(),
-                    root_page: page,
-                    page_bounds: std::sync::Arc::from([]),
-                    bounds: [0.0, 0.0, 0.0, 1.0],
-                    source_generation: 1,
-                    flags: 0,
-                    mechanics: [0; 4],
-                },
-            ))
-            .expect("prototype")
-        {
-            GpuSceneSharedDeltaResult::PrototypeCreated(handle) => handle,
-            other => panic!("unexpected {other:?}"),
-        };
-        let front = create_instance(&mut gpu_scene, prototype, Vec3::ZERO);
-        let aside = create_instance(&mut gpu_scene, prototype, Vec3::new(1000.0, 0.0, 0.0));
-        let second = create_instance(&mut gpu_scene, prototype, Vec3::new(0.5, 0.0, 0.0));
+        let prototype = unit_bounds_prototype(&mut gpu_scene);
+        let front = create_instance(&mut gpu_scene, prototype, Vec3::ZERO, 0);
+        let aside = create_instance(&mut gpu_scene, prototype, Vec3::new(1000.0, 0.0, 0.0), 0);
+        let second = create_instance(&mut gpu_scene, prototype, Vec3::new(0.5, 0.0, 0.0), 0);
 
         gpu_data.begin_frame(0).expect("gpu data");
         uploader.begin_frame(0).expect("uploader");
@@ -155,7 +103,7 @@ fn cull_frustum_occlusion_and_retest_classify_instances() {
             vk::ImageLayout::GENERAL,
             None,
         );
-        let wind_buffer = wind_records_buffer(&device);
+        let wind_buffer = wind_records_buffer(&device, &[]);
         let wind_records_res = graph.import_buffer(wind_buffer.handle(), None);
         view.add_cull_pass(
             &device,
@@ -174,11 +122,11 @@ fn cull_frustum_occlusion_and_retest_classify_instances() {
         assert_eq!(counters[2], 0, "no overflow");
         let mut visible = read_words(&device, view.visible(0), 2);
         visible.sort_unstable();
-        let mut expected = vec![front.index, second.index];
+        let mut expected = vec![front.raw().index, second.raw().index];
         expected.sort_unstable();
         assert_eq!(visible, expected);
         assert!(
-            !read_words(&device, view.visible(0), 2).contains(&aside.index),
+            !read_words(&device, view.visible(0), 2).contains(&aside.raw().index),
             "the far-off instance frustum-culls"
         );
 
@@ -200,7 +148,7 @@ fn cull_frustum_occlusion_and_retest_classify_instances() {
             vk::ImageLayout::GENERAL,
             None,
         );
-        let wind_buffer = wind_records_buffer(&device);
+        let wind_buffer = wind_records_buffer(&device, &[]);
         let wind_records_res = graph.import_buffer(wind_buffer.handle(), None);
         view.add_cull_pass(
             &device,
@@ -235,6 +183,182 @@ fn cull_frustum_occlusion_and_retest_classify_instances() {
         drop(open);
         drop(wall);
         drop(address_ubo);
+        drop(pipeline);
+        drop(pipelines);
+        drop(gpu_scene);
+        drop(uploader);
+        drop(gpu_data);
+        drop(visibility);
+        drop(descriptors);
+    }
+    device.wait_idle().expect("idle before teardown");
+    drop(device);
+    assert_eq!(validation_issue_count(), before);
+}
+
+/// A displaced instance is culled against its COOKED bounds, which describe the undisplaced
+/// surface — so the cull has to add the frame's relief bound or geometry that pokes outside the
+/// base sphere disappears at the screen edge. The instance here sits far enough off-axis that its
+/// cooked sphere is provably outside the frustum and only the amplitude reaches back in, which is
+/// what makes the assertion sensitive to the inflation alone.
+#[test]
+fn a_displaced_instance_is_culled_against_its_inflated_bounds() {
+    let device = offscreen_device();
+    let before = validation_issue_count();
+    {
+        let free_list: BindlessFreeList = Arc::new(Mutex::new(Vec::new()));
+        let descriptors = Descriptors::new(&device, &free_list).expect("descriptors");
+        let visibility = SceneVisibility::new(&device).expect("visibility");
+        let mut pipelines = Pipelines::new(&device, &descriptors, vk::SampleCountFlags::TYPE_1);
+        let pipeline = pipelines
+            .request_scene_visibility(visibility.layout())
+            .expect("visibility pso");
+
+        let mut gpu_data = GlobalGpuData::new(&device).expect("GlobalGpuData");
+        let mut uploader = GpuSceneUploader::new(&device).expect("uploader");
+        let mut gpu_scene =
+            PersistentGpuScene::new(GpuSceneUploadLimits::default()).expect("scene");
+        gpu_scene.create_world(WORLD).expect("world");
+        let prototype = unit_bounds_prototype(&mut gpu_scene);
+        // Just outside: at 5 units from the eye the frustum half-width is 2.73, and the unit
+        // sphere's most-inside corner projects to NDC x = 1.37.
+        let edge = create_instance(&mut gpu_scene, prototype, Vec3::new(5.0, 0.0, 0.0), 0);
+
+        gpu_data.begin_frame(0).expect("gpu data");
+        uploader.begin_frame(0).expect("uploader");
+        gpu_scene.begin_frame(0).expect("scene");
+        let mut graph = RenderGraph::new();
+        uploader
+            .record_frame(&device, &mut graph, &mut gpu_data, &mut gpu_scene, 0)
+            .expect("record");
+        one_shot(&device, |cmd| graph.execute(&device, cmd));
+
+        let view_proj = Mat4::perspective_rh(1.0, 1.0, 0.1, 100.0)
+            * Mat4::look_at_rh(Vec3::new(0.0, 0.0, 5.0), Vec3::ZERO, Vec3::Y);
+        let push = SceneVisibilityPush {
+            view_proj: view_proj.to_cols_array(),
+            prev_view_proj: view_proj.to_cols_array(),
+            hzb_extent: [64, 64],
+            hzb_mip_count: 7,
+            pass_kind: 0,
+            history_valid: 0,
+            list_capacity: 64,
+            reserved: [0; 2],
+            reach_min: [0.0; 4],
+            reach_max: [0.0; 4],
+        };
+        let open = hzb_image(&device, 1.0);
+
+        // Two rounds over the same scene: no displaced-row table, then one naming the instance
+        // with a 3-unit local relief. Only the table differs.
+        for (rows, expect_visible) in [
+            (Vec::new(), 0_u32),
+            (
+                vec![crate::DisplacedRow {
+                    slot: edge.raw().index,
+                    row: 0,
+                    local_amplitude: 3.0,
+                    reserved: 0,
+                }],
+                1,
+            ),
+        ] {
+            let row_buffer = displaced_rows_buffer(&device, &rows);
+            let displaced = crate::DisplacedFrameAddresses {
+                rows: if rows.is_empty() {
+                    0
+                } else {
+                    device.buffer_device_address(row_buffer.handle())
+                },
+                row_count: rows.len() as u32,
+                ..Default::default()
+            };
+            let block = uploader.build_address_block(
+                &device,
+                &gpu_data,
+                WORLD,
+                0,
+                (0, 0),
+                0,
+                0,
+                0,
+                displaced,
+                (0, 0),
+                0,
+            );
+            let address_ubo = Buffer::new(
+                device.resources(),
+                size_of::<crate::GpuSceneAddressBlock>() as u64,
+                vk::BufferUsageFlags::UNIFORM_BUFFER,
+                &vk_mem::AllocationCreateInfo {
+                    usage: vk_mem::MemoryUsage::Auto,
+                    flags: vk_mem::AllocationCreateFlags::HOST_ACCESS_RANDOM
+                        | vk_mem::AllocationCreateFlags::MAPPED,
+                    ..Default::default()
+                },
+            )
+            .expect("address ubo");
+            // SAFETY: HOST_VISIBLE + MAPPED, written before any submit that reads it.
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    bytemuck::bytes_of(&block).as_ptr(),
+                    address_ubo.mapped_ptr(),
+                    size_of::<crate::GpuSceneAddressBlock>(),
+                );
+            }
+            let lists = SceneVisibilityView::new(&device, &descriptors, &visibility, 64, 256, 2)
+                .expect("view lists");
+            lists.write_frame_bindings(
+                &device,
+                &visibility,
+                0,
+                open.view(),
+                open.view(),
+                (
+                    address_ubo.handle(),
+                    0,
+                    size_of::<crate::GpuSceneAddressBlock>() as u64,
+                ),
+            );
+            let mut graph = RenderGraph::new();
+            let hzb_res = graph.import_image(
+                open.handle(),
+                open.view(),
+                vk::ImageAspectFlags::COLOR,
+                vk::ImageLayout::GENERAL,
+                None,
+            );
+            let wind_buffer = wind_records_buffer(&device, &[]);
+            let wind_records_res = graph.import_buffer(wind_buffer.handle(), None);
+            lists.add_cull_pass(
+                &device,
+                &mut graph,
+                &pipeline,
+                0,
+                hzb_res,
+                wind_records_res,
+                64,
+                push,
+            );
+            one_shot(&device, |cmd| graph.execute(&device, cmd));
+            let counters = read_words(&device, lists.counters(0), 3);
+            assert_eq!(
+                counters[0],
+                expect_visible,
+                "displaced rows {}: the cooked sphere is outside the frustum and the relief \
+                 bound is what reaches back in",
+                rows.len()
+            );
+            device.wait_idle().expect("idle");
+            let mut lists = lists;
+            lists.free_sets(&descriptors);
+            drop(lists);
+            drop(address_ubo);
+            drop(row_buffer);
+        }
+
+        device.wait_idle().expect("idle");
+        drop(open);
         drop(pipeline);
         drop(pipelines);
         drop(gpu_scene);

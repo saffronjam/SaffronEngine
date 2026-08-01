@@ -98,18 +98,20 @@ impl SceneVisibilityView {
             unsafe {
                 std::ptr::write_bytes(bucket_table.mapped_ptr(), 0, bucket_table.size() as usize);
             }
+            let command_slots =
+                u64::from(record_capacity) * u64::from(1 + transparent_group_capacity);
             let commands = Buffer::new(
                 device.resources(),
-                u64::from(record_capacity) * 20,
+                command_slots * 20,
                 storage | vk::BufferUsageFlags::INDIRECT_BUFFER,
                 &device_local,
             )?;
             // One `VkDrawMeshTasksIndirectCommandEXT` (three u32s) per draw slot, parallel to
-            // `commands`. The scatter knows each draw's triangle count, so it writes the group
-            // count directly and no conversion pass is needed.
+            // `commands`. The kernel that fills a slot knows that draw's triangle count, so it
+            // writes the group count directly and no conversion pass is needed.
             let mesh_args = Buffer::new(
                 device.resources(),
-                u64::from(record_capacity) * MESH_TASK_COMMAND_STRIDE,
+                command_slots * MESH_TASK_COMMAND_STRIDE,
                 storage | vk::BufferUsageFlags::INDIRECT_BUFFER,
                 &device_local,
             )?;
@@ -132,12 +134,6 @@ impl SceneVisibilityView {
                 device.resources(),
                 u64::from(workgroups) * 256 * 4,
                 storage,
-                &device_local,
-            )?;
-            let transparent_commands = Buffer::new(
-                device.resources(),
-                u64::from(transparent_group_capacity) * u64::from(record_capacity) * 20,
-                storage | vk::BufferUsageFlags::INDIRECT_BUFFER,
                 &device_local,
             )?;
             let micro_scratch = Buffer::new(
@@ -210,7 +206,8 @@ impl SceneVisibilityView {
             write_storage(raw, transparent_reorder_set, 0, &counters);
             write_storage(raw, transparent_reorder_set, 1, &pairs[0]);
             write_storage(raw, transparent_reorder_set, 2, &records);
-            write_storage(raw, transparent_reorder_set, 3, &transparent_commands);
+            write_storage(raw, transparent_reorder_set, 3, &commands);
+            write_storage(raw, transparent_reorder_set, 5, &mesh_args);
             frames.push(VisibilityFrame {
                 counters,
                 readback,
@@ -224,7 +221,6 @@ impl SceneVisibilityView {
                 mesh_args,
                 pairs,
                 histograms,
-                transparent_commands,
                 micro_scratch,
                 cull_set,
                 retest_set,
@@ -261,6 +257,13 @@ impl SceneVisibilityView {
         self.transparent_group_capacity
     }
 
+    /// Draw slots in the executor command arena: the binner's per-bucket region plus one
+    /// full-length sorted slice per allocated blend bucket. The mesh executor reads the whole
+    /// arena as data, so this is the range its descriptor binding must span.
+    pub fn command_slots(&self) -> u32 {
+        self.record_capacity * (1 + self.transparent_group_capacity)
+    }
+
     /// The frame slot's semantic record stream.
     pub fn records(&self, frame: usize) -> vk::Buffer {
         self.frames[frame].records.handle()
@@ -281,6 +284,12 @@ impl SceneVisibilityView {
         self.frames[frame].counters.handle()
     }
 
+    /// The frame slot's cull descriptor set, for a pass that reads only the GPU-scene address
+    /// block this set already carries rather than owning a second set for the same block.
+    pub fn cull_set(&self, frame: usize) -> vk::DescriptorSet {
+        self.frames[frame].cull_set
+    }
+
     /// The frame slot's counters buffer as a device address, for shaders with no binding for it.
     pub fn counters_address(&self, device: &Device, frame: usize) -> u64 {
         device.buffer_device_address(self.frames[frame].counters.handle())
@@ -294,6 +303,11 @@ impl SceneVisibilityView {
     /// The frame slot's retest slot list.
     pub fn retest(&self, frame: usize) -> vk::Buffer {
         self.frames[frame].retest.handle()
+    }
+
+    /// The frame slot's micro-field pass set (counters, records, the address block, scratch).
+    pub fn micro_set(&self, frame: usize) -> vk::DescriptorSet {
+        self.frames[frame].micro_set
     }
 
     /// Returns the sets to the pool before replacement (capacity growth under an idle

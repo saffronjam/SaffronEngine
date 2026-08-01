@@ -265,7 +265,7 @@ fn displaced_instances_draw_through_the_binned_cut() {
             GpuSceneSharedDeltaResult::PrototypeCreated(handle) => handle,
             other => panic!("unexpected {other:?}"),
         };
-        let instance = create_instance(&mut gpu_scene, prototype, Vec3::ZERO);
+        let instance = create_instance(&mut gpu_scene, prototype, Vec3::ZERO, 0);
 
         gpu_data.begin_frame(0).expect("gpu data");
         uploader.begin_frame(0).expect("uploader");
@@ -313,7 +313,7 @@ fn displaced_instances_draw_through_the_binned_cut() {
             bytemuck::cast_slice(&arena_indices),
             vk::BufferUsageFlags::INDEX_BUFFER,
         );
-        let rows = addressed_words(&device, &[instance.index, ROW]);
+        let rows = addressed_words(&device, &[instance.raw().index, ROW]);
         let seeds = addressed_words(&device, &SEED);
         let vertex_address = device.buffer_device_address(vertices.handle());
         let displaced = crate::DisplacedFrameAddresses {
@@ -330,7 +330,7 @@ fn displaced_instances_draw_through_the_binned_cut() {
         let open = hzb_image(&device, 1.0);
         let view_proj = Mat4::perspective_rh(1.0, 1.0, 0.1, 100.0)
             * Mat4::look_at_rh(Vec3::new(0.0, 0.0, 5.0), Vec3::ZERO, Vec3::Y);
-        let wind_buffer = wind_records_buffer(&device);
+        let wind_buffer = wind_records_buffer(&device, &[]);
         let pages_buffer = gpu_data.pages.buffer();
 
         // Two walks over the identical scene and the identical frame arena — the address

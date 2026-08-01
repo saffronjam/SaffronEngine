@@ -5,6 +5,10 @@
 // bucket's full-length stream at `groupBase`: a pair outside the bucket masks to a
 // zero draw, so every bucket's PSO replays the whole sorted order and global
 // back-to-front holds across buckets.
+//
+// Each slot carries both executors' arguments — the indexed command and the mesh-task
+// dispatch covering the same draw — exactly as the bin scatter writes them for the
+// opaque slices, so the translucent scope reaches the sorted cut through either stage.
 
 import global_gpu_data;
 import scene_bin_common;
@@ -14,6 +18,7 @@ import scene_bin_common;
 [[vk::binding(2, 0)]] StructuredBuffer<GpuDrawRecord> records;
 [[vk::binding(3, 0)]] RWStructuredBuffer<DrawIndexedIndirectCommand> commands;
 [[vk::binding(4, 0)]] ConstantBuffer<GpuSceneAddressBlock> sceneAddresses;
+[[vk::binding(5, 0)]] RWStructuredBuffer<DrawMeshTasksIndirectCommand> meshArgs;
 
 struct Push
 {
@@ -48,6 +53,7 @@ void computeMain(uint3 tid : SV_DispatchThreadID)
         masked.vertexOffset = 0;
         masked.firstInstance = pair.y;
         commands[pc.groupBase + tid.x] = masked;
+        meshArgs[pc.groupBase + tid.x] = meshTaskArgs(masked.indexCount);
         return;
     }
 
@@ -74,4 +80,5 @@ void computeMain(uint3 tid : SV_DispatchThreadID)
         command.firstIndex = uint(indexBlob / 4u) + cluster.firstIndex;
     }
     commands[pc.groupBase + tid.x] = command;
+    meshArgs[pc.groupBase + tid.x] = meshTaskArgs(command.indexCount);
 }

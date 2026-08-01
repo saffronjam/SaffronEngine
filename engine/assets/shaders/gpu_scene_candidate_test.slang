@@ -1,21 +1,21 @@
-// GPU harness for the ray-candidate coverage contract: resolves each test case's
-// candidate surface through the persistent-scene address block
-// (gpuSceneResolveCandidate) and classifies it exactly as the ray-query candidate
-// loops do (explicit-LOD sample supplied by the case, zero alpha width, no
-// alpha-to-coverage), writing every resolved word for the Rust fixture to compare
+// GPU harness for the ray-candidate coverage contract: reads each case's identity from the
+// per-frame ray-instance table (gpuSceneRayInstance), resolves the candidate surface through
+// the persistent-scene address block (gpuSceneResolveCandidate) and classifies it exactly as
+// the ray-query candidate loops do (explicit-LOD sample supplied by the case, zero alpha
+// width, no alpha-to-coverage), writing every resolved word for the Rust fixture to compare
 // byte-exactly against the CPU classifier.
 import global_gpu_data;
 import coverage;
 
 struct CandidateCase
 {
-    uint instanceSlot;
+    uint rayInstance;
     uint primitive;
     float sampledAlpha;
-    uint firstSubmesh;
-    float2 barycentrics;
     uint geometryIndex;
-    uint reserved;
+    float2 barycentrics;
+    uint reserved0;
+    uint reserved1;
 };
 
 [[vk::binding(0, 0)]] RWStructuredBuffer<uint> output;
@@ -28,15 +28,15 @@ void computeMain(uint3 tid : SV_DispatchThreadID)
 {
     let addresses = addressBlocks[0];
     let testCase = cases[tid.x];
+    let identity = gpuSceneRayInstance(addresses, testCase.rayInstance);
     let surface = gpuSceneResolveCandidate(
         addresses,
-        testCase.instanceSlot,
-        testCase.firstSubmesh,
+        identity,
         testCase.geometryIndex,
         testCase.primitive,
         testCase.barycentrics);
 
-    uint base = tid.x * 16u;
+    uint base = tid.x * 20u;
     output[base + 0u] = surface.valid ? 1u : 0u;
     output[base + 1u] = asuint(surface.uv.x);
     output[base + 2u] = asuint(surface.uv.y);
@@ -77,4 +77,10 @@ void computeMain(uint3 tid : SV_DispatchThreadID)
     output[base + 13u] = covered;
     output[base + 14u] = surface.valid ? asuint(surface.coverage.cutoff) : 0u;
     output[base + 15u] = surface.valid ? surface.coverage.hashSalt.x : 0u;
+
+    // The identity the table returned, so a bad table read is distinguishable from a bad resolve.
+    output[base + 16u] = identity.instanceSlot;
+    output[base + 17u] = identity.firstSubmesh;
+    output[base + 18u] = identity.clusterCount;
+    output[base + 19u] = identity.clusterCorners != 0 ? 1u : 0u;
 }

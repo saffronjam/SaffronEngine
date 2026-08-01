@@ -69,8 +69,9 @@ struct Push
     // 2 = always refine (finest cut, triangle clusters). A representation comparison needs
     // the cut to move while the camera holds still; distance moves both at once.
     uint representationOverride;
-    // Zero: skip the node cull and walk every node of every visible instance. The
-    // cull is a pure reduction, so a host with it off must render the identical frame.
+    // Zero: skip the swept-bounds cull and walk every node and emit every cluster of
+    // every visible instance. The cull is a pure reduction, so a host with it off must
+    // render the identical frame.
     uint nodeCull;
     // Nonzero: walk for page demand only and emit no draw records. A view that reads
     // the scene through something other than the record stream still has to keep the
@@ -148,52 +149,49 @@ float assemblyUseScale(GpuAssemblyUseRecord use)
     return max((length(c0) + length(c1) + length(c2)) / 3.0, 1e-4);
 }
 
-// Whether this node's swept world bounds leave the view entirely.
+// Whether a local-space swept box leaves the view entirely once placed in the world.
 //
-// The local box is the node's DEFORMED bounds: the cooked swept extent, which encloses
-// the node's rest geometry, its authored deformation, and — by the cooker's subtree
-// closure — every descendant. Runtime wind is not cooked, so the world box additionally
-// gains the prepass record's world-space sway slack, the same term the instance sphere
-// adds. A rejected node therefore never hides geometry the frame can see, at any level
-// of the walk, which is what lets the rejection take the whole subtree with it.
-bool nodeCulled(
+// The box is a DEFORMED extent — the cooked swept form that encloses the rest geometry
+// and its authored deformation. Runtime wind is not cooked, so the world box additionally
+// gains the prepass record's slack, taken at THIS box's own height weight rather than the
+// whole instance's: the crown of a tall plant carries the full sway, a cluster at the root
+// carries almost none, and giving both the crown's would undo the tightness the cooked
+// per-cluster boxes bought. A rejected box therefore never hides geometry the frame can see.
+bool sweptBoxCulled(
     GpuSceneAddressBlock addresses,
     GpuSceneInstanceGpuRecord instance,
     uint slot,
-    GpuPageNodeRecord node,
-    GpuGeometryRecord geometry,
-    uint use)
+    float3 localMin,
+    float3 localMax,
+    bool assemblyUse,
+    GpuAssemblyUseRecord useRecord)
 {
     float4 c0, c1, c2, c3;
     gpuSceneInstanceColumns(instance, false, c0, c1, c2, c3);
-    bool assemblyUse = use != GPU_ASSEMBLY_NO_USE;
-    GpuAssemblyUseRecord useRecord;
-    if (assemblyUse)
-    {
-        useRecord = gpuSceneAssemblyUse(addresses, geometry, geometry.reserved, use);
-    }
     float3 worldMin = float3(1e30);
     float3 worldMax = float3(-1e30);
+    // The deformation weight is read off the INSTANCE-local height, which is what the vertex
+    // path weighs by, so the assembly use's placement has to be folded in first.
+    float topLocalY = -1e30;
     for (uint corner = 0u; corner < 8u; ++corner)
     {
         float3 local = float3(
-            (corner & 1u) != 0u ? node.deformedMax.x : node.deformedMin.x,
-            (corner & 2u) != 0u ? node.deformedMax.y : node.deformedMin.y,
-            (corner & 4u) != 0u ? node.deformedMax.z : node.deformedMin.z);
+            (corner & 1u) != 0u ? localMax.x : localMin.x,
+            (corner & 2u) != 0u ? localMax.y : localMin.y,
+            (corner & 4u) != 0u ? localMax.z : localMin.z);
         if (assemblyUse)
         {
             local = gpuSceneAssemblyTransformPoint(useRecord, local);
         }
+        topLocalY = max(topLocalY, local.y);
         float3 world = c0.xyz * local.x + c1.xyz * local.y + c2.xyz * local.z + c3.xyz;
         worldMin = min(worldMin, world);
         worldMax = max(worldMax, world);
     }
-    if ((instance.flags & GPU_SCENE_INSTANCE_FLAG_WIND) != 0u
-        && addresses.windRecords != 0)
+    float slack = gpuSceneWindBoxSlack(
+        addresses, instance, slot, topLocalY, assemblyUse, useRecord);
+    if (slack > 0.0)
     {
-        GpuWindInstanceRecord* record = (GpuWindInstanceRecord*)(
-            addresses.windRecords + uint64_t(slot) * GPU_WIND_INSTANCE_RECORD_SIZE);
-        float slack = (*record).boundsInflation;
         worldMin -= float3(slack);
         worldMax += float3(slack);
     }
@@ -217,6 +215,40 @@ bool nodeCulled(
     }
     return ndcMax.x < -1.0 || ndcMin.x > 1.0 || ndcMax.y < -1.0 || ndcMin.y > 1.0
         || ndcMax.z < 0.0 || ndcMin.z > 1.0;
+}
+
+// The assembly use's transform for this walk, or a zeroed record when the walk is not
+// forked over uses.
+GpuAssemblyUseRecord walkUseRecord(
+    GpuSceneAddressBlock addresses, GpuGeometryRecord geometry, uint use)
+{
+    GpuAssemblyUseRecord useRecord = {};
+    if (use != GPU_ASSEMBLY_NO_USE)
+    {
+        useRecord = gpuSceneAssemblyUse(addresses, geometry, geometry.reserved, use);
+    }
+    return useRecord;
+}
+
+// Whether this node's swept world bounds leave the view entirely. The node's deformed
+// bounds enclose every descendant by the cooker's subtree closure, which is what lets the
+// rejection take the whole subtree with it.
+bool nodeCulled(
+    GpuSceneAddressBlock addresses,
+    GpuSceneInstanceGpuRecord instance,
+    uint slot,
+    GpuPageNodeRecord node,
+    GpuGeometryRecord geometry,
+    uint use)
+{
+    return sweptBoxCulled(
+        addresses,
+        instance,
+        slot,
+        node.deformedMin,
+        node.deformedMax,
+        use != GPU_ASSEMBLY_NO_USE,
+        walkUseRecord(addresses, geometry, use));
 }
 
 // The stable flip key of one (instance slot, page, use) triple — never zero, so zero
@@ -273,10 +305,15 @@ uint transitionSlot(uint key)
 // outside assemblies): the voxel payload as one record, or one record per triangle
 // cluster, each carrying the use index in `clusterState` and the representation
 // crossfade word in `transition` (zero when settled).
+//
+// Each cluster is tested on its OWN swept bounds before it emits. The node's bounds close
+// over its whole subtree, so they are as wide as the family; a cluster's are the part's,
+// which is what lets one assembly part leave the view while its siblings draw.
 void emitNodeRecords(
     GpuSceneAddressBlock addresses,
     GpuSceneInstanceGpuRecord instance,
     GpuScenePrototypeGpuRecord prototype,
+    GpuGeometryRecord geometry,
     uint slot,
     GpuHandle pageHandle,
     GpuPageRecord page,
@@ -319,9 +356,25 @@ void emitNodeRecords(
     }
     else
     {
+        bool assemblyUse = use != GPU_ASSEMBLY_NO_USE;
+        GpuAssemblyUseRecord useRecord = walkUseRecord(addresses, geometry, use);
         for (uint cluster = 0u; cluster < node.clusterCount; ++cluster)
         {
             let clusterRecord = gpuScenePageCluster(addresses, page, node, cluster);
+            if (pc.nodeCull != 0u
+                && sweptBoxCulled(
+                    addresses,
+                    instance,
+                    slot,
+                    clusterRecord.deformedMin,
+                    clusterRecord.deformedMax,
+                    assemblyUse,
+                    useRecord))
+            {
+                // Counter word 23: clusters rejected on their own swept bounds.
+                InterlockedAdd(counters[23], 1u);
+                continue;
+            }
             let sceneMaterial = resolveMaterial(
                 addresses, instance, prototype, clusterRecord.materialSlot);
             let materialReference =
@@ -400,11 +453,11 @@ void computeMain(uint3 tid : SV_DispatchThreadID)
     let instance = gpuSceneLoadInstance(addresses, slot);
     let prototype = gpuSceneLoadPrototype(addresses, instance.prototype.index);
 
-    uint displacedRow;
+    GpuDisplacedRow displaced;
     if (pc.displacedRecords != 0u && pc.demandOnly == 0u
-        && gpuSceneDisplacedRow(addresses, slot, displacedRow))
+        && gpuSceneDisplacedRow(addresses, slot, displaced))
     {
-        emitDisplacedRecord(addresses, instance, prototype, slot, displacedRow);
+        emitDisplacedRecord(addresses, instance, prototype, slot, displaced.row);
         return;
     }
 
@@ -533,6 +586,7 @@ void computeMain(uint3 tid : SV_DispatchThreadID)
                     addresses,
                     instance,
                     prototype,
+                    geometry,
                     slot,
                     pageHandle,
                     page,
@@ -664,6 +718,7 @@ void computeMain(uint3 tid : SV_DispatchThreadID)
                                 addresses,
                                 instance,
                                 prototype,
+                                geometry,
                                 slot,
                                 childHandle,
                                 childPage,
@@ -682,8 +737,8 @@ void computeMain(uint3 tid : SV_DispatchThreadID)
             if (emitParentDuringRefine)
             {
                 emitNodeRecords(
-                    addresses, instance, prototype, slot, pageHandle, page, node, use,
-                    ownTransition, false);
+                    addresses, instance, prototype, geometry, slot, pageHandle, page, node,
+                    use, ownTransition, false);
             }
             for (uint child = 0u; child < node.childCount; ++child)
             {
@@ -699,7 +754,7 @@ void computeMain(uint3 tid : SV_DispatchThreadID)
         // Counter word 12: the deepest hierarchy level on the emitted cut.
         InterlockedMax(counters[12], level);
         emitNodeRecords(
-            addresses, instance, prototype, slot, pageHandle, page, node, use, ownTransition,
-            projectedPx < 2.0);
+            addresses, instance, prototype, geometry, slot, pageHandle, page, node, use,
+            ownTransition, projectedPx < 2.0);
     }
 }

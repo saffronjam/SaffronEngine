@@ -261,7 +261,7 @@ fn the_depth_prepass_rasterizes_every_cooked_representation() {
             GpuSceneSharedDeltaResult::PrototypeCreated(handle) => handle,
             other => panic!("unexpected {other:?}"),
         };
-        let instance = create_instance(&mut gpu_scene, prototype, Vec3::ZERO);
+        let instance = create_instance(&mut gpu_scene, prototype, Vec3::ZERO, 0);
 
         // The resident micro field: the tile's dense texels plus the one-entry directory the
         // micro pass dispatches over. The anchoring instance is the scene's own — blade
@@ -290,7 +290,7 @@ fn the_depth_prepass_rasterizes_every_cooked_representation() {
             data: tile_bytes,
         });
         let directory = [GpuFieldDirectoryEntry {
-            instance,
+            instance: instance.raw(),
             tile_offset: tile_range.first,
             predicted: 4,
         }];
@@ -358,7 +358,7 @@ fn the_depth_prepass_rasterizes_every_cooked_representation() {
         let open = hzb_image(&device, 1.0);
         view.write_frame_bindings(&device, &visibility, 0, open.view(), open.view(), address);
         let instance_set = production_instance_set(&descriptors, &gpu_data, &view, 0, address);
-        let wind_buffer = wind_records_buffer(&device);
+        let wind_buffer = wind_records_buffer(&device, &[]);
         let pages_buffer = gpu_data.pages.buffer();
         let (buckets, table) = build_executor_buckets(&[(0, material_class.bits())], 256, false);
         view.write_bucket_table(0, &table);

@@ -150,7 +150,7 @@ fn traversal_emits_cut_records_and_requests_missing_children() {
             GpuSceneSharedDeltaResult::PrototypeCreated(handle) => handle,
             other => panic!("unexpected {other:?}"),
         };
-        let front = create_instance(&mut gpu_scene, prototype, Vec3::ZERO);
+        let front = create_instance(&mut gpu_scene, prototype, Vec3::ZERO, 0);
 
         gpu_data.begin_frame(0).expect("gpu data");
         uploader.begin_frame(0).expect("uploader");
@@ -219,7 +219,7 @@ fn traversal_emits_cut_records_and_requests_missing_children() {
             vk::ImageLayout::GENERAL,
             None,
         );
-        let wind_buffer = wind_records_buffer(&device);
+        let wind_buffer = wind_records_buffer(&device, &[]);
         let wind_records_res = graph.import_buffer(wind_buffer.handle(), None);
         view.add_cull_pass(
             &device,
@@ -283,7 +283,7 @@ fn traversal_emits_cut_records_and_requests_missing_children() {
             GpuRepresentation::AggregateVoxel as u32,
             "the cooked root is the aggregate voxel node"
         );
-        assert_eq!(record.instance.index, front.index);
+        assert_eq!(record.instance.index, front.raw().index);
 
         let requested = uploader.drain_page_requests(0);
         let root_node = &hierarchy.nodes[hierarchy
@@ -488,7 +488,7 @@ fn representation_flip_crossfades_and_settles_in_both_directions() {
             GpuSceneSharedDeltaResult::PrototypeCreated(handle) => handle,
             other => panic!("unexpected {other:?}"),
         };
-        create_instance(&mut gpu_scene, prototype, Vec3::ZERO);
+        create_instance(&mut gpu_scene, prototype, Vec3::ZERO, 0);
 
         gpu_data.begin_frame(0).expect("gpu data");
         uploader.begin_frame(0).expect("uploader");
@@ -559,7 +559,7 @@ fn representation_flip_crossfades_and_settles_in_both_directions() {
                 vk::ImageLayout::GENERAL,
                 None,
             );
-            let wind_buffer = wind_records_buffer(&device);
+            let wind_buffer = wind_records_buffer(&device, &[]);
             let wind_records_res = graph.import_buffer(wind_buffer.handle(), None);
             view.add_cull_pass(
                 &device,
@@ -667,4 +667,242 @@ fn representation_flip_crossfades_and_settles_in_both_directions() {
     device.wait_idle().expect("idle before teardown");
     drop(device);
     assert_eq!(validation_issue_count(), before);
+}
+
+/// A one-node page holding two triangle clusters whose swept bounds are far apart in x:
+/// `near` sits at the origin, `far` at +5000 m. Both are inside the node's bounds, so the
+/// node survives any frustum the origin is in and only the per-cluster test can reject the
+/// far one.
+fn two_cluster_hierarchy() -> saffron_geometry::PortableVirtualHierarchy {
+    use saffron_geometry::{
+        AppearanceError, HierarchyRepresentation, PortableBounds, PortableHierarchyNode,
+        PortableHierarchyPage, PortableTriangleCluster, PortableVirtualHierarchy,
+    };
+
+    const METRE: i32 = 1 << 16;
+    let box_bits = |x_min: i32, x_max: i32| PortableBounds {
+        min_bits: [x_min * METRE, -METRE, -METRE],
+        max_bits: [x_max * METRE, METRE, METRE],
+    };
+    let cluster = |id: u32, bounds: PortableBounds| PortableTriangleCluster {
+        id,
+        prototype: 0,
+        source_submesh: 0,
+        material_slot: 0,
+        material_class: saffron_geometry::VirtualMaterialClass::Opaque,
+        material_moments: Default::default(),
+        opacity_micromap: false,
+        vertices: Vec::new(),
+        source_vertices: vec![0, 1, 2],
+        local_indices: vec![0, 1, 2],
+        bounds,
+        deformed_bounds: bounds,
+        sphere_bits: [0; 4],
+        cone: [0; 4],
+        deformation_joints: Vec::new(),
+        page: 0,
+        appearance_error: AppearanceError::default(),
+        parent_appearance_error: AppearanceError::default(),
+    };
+    let near = box_bits(-1, 1);
+    let far = box_bits(5000, 5001);
+    let node_bounds = PortableBounds {
+        min_bits: near.min_bits,
+        max_bits: far.max_bits,
+    };
+    PortableVirtualHierarchy {
+        triangle_clusters: vec![cluster(0, near), cluster(1, far)],
+        nodes: vec![PortableHierarchyNode {
+            id: 0,
+            representation: HierarchyRepresentation::Triangles { first: 0, count: 2 },
+            parent: None,
+            children: Vec::new(),
+            page: 0,
+            bounds: node_bounds,
+            deformed_bounds: node_bounds,
+            appearance_error: AppearanceError::default(),
+        }],
+        pages: vec![PortableHierarchyPage {
+            id: 0,
+            dependency: None,
+            node: 0,
+            bounds: node_bounds,
+            deformed_bounds: node_bounds,
+            transition_error: AppearanceError::default(),
+            guaranteed_root: true,
+        }],
+        roots: vec![0],
+        ..Default::default()
+    }
+}
+/// Swept bounds cull at CLUSTER granularity: a node whose own bounds span the view keeps
+/// its subtree, and the clusters inside it are each tested on their own swept extent, so
+/// one part leaves the frame while its siblings draw.
+///
+/// The same walk with the cull off emits both clusters, which is what makes the rejection
+/// a measured reduction rather than a number the test defines into existence.
+#[test]
+fn a_cluster_outside_the_view_is_rejected_while_its_sibling_draws() {
+    let walks = cluster_walk_counters(
+        &ClusterWalk {
+            hierarchy: two_cluster_hierarchy(),
+            prototype_bounds: [2500.0, 0.0, 0.0, 2502.0],
+            instance_flags: 0,
+            wind_record: crate::GpuWindInstanceRecord::default(),
+            eye: Vec3::new(0.0, 0.0, 8.0),
+            target: Vec3::ZERO,
+        },
+        &[0, 1],
+    );
+    let (off, on) = (&walks[0], &walks[1]);
+
+    assert_eq!(off[0], 1, "the instance is visible with the cull off");
+    assert_eq!(off[3], 2, "both clusters emit with the cull off");
+    assert_eq!(
+        off[crate::SCENE_VISIBILITY_COUNTER_CULLED_CLUSTERS],
+        0,
+        "the cull off rejects nothing"
+    );
+
+    assert_eq!(on[0], 1, "the instance is visible with the cull on");
+    assert_eq!(
+        on[crate::SCENE_VISIBILITY_COUNTER_CULLED_NODES],
+        0,
+        "the node spans the view and survives"
+    );
+    assert_eq!(
+        on[crate::SCENE_VISIBILITY_COUNTER_CULLED_CLUSTERS],
+        1,
+        "the far cluster is rejected on its own swept bounds"
+    );
+    assert_eq!(on[3], 1, "the near cluster still draws");
+    assert_eq!(on[4], 0, "no record overflow");
+}
+
+/// One wind-deformed instance whose node spans the view — so the walk reaches the clusters —
+/// holding a cluster inside the frustum plus two outside it that differ only in height: a
+/// crown at the plant's top and a skirt at its foot.
+///
+/// `heightScale` is the reciprocal of the ten-metre bounds top, so the crown's deformation
+/// weight is 1 and the skirt's is 0.1 — the same ratio `gpuSceneWindDeform` gives their
+/// vertices.
+fn tall_and_short_cluster_hierarchy() -> saffron_geometry::PortableVirtualHierarchy {
+    use saffron_geometry::{
+        AppearanceError, HierarchyRepresentation, PortableBounds, PortableHierarchyNode,
+        PortableHierarchyPage, PortableTriangleCluster, PortableVirtualHierarchy,
+    };
+
+    const METRE: i32 = 1 << 16;
+    let box_bits = |x_min: i32, x_max: i32, y_min: i32, y_max: i32| PortableBounds {
+        min_bits: [x_min * METRE, y_min * METRE, -METRE],
+        max_bits: [x_max * METRE, y_max * METRE, METRE],
+    };
+    let cluster = |id: u32, bounds: PortableBounds| PortableTriangleCluster {
+        id,
+        prototype: 0,
+        source_submesh: 0,
+        material_slot: 0,
+        material_class: saffron_geometry::VirtualMaterialClass::Opaque,
+        material_moments: Default::default(),
+        opacity_micromap: false,
+        vertices: Vec::new(),
+        source_vertices: vec![0, 1, 2],
+        local_indices: vec![0, 1, 2],
+        bounds,
+        deformed_bounds: bounds,
+        sphere_bits: [0; 4],
+        cone: [0; 4],
+        deformation_joints: Vec::new(),
+        page: 0,
+        appearance_error: AppearanceError::default(),
+        parent_appearance_error: AppearanceError::default(),
+    };
+    let anchor = box_bits(-1, 1, 0, 1);
+    let skirt = box_bits(40, 41, 0, 1);
+    let crown = box_bits(40, 41, 9, 10);
+    let node_bounds = PortableBounds {
+        min_bits: anchor.min_bits,
+        max_bits: crown.max_bits,
+    };
+    PortableVirtualHierarchy {
+        triangle_clusters: vec![cluster(0, anchor), cluster(1, skirt), cluster(2, crown)],
+        nodes: vec![PortableHierarchyNode {
+            id: 0,
+            representation: HierarchyRepresentation::Triangles { first: 0, count: 3 },
+            parent: None,
+            children: Vec::new(),
+            page: 0,
+            bounds: node_bounds,
+            deformed_bounds: node_bounds,
+            appearance_error: AppearanceError::default(),
+        }],
+        pages: vec![PortableHierarchyPage {
+            id: 0,
+            dependency: None,
+            node: 0,
+            bounds: node_bounds,
+            deformed_bounds: node_bounds,
+            transition_error: AppearanceError::default(),
+            guaranteed_root: true,
+        }],
+        roots: vec![0],
+        ..Default::default()
+    }
+}
+
+/// The wind cull slack is the box's OWN, not the whole instance's.
+///
+/// The skirt and the crown both sit outside the frustum's right edge and the prepass record
+/// carries twenty metres of sway. Applied whole to both — the way one instance-wide scalar
+/// would — each box reaches back into the view and neither is rejected. Weighted by height,
+/// the crown reaches in and the skirt, which the vertex path barely moves, does not.
+#[test]
+fn a_cluster_takes_the_wind_slack_its_own_height_earns() {
+    let record = crate::GpuWindInstanceRecord {
+        sway_current: [20.0, 0.0, 0.0],
+        sway_previous: [20.0, 0.0, 0.0],
+        height_scale: 0.1,
+        sway_slack: 20.0,
+        bounds_inflation: 20.0,
+        ..Default::default()
+    };
+    let walk = |instance_flags: u32| -> Vec<u32> {
+        cluster_walk_counters(
+            &ClusterWalk {
+                hierarchy: tall_and_short_cluster_hierarchy(),
+                // A sphere reaching every cluster plus the slack, so the instance survives
+                // its own test whatever the boxes do.
+                prototype_bounds: [40.0, 5.0, 0.0, 60.0],
+                instance_flags,
+                wind_record: record,
+                eye: Vec3::new(0.0, 5.0, 60.0),
+                target: Vec3::new(0.0, 5.0, 0.0),
+            },
+            &[1],
+        )
+        .remove(0)
+    };
+
+    let still = walk(0);
+    assert_eq!(still[0], 1, "the instance is visible");
+    assert_eq!(
+        still[crate::SCENE_VISIBILITY_COUNTER_CULLED_NODES],
+        0,
+        "the node spans the view and survives, so the walk reaches the clusters"
+    );
+    assert_eq!(
+        still[crate::SCENE_VISIBILITY_COUNTER_CULLED_CLUSTERS],
+        2,
+        "with no wind flag neither outside box grows, so both leave the view"
+    );
+    assert_eq!(still[3], 1, "only the cluster already in view draws");
+
+    let blowing = walk(crate::GPU_SCENE_INSTANCE_FLAG_WIND);
+    assert_eq!(blowing[0], 1, "the instance is visible");
+    assert_eq!(
+        blowing[crate::SCENE_VISIBILITY_COUNTER_CULLED_CLUSTERS],
+        1,
+        "the crown's own sway reaches back into the view; the skirt's does not"
+    );
+    assert_eq!(blowing[3], 2, "the crown joins the cluster already in view");
 }
