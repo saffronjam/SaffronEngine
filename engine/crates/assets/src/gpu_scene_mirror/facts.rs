@@ -91,6 +91,9 @@ impl GpuSceneMirror {
                 instance_slot: entry.handle.raw().index,
                 opacity_override: entry.facts.opacity_override,
                 combination: entry.facts.combination,
+                // The wind prepass displaces vegetation only; an ECS mesh instance never carries
+                // the flag, so its structure at rest pose is the pose every pass draws.
+                wind: false,
             });
         }
         // Vegetation never enters the ECS; its placed plants reach the structure through the
@@ -125,6 +128,9 @@ impl GpuSceneMirror {
                 instance_slot: entry.handle.raw().index,
                 opacity_override: None,
                 combination: entry.record.combination,
+                // Every placed plant is wind-flagged, so its structure is materialized from the
+                // wind record rather than built at rest pose — as far as the frame's budget reaches.
+                wind: entry.record.flags & GPU_SCENE_INSTANCE_FLAG_WIND != 0,
             });
         }
 
@@ -144,19 +150,13 @@ impl GpuSceneMirror {
 
     /// Entities in the world bound to `scene_instance` whose resolved materials displace — the
     /// static half of the frame's deformation work list.
+    ///
+    /// Read straight off the set the resolve maintains, so the cost is the number of displaced
+    /// instances rather than the number the world holds.
     #[must_use]
     pub fn displaced_static_entities(&self, scene_instance: Uuid) -> Vec<Entity> {
         self.world_for(scene_instance)
-            .map_or_else(Vec::new, |world| {
-                world
-                    .instances
-                    .iter()
-                    .filter(|((_, source), entry)| {
-                        *source == InstanceSource::Static && entry.facts.displace.is_some()
-                    })
-                    .map(|((entity, _), _)| *entity)
-                    .collect()
-            })
+            .map_or_else(Vec::new, |world| world.displaced.iter().copied().collect())
     }
 
     /// One mirrored instance's deformation inputs, or `None` when the entity is not mirrored
@@ -192,6 +192,16 @@ impl WorldMirror {
     /// one silently keeps a destroyed instance casting or a moved one casting from where it was.
     pub(super) fn invalidate_rays(&mut self) {
         self.rays = None;
+    }
+
+    /// Records whether `entity`'s static instance displaces, keeping the displacement set in
+    /// step with the facts the resolve just derived.
+    pub(super) fn track_displacement(&mut self, entity: Entity, displaces: bool) {
+        if displaces {
+            self.displaced.insert(entity);
+        } else {
+            self.displaced.remove(&entity);
+        }
     }
 }
 
@@ -326,5 +336,83 @@ mod tests {
         assert!(reachable(
             Mat4::from_scale(Vec3::splat(40.0)) * Mat4::from_translation(Vec3::new(0.0, 0.0, 0.55))
         ));
+    }
+
+    /// The displacement set is maintained by the resolve rather than filtered out of the instance
+    /// map per frame, so it has to stay in step with the facts on every term that can change one:
+    /// a material that starts displacing, one that stops, and a destroy. A stale set either
+    /// amplifies geometry for an entity that no longer displaces or silently drops one that does.
+    #[test]
+    fn the_displacement_set_follows_the_materials_the_instances_resolve() {
+        let Some(mut harness) = harness("displaced-set") else {
+            return;
+        };
+        let mesh_id = Uuid(7801);
+        write_triangle_mesh(&mut harness.assets, mesh_id, "tri");
+        let displacing = write_displacing_material(&mut harness.assets, "relief");
+
+        let mut scene = Scene::new();
+        let plain = scene.create_entity("Plain");
+        scene
+            .add_component(plain, MeshComponent { mesh: mesh_id })
+            .unwrap();
+        let relief = scene.create_entity("Relief");
+        scene
+            .add_component(relief, MeshComponent { mesh: mesh_id })
+            .unwrap();
+        scene
+            .add_component(
+                relief,
+                saffron_scene::MaterialSet {
+                    slots: vec![saffron_scene::MaterialSlot {
+                        material: displacing,
+                        ..saffron_scene::MaterialSlot::default()
+                    }],
+                },
+            )
+            .unwrap();
+        harness.sync(&mut scene);
+        let instance = scene.instance_id();
+
+        assert_eq!(
+            harness.mirror.displaced_static_entities(instance),
+            vec![relief],
+            "only the entity binding the displacing material is a candidate"
+        );
+
+        // The same entity rebound to the built-in default material stops displacing.
+        scene
+            .with_component_mut::<saffron_scene::MaterialSet, _>(relief, |set| {
+                set.slots[0].material = Uuid(0);
+            })
+            .unwrap();
+        harness.sync(&mut scene);
+        assert!(
+            harness
+                .mirror
+                .displaced_static_entities(instance)
+                .is_empty(),
+            "an entity that stopped displacing leaves the set"
+        );
+
+        // Back to displacing, then destroyed: the destroy must clear it too.
+        scene
+            .with_component_mut::<saffron_scene::MaterialSet, _>(relief, |set| {
+                set.slots[0].material = displacing;
+            })
+            .unwrap();
+        harness.sync(&mut scene);
+        assert_eq!(harness.mirror.displaced_static_entities(instance).len(), 1);
+        scene.destroy_entity(relief);
+        harness.sync(&mut scene);
+        assert!(
+            harness
+                .mirror
+                .displaced_static_entities(instance)
+                .is_empty(),
+            "a destroyed instance leaves the set"
+        );
+
+        harness.finish();
     }
 }

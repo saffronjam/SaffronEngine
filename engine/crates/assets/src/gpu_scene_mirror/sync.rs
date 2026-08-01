@@ -267,6 +267,19 @@ impl GpuSceneMirror {
         }
         if refresh_materials {
             self.refresh_all_materials(assets, gpu, target)?;
+            // An instance's ray-tracing opacity class and its displacement inputs are DERIVED
+            // from its resolved materials, not stored in the material records, so refreshing
+            // the records alone leaves them describing a class the entity no longer has — a
+            // leaf card that becomes masked at runtime would keep casting a solid ray shadow.
+            // Re-resolving the instance re-derives both.
+            for world_state in self.worlds.values_mut() {
+                let touched: Vec<Entity> = world_state
+                    .instances
+                    .keys()
+                    .map(|(entity, _)| *entity)
+                    .collect();
+                world_state.dirty.extend(touched);
+            }
         }
         for id in dropped_meshes {
             self.drop_mesh(id, target)?;
@@ -605,6 +618,9 @@ pub(super) fn remove_instance(
         return Ok(());
     };
     world_state.invalidate_rays();
+    if key.1 == InstanceSource::Static {
+        world_state.track_displacement(key.0, false);
+    }
     target
         .gpu_scene
         .apply_world_delta(world, GpuSceneWorldDelta::RemoveInstance(entry.handle))

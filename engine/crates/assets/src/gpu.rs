@@ -124,11 +124,6 @@ pub trait GpuUploader {
     /// gathered only when this is true, so a build with skinning off is byte-identical
     /// to one without the skinned path.
     fn skinning_enabled(&self) -> bool;
-
-    /// Temporal phase used by canonical stochastic coverage for the active frame.
-    fn coverage_temporal_phase(&self) -> u32 {
-        0
-    }
 }
 
 /// The live-renderer [`GpuUploader`]: an [`Uploader`] (its own one-off command pool +

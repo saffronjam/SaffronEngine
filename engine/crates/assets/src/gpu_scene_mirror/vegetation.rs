@@ -102,16 +102,21 @@ impl GpuSceneMirror {
                 // A family that cooked an atlas addresses it from its UVs, so every slot of every
                 // point in this family reads the atlas rather than the slot's own image.
                 let atlas = render.atlas.clone();
-                // The rendered phenotype derives from typed lifecycle state and the
-                // seasonal phase — never inferred from the active mesh.
+                // The rendered phenotype derives from typed lifecycle state, the seasonal
+                // phase, and the plant's persistent health and moisture — never inferred
+                // from the active mesh.
                 let rendered_phenotype = saffron_vegetation::resolve_rendered_phenotype(
                     render
                         .phenotypes
                         .iter()
-                        .map(|row| (row.id, row.role, row.season_window)),
+                        .map(|row| (row.id, row.role, row.response)),
                     points.phenotypes[index],
-                    points.lifecycles[index],
-                    season_mille,
+                    saffron_vegetation::PhenologyState {
+                        lifecycle: points.lifecycles[index],
+                        season_mille,
+                        health: points.health[index],
+                        moisture: points.moisture[index],
+                    },
                 );
                 // The rendered phenotype remaps material slots before slot resolution.
                 let phenotype_remap = render
@@ -265,10 +270,14 @@ impl GpuSceneMirror {
                         render
                             .phenotypes
                             .iter()
-                            .map(|row| (row.id, row.role, row.season_window)),
+                            .map(|row| (row.id, row.role, row.response)),
                         points.phenotypes[index],
-                        points.lifecycles[index],
-                        season_mille,
+                        saffron_vegetation::PhenologyState {
+                            lifecycle: points.lifecycles[index],
+                            season_mille,
+                            health: points.health[index],
+                            moisture: points.moisture[index],
+                        },
                     );
                     let combination = render
                         .combinations
@@ -596,14 +605,14 @@ mod tests {
                     crate::PlantPhenotypeRender {
                         id: 0,
                         role: saffron_vegetation::PhenotypeRole::Healthy,
-                        season_window: None,
+                        response: saffron_vegetation::PhenotypeResponse::default(),
                         variation: 0,
                         material_remap: Arc::from([]),
                     },
                     crate::PlantPhenotypeRender {
                         id: 1,
                         role: saffron_vegetation::PhenotypeRole::Senescent,
-                        season_window: None,
+                        response: saffron_vegetation::PhenotypeResponse::default(),
                         variation: 0,
                         material_remap: Arc::from([]),
                     },

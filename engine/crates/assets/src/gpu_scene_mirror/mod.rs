@@ -327,6 +327,23 @@ struct LightEntry {
     record: GpuSceneLightRecord,
 }
 
+/// What one mirrored GPU-scene instance slot was translated from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MirrorInstanceIdentity {
+    /// A scene entity.
+    Entity(Entity),
+    /// A resident macro plant, addressed by its owning cell and stable identity.
+    Plant {
+        /// The cell the plant streams from.
+        cell: WorldCellKey,
+        /// The plant's stable identity.
+        plant: PlantId,
+    },
+    /// A micro vegetation field's anchor instance. Its blade records are regenerated every
+    /// frame and are never persistent objects.
+    MicroField,
+}
+
 #[derive(Default)]
 struct WorldMirror {
     scene_instance: Uuid,
@@ -335,6 +352,10 @@ struct WorldMirror {
     /// skinned entity so its deformation slot appears or retires.
     skinning: Option<bool>,
     instances: HashMap<(Entity, InstanceSource), InstanceEntry>,
+    /// Static-source entities whose resolved materials displace, maintained as each instance
+    /// resolves. Kept as a set rather than filtered out of `instances` per frame so the frame
+    /// driver's displacement candidate list costs what displaces, not what the world holds.
+    displaced: HashSet<Entity>,
     lights: HashMap<(Entity, MirrorLightKind), LightEntry>,
     unresolved: HashMap<(Entity, InstanceSource), u64>,
     dirty: HashSet<Entity>,
@@ -461,6 +482,11 @@ pub struct GpuSceneMirror {
     world_rebuilds: u64,
     worker: PageStreamWorker,
     vegetation_budgets: VegetationBudgets,
+    /// Measures each world's eye between frames so page demand leads the camera. Reuses the
+    /// residency tracker so there is one smoothing rule for predicted demand in the engine.
+    /// Keyed by world because the views share this mirror: a thumbnail excursion between two
+    /// scene frames would otherwise read as the camera teleporting and zero its estimate.
+    eye_motion: BTreeMap<u64, saffron_spatial::SourceMotion>,
 }
 
 struct SyncCtx<'a, 'b> {
@@ -680,6 +706,41 @@ impl GpuSceneMirror {
         Some((entry.handle.raw().index, mechanics))
     }
 
+    /// What a GPU-scene instance slot mirrors, for the selection readback: the entity it was
+    /// translated from, the plant it streams from, or a micro field's anchor.
+    ///
+    /// The mirror is keyed by identity in both directions on purpose — a slot is a device
+    /// address, so a pick answers with the entity or the [`PlantId`] behind it, never the slot.
+    #[must_use]
+    pub fn identify_instance_slot(
+        &self,
+        world: GpuSceneWorldId,
+        slot: u32,
+    ) -> Option<MirrorInstanceIdentity> {
+        let world = self.worlds.get(&world.0)?;
+        if let Some((entity, _)) = world
+            .instances
+            .iter()
+            .find(|(_, entry)| entry.handle.raw().index == slot)
+            .map(|((entity, source), _)| (*entity, *source))
+        {
+            return Some(MirrorInstanceIdentity::Entity(entity));
+        }
+        if let Some((cell, plant)) = world
+            .plants
+            .iter()
+            .find(|(_, entry)| entry.handle.raw().index == slot)
+            .map(|(key, _)| *key)
+        {
+            return Some(MirrorInstanceIdentity::Plant { cell, plant });
+        }
+        world
+            .field_instances
+            .values()
+            .any(|handle| handle.raw().index == slot)
+            .then_some(MirrorInstanceIdentity::MicroField)
+    }
+
     /// Host bytes retained across mirrored meshes for exact surface and deformation
     /// queries (the render-stats `retained_mesh_cpu_bytes` source).
     #[must_use]
@@ -689,29 +750,5 @@ impl GpuSceneMirror {
             .values()
             .map(|entry| entry.mesh.retained_query_cpu_bytes())
             .sum()
-    }
-
-    /// The global material-parameter arena index of `entity`'s slot-0 material — its
-    /// slot-0 override when present, else the default material — for the tessellation
-    /// seam's instance rows (the mesh fragments index the arena at set 2, binding 2).
-    #[must_use]
-    pub fn material_parameter_index(&self, scene_instance: Uuid, entity: Entity) -> Option<u32> {
-        let world = self
-            .worlds
-            .values()
-            .find(|world| world.scene_instance == scene_instance)?;
-        let entry = world
-            .instances
-            .get(&(entity, InstanceSource::Static))
-            .or_else(|| world.instances.get(&(entity, InstanceSource::Skinned)))?;
-        let key = entry
-            .overrides
-            .iter()
-            .find(|(slot, _)| *slot == 0)
-            .map_or_else(MaterialKey::default_key, |(_, key)| key.clone());
-        self.shared
-            .materials
-            .get(&key)
-            .map(|material| material.device.parameters.first)
     }
 }

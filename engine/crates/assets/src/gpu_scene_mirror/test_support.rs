@@ -116,6 +116,40 @@ pub(crate) fn write_triangle_mesh(assets: &mut AssetServer, id: Uuid, name: &str
     });
 }
 
+/// Writes a `.smat` whose height slot displaces, plus the 4x4 height PNG it references, and
+/// returns the material id a [`saffron_scene::MaterialSlot`] binds. Real displacement needs a
+/// decodable height texture — `displace_info_from` returns `None` without one — so the texture
+/// is written to disk rather than stubbed.
+pub(crate) fn write_displacing_material(assets: &mut AssetServer, name: &str) -> Uuid {
+    let texture_id = Uuid::new();
+    let rel = format!("textures/{name}-height.png");
+    std::fs::create_dir_all(format!("{}/textures", assets.root.display())).unwrap();
+    let mut pixels = image::RgbaImage::new(4, 4);
+    for (x, y, pixel) in pixels.enumerate_pixels_mut() {
+        let height = ((x * 4 + y) * 16) as u8;
+        *pixel = image::Rgba([height, height, height, 255]);
+    }
+    pixels
+        .save(assets.root.join(&rel))
+        .expect("write height png");
+    assets.catalog.put(AssetEntry {
+        id: texture_id,
+        name: format!("{name}-height"),
+        asset_type: AssetType::Texture,
+        path: rel,
+        chunk: -1,
+        ..AssetEntry::default()
+    });
+
+    let material = crate::MaterialAsset {
+        height_texture: texture_id,
+        height_mode: saffron_core::HeightMode::Displacement,
+        height_scale: 0.3,
+        ..crate::MaterialAsset::default()
+    };
+    crate::save_material_asset(assets, &material, name, "").expect("write smat")
+}
+
 /// Field order is the drop order: every GPU-resource holder precedes `fixture`, so an
 /// assertion unwind tears down buffers and textures before the device.
 pub(crate) struct MirrorHarness {

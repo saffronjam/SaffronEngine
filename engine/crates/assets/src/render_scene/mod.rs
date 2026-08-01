@@ -1,8 +1,8 @@
 //! `render_scene` — the engine's highest-coupling driver — and its read-side twin
-//! [`pick_entity`].
+//! [`pick_scene_surface`].
 //!
 //! [`render_scene`] translates a scene + camera into the renderer's draw list plus every
-//! per-frame lighting / shadow / GI / sky / RT / cluster / SSAO setter; [`pick_entity`]
+//! per-frame lighting / shadow / GI / sky / RT / cluster / SSAO setter; [`pick_scene_surface`]
 //! ray-casts the same scene to find the clicked entity. Both read the same last-frame
 //! world-transform flatten the draw loop writes ([`Scene::update_world_transforms`]),
 //! rebuilding the joint palette fresh.
@@ -28,8 +28,8 @@ use saffron_rendering::{
 use saffron_scene::{
     AtmosphereRole, Camera, CameraView, DirectionalLight, Entity, FogShape, FogVolume, IdComponent,
     MaterialSet, MaterialSlot, Mesh as MeshComponent, MorphComponent, MorphWeightOverride,
-    PointLight, PreviewGhost, ReflectionProbe, Relationship, Scene, SkinnedMesh, SkyMode,
-    SpotLight, Transform, camera_projection,
+    PlantOrigin, PointLight, PreviewGhost, ReflectionProbe, Relationship, Scene, SkinnedMesh,
+    SkyMode, SpotLight, Transform, camera_projection,
 };
 use saffron_spatial::{
     FieldChannel, FieldDerivative, FieldSample, SurfaceCapabilities, SurfaceCoordinates,
@@ -59,8 +59,8 @@ mod test_support;
 
 pub use frame::render_scene;
 pub use pick::{
-    pick_entity, pick_scene_surface, query_scene_surface_ray, sample_scene_surface_field,
-    scene_surface_field_snapshots, scene_surface_providers, viewport_pick_ray, viewport_ray,
+    pick_scene_surface, query_scene_surface_ray, sample_scene_surface_field,
+    scene_surface_field_snapshots, scene_surface_providers, viewport_ray,
 };
 
 pub(crate) use gather::{gpu_point_light, gpu_spot_light};
@@ -324,10 +324,6 @@ impl GpuUploader for RendererScene<'_> {
 
     fn skinning_enabled(&self) -> bool {
         self.skinning_enabled
-    }
-
-    fn coverage_temporal_phase(&self) -> u32 {
-        self.renderer.active_view().jitter_index
     }
 }
 

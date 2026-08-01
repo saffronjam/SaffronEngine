@@ -199,8 +199,10 @@ pub(super) struct FrameSceneBuild {
     /// The frame's static RT instances (skinned casters ride the deformation gather's
     /// refit entries instead).
     pub(super) rt_instances: Arc<[saffron_rendering::RtInstanceInput]>,
-    /// Instances whose frame facts this gather derived — zero on a frame that reused the
-    /// mirror's cut and has nothing deforming.
+    /// Instances this gather visited — the mirrored set when the reach cut was re-derived, plus
+    /// every deformation candidate it resolved. Zero on a frame that reused the cut and has
+    /// nothing deforming, which is what makes the number a regression tripwire: a gather that
+    /// went back to walking the scene reports the scene's size here.
     pub(super) entities_derived: u32,
 }
 
@@ -249,6 +251,10 @@ pub(super) fn gather_static_frame_facts<R: SceneRenderer>(
     });
 
     for entity in candidates {
+        // Counted before the resolve, not after: the counter has to measure what the gather
+        // VISITED, or a walk that touches every instance and finds nothing to deform reads as
+        // zero cost.
+        build.entities_derived += 1;
         let Some(instance) = mirror.mirrored_instance(scene_instance, entity, false) else {
             continue;
         };
@@ -261,7 +267,6 @@ pub(super) fn gather_static_frame_facts<R: SceneRenderer>(
         if morph_weights.is_empty() && displace.is_none() {
             continue;
         }
-        build.entities_derived += 1;
         build.work.push(saffron_rendering::DeformationWork {
             mesh: instance.mesh,
             entity: entity_id_or_zero(scene, entity),
@@ -294,6 +299,7 @@ pub(super) fn gather_skinned_frame_facts<R: SceneRenderer>(
     });
 
     for (entity, skin) in skins {
+        build.entities_derived += 1;
         let Some(instance) = mirror.mirrored_instance(scene_instance, entity, true) else {
             continue;
         };
@@ -304,7 +310,6 @@ pub(super) fn gather_skinned_frame_facts<R: SceneRenderer>(
         if palette.is_empty() {
             continue;
         }
-        build.entities_derived += 1;
         build.work.push(saffron_rendering::DeformationWork {
             mesh: instance.mesh,
             entity: entity_id_or_zero(scene, entity),

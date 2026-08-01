@@ -278,6 +278,9 @@ fn resolve_instance(
     };
     let facts = instance_facts(shared, mesh_id, entity, state.current, combination, ctx);
     world_state.invalidate_rays();
+    if source == InstanceSource::Static {
+        world_state.track_displacement(entity, facts.displace.is_some());
+    }
 
     if let Some(entry) = world_state.instances.get(&key) {
         let unchanged = ctx
@@ -381,7 +384,7 @@ fn instance_facts(
         .all(|material| material.blend_mode == BlendMode::Opaque && material.thin_sheet.is_none());
     InstanceFacts {
         bounds: super::facts::world_bounds(&model, mesh.bounds_min, mesh.bounds_max),
-        opacity_override: (resolved_opaque != mesh.cooked_opaque).then_some(resolved_opaque),
+        opacity_override: (resolved_opaque != mesh.cooked_opaque()).then_some(resolved_opaque),
         displace: saffron_rendering::displace_info_from(&materials.submeshes),
         mesh,
         model,

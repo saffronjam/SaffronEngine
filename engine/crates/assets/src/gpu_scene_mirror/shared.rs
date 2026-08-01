@@ -633,13 +633,28 @@ fn prototype_bounds(mesh: &GpuMesh) -> [f32; 4] {
     [center.x, center.y, center.z, radius.max(0.0)]
 }
 
-/// Each cooked hierarchy page's SWEPT local bounds, in page order.
+/// The SWEPT local bounds of each cooked LEAF page — one triangle cluster or one aggregate brick
+/// each, in page order.
 ///
 /// The deformed extent rather than the static one: consumers dirty shadow pages from these, and a
 /// static box would leave a swaying branch's new position un-re-rendered.
+///
+/// Leaves only, because an interior page's bounds ENCLOSE its whole subtree: including them would
+/// add the prototype's own root box to every dirty set and make the tight cluster boxes beside it
+/// pointless. Dropping them stays conservative — a coarse representation's vertices are convex
+/// combinations of the fine ones it simplifies, so it lies inside the union of its children's
+/// boxes, which is what the cook's own subtree closure asserts.
 fn prototype_page_bounds(mesh: &GpuMesh) -> Arc<[GpuScenePageBounds]> {
-    mesh.hierarchy_pages
+    leaf_page_bounds(&mesh.hierarchy_pages)
+}
+
+/// [`prototype_page_bounds`] over a bare page directory: a page is a leaf when no other page
+/// depends on it, which is the only place the cooked directory records the tree.
+fn leaf_page_bounds(pages: &[PortableHierarchyPage]) -> Arc<[GpuScenePageBounds]> {
+    let interior: HashSet<u32> = pages.iter().filter_map(|page| page.dependency).collect();
+    pages
         .iter()
+        .filter(|page| !interior.contains(&page.id))
         .map(|page| {
             let scale = |bits: i32| bits as f32 / 65_536.0;
             GpuScenePageBounds {
@@ -989,5 +1004,64 @@ mod tests {
         drop(uploaded);
         harness.finish();
         assert_eq!(validation_issue_count(), before);
+    }
+
+    /// The dirty-bounds list a moved instance dirties shadow pages from is the prototype's LEAF
+    /// pages — one cluster or brick each — and nothing above them.
+    ///
+    /// An interior page's cooked bounds enclose its whole subtree, so a directory walked whole
+    /// hands the consumer the prototype's own root box beside every tight cluster box. The union
+    /// is then the root box and the split buys nothing: the sparse gap between a trunk's clusters
+    /// and a canopy's re-rasterizes anyway. This test dies the moment an interior page rejoins the
+    /// list, because the root's twelve-metre span appears in the output.
+    #[test]
+    fn only_leaf_pages_contribute_dirty_bounds() {
+        let page = |id: u32, dependency: Option<u32>, min: i32, max: i32| PortableHierarchyPage {
+            id,
+            dependency,
+            node: id,
+            bounds: saffron_geometry::PortableBounds {
+                min_bits: [min << 16, 0, 0],
+                max_bits: [max << 16, 1 << 16, 1 << 16],
+            },
+            deformed_bounds: saffron_geometry::PortableBounds {
+                min_bits: [min << 16, 0, 0],
+                max_bits: [max << 16, 1 << 16, 1 << 16],
+            },
+            transition_error: saffron_geometry::AppearanceError::default(),
+            guaranteed_root: dependency.is_none(),
+        };
+        // A trunk cluster at the origin, a canopy cluster ten metres away, and the root page whose
+        // bounds enclose both — the shape `close_subtree_bounds` always produces.
+        let pages = [
+            page(0, None, -1, 11),
+            page(1, Some(0), -1, 1),
+            page(2, Some(0), 9, 11),
+        ];
+        let bounds = leaf_page_bounds(&pages);
+        assert_eq!(
+            bounds.len(),
+            2,
+            "the root page is not a dirty-bounds source"
+        );
+        let spans: Vec<f32> = bounds
+            .iter()
+            .map(|box_| box_.max[0] - box_.min[0])
+            .collect();
+        assert_eq!(spans, vec![2.0, 2.0], "each box is one cluster wide");
+        assert!(
+            !bounds
+                .iter()
+                .any(|box_| box_.min[0] <= -1.0 && box_.max[0] >= 11.0),
+            "no box spans the whole prototype"
+        );
+        // A prototype that cooked one node is that node: it depends on nothing and nothing
+        // depends on it, so a leaf filter that keyed on `guaranteed_root` would drop it entirely.
+        let single = leaf_page_bounds(&[page(0, None, -1, 1)]);
+        assert_eq!(
+            single.len(),
+            1,
+            "a single-page prototype still dirties itself"
+        );
     }
 }
