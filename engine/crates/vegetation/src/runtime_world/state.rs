@@ -6,14 +6,15 @@ use std::sync::Arc;
 use saffron_spatial::{ResidencyMask, WorldCellKey};
 
 use crate::{
-    DisturbanceTileKey, Error, PlantId, PlantPointColumns, Result, SaveStateEnvelope,
-    VegetationCellFacet, VegetationCellSectionKind, VegetationMutationRecord, VegetationState,
+    Error, PlantId, PlantPointColumns, Result, SaveStateEnvelope, VegetationCellFacet,
+    VegetationCellSectionKind, VegetationMutation, VegetationMutationRecord, VegetationState,
     VegetationStateBinding, reduce_mutations,
 };
 
 use super::VegetationWorld;
 use super::generation::{
-    VegetationCellGeneration, VegetationCellGenerationId, effective_macro_points, macro_columns,
+    CellPersistentOverlay, VegetationCellGeneration, VegetationCellGenerationId,
+    effective_macro_points, macro_columns,
 };
 use super::load::StagedVegetationCellGeneration;
 
@@ -45,6 +46,53 @@ impl VegetationWorld {
         self.replace_persistent_state(envelope.reduced_state()?)
     }
 
+    /// Highest transport sequence accepted from a network envelope.
+    #[must_use]
+    pub const fn network_sequence(&self) -> u64 {
+        self.network_sequence
+    }
+
+    /// Accepts one sequenced network envelope, reporting whether it advanced the stream.
+    ///
+    /// A carried authoritative snapshot replaces persistent state first — that is how a receiver
+    /// joins, and how one too far behind is corrected — and the sequenced operations then reduce
+    /// through the same confirmed path an authored mutation takes. A sequence at or below the last
+    /// accepted one is a retransmission and is dropped without touching the world.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::ManifestMismatch`] when the sender and receiver disagree on the immutable base,
+    /// [`Error::Network`] when an operation falls outside the seated interest declaration, and
+    /// any reducer error the operations raise.
+    pub fn receive_network_envelope(
+        &mut self,
+        envelope: &crate::NetworkMutationEnvelope,
+    ) -> Result<bool> {
+        if envelope.manifest_identity != self.manifest_identity.bytes() {
+            return Err(Error::ManifestMismatch);
+        }
+        if let Some(interest) = &self.network_interest
+            && let Some(record) = envelope
+                .operations
+                .iter()
+                .find(|record| interest.facets(record.header.cell) == ResidencyMask::NONE)
+        {
+            return Err(Error::Network(format!(
+                "operation targets cell {}, which this peer declared no interest in",
+                record.header.cell
+            )));
+        }
+        if envelope.sequence <= self.network_sequence {
+            return Ok(false);
+        }
+        if let Some(snapshot) = &envelope.snapshot {
+            self.replace_persistent_state(snapshot.clone())?;
+        }
+        self.apply_confirmed_mutations(&envelope.operations)?;
+        self.network_sequence = envelope.sequence;
+        Ok(true)
+    }
+
     /// Replaces the persistent state only when it matches the exact base generation.
     pub fn replace_persistent_state(&mut self, state: VegetationState) -> Result<()> {
         if state.manifest_identity() != self.manifest_identity.bytes() {
@@ -55,8 +103,25 @@ impl VegetationWorld {
         self.persistent = state.clone();
         self.effective = state;
         self.predictions.clear();
+        self.plant_authority.clear();
+        self.authority_epoch = self.authority_epoch.wrapping_add(1);
         self.bump_ecology_planted_revision();
         self.publish_state_rebuilds(staged)
+    }
+
+    /// The authority that last claimed simulation ownership of `plant`, absent while no authority
+    /// has moved, restored, or removed it since the last wholesale state replacement.
+    #[must_use]
+    pub fn plant_simulation_authority(&self, plant: PlantId) -> Option<u128> {
+        self.plant_authority.get(&plant).copied()
+    }
+
+    /// How many times persistent state has been replaced wholesale. A holder of a live
+    /// representation compares the epoch it took the representation at against this one: a move
+    /// means the world it observed was superseded by another authority's answer.
+    #[must_use]
+    pub const fn authority_epoch(&self) -> u64 {
+        self.authority_epoch
     }
 
     pub fn apply_confirmed_mutations(
@@ -109,6 +174,21 @@ impl VegetationWorld {
         // must re-derive the cell, exactly as a promotion does.
         for cell in &changed_cells {
             self.bump_bulk_revision(*cell);
+        }
+        // Only a committed transaction moves ownership; a replay claims nothing it did not
+        // already own, and a prediction is transient.
+        let committed = reduction
+            .committed_transactions
+            .iter()
+            .copied()
+            .collect::<BTreeSet<_>>();
+        for record in records
+            .iter()
+            .filter(|record| committed.contains(&record.header.transaction))
+        {
+            if let Some(plant) = claims_simulation_ownership(&record.mutation) {
+                self.plant_authority.insert(plant, record.header.authority);
+            }
         }
         // Only a confirmed commit is observable. A prediction is transient and a replay is a
         // no-op, so neither reaches the ring — every consumer sees each transition exactly once.
@@ -187,13 +267,16 @@ impl VegetationWorld {
         self.predictions.len()
     }
 
-    pub fn promote_plant(&mut self, plant: PlantId) -> Result<WorldCellKey> {
+    /// Suppresses `plant`'s bulk representation for `authority`, which becomes the plant's
+    /// simulation owner until another authority claims it.
+    pub fn promote_plant(&mut self, plant: PlantId, authority: u128) -> Result<WorldCellKey> {
         let cell = self.owner_cell(plant)?;
         if !self.bulk_suppressed.insert(plant) {
             return Err(Error::Mutation(format!(
                 "plant {plant} is already promoted"
             )));
         }
+        self.plant_authority.insert(plant, authority);
         self.bump_bulk_revision(cell);
         Ok(cell)
     }
@@ -260,7 +343,7 @@ impl VegetationWorld {
             resident: ResidencyMask,
             facets: BTreeMap<VegetationCellSectionKind, VegetationCellFacet>,
             points: PlantPointColumns,
-            disturbance_masks: BTreeMap<DisturbanceTileKey, Vec<i16>>,
+            overlay: CellPersistentOverlay,
         }
 
         let mut seeds = Vec::new();
@@ -278,11 +361,7 @@ impl VegetationWorld {
                 resident: current.resident,
                 facets: current.facets.clone(),
                 points: effective_macro_points(base, state.cells().get(cell))?,
-                disturbance_masks: state
-                    .cells()
-                    .get(cell)
-                    .map(|state| state.disturbance_masks.clone())
-                    .unwrap_or_default(),
+                overlay: CellPersistentOverlay::from_state(state.cells().get(cell)),
             });
         }
 
@@ -299,7 +378,7 @@ impl VegetationWorld {
                 seed.facets,
                 seed.points,
                 self.family_tags.clone(),
-                seed.disturbance_masks,
+                seed.overlay,
             )?);
             staged.push(StagedVegetationCellGeneration { token, generation });
         }
@@ -315,6 +394,37 @@ impl VegetationWorld {
             debug_assert!(published);
         }
         Ok(())
+    }
+}
+
+/// The plant a mutation takes simulation ownership of, if it takes any. Where the plant *is*,
+/// whether it exists at all, and what its whole delta reads are the authority's answers; how
+/// healthy or wet it is is not.
+fn claims_simulation_ownership(mutation: &VegetationMutation) -> Option<PlantId> {
+    match mutation {
+        VegetationMutation::TransformOverride { plant, .. }
+        | VegetationMutation::PromotionOriginState { plant, .. }
+        | VegetationMutation::PlantDeltaRestore { plant, .. }
+        | VegetationMutation::Tombstone { plant }
+        | VegetationMutation::Regrow { plant, .. } => Some(*plant),
+        // Removal is an existence claim; every other lifecycle step is biology.
+        VegetationMutation::LifecycleTransition { plant, to, .. } => {
+            (*to == crate::PlantLifecycle::Removed).then_some(*plant)
+        }
+        VegetationMutation::AnchorAddition(point) | VegetationMutation::Planting(point) => {
+            Some(point.id)
+        }
+        VegetationMutation::StateOverride { .. }
+        | VegetationMutation::Damage { .. }
+        | VegetationMutation::MoistureFuel { .. }
+        | VegetationMutation::Harvest { .. }
+        | VegetationMutation::Burn { .. }
+        | VegetationMutation::Ignite { .. }
+        | VegetationMutation::Extinguish { .. }
+        | VegetationMutation::FieldTilePatch { .. }
+        | VegetationMutation::FieldTileClear { .. }
+        | VegetationMutation::DisturbanceMask { .. }
+        | VegetationMutation::DisturbanceMaskClear { .. } => None,
     }
 }
 

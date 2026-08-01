@@ -13,8 +13,8 @@ use crate::{
 
 use super::VegetationWorld;
 use super::generation::{
-    VegetationCellGeneration, VegetationCellGenerationId, effective_macro_points, macro_columns,
-    required_sections,
+    CellPersistentOverlay, VegetationCellGeneration, VegetationCellGenerationId,
+    effective_macro_points, macro_columns, required_sections,
 };
 use super::residency::union_masks;
 
@@ -61,10 +61,7 @@ impl VegetationCellLoad {
         decoded.retain(|kind, _| required_sections(resident).contains(kind));
         let base = macro_columns(&decoded)?;
         let macro_points = effective_macro_points(base, self.persistent.as_ref())?;
-        let disturbance_masks = self
-            .persistent
-            .map(|state| state.disturbance_masks)
-            .unwrap_or_default();
+        let overlay = CellPersistentOverlay::from_state(self.persistent.as_ref());
         let generation = Arc::new(VegetationCellGeneration::build(
             VegetationCellGenerationId {
                 cell: self.token.cell,
@@ -75,7 +72,7 @@ impl VegetationCellLoad {
             decoded,
             macro_points,
             self.family_tags,
-            disturbance_masks,
+            overlay,
         )?);
         Ok(StagedVegetationCellGeneration {
             token: self.token,

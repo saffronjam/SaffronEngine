@@ -96,7 +96,7 @@ pub fn plant_hierarchy_input(
         meshes,
         micro_instances,
         combinations,
-        deformation: deformation_regions(asset, family_bounds, padding),
+        deformation: deformation_regions(asset, family, family_bounds, padding),
         bounds: family_bounds,
         root_material: aggregate_virtual_hierarchy_materials(materials),
         deformation_padding: padding,
@@ -275,29 +275,118 @@ fn deformation_padding(asset: &PlantFamilyAsset) -> i32 {
     i32::try_from(extent.saturating_mul(bend) / u64::from(u16::MAX) / 2).unwrap_or(i32::MAX)
 }
 
+/// The share of the family's authored bend a part reaching `part_top_bits` takes.
+///
+/// The vertex path scales sway by the square of a vertex's root-anchored height weight, so a
+/// part whose crown reaches half the family height moves a quarter as far. Integer throughout,
+/// in Q15.16: a cooked bound has to be the same byte on every target.
+fn bend_share(padding: i32, part_top_bits: i32, family_top_bits: i32) -> i32 {
+    if family_top_bits <= 0 {
+        return padding;
+    }
+    let top = i128::from(part_top_bits.clamp(0, family_top_bits));
+    let family = i128::from(family_top_bits);
+    let scaled = i128::from(padding) * top * top / (family * family);
+    i32::try_from(scaled).unwrap_or(padding)
+}
+
+/// Each part's own geometry bounds, by the same source-to-part rule the micro instances take:
+/// an exact semantic target claims its mesh alone, otherwise every part naming the mesh's
+/// source shares it. A part contributing no geometry has no entry.
+fn part_bounds(
+    asset: &PlantFamilyAsset,
+    family: &NormalizedPlantFamily,
+) -> BTreeMap<u128, PortableBounds> {
+    let mut bounds: BTreeMap<u128, PortableBounds> = BTreeMap::new();
+    for mesh in family
+        .meshes
+        .iter()
+        .filter(|mesh| mesh.role == PlantSourceRole::Geometry)
+    {
+        let Some(mesh_bounds) = mesh
+            .vertices
+            .iter()
+            .map(|vertex| vertex.position_bits)
+            .fold(None::<PortableBounds>, |folded, position| {
+                let point = PortableBounds {
+                    min_bits: position,
+                    max_bits: position,
+                };
+                Some(folded.map_or(point, |bounds| PortableBounds {
+                    min_bits: std::array::from_fn(|axis| bounds.min_bits[axis].min(position[axis])),
+                    max_bits: std::array::from_fn(|axis| bounds.max_bits[axis].max(position[axis])),
+                }))
+            })
+        else {
+            continue;
+        };
+        let mut widen = |part: u128| {
+            bounds
+                .entry(part)
+                .and_modify(|current| {
+                    *current = PortableBounds {
+                        min_bits: std::array::from_fn(|axis| {
+                            current.min_bits[axis].min(mesh_bounds.min_bits[axis])
+                        }),
+                        max_bits: std::array::from_fn(|axis| {
+                            current.max_bits[axis].max(mesh_bounds.max_bits[axis])
+                        }),
+                    };
+                })
+                .or_insert(mesh_bounds);
+        };
+        if let Some(part) = target_part_for_mesh(asset, mesh) {
+            widen(part);
+            continue;
+        }
+        for part in asset
+            .parts
+            .iter()
+            .filter(|part| part.sources.contains(&mesh.source))
+        {
+            widen(part.id);
+        }
+    }
+    bounds
+}
+
+/// One deformation region per part, each on its OWN geometry and its own share of the bend.
+///
+/// The family box would be conservative for every part at once and useless for any of them: a
+/// trunk and the leaves it carries would declare the same swept extent, and a consumer culling
+/// on it could never reject one without the other.
 fn deformation_regions(
     asset: &PlantFamilyAsset,
+    family: &NormalizedPlantFamily,
     bounds: PortableBounds,
     padding: i32,
 ) -> Vec<PortableDeformationRegion> {
-    let swept_bounds = PortableBounds {
-        min_bits: bounds.min_bits.map(|value| value.saturating_sub(padding)),
-        max_bits: bounds.max_bits.map(|value| value.saturating_add(padding)),
-    };
+    let by_part = part_bounds(asset, family);
     let mut regions = asset
         .parts
         .iter()
-        .map(|part| PortableDeformationRegion {
-            part: part.id,
-            semantic: PortableDeformationKind(semantic_tag(part.semantic)),
-            influences: asset
-                .spines
-                .iter()
-                .filter(|spine| spine.part == part.id)
-                .map(|spine| spine.id)
-                .collect(),
-            static_bounds: bounds,
-            swept_bounds,
+        .map(|part| {
+            let static_bounds = by_part.get(&part.id).copied().unwrap_or(bounds);
+            let share = bend_share(padding, static_bounds.max_bits[1], bounds.max_bits[1]);
+            PortableDeformationRegion {
+                part: part.id,
+                semantic: PortableDeformationKind(semantic_tag(part.semantic)),
+                influences: asset
+                    .spines
+                    .iter()
+                    .filter(|spine| spine.part == part.id)
+                    .map(|spine| spine.id)
+                    .collect(),
+                static_bounds,
+                swept_bounds: PortableBounds {
+                    min_bits: static_bounds
+                        .min_bits
+                        .map(|value| value.saturating_sub(share)),
+                    max_bits: static_bounds
+                        .max_bits
+                        .map(|value| value.saturating_add(share)),
+                },
+            }
         })
         .collect::<Vec<_>>();
     for region in &mut regions {
@@ -326,8 +415,8 @@ mod tests {
     use super::*;
     use crate::{
         BotanicalGraphDocument, InteractionPolicy, MechanicalResponse, PLANT_ASSET_VERSION,
-        PhenotypeRole, PlantDimensions, PlantFamilyAsset, PlantFamilySource, PlantPart,
-        PlantPhenotype, PlantSourceRole, PlantVariation,
+        PhenotypeResponse, PhenotypeRole, PlantDimensions, PlantFamilyAsset, PlantFamilySource,
+        PlantPart, PlantPhenotype, PlantSourceRole, PlantVariation,
     };
     use saffron_spatial::{DecisionScalar, UnitInterval};
 
@@ -341,44 +430,45 @@ mod tests {
         }
     }
 
-    #[test]
-    fn phenotype_active_parts_mask_the_uses() {
-        let fixed = |value: i32| DecisionScalar::from_integer(value).expect("scalar");
-        let asset = PlantFamilyAsset {
+    fn fixed(value: i32) -> DecisionScalar {
+        DecisionScalar::from_integer(value).expect("scalar")
+    }
+
+    fn part(id: u128, parent: Option<u128>, semantic: PlantPartSemantic) -> PlantPart {
+        PlantPart {
+            id,
+            parent,
+            semantic,
+            material_slot: 0,
+            sources: vec![id],
+        }
+    }
+
+    fn fixture_asset(
+        parts: Vec<PlantPart>,
+        top: i32,
+        bend_limit: UnitInterval,
+    ) -> PlantFamilyAsset {
+        PlantFamilyAsset {
             role: crate::PlantFamilyRole::Family,
             modules: Vec::new(),
             module_recursion_limit: crate::MAX_PLANT_MODULE_RECURSION,
             version: PLANT_ASSET_VERSION,
             id: saffron_core::Uuid(1),
-            name: "Mask fixture".to_owned(),
+            name: "Fixture".to_owned(),
             tags: Vec::new(),
             source: PlantFamilySource::Native {
                 graph: BotanicalGraphDocument::sapling(0x5a11),
                 grafts: Vec::new(),
             },
-            parts: vec![
-                PlantPart {
-                    id: 40,
-                    parent: None,
-                    semantic: PlantPartSemantic::Trunk,
-                    material_slot: 0,
-                    sources: Vec::new(),
-                },
-                PlantPart {
-                    id: 41,
-                    parent: Some(40),
-                    semantic: PlantPartSemantic::Fruit,
-                    material_slot: 0,
-                    sources: Vec::new(),
-                },
-            ],
+            parts,
             dimensions: PlantDimensions {
-                height: fixed(4),
+                height: fixed(top),
                 trunk_radius: fixed(1),
                 crown_radius: [fixed(1); 2],
                 root_radius: [fixed(1); 2],
-                local_bounds_min: [fixed(-1); 3],
-                local_bounds_max: [fixed(1); 3],
+                local_bounds_min: [fixed(-1), fixed(0), fixed(-1)],
+                local_bounds_max: [fixed(1), fixed(top), fixed(1)],
             },
             material_slots: Vec::new(),
             spines: Vec::new(),
@@ -387,7 +477,7 @@ mod tests {
                 damping: UnitInterval::from_bits(1),
                 drag: fixed(1),
                 flutter: fixed(1),
-                bend_limit: UnitInterval::from_bits(1),
+                bend_limit,
                 damage_threshold: fixed(1),
                 break_threshold: fixed(2),
             },
@@ -397,58 +487,79 @@ mod tests {
                 sources: Vec::new(),
                 active_parts: Vec::new(),
             }],
-            phenotypes: vec![
-                PlantPhenotype {
-                    id: 0,
-                    role: PhenotypeRole::Healthy,
-                    season_window: None,
-                    variation: 0,
-                    material_remap: Vec::new(),
-                    active_parts: Vec::new(),
-                },
-                PlantPhenotype {
-                    id: 1,
-                    role: PhenotypeRole::Harvested,
-                    season_window: None,
-                    variation: 0,
-                    material_remap: Vec::new(),
-                    active_parts: vec![40],
-                },
-            ],
+            phenotypes: vec![PlantPhenotype {
+                id: 0,
+                role: PhenotypeRole::Healthy,
+                response: PhenotypeResponse::default(),
+                variation: 0,
+                material_remap: Vec::new(),
+                active_parts: Vec::new(),
+            }],
             collision_proxies: Vec::new(),
             navigation_proxies: Vec::new(),
             interaction_policy: InteractionPolicy::Decorative,
             habitat: None,
             ecology: crate::PlantEcologyDeclaration::default(),
-        };
-        let family = crate::NormalizedPlantFamily {
+        }
+    }
+
+    fn fixture_mesh(source: u128, positions: &[[i32; 3]]) -> crate::NormalizedPlantMesh {
+        crate::NormalizedPlantMesh {
+            source,
+            role: PlantSourceRole::Geometry,
+            selector: crate::PlantSourceSelector::Whole,
+            vertices: positions
+                .iter()
+                .map(|position| crate::NormalizedPlantVertex {
+                    position_bits: position.map(|value| value * 65_536),
+                    normal_snorm: [0, 32_767, 0],
+                    uv_bits: [0; 2],
+                    tangent_snorm: [32_767, 0, 0, 32_767],
+                })
+                .collect(),
+            indices: Vec::new(),
+            submeshes: Vec::new(),
+            skin: Vec::new(),
+        }
+    }
+
+    fn fixture_family(
+        asset: &PlantFamilyAsset,
+        meshes: Vec<crate::NormalizedPlantMesh>,
+    ) -> crate::NormalizedPlantFamily {
+        crate::NormalizedPlantFamily {
             family: saffron_core::Uuid(1),
             tags: Vec::new(),
             sources: Vec::new(),
-            meshes: vec![
-                crate::NormalizedPlantMesh {
-                    source: 10,
-                    role: PlantSourceRole::Geometry,
-                    selector: crate::PlantSourceSelector::Whole,
-                    vertices: Vec::new(),
-                    indices: Vec::new(),
-                    submeshes: Vec::new(),
-                    skin: Vec::new(),
-                },
-                crate::NormalizedPlantMesh {
-                    source: 11,
-                    role: PlantSourceRole::Geometry,
-                    selector: crate::PlantSourceSelector::Whole,
-                    vertices: Vec::new(),
-                    indices: Vec::new(),
-                    submeshes: Vec::new(),
-                    skin: Vec::new(),
-                },
-            ],
+            meshes,
             joints: Vec::new(),
             materials: Vec::new(),
             dimensions: asset.dimensions,
-        };
+        }
+    }
+
+    #[test]
+    fn phenotype_active_parts_mask_the_uses() {
+        let mut asset = fixture_asset(
+            vec![
+                part(40, None, PlantPartSemantic::Trunk),
+                part(41, Some(40), PlantPartSemantic::Fruit),
+            ],
+            4,
+            UnitInterval::from_bits(1),
+        );
+        for part in &mut asset.parts {
+            part.sources.clear();
+        }
+        asset.phenotypes.push(PlantPhenotype {
+            id: 1,
+            role: PhenotypeRole::Harvested,
+            response: PhenotypeResponse::default(),
+            variation: 0,
+            material_remap: Vec::new(),
+            active_parts: vec![40],
+        });
+        let family = fixture_family(&asset, vec![fixture_mesh(10, &[]), fixture_mesh(11, &[])]);
         let uses = vec![identity_use(40, 0), identity_use(41, 1)];
         let combinations = use_combinations(&asset, &family, &uses);
         assert_eq!(combinations.len(), 2);
@@ -466,5 +577,89 @@ mod tests {
             vec![0b01],
             "the harvested phenotype drops the fruit use"
         );
+    }
+
+    /// An eight-metre family whose trunk occupies the lowest two metres and whose crown sits
+    /// between six and eight: two parts that must not share one box.
+    fn two_storey_family() -> (PlantFamilyAsset, crate::NormalizedPlantFamily) {
+        let asset = fixture_asset(
+            vec![
+                part(1, None, PlantPartSemantic::Trunk),
+                part(2, Some(1), PlantPartSemantic::Leaf),
+            ],
+            8,
+            UnitInterval::ONE,
+        );
+        let family = fixture_family(
+            &asset,
+            vec![
+                fixture_mesh(1, &[[-1, 0, -1], [1, 2, 1]]),
+                fixture_mesh(2, &[[-3, 6, -3], [3, 8, 3]]),
+            ],
+        );
+        (asset, family)
+    }
+
+    #[test]
+    fn each_part_declares_its_own_box_not_the_familys() {
+        let (asset, family) = two_storey_family();
+        let input = plant_hierarchy_input(&asset, &family, &[]).expect("hierarchy input");
+        let trunk = &input.deformation[0];
+        let crown = &input.deformation[1];
+        assert_eq!((trunk.part, crown.part), (1, 2));
+        assert_eq!(
+            (
+                trunk.static_bounds.min_bits[1],
+                trunk.static_bounds.max_bits[1]
+            ),
+            (0, 2 * 65_536),
+            "the trunk region carries the trunk's own geometry"
+        );
+        assert_eq!(
+            (
+                crown.static_bounds.min_bits[1],
+                crown.static_bounds.max_bits[1]
+            ),
+            (6 * 65_536, 8 * 65_536),
+            "the crown region carries the crown's own geometry"
+        );
+        assert_ne!(
+            trunk.static_bounds, crown.static_bounds,
+            "the family box would make every part identical"
+        );
+        assert_eq!(
+            input.bounds.max_bits[1],
+            8 * 65_536,
+            "the family box is still the whole plant"
+        );
+    }
+
+    #[test]
+    fn a_part_sweeps_by_its_own_share_of_the_bend() {
+        let (asset, family) = two_storey_family();
+        let input = plant_hierarchy_input(&asset, &family, &[]).expect("hierarchy input");
+        let sweep = |region: &PortableDeformationRegion| {
+            region.swept_bounds.max_bits[0] - region.static_bounds.max_bits[0]
+        };
+        let trunk = sweep(&input.deformation[0]);
+        let crown = sweep(&input.deformation[1]);
+        assert!(trunk >= 0 && crown > 0, "trunk {trunk} crown {crown}");
+        // The vertex path scales sway by weight², so a part topping out at a quarter of the
+        // family height sweeps a sixteenth as far — not the same distance.
+        assert!(
+            crown > trunk * 8,
+            "the crown sweeps far more than the trunk: trunk {trunk} crown {crown}"
+        );
+        assert_eq!(
+            crown, input.deformation_padding,
+            "the part reaching the family top takes the whole bend"
+        );
+        for region in &input.deformation {
+            assert!(
+                region.swept_bounds.min_bits[1] <= region.static_bounds.min_bits[1]
+                    && region.swept_bounds.max_bits[1] >= region.static_bounds.max_bits[1],
+                "a swept box always encloses its static one"
+            );
+        }
     }
 }

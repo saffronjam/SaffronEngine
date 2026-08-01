@@ -4,6 +4,7 @@ mod bvh;
 mod events;
 mod generation;
 mod load;
+mod network;
 mod query;
 mod residency;
 mod simulation;
@@ -13,6 +14,7 @@ mod tests;
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use saffron_spatial::{GenerationSlot, ResidencyManager, WorldCellKey};
 
@@ -21,6 +23,7 @@ use crate::{
     VegetationManifestCell, VegetationMutationRecord, VegetationState,
 };
 
+pub use bvh::VegetationQueryCost;
 pub use events::{VEGETATION_EVENT_RING_CAP, VegetationEvent, VegetationEventDrain};
 pub use generation::{
     VegetationCellGeneration, VegetationCellGenerationId, VegetationPlantHandle,
@@ -55,6 +58,13 @@ pub struct VegetationWorld {
     persistent: VegetationState,
     effective: VegetationState,
     predictions: BTreeMap<u128, Vec<VegetationMutationRecord>>,
+    /// Highest transport sequence accepted from a network envelope; zero before the first one, so
+    /// a stream numbers from one and a retransmission never reduces twice.
+    network_sequence: u64,
+    /// Cells and facets this world is seated with, present only while it is in a network
+    /// session. Absent is not the same as empty: a world outside a session accepts mutations for
+    /// any cell, whereas a seated one refuses anything outside its declaration.
+    network_interest: Option<crate::CellInterestSet>,
     residency: ResidencyManager,
     budgets: VegetationResidencyBudgets,
     residency_revision: u64,
@@ -78,6 +88,27 @@ pub struct VegetationWorld {
     /// Keyed by identity rather than held in an immutable published generation, so a cell
     /// unload, republication, or reload never loses or duplicates the suppression.
     bulk_suppressed: BTreeSet<PlantId>,
+    /// The authority that last claimed a plant's *simulation* ownership — the one that moved it,
+    /// returned promoted state for it, restored its whole delta, or removed it. Biological writes
+    /// (damage, harvest, weather) claim nothing, so a script damaging a promoted plant does not
+    /// take the plant away from the view simulating it.
+    plant_authority: BTreeMap<PlantId, u128>,
+    /// Bumped whenever persistent state is replaced wholesale — a save load, a snapshot import, or
+    /// a network join. Every plant's ownership is then somebody else's answer, so a local view
+    /// standing over one has to yield rather than write back into a world it never observed.
+    authority_epoch: u64,
+    /// Traversal work the query surface has performed since the last drain. Atomic because every
+    /// query takes `&self` and the render adapter may ask from another thread.
+    query_cost: QueryCostCounters,
+}
+
+#[derive(Debug, Default)]
+struct QueryCostCounters {
+    queries: AtomicU64,
+    hits: AtomicU64,
+    generations_visited: AtomicU64,
+    nodes_visited: AtomicU64,
+    rows_tested: AtomicU64,
 }
 
 impl VegetationWorld {
@@ -106,6 +137,8 @@ impl VegetationWorld {
             effective: persistent.clone(),
             persistent,
             predictions: BTreeMap::new(),
+            network_sequence: 0,
+            network_interest: None,
             manifest,
             manifest_identity,
             manifest_cells,
@@ -120,7 +153,36 @@ impl VegetationWorld {
             event_ring: VecDeque::new(),
             event_seq: 0,
             bulk_suppressed: BTreeSet::new(),
+            plant_authority: BTreeMap::new(),
+            authority_epoch: 0,
+            query_cost: QueryCostCounters::default(),
         })
+    }
+
+    /// Drains the traversal work the CPU query surface performed since the last call.
+    pub fn take_query_cost(&self) -> VegetationQueryCost {
+        let take = |counter: &AtomicU64| counter.swap(0, Ordering::Relaxed);
+        VegetationQueryCost {
+            queries: take(&self.query_cost.queries),
+            hits: take(&self.query_cost.hits),
+            generations_visited: take(&self.query_cost.generations_visited),
+            nodes_visited: take(&self.query_cost.nodes_visited),
+            rows_tested: take(&self.query_cost.rows_tested),
+        }
+    }
+
+    fn record_query_cost(&self, cost: VegetationQueryCost) {
+        let add = |counter: &AtomicU64, value: u64| {
+            counter.fetch_add(value, Ordering::Relaxed);
+        };
+        add(&self.query_cost.queries, cost.queries);
+        add(&self.query_cost.hits, cost.hits);
+        add(
+            &self.query_cost.generations_visited,
+            cost.generations_visited,
+        );
+        add(&self.query_cost.nodes_visited, cost.nodes_visited);
+        add(&self.query_cost.rows_tested, cost.rows_tested);
     }
 
     /// Bound immutable manifest.

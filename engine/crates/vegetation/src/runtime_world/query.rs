@@ -9,7 +9,7 @@ use saffron_spatial::{UnitInterval, WorldBounds, WorldCellKey, WorldPosition};
 use crate::{Error, InteractionPolicy, PlantId, PlantLifecycle, PlantPoint, PlantTagId, Result};
 
 use super::VegetationWorld;
-use super::bvh::distance_squared_to_bounds;
+use super::bvh::{VegetationQueryCost, distance_squared_to_bounds};
 use super::generation::{VegetationPlantHandle, VegetationPlantSnapshot};
 use super::simulation::canopy_share;
 
@@ -157,13 +157,20 @@ impl VegetationWorld {
         filter: &VegetationQueryFilter,
     ) -> Result<Vec<VegetationPlantSnapshot>> {
         let mut results = Vec::new();
+        let mut cost = VegetationQueryCost {
+            queries: 1,
+            ..VegetationQueryCost::default()
+        };
         for generation in self.resident_macro_generations() {
-            for row in generation.bvh.query_bounds(bounds) {
+            cost.generations_visited += 1;
+            for row in generation.bvh.query_bounds(bounds, &mut cost) {
                 if let Some(snapshot) = generation.matching_snapshot(row, filter)? {
                     results.push(snapshot);
                 }
             }
         }
+        cost.hits = results.len() as u64;
+        self.record_query_cost(cost);
         results.sort_unstable_by_key(|snapshot| snapshot.plant);
         Ok(results)
     }
@@ -187,8 +194,13 @@ impl VegetationWorld {
             WorldBounds::from_world_meters(center_m - extent, center_m + extent)?;
         let radius_squared = radius_m * radius_m;
         let mut results = Vec::new();
+        let mut cost = VegetationQueryCost {
+            queries: 1,
+            ..VegetationQueryCost::default()
+        };
         for generation in self.resident_macro_generations() {
-            for row in generation.bvh.query_bounds(candidate_bounds) {
+            cost.generations_visited += 1;
+            for row in generation.bvh.query_bounds(candidate_bounds, &mut cost) {
                 let point_bounds = generation.macro_points.bounds[row as usize];
                 if distance_squared_to_bounds(center_m, point_bounds) <= radius_squared
                     && let Some(snapshot) = generation.matching_snapshot(row, filter)?
@@ -197,6 +209,8 @@ impl VegetationWorld {
                 }
             }
         }
+        cost.hits = results.len() as u64;
+        self.record_query_cost(cost);
         results.sort_unstable_by_key(|snapshot| snapshot.plant);
         Ok(results)
     }
@@ -209,17 +223,24 @@ impl VegetationWorld {
     ) -> Result<Vec<VegetationRayHit>> {
         let origin = ray.origin.world_meters();
         let mut results = Vec::new();
+        let mut cost = VegetationQueryCost {
+            queries: 1,
+            ..VegetationQueryCost::default()
+        };
         for generation in self.resident_macro_generations() {
+            cost.generations_visited += 1;
             for (row, distance_m) in
                 generation
                     .bvh
-                    .query_ray(origin, ray.direction, ray.max_distance_m)
+                    .query_ray(origin, ray.direction, ray.max_distance_m, &mut cost)
             {
                 if let Some(plant) = generation.matching_snapshot(row, filter)? {
                     results.push(VegetationRayHit { plant, distance_m });
                 }
             }
         }
+        cost.hits = results.len() as u64;
+        self.record_query_cost(cost);
         results.sort_by(|left, right| {
             left.distance_m
                 .total_cmp(&right.distance_m)
@@ -263,7 +284,10 @@ impl VegetationWorld {
                     ((point.z - min[2]) / (max[2] - min[2]) * f64::from(dims[2])).floor() as u32;
                 let texel_x = texel_x.min(dims[0].saturating_sub(1));
                 let texel_z = texel_z.min(dims[2].saturating_sub(1));
-                let index = (texel_x + dims[0] * dims[1] * texel_z) as usize;
+                // The floor crossing sits in the tile's lowest Y layer, and the density grid
+                // linearizes as `(x * dims[1] + y) * dims[2] + z`.
+                let index =
+                    (texel_x as usize * dims[1] as usize) * dims[2] as usize + texel_z as usize;
                 if tile.density.get(index).is_none_or(|density| *density == 0) {
                     continue;
                 }
@@ -298,8 +322,13 @@ impl VegetationWorld {
         }
         let point = position.world_meters();
         let mut best: Option<VegetationNearestHit> = None;
+        let mut cost = VegetationQueryCost {
+            queries: 1,
+            ..VegetationQueryCost::default()
+        };
         for generation in self.resident_macro_generations() {
-            for row in generation.bvh.rows_by_nearness(point) {
+            cost.generations_visited += 1;
+            for row in generation.bvh.rows_by_nearness(point, &mut cost) {
                 let distance_m =
                     distance_squared_to_bounds(point, generation.macro_points.bounds[row as usize])
                         .sqrt();
@@ -318,6 +347,8 @@ impl VegetationWorld {
                 }
             }
         }
+        cost.hits = u64::from(best.is_some());
+        self.record_query_cost(cost);
         Ok(best)
     }
 

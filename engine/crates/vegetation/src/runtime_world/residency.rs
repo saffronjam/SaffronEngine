@@ -1,6 +1,6 @@
 //! Per-facet residency budgets, admission, and the load requests they produce.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use saffron_spatial::{
@@ -11,8 +11,8 @@ use crate::{Error, PlantPointColumns, Result, VegetationManifestCell};
 
 use super::VegetationWorld;
 use super::generation::{
-    VegetationCellGeneration, VegetationCellGenerationId, effective_macro_points,
-    macro_columns_optional, required_sections,
+    CellPersistentOverlay, VegetationCellGeneration, VegetationCellGenerationId,
+    effective_macro_points, macro_columns_optional, required_sections,
 };
 
 /// Explicit decoded-byte ceilings for each logical residency facet.
@@ -94,19 +94,19 @@ pub struct VegetationResidencyReport {
 
 impl VegetationWorld {
     pub fn update_source(&mut self, source: SpatialSource) -> Result<()> {
+        let before = self.admitted_masks(&self.residency.snapshots()?)?;
         self.residency.update_source(source)?;
         self.advance_residency_revision()?;
-        self.invalidate_cell_loads()?;
-        self.unload_unrequested_facets()
+        self.reconcile_demand(&before)
     }
 
     /// Removes one predictive source and releases unreferenced facets.
     pub fn remove_source(&mut self, source: SpatialSourceId) -> Result<bool> {
+        let before = self.admitted_masks(&self.residency.snapshots()?)?;
         let removed = self.residency.remove_source(source);
         if removed {
             self.advance_residency_revision()?;
-            self.invalidate_cell_loads()?;
-            self.unload_unrequested_facets()?;
+            self.reconcile_demand(&before)?;
         }
         Ok(removed)
     }
@@ -156,11 +156,24 @@ impl VegetationWorld {
         Ok(())
     }
 
-    fn invalidate_cell_loads(&self) -> Result<()> {
-        for entry in self.cells.values() {
-            entry.slot.begin(self.residency_revision)?;
+    /// Settles the world against the demand the sources now resolve to, given the admitted masks
+    /// they resolved to before the change.
+    ///
+    /// Only a cell whose admitted mask moved has its staging token invalidated. A cell load is
+    /// decoded from immutable artifact bytes, so a source that merely travelled leaves an in-flight
+    /// load answering exactly the question that was asked; invalidating it on every source update
+    /// would mean a viewpoint moving faster than a cell decodes could never bring one resident.
+    fn reconcile_demand(&mut self, before: &BTreeMap<WorldCellKey, ResidencyMask>) -> Result<()> {
+        let after = self.admitted_masks(&self.residency.snapshots()?)?;
+        for cell in before.keys().chain(after.keys()).collect::<BTreeSet<_>>() {
+            if before.get(cell) == after.get(cell) {
+                continue;
+            }
+            if let Some(entry) = self.cells.get(cell) {
+                entry.slot.begin(self.residency_revision)?;
+            }
         }
-        Ok(())
+        self.unload_unrequested_facets(&after)
     }
 
     fn requested_bytes(
@@ -245,12 +258,13 @@ impl VegetationWorld {
         Ok(admitted)
     }
 
-    fn unload_unrequested_facets(&mut self) -> Result<()> {
-        let snapshots = self.residency.snapshots()?;
-        let requested = self.admitted_masks(&snapshots)?;
+    fn unload_unrequested_facets(
+        &mut self,
+        admitted: &BTreeMap<WorldCellKey, ResidencyMask>,
+    ) -> Result<()> {
         let cells = self.cells.keys().copied().collect::<Vec<_>>();
         for cell in cells {
-            let desired = requested.get(&cell).copied().unwrap_or(ResidencyMask::NONE);
+            let desired = admitted.get(&cell).copied().unwrap_or(ResidencyMask::NONE);
             let current = self.cells[&cell].slot.read();
             let retained = intersect_masks(current.resident, desired);
             if retained == current.resident {
@@ -265,9 +279,7 @@ impl VegetationWorld {
                 Some(base) => effective_macro_points(base, state)?,
                 None => PlantPointColumns::default(),
             };
-            let disturbance_masks = state
-                .map(|state| state.disturbance_masks.clone())
-                .unwrap_or_default();
+            let overlay = CellPersistentOverlay::from_state(state);
             let generation = Arc::new(VegetationCellGeneration::build(
                 VegetationCellGenerationId {
                     cell,
@@ -278,7 +290,7 @@ impl VegetationWorld {
                 facets,
                 points,
                 self.family_tags.clone(),
-                disturbance_masks,
+                overlay,
             )?);
             let published = self.cells[&cell].slot.try_publish(token, generation)?;
             debug_assert!(published);

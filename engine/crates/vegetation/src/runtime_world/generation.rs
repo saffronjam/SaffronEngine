@@ -69,6 +69,12 @@ pub struct VegetationPlantSnapshot {
     pub fuel: UnitInterval,
     /// Whether the plant is alight.
     pub ignited: bool,
+    /// Linear velocity in Q15.16 metres per fixed physics tick, carried over from the last
+    /// promoted simulation of the plant; zero for a plant that never simulated.
+    pub linear_velocity: [DecisionScalar; 3],
+    /// Angular velocity in Q15.16 turns per fixed physics tick, in the same units the promotion
+    /// write-back records.
+    pub angular_velocity: [DecisionScalar; 3],
     /// Compact accepted-point provenance when the editing facet is resident.
     pub provenance: Option<ProvenanceRecord>,
 }
@@ -84,7 +90,38 @@ pub struct VegetationCellGeneration {
     pub(super) slots: BTreeMap<PlantId, PlantSlot>,
     pub(super) bvh: MacroBvh,
     family_tags: Arc<BTreeMap<u64, Vec<PlantTagId>>>,
-    disturbance_masks: BTreeMap<DisturbanceTileKey, Vec<i16>>,
+    overlay: CellPersistentOverlay,
+}
+
+/// What a cell's persistent delta contributes to a published generation beyond the effective
+/// macro columns: tile truth an adapter re-reads, and the momentum a promoted simulation left
+/// behind for the next promotion to pick back up.
+#[derive(Clone, Debug, Default)]
+pub(super) struct CellPersistentOverlay {
+    pub(super) disturbance_masks: BTreeMap<DisturbanceTileKey, Vec<i16>>,
+    /// Per-plant `(linear, angular)` velocity in the units the reducer stores.
+    pub(super) velocities: BTreeMap<PlantId, ([DecisionScalar; 3], [DecisionScalar; 3])>,
+}
+
+impl CellPersistentOverlay {
+    /// Reads the overlay one cell's persistent delta describes.
+    pub(super) fn from_state(state: Option<&VegetationCellState>) -> Self {
+        let Some(state) = state else {
+            return Self::default();
+        };
+        Self {
+            disturbance_masks: state.disturbance_masks.clone(),
+            velocities: state
+                .plants
+                .iter()
+                .filter_map(|(plant, delta)| {
+                    delta
+                        .promotion_origin
+                        .map(|origin| (*plant, (origin.linear_velocity, origin.angular_velocity)))
+                })
+                .collect(),
+        }
+    }
 }
 
 impl VegetationCellGeneration {
@@ -103,7 +140,7 @@ impl VegetationCellGeneration {
             BTreeMap::new(),
             PlantPointColumns::default(),
             family_tags,
-            BTreeMap::new(),
+            CellPersistentOverlay::default(),
         )
     }
 
@@ -114,7 +151,7 @@ impl VegetationCellGeneration {
         facets: BTreeMap<VegetationCellSectionKind, VegetationCellFacet>,
         macro_points: PlantPointColumns,
         family_tags: Arc<BTreeMap<u64, Vec<PlantTagId>>>,
-        disturbance_masks: BTreeMap<DisturbanceTileKey, Vec<i16>>,
+        overlay: CellPersistentOverlay,
     ) -> Result<Self> {
         let rows = macro_points.row_count()?;
         let mut slots = BTreeMap::new();
@@ -152,7 +189,7 @@ impl VegetationCellGeneration {
             slots,
             bvh,
             family_tags,
-            disturbance_masks,
+            overlay,
         })
     }
 
@@ -191,7 +228,7 @@ impl VegetationCellGeneration {
     /// Persistent disturbance masks overlaid on quantized micro fields.
     #[must_use]
     pub fn disturbance_masks(&self) -> &BTreeMap<DisturbanceTileKey, Vec<i16>> {
-        &self.disturbance_masks
+        &self.overlay.disturbance_masks
     }
 
     /// Per-plant navigation contribution rows when the navigation facet is resident.
@@ -251,6 +288,12 @@ impl VegetationCellGeneration {
             .provenance()
             .and_then(|table| table.get(ProvenanceHandle(point.provenance)))
             .cloned();
+        let (linear_velocity, angular_velocity) = self
+            .overlay
+            .velocities
+            .get(&point.id)
+            .copied()
+            .unwrap_or_default();
         Ok(VegetationPlantSnapshot {
             plant: point.id,
             ecology_tick: point.ecology_tick,
@@ -272,6 +315,8 @@ impl VegetationCellGeneration {
             moisture: point.moisture,
             fuel: point.fuel,
             ignited: point.flags.contains(PlantFlags::IGNITED),
+            linear_velocity,
+            angular_velocity,
             provenance,
         })
     }

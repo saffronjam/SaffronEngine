@@ -57,7 +57,7 @@ fn point_in(cell: WorldCellKey, identity: u8) -> PlantPoint {
 }
 
 fn fixture() -> (VegetationWorld, Vec<u8>, PlantId) {
-    fixture_with_micro(false)
+    fixture_with_micro(None)
 }
 
 fn platform() -> CookPlatformProfile {
@@ -83,13 +83,30 @@ fn manifest_plant() -> VegetationManifestPlant {
     }
 }
 
-/// One cell's artifact bytes and the manifest row naming them.
+/// The cosmetic field a cell carries by default: a square grid at `blades` per texel whose first
+/// texel is empty, so a query can tell a dense texel from a bare one.
+fn micro_tile(point: &PlantPoint, blades: u16) -> crate::MicroFieldTile {
+    let mut density = vec![blades; 16];
+    density[0] = 0;
+    crate::MicroFieldTile {
+        cell: point.owner,
+        family: point.family,
+        dimensions: [4, 1, 4],
+        density,
+        attributes: BTreeMap::new(),
+        reconstruction_seed: 0x0102_0304_0506_0708_090a_0b0c_0d0e_0f10,
+    }
+}
+
+/// One cell's artifact bytes and the manifest row naming them. `micro` is the cosmetic field the
+/// cell carries, which is what a blade count scales with; `None` omits the micro sections entirely.
 fn cell_artifact(
-    point: &PlantPoint,
+    points: &[PlantPoint],
     platform: &CookPlatformProfile,
-    micro: bool,
+    micro: Option<crate::MicroFieldTile>,
 ) -> (Vec<u8>, VegetationManifestCell) {
-    let columns = PlantPointColumns::from_points(vec![point.clone()]).unwrap();
+    let point = &points[0];
+    let columns = PlantPointColumns::from_points(points.to_vec()).unwrap();
     let mut sections = vec![
         VegetationCellSection::new(
             VegetationCellSectionKind::MacroPoints,
@@ -100,17 +117,7 @@ fn cell_artifact(
             [b"SVEGCOL1".as_slice(), &0_u64.to_be_bytes()].concat(),
         ),
     ];
-    if micro {
-        let mut density = vec![32_768_u16; 16];
-        density[0] = 0;
-        let tile = crate::MicroFieldTile {
-            cell: point.owner,
-            family: point.family,
-            dimensions: [4, 1, 4],
-            density,
-            attributes: BTreeMap::new(),
-            reconstruction_seed: 0x0102_0304_0506_0708_090a_0b0c_0d0e_0f10,
-        };
+    if let Some(tile) = micro {
         sections.push(VegetationCellSection::new(
             VegetationCellSectionKind::MicroFields,
             crate::encode_vegetation_micro_fields(std::slice::from_ref(&tile)).unwrap(),
@@ -143,10 +150,10 @@ fn cell_artifact(
         dependencies: Vec::new(),
         species_counts: vec![ManifestSpeciesCount {
             family: point.family,
-            macro_count: 1,
+            macro_count: points.len() as u64,
             micro_count: 0,
         }],
-        macro_count: 1,
+        macro_count: points.len() as u64,
         micro_count: 0,
         resident_memory_bytes: index.sections.iter().map(|value| value.decoded_size).sum(),
         stored_bytes: bytes.len() as u64,
@@ -183,9 +190,10 @@ fn world_from(cells: Vec<VegetationManifestCell>) -> VegetationWorld {
     VegetationWorld::new(manifest, VegetationResidencyBudgets::UNLIMITED).unwrap()
 }
 
-fn fixture_with_micro(micro: bool) -> (VegetationWorld, Vec<u8>, PlantId) {
+fn fixture_with_micro(micro: Option<u16>) -> (VegetationWorld, Vec<u8>, PlantId) {
     let point = point();
-    let (bytes, row) = cell_artifact(&point, &platform(), micro);
+    let tile = micro.map(|blades| micro_tile(&point, blades));
+    let (bytes, row) = cell_artifact(std::slice::from_ref(&point), &platform(), tile);
     (world_from(vec![row]), bytes, point.id)
 }
 
@@ -197,7 +205,7 @@ fn multi_region_world(cells: &[WorldCellKey]) -> (VegetationWorld, Vec<Vec<u8>>)
     let mut artifacts = Vec::new();
     for (index, cell) in cells.iter().enumerate() {
         let point = point_in(*cell, u8::try_from(index).unwrap() + 1);
-        let (bytes, row) = cell_artifact(&point, &platform, false);
+        let (bytes, row) = cell_artifact(std::slice::from_ref(&point), &platform, None);
         rows.push(row);
         artifacts.push(bytes);
     }
@@ -283,6 +291,75 @@ fn a_confirmed_mutation_bumps_the_cell_bulk_revision() {
         }])
         .unwrap();
     assert_eq!(world.cell_bulk_revision(cell), before + 1);
+}
+
+/// A sequenced network envelope is retransmit-safe at the transport layer, not only through
+/// per-operation idempotency: a duplicate at or below the accepted sequence never reaches the
+/// reducer, and a later envelope with a correcting snapshot rebases the receiver before its
+/// operations reduce.
+#[test]
+fn a_network_envelope_advances_once_per_sequence_and_corrects_from_a_snapshot() {
+    let (mut world, artifact, plant) = fixture();
+    world.update_source(source()).unwrap();
+    let cell = WorldCellKey::base(0, 0, 0);
+    let staged = world
+        .begin_load(cell, ResidencyMask::one(ResidencyFacet::Physics))
+        .unwrap()
+        .stage(&artifact)
+        .unwrap();
+    assert!(world.publish_staged(staged).unwrap());
+    let corrected = world.persistent_state().clone();
+
+    let tombstone = VegetationMutationRecord {
+        header: crate::MutationHeader {
+            cell,
+            transaction: 31,
+            authority: 2,
+            logical_tick: 3,
+            idempotency_key: 32,
+            base_revision: None,
+        },
+        mutation: crate::VegetationMutation::Tombstone { plant },
+    };
+    let envelope = crate::NetworkMutationEnvelope {
+        sequence: 1,
+        manifest_identity: world.manifest_identity().bytes(),
+        operations: vec![tombstone],
+        snapshot: None,
+    };
+    assert!(world.receive_network_envelope(&envelope).unwrap());
+    assert_eq!(world.network_sequence(), 1);
+    assert!(world.find_plant(plant).unwrap().is_none());
+
+    assert!(
+        !world.receive_network_envelope(&envelope).unwrap(),
+        "a retransmission is dropped at the sequence gate"
+    );
+    assert_eq!(world.network_sequence(), 1);
+
+    let correction = crate::NetworkMutationEnvelope {
+        sequence: 2,
+        manifest_identity: world.manifest_identity().bytes(),
+        operations: Vec::new(),
+        snapshot: Some(corrected),
+    };
+    assert!(world.receive_network_envelope(&correction).unwrap());
+    assert_eq!(world.network_sequence(), 2);
+    assert!(
+        world.find_plant(plant).unwrap().is_some(),
+        "the authoritative snapshot replaced the receiver's state"
+    );
+
+    let foreign = crate::NetworkMutationEnvelope {
+        sequence: 3,
+        manifest_identity: [0; 32],
+        operations: Vec::new(),
+        snapshot: None,
+    };
+    assert!(matches!(
+        world.receive_network_envelope(&foreign),
+        Err(Error::ManifestMismatch)
+    ));
 }
 
 #[test]
@@ -465,9 +542,124 @@ fn spatial_queries_filter_tags_and_return_only_stable_identity() {
     );
 }
 
+/// Cosmetic blades are a quantized field, so a cell that reconstructs tens of thousands of them
+/// must cost the CPU exactly what an almost-bare one costs: the same resident bytes and the same
+/// traversal. Comparing measured work is what separates that from a regression that walks the micro
+/// tiles per query and throws the result away — such a regression leaves every macro result equal.
+#[test]
+fn cpu_bytes_and_query_work_track_macro_rows_never_micro_blade_count() {
+    const ROWS: usize = 64;
+
+    let cell = WorldCellKey::base(0, 0, 0);
+    let min = cell.bounds().min_ticks();
+    let points = (0..ROWS)
+        .map(|row| {
+            let mut point = point_in(cell, u8::try_from(row).unwrap() + 1);
+            let local = u32::try_from(row).unwrap() * 1_000;
+            let offset = i128::from(local);
+            point.position = WorldPosition::new(
+                cell,
+                QuantizedLocalPosition::new([10 + local, 20, 30 + local]).unwrap(),
+            )
+            .unwrap();
+            point.bounds = WorldBounds::new(
+                [min[0] + offset, min[1], min[2] + offset],
+                [min[0] + offset + 100, min[1] + 100, min[2] + offset + 100],
+            )
+            .unwrap();
+            point
+        })
+        .collect::<Vec<_>>();
+
+    let resident = |blades: u16| {
+        let (bytes, row) =
+            cell_artifact(&points, &platform(), Some(micro_tile(&points[0], blades)));
+        let mut world = world_from(vec![row]);
+        world
+            .update_source(source_with_facet(ResidencyFacet::Render))
+            .unwrap();
+        let staged = world
+            .begin_load(cell, ResidencyMask::one(ResidencyFacet::Render))
+            .unwrap()
+            .stage(&bytes)
+            .unwrap();
+        world.publish_staged(staged).unwrap();
+        world
+    };
+    let sparse = resident(1);
+    let dense = resident(u16::MAX);
+
+    let blades = |world: &VegetationWorld| {
+        world
+            .resident_cells()
+            .filter_map(|(_, generation)| generation.micro_fields().map(<[_]>::to_vec))
+            .flatten()
+            .map(|tile| {
+                tile.density
+                    .iter()
+                    .map(|value| u64::from(*value))
+                    .sum::<u64>()
+            })
+            .sum::<u64>()
+    };
+    let sparse_blades = blades(&sparse);
+    assert!(
+        blades(&dense) >= sparse_blades.saturating_mul(60_000),
+        "the dense field must reconstruct orders of magnitude more blades to make this a test"
+    );
+
+    let report = |world: &VegetationWorld| world.residency_report().unwrap();
+    assert_eq!(
+        report(&sparse).resident_bytes,
+        report(&dense).resident_bytes
+    );
+    assert_eq!(
+        report(&sparse).requested_bytes,
+        report(&dense).requested_bytes
+    );
+
+    let filter = VegetationQueryFilter::default();
+    let bounds =
+        WorldBounds::new(min, [min[0] + 100_000, min[1] + 100_000, min[2] + 100_000]).unwrap();
+    let ray = VegetationQueryRay::new(
+        WorldPosition::from_world_meters(DVec3::new(0.2, 10.0, 0.2)).unwrap(),
+        -DVec3::Y,
+        100.0,
+    )
+    .unwrap();
+    let exercise = |world: &VegetationWorld| {
+        let hits = world.query_bounds(bounds, &filter).unwrap();
+        let rays = world.query_ray(ray, &filter).unwrap();
+        let near = world
+            .query_nearest(WorldPosition::origin(), None, &filter)
+            .unwrap();
+        let radius = world
+            .query_radius(WorldPosition::origin(), 500.0, &filter)
+            .unwrap();
+        (hits, rays, near, radius, world.take_query_cost())
+    };
+    let (sparse_bounds, sparse_ray, sparse_near, sparse_radius, sparse_cost) = exercise(&sparse);
+    let (dense_bounds, dense_ray, dense_near, dense_radius, dense_cost) = exercise(&dense);
+    assert_eq!(sparse_bounds, dense_bounds);
+    assert_eq!(sparse_ray, dense_ray);
+    assert_eq!(sparse_near, dense_near);
+    assert_eq!(sparse_radius, dense_radius);
+    assert_eq!(sparse_cost, dense_cost);
+    assert_eq!(sparse_bounds.len(), ROWS);
+    assert_eq!(sparse_cost.queries, 4);
+    assert_eq!(sparse_cost.generations_visited, 4);
+    // A hierarchy over 64 rows, not a linear scan: the bounds query rejects whole subtrees.
+    assert!(sparse_cost.nodes_visited > 4);
+    assert!(sparse_cost.nodes_visited < 4 * ROWS as u64);
+    assert!(sparse_cost.rows_tested >= ROWS as u64);
+
+    // Draining leaves the counters at zero, so a caller reads work per interval and never a total.
+    assert_eq!(sparse.take_query_cost(), VegetationQueryCost::default());
+}
+
 #[test]
 fn micro_ray_lands_on_the_nearest_dense_floor_texel() {
-    let (mut world, artifact, _) = fixture_with_micro(true);
+    let (mut world, artifact, _) = fixture_with_micro(Some(32_768));
     world
         .update_source(source_with_facet(ResidencyFacet::Render))
         .unwrap();
@@ -508,6 +700,56 @@ fn micro_ray_lands_on_the_nearest_dense_floor_texel() {
 }
 
 #[test]
+fn micro_ray_reads_a_non_square_tile_in_the_canonical_texel_order() {
+    // Density linearizes as `(x * dims[1] + y) * dims[2] + z`. Square dimensions turn a
+    // transposed read into a symmetric relabel that lands on the same texels; these do not.
+    const DIMENSIONS: [u32; 3] = [8, 1, 2];
+    let point = point();
+    let mut density = vec![0_u16; 16];
+    // Texel (6, 0, 0): X spans 8 m per texel, Z spans 32 m, so the dense ground is
+    // x in [48, 56) and z in [0, 32).
+    density[12] = 32_768;
+    let (artifact, row) = cell_artifact(
+        std::slice::from_ref(&point),
+        &platform(),
+        Some(crate::MicroFieldTile {
+            cell: point.owner,
+            family: point.family,
+            dimensions: DIMENSIONS,
+            density,
+            attributes: BTreeMap::new(),
+            reconstruction_seed: 0x0102_0304_0506_0708_090a_0b0c_0d0e_0f10,
+        }),
+    );
+    let mut world = world_from(vec![row]);
+    world
+        .update_source(source_with_facet(ResidencyFacet::Render))
+        .unwrap();
+    let staged = world
+        .begin_load(
+            WorldCellKey::base(0, 0, 0),
+            ResidencyMask::one(ResidencyFacet::Render),
+        )
+        .unwrap()
+        .stage(&artifact)
+        .unwrap();
+    world.publish_staged(staged).unwrap();
+
+    let down = |x: f64, z: f64| {
+        VegetationQueryRay::new(
+            WorldPosition::from_world_meters(DVec3::new(x, 10.0, z)).unwrap(),
+            -DVec3::Y,
+            100.0,
+        )
+        .unwrap()
+    };
+    let hit = world.query_micro_ray(down(52.0, 8.0)).unwrap();
+    assert_eq!(hit.position, DVec3::new(52.0, 0.0, 8.0));
+    // The texel a transposed read would name — x in [32, 40), z in [32, 64) — is bare ground.
+    assert!(world.query_micro_ray(down(36.0, 40.0)).is_none());
+}
+
+#[test]
 fn source_budget_limits_admission_without_losing_demand() {
     let (mut world, _, _) = fixture();
     world.budgets.physics = 1;
@@ -544,8 +786,12 @@ fn corrupt_artifact_never_reaches_publication() {
     );
 }
 
+/// A cell decodes from immutable artifact bytes, so a viewpoint that travels while still asking for
+/// the cell has asked nothing new: the in-flight load answers the current question and publishes. A
+/// world that staged the load against every source update instead could never bring a cell resident
+/// under a camera that moves faster than one decodes — which is every camera in motion.
 #[test]
-fn residency_revision_discards_late_staged_work() {
+fn a_travelling_source_does_not_discard_the_load_it_still_wants() {
     let (mut world, artifact, _) = fixture();
     world.update_source(source()).unwrap();
     let staged = world
@@ -556,9 +802,43 @@ fn residency_revision_discards_late_staged_work() {
         .unwrap()
         .stage(&artifact)
         .unwrap();
+    // Twenty steps of travel, each a fresh source revision, all inside the cleanup band that keeps
+    // cell (0,0,0) claimed.
+    for step in 1..=20_u32 {
+        let mut moved = source();
+        moved.revision = u64::from(1 + step);
+        moved.position =
+            WorldPosition::from_world_meters(DVec3::new(f64::from(step) * 3.0, 0.0, 0.0)).unwrap();
+        world.update_source(moved).unwrap();
+    }
+    assert!(world.publish_staged(staged).unwrap());
+    assert_eq!(
+        world
+            .cell_snapshot(WorldCellKey::base(0, 0, 0))
+            .unwrap()
+            .resident_facets(),
+        ResidencyMask::one(ResidencyFacet::Physics)
+    );
+}
+
+/// The staging token guards demand, so work whose cell left every claim cube while it decoded is
+/// discarded rather than published into a world that no longer asks for it.
+#[test]
+fn demand_leaving_a_cell_discards_its_late_staged_work() {
+    let (mut world, artifact, _) = fixture();
+    world.update_source(source()).unwrap();
+    let staged = world
+        .begin_load(
+            WorldCellKey::base(0, 0, 0),
+            ResidencyMask::one(ResidencyFacet::Physics),
+        )
+        .unwrap()
+        .stage(&artifact)
+        .unwrap();
+    // Past the cleanup radius: (0,0,0) is claimed by neither the load nor the retention cube.
     let mut moved = source();
     moved.revision = 2;
-    moved.position = WorldPosition::from_world_meters(DVec3::new(64.0, 0.0, 0.0)).unwrap();
+    moved.position = WorldPosition::from_world_meters(DVec3::new(192.0, 0.0, 0.0)).unwrap();
     world.update_source(moved).unwrap();
     assert!(!world.publish_staged(staged).unwrap());
     assert_eq!(
@@ -906,4 +1186,328 @@ fn a_budget_is_spent_a_round_at_a_time_across_regions() {
             "both regions advanced once rather than one taking the whole budget",
         );
     }
+}
+
+/// A recook publishes a different immutable base, and the deltas an author or a player accumulated
+/// have to cross it: a plant's identity comes from authoring ancestry, not from the cook that
+/// placed it. Only what the new base no longer carries is dropped.
+#[test]
+fn persistent_state_rebases_onto_a_new_base_and_still_removes_what_it_removed() {
+    let near = WorldCellKey::base(0, 0, 0);
+    let far = WorldCellKey::base(40, 0, 0);
+    let platform = platform();
+    let kept = point_in(near, 1);
+    let felled = point_in(near, 2);
+    let distant = point_in(far, 3);
+    let (near_artifact, near_row) = cell_artifact(&[kept.clone(), felled.clone()], &platform, None);
+    let (_, far_row) = cell_artifact(std::slice::from_ref(&distant), &platform, None);
+
+    let mut wide = world_from(vec![near_row.clone(), far_row]);
+    wide.update_source(source()).unwrap();
+    for (index, plant) in [felled.id, distant.id].into_iter().enumerate() {
+        wide.apply_confirmed_mutations(&[VegetationMutationRecord {
+            header: crate::MutationHeader {
+                cell: if index == 0 { near } else { far },
+                transaction: index as u128 + 1,
+                authority: 2,
+                logical_tick: 3,
+                idempotency_key: index as u128 + 1,
+                base_revision: None,
+            },
+            mutation: crate::VegetationMutation::Tombstone { plant },
+        }])
+        .unwrap();
+    }
+    let carried = wide.persistent_state().clone();
+    assert_eq!(carried.cells().len(), 2);
+
+    // The next cook drops the far cell from the world, which re-keys the manifest.
+    let mut narrow = world_from(vec![near_row]);
+    assert_ne!(narrow.manifest_identity(), wide.manifest_identity());
+    let rebased = carried.rebase(narrow.manifest()).unwrap();
+    assert_eq!(
+        rebased.manifest_identity(),
+        narrow.manifest_identity().bytes()
+    );
+    assert_eq!(
+        rebased.cells().keys().copied().collect::<Vec<_>>(),
+        vec![near, far],
+        "a delta the new base has no ground for is inert, not deleted — the cook that dropped the \
+         cell may be the one that comes back",
+    );
+
+    narrow.replace_persistent_state(rebased).unwrap();
+    narrow.update_source(source()).unwrap();
+    let staged = narrow
+        .begin_load(near, ResidencyMask::one(ResidencyFacet::Physics))
+        .unwrap()
+        .stage(&near_artifact)
+        .unwrap();
+    assert!(narrow.publish_staged(staged).unwrap());
+    assert!(
+        narrow.find_plant(felled.id).unwrap().is_none(),
+        "the base the recook produced carries the plant again, and the delta still takes it out",
+    );
+    assert!(
+        narrow.find_plant(kept.id).unwrap().is_some(),
+        "and the rebase carried a delta rather than emptying the world",
+    );
+}
+
+/// A promoted simulation returns momentum as well as a pose, and the next reader has to see it:
+/// the snapshot a re-promotion builds its entity view from carries the velocity the write-back
+/// recorded, so a demote/re-promote cycle continues the motion instead of restarting at rest.
+#[test]
+fn promotion_origin_velocity_survives_into_the_next_snapshot() {
+    let (mut world, artifact, plant) = fixture();
+    world.update_source(source()).unwrap();
+    let cell = WorldCellKey::base(0, 0, 0);
+    let staged = world
+        .begin_load(cell, ResidencyMask::one(ResidencyFacet::Physics))
+        .unwrap()
+        .stage(&artifact)
+        .unwrap();
+    assert!(world.publish_staged(staged).unwrap());
+    let before = world.find_plant(plant).unwrap().expect("a resident plant");
+    assert_eq!(before.linear_velocity, [DecisionScalar::default(); 3]);
+
+    let linear = [
+        DecisionScalar::from_f64(0.25).unwrap(),
+        DecisionScalar::from_f64(-0.5).unwrap(),
+        DecisionScalar::from_f64(0.125).unwrap(),
+    ];
+    let angular = [DecisionScalar::from_f64(0.0625).unwrap(); 3];
+    world
+        .apply_confirmed_mutations(&[VegetationMutationRecord {
+            header: crate::MutationHeader {
+                cell,
+                transaction: 21,
+                authority: 5,
+                logical_tick: 1,
+                idempotency_key: 22,
+                base_revision: None,
+            },
+            mutation: crate::VegetationMutation::PromotionOriginState {
+                plant,
+                state: crate::PromotionOriginState {
+                    position: before.position,
+                    orientation: before.orientation,
+                    scale: before.scale,
+                    linear_velocity: linear,
+                    angular_velocity: angular,
+                },
+            },
+        }])
+        .unwrap();
+
+    let after = world.find_plant(plant).unwrap().expect("still resident");
+    assert_eq!(after.linear_velocity, linear);
+    assert_eq!(after.angular_velocity, angular);
+
+    // And it survives the cell leaving and coming back, exactly as the pose does: the overlay is
+    // read off persistent state every time a generation is built.
+    assert!(world.remove_source(SpatialSourceId(1)).unwrap());
+    assert_eq!(
+        world.cell_snapshot(cell).unwrap().resident_facets(),
+        ResidencyMask::NONE
+    );
+    world.update_source(source()).unwrap();
+    let staged = world
+        .begin_load(cell, ResidencyMask::one(ResidencyFacet::Physics))
+        .unwrap()
+        .stage(&artifact)
+        .unwrap();
+    assert!(world.publish_staged(staged).unwrap());
+    let reloaded = world.find_plant(plant).unwrap().expect("reloaded");
+    assert_eq!(reloaded.linear_velocity, linear);
+    assert_eq!(reloaded.angular_velocity, angular);
+}
+
+/// Simulation ownership is a claim, and only the mutations that say where a plant is — or whether
+/// it exists — make one. A biological write by another authority leaves the promoted view's claim
+/// standing, while a foreign transform, delta restore, or removal takes it away; a wholesale state
+/// replacement moves the epoch, which is how a network join or a save load is noticed at all.
+#[test]
+fn simulation_ownership_moves_only_on_a_positional_or_existence_claim() {
+    const PROMOTER: u128 = 0x51;
+    const EDITOR: u128 = 0x52;
+    let (mut world, artifact, plant) = fixture();
+    world.update_source(source()).unwrap();
+    let cell = WorldCellKey::base(0, 0, 0);
+    let staged = world
+        .begin_load(cell, ResidencyMask::one(ResidencyFacet::Physics))
+        .unwrap()
+        .stage(&artifact)
+        .unwrap();
+    assert!(world.publish_staged(staged).unwrap());
+    assert_eq!(world.plant_simulation_authority(plant), None);
+
+    world.promote_plant(plant, PROMOTER).unwrap();
+    assert_eq!(world.plant_simulation_authority(plant), Some(PROMOTER));
+
+    let mut transaction = 100_u128;
+    let mut commit = |world: &mut VegetationWorld, mutation: crate::VegetationMutation| {
+        transaction += 1;
+        world
+            .apply_confirmed_mutations(&[VegetationMutationRecord {
+                header: crate::MutationHeader {
+                    cell,
+                    transaction,
+                    authority: EDITOR,
+                    logical_tick: transaction as u64,
+                    idempotency_key: transaction,
+                    base_revision: None,
+                },
+                mutation,
+            }])
+            .unwrap();
+    };
+
+    // Biology from another authority claims nothing.
+    commit(
+        &mut world,
+        crate::VegetationMutation::Damage {
+            plant,
+            amount: UnitInterval::from_bits(1000),
+            phenotype: None,
+        },
+    );
+    assert_eq!(
+        world.plant_simulation_authority(plant),
+        Some(PROMOTER),
+        "damage is not a statement about who simulates the plant"
+    );
+
+    // A foreign transform is a claim.
+    let resident = world.find_plant(plant).unwrap().expect("resident");
+    commit(
+        &mut world,
+        crate::VegetationMutation::TransformOverride {
+            plant,
+            position: resident.position,
+            orientation: resident.orientation,
+            scale: resident.scale,
+        },
+    );
+    assert_eq!(world.plant_simulation_authority(plant), Some(EDITOR));
+
+    // A wholesale replacement is everyone's claim gone and a new epoch.
+    let epoch = world.authority_epoch();
+    let state = world.persistent_state().clone();
+    world.replace_persistent_state(state).unwrap();
+    assert_eq!(world.plant_simulation_authority(plant), None);
+    assert_eq!(world.authority_epoch(), epoch + 1);
+}
+
+/// A late joiner is seated by the same receive path a correction takes, and it proves it landed
+/// where the authority said: it reproduces the granted checkpoint from its own scoped state.
+#[test]
+fn a_late_joiner_reproduces_the_authority_checkpoint_for_its_declared_scope() {
+    let cell = WorldCellKey::base(0, 0, 0);
+    let outside = WorldCellKey::base(9, 0, 0);
+    let (mut authority, artifact, plant) = fixture();
+    authority.update_source(source()).unwrap();
+    let staged = authority
+        .begin_load(cell, ResidencyMask::one(ResidencyFacet::Physics))
+        .unwrap()
+        .stage(&artifact)
+        .unwrap();
+    assert!(authority.publish_staged(staged).unwrap());
+    authority
+        .apply_confirmed_mutations(&[VegetationMutationRecord {
+            header: crate::MutationHeader {
+                cell,
+                transaction: 41,
+                authority: 1,
+                logical_tick: 1,
+                idempotency_key: 42,
+                base_revision: None,
+            },
+            mutation: crate::VegetationMutation::StateOverride {
+                plant,
+                lifecycle: None,
+                phenotype: Some(4),
+                health: None,
+                moisture: None,
+                fuel: None,
+                interaction_policy: None,
+            },
+        }])
+        .unwrap();
+
+    let mut declared = crate::CellInterestSet::new();
+    declared
+        .declare(
+            cell,
+            ResidencyMask::one(ResidencyFacet::Render).with(ResidencyFacet::Simulation),
+        )
+        .unwrap();
+    let offer = authority.network_offer().unwrap();
+    let mut joiner = world_from(authority.manifest().cells.clone());
+    let request = crate::LateJoinRequest::accept(
+        joiner.network_peer_identity().unwrap(),
+        offer,
+        declared.clone(),
+    )
+    .unwrap();
+    let grant = authority.issue_late_join(&request).unwrap();
+    joiner.accept_late_join(&grant).unwrap();
+
+    assert_eq!(joiner.network_interest(), Some(&declared));
+    assert_eq!(
+        joiner.persistent_state().cells().keys().collect::<Vec<_>>(),
+        vec![&cell],
+        "only the declared cell crossed"
+    );
+    assert!(
+        joiner
+            .persistent_state()
+            .cells()
+            .values()
+            .all(|state| !state.plants.is_empty()),
+        "the declared cell carried its plant deltas"
+    );
+
+    // A seated peer refuses an operation outside its declaration rather than silently widening.
+    let stray = crate::NetworkMutationEnvelope {
+        sequence: grant.checkpoint.sequence + 1,
+        manifest_identity: joiner.manifest_identity().bytes(),
+        operations: vec![VegetationMutationRecord {
+            header: crate::MutationHeader {
+                cell: outside,
+                transaction: 51,
+                authority: 1,
+                logical_tick: 2,
+                idempotency_key: 52,
+                base_revision: None,
+            },
+            mutation: crate::VegetationMutation::Tombstone { plant },
+        }],
+        snapshot: None,
+    };
+    assert!(matches!(
+        joiner.receive_network_envelope(&stray),
+        Err(Error::Network(_))
+    ));
+
+    // Diverging locally is detected by the fingerprint, not by comparing whole states.
+    joiner
+        .apply_confirmed_mutations(&[VegetationMutationRecord {
+            header: crate::MutationHeader {
+                cell,
+                transaction: 61,
+                authority: 3,
+                logical_tick: 4,
+                idempotency_key: 62,
+                base_revision: None,
+            },
+            mutation: crate::VegetationMutation::Tombstone { plant },
+        }])
+        .unwrap();
+    let diverged = joiner.network_checkpoint().unwrap();
+    assert_eq!(
+        diverged.reconcile(grant.checkpoint),
+        crate::CheckpointReconciliation::Diverged
+    );
+    assert!(diverged.reconcile(grant.checkpoint).requires_snapshot());
 }

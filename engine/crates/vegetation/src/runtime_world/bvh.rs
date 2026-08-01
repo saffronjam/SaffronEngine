@@ -5,6 +5,23 @@ use saffron_spatial::WorldBounds;
 
 use crate::{Error, Result};
 
+/// Traversal work one CPU vegetation query performed, accumulated across the resident generations
+/// it walked. Every term counts macro rows or the nodes built over them; micro fields are quantized
+/// tiles that no traversal here can reach, which is the scaling contract this measures.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct VegetationQueryCost {
+    /// Queries answered.
+    pub queries: u64,
+    /// Plants those queries matched, before any caller-side result limit.
+    pub hits: u64,
+    /// Resident macro generations walked.
+    pub generations_visited: u64,
+    /// Hierarchy nodes whose bounds were tested.
+    pub nodes_visited: u64,
+    /// Macro rows whose exact bounds were tested.
+    pub rows_tested: u64,
+}
+
 #[derive(Clone, Debug, Default)]
 pub(super) struct MacroBvh {
     nodes: Vec<MacroBvhNode>,
@@ -85,13 +102,18 @@ impl MacroBvh {
         Ok(index)
     }
 
-    pub(super) fn query_bounds(&self, bounds: WorldBounds) -> Vec<u32> {
+    pub(super) fn query_bounds(
+        &self,
+        bounds: WorldBounds,
+        cost: &mut VegetationQueryCost,
+    ) -> Vec<u32> {
         let mut result = Vec::new();
         let Some(root) = self.root else {
             return result;
         };
         let mut pending = vec![root];
         while let Some(index) = pending.pop() {
+            cost.nodes_visited = cost.nodes_visited.saturating_add(1);
             match &self.nodes[index as usize] {
                 MacroBvhNode::Leaf {
                     bounds: node_bounds,
@@ -113,13 +135,19 @@ impl MacroBvh {
                 }
             }
         }
+        cost.rows_tested = cost.rows_tested.saturating_add(result.len() as u64);
         result.retain(|row| bounds_intersect(self.row_bounds[*row as usize], bounds));
         result.sort_unstable();
         result
     }
 
-    pub(super) fn rows_by_nearness(&self, point: DVec3) -> Vec<u32> {
-        let mut rows = self.query_all();
+    pub(super) fn rows_by_nearness(
+        &self,
+        point: DVec3,
+        cost: &mut VegetationQueryCost,
+    ) -> Vec<u32> {
+        let mut rows = self.query_all(cost);
+        cost.rows_tested = cost.rows_tested.saturating_add(rows.len() as u64);
         rows.sort_by(|left, right| {
             let left_distance = self.row_bounds(*left).map_or(f64::INFINITY, |bounds| {
                 distance_squared_to_bounds(point, bounds)
@@ -139,6 +167,7 @@ impl MacroBvh {
         origin: DVec3,
         direction: DVec3,
         maximum: f64,
+        cost: &mut VegetationQueryCost,
     ) -> Vec<(u32, f64)> {
         let mut result = Vec::new();
         let Some(root) = self.root else {
@@ -146,12 +175,14 @@ impl MacroBvh {
         };
         let mut pending = vec![root];
         while let Some(index) = pending.pop() {
+            cost.nodes_visited = cost.nodes_visited.saturating_add(1);
             let node = &self.nodes[index as usize];
             if ray_bounds_distance(origin, direction, node.bounds(), maximum).is_none() {
                 continue;
             }
             match node {
                 MacroBvhNode::Leaf { rows, .. } => {
+                    cost.rows_tested = cost.rows_tested.saturating_add(rows.len() as u64);
                     result.extend(rows.iter().filter_map(|row| {
                         self.row_bounds(*row)
                             .and_then(|bounds| {
@@ -174,13 +205,14 @@ impl MacroBvh {
         result
     }
 
-    fn query_all(&self) -> Vec<u32> {
+    fn query_all(&self, cost: &mut VegetationQueryCost) -> Vec<u32> {
         let Some(root) = self.root else {
             return Vec::new();
         };
         let mut pending = vec![root];
         let mut rows = Vec::new();
         while let Some(index) = pending.pop() {
+            cost.nodes_visited = cost.nodes_visited.saturating_add(1);
             match &self.nodes[index as usize] {
                 MacroBvhNode::Leaf { rows: leaf, .. } => rows.extend(leaf),
                 MacroBvhNode::Branch { left, right, .. } => {
