@@ -131,6 +131,16 @@ impl ControlRenderer for HostControlRenderer<'_> {
             }))
     }
 
+    fn capture_interaction_field(
+        &self,
+        cascade: u32,
+        resolution: u32,
+    ) -> Result<Option<saffron_rendering::InteractionFieldCapture>, String> {
+        self.renderer
+            .capture_interaction_field(cascade, resolution)
+            .map_err(|error| error.to_string())
+    }
+
     fn page_faults(&self) -> u64 {
         self.renderer.page_faults()
     }
@@ -317,6 +327,64 @@ impl ControlRenderer for HostControlRenderer<'_> {
     fn mesh_executor_active(&self) -> bool {
         self.renderer.mesh_executor_active()
     }
+
+    fn mesh_executor_supported(&self) -> bool {
+        saffron_rendering::mesh_executor_supported(&self.renderer.device().capabilities)
+    }
+
+    fn set_mesh_executor(&mut self, mesh: bool) -> bool {
+        self.renderer.set_mesh_executor(mesh)
+    }
+    fn async_compute_queue_supported(&self) -> bool {
+        self.renderer.async_compute_queue_supported()
+    }
+
+    fn pick_selection_id(
+        &mut self,
+        u: f32,
+        v: f32,
+    ) -> Result<Option<saffron_control::SelectionPick>, String> {
+        let world = self.renderer.active_view_id().gpu_scene_world();
+        let Some(hit) = self
+            .renderer
+            .pick_selection_id(u, v)
+            .map_err(|error| error.to_string())?
+        else {
+            return Ok(None);
+        };
+        let position = hit.position;
+        let normal = hit.normal;
+        // A blade never has a persistent identity, whatever instance anchors its field.
+        if hit.representation == saffron_rendering::GpuRepresentation::MicroBlade {
+            return Ok(Some(saffron_control::SelectionPick::Micro {
+                position,
+                normal,
+            }));
+        }
+        Ok(
+            match self.mirror.identify_instance_slot(world, hit.instance_slot) {
+                Some(saffron_assets::MirrorInstanceIdentity::Entity(entity)) => {
+                    Some(saffron_control::SelectionPick::Entity {
+                        entity,
+                        position,
+                        normal,
+                    })
+                }
+                Some(saffron_assets::MirrorInstanceIdentity::Plant { cell, plant }) => {
+                    Some(saffron_control::SelectionPick::Plant {
+                        cell,
+                        plant,
+                        position,
+                        normal,
+                    })
+                }
+                Some(saffron_assets::MirrorInstanceIdentity::MicroField) => {
+                    Some(saffron_control::SelectionPick::Micro { position, normal })
+                }
+                None => None,
+            },
+        )
+    }
     fn sdf_instances_dropped(&self) -> u32 {
         self.renderer.sdf_instances_dropped()
     }
@@ -338,6 +406,9 @@ impl ControlRenderer for HostControlRenderer<'_> {
     }
     fn rt_tessellated_blas_count(&self) -> u32 {
         self.renderer.rt_tessellated_blas_count()
+    }
+    fn rt_wind_deformed(&self) -> u32 {
+        self.renderer.rt_wind_deformed()
     }
     fn cluster_as_supported(&self) -> bool {
         self.renderer.cluster_as_supported()
@@ -392,6 +463,10 @@ impl ControlRenderer for HostControlRenderer<'_> {
 
     fn rt_omm_classes(&self) -> (u64, u64, u64) {
         self.renderer.rt_omm_classes()
+    }
+
+    fn rt_omm_derived(&self) -> (u64, u64, u64, u64) {
+        self.renderer.rt_omm_derived()
     }
 
     fn rt_blas_bytes(&self) -> u64 {

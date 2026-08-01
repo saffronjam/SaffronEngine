@@ -109,7 +109,7 @@ impl HostLayer {
             }
         }
         let profile = self.editor.active_scene().environment.wind.profile();
-        let sources = self.editor.active_scene().local_wind_sources();
+        let sources = self.editor.active_scene().local_wind_source_field();
         let time = self.editor.simulation_time_s;
         for gz in 0..GRID {
             for gx in 0..GRID {

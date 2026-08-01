@@ -23,8 +23,8 @@ use saffron_rendering::{Renderer, Uploader};
 use saffron_runtime::RuntimeSession;
 use saffron_scene::{ComponentRegistry, Scene, ScriptInputState, register_builtin_components};
 use saffron_spatial::{
-    ResidencyFacet, ResidencyManager, ResidencyMask, SourceLevel, SpatialSource, SpatialSourceId,
-    WorldPosition,
+    ResidencyFacet, ResidencyManager, ResidencyMask, SourceLevel, SourceMotion, SpatialSource,
+    SpatialSourceId, WorldPosition,
 };
 use saffron_window::keyboard::{KeyCode, PhysicalKey};
 use saffron_window::{
@@ -172,6 +172,9 @@ struct PlayerLayer {
     assets: AssetServer,
     runtime: RuntimeSession,
     spatial: ResidencyManager,
+    /// Measures the view camera's travel so its residency claim leads the player instead of
+    /// trailing them; the camera carries no rigidbody to read a velocity from.
+    spatial_motion: SourceMotion,
     registry: ComponentRegistry,
     project: ProjectInfo,
     uploader: Option<Uploader>,
@@ -192,6 +195,7 @@ impl PlayerLayer {
             assets,
             runtime: RuntimeSession::new(),
             spatial: ResidencyManager::new(),
+            spatial_motion: SourceMotion::default(),
             registry: register_builtin_components(),
             project: ProjectInfo::default(),
             uploader: None,
@@ -244,10 +248,11 @@ impl PlayerLayer {
         }
     }
 
-    fn update_vegetation_source(&mut self) {
+    fn update_vegetation_source(&mut self, dt: TimeSpan) {
         const PLAYER_VIEW_SOURCE: SpatialSourceId = SpatialSourceId(1);
         let Some(camera) = self.scene.primary_camera() else {
             self.spatial.remove_source(PLAYER_VIEW_SOURCE);
+            self.spatial_motion.reset();
             return;
         };
         let render_position = camera.view.inverse().w_axis.truncate();
@@ -255,17 +260,23 @@ impl PlayerLayer {
             WorldPosition::from_render_relative(render_position, WorldPosition::origin())
         else {
             self.spatial.remove_source(PLAYER_VIEW_SOURCE);
+            self.spatial_motion.reset();
             return;
         };
-        let revision =
-            position
-                .global_ticks()
-                .into_iter()
-                .fold(0xcbf2_9ce4_8422_2325_u64, |hash, value| {
-                    value.to_le_bytes().into_iter().fold(hash, |hash, byte| {
-                        (hash ^ u64::from(byte)).wrapping_mul(0x0000_0100_0000_01b3)
-                    })
-                });
+        let velocity_mps = self.spatial_motion.observe(position, f64::from(dt.seconds));
+        let revision = position
+            .global_ticks()
+            .into_iter()
+            .flat_map(|value| value.to_le_bytes())
+            .chain(
+                velocity_mps
+                    .to_array()
+                    .into_iter()
+                    .flat_map(|value| value.to_bits().to_le_bytes()),
+            )
+            .fold(0xcbf2_9ce4_8422_2325_u64, |hash, byte| {
+                (hash ^ u64::from(byte)).wrapping_mul(0x0000_0100_0000_01b3)
+            });
         let facets = ResidencyMask::one(ResidencyFacet::Render)
             .with(ResidencyFacet::Physics)
             .with(ResidencyFacet::Simulation)
@@ -274,7 +285,7 @@ impl PlayerLayer {
             id: PLAYER_VIEW_SOURCE,
             revision,
             position,
-            velocity_mps: saffron_geometry::glam::DVec3::ZERO,
+            velocity_mps,
             prediction_seconds: 0.25,
             levels: vec![
                 SourceLevel {
@@ -372,7 +383,7 @@ impl Layer for PlayerLayer {
         if !self.started {
             return;
         }
-        self.update_vegetation_source();
+        self.update_vegetation_source(dt);
         if let Err(error) =
             self.runtime
                 .synchronize_vegetation(&mut self.scene, &self.assets, &self.spatial)

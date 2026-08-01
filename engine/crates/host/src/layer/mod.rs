@@ -34,6 +34,9 @@ pub struct HostLayer {
     assets: AssetServer,
     control: ControlContext,
     spatial: saffron_spatial::ResidencyManager,
+    /// Measures the viewport's travel so its residency claim leads the camera instead of trailing
+    /// it; a viewpoint carries no rigidbody to read a velocity from.
+    spatial_motion: saffron_spatial::SourceMotion,
     /// The same `RuntimeSession` the standalone `saffron-player` runs, so "advance the world a
     /// frame" is one code path. Idle in Edit.
     runtime: RuntimeSession,
@@ -132,6 +135,7 @@ impl HostLayer {
             assets,
             control,
             spatial: saffron_spatial::ResidencyManager::new(),
+            spatial_motion: saffron_spatial::SourceMotion::default(),
             runtime: RuntimeSession::new(),
             last_play_state: PlayState::Edit,
             uploader: None,
@@ -358,7 +362,7 @@ impl Layer for HostLayer {
         // `window` are distinct `App` fields, so they borrow disjointly.
         let mut mutated = false;
         if let Some(renderer) = app.frame_host.renderer_mut() {
-            self.update_spatial_source();
+            self.update_spatial_source(dt);
             // Headless editor mode has no window, but the control plane still takes a `Window`
             // facade: the size is unused in publish mode and the signals are inert without an
             // event loop.

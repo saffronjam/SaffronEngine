@@ -70,6 +70,18 @@ impl HostLayer {
         // A contained script failure surfaces through the drained errors and defers a pause —
         // never inside the step, which would re-enter the play machine.
         if let Some(step_dt) = self.editor.play_step_dt(dt.seconds) {
+            // Bind the shared wind field to the play world before the step, so a rigid body
+            // and the vegetation beside it are pushed by one field rather than two models.
+            {
+                let time_s = self.editor.simulation_time_s;
+                let (scene, _) = self.editor.play_scene_and_input();
+                let profile = scene.environment.wind.profile();
+                let sources = scene.local_wind_source_field();
+                let physics_cell = self.runtime.physics_cell();
+                if let Some(physics) = physics_cell.borrow_mut().as_mut() {
+                    physics.set_wind(profile, &sources, time_s);
+                }
+            }
             {
                 let (scene, input) = self.editor.play_scene_and_input();
                 self.runtime.step(scene, step_dt, input);
@@ -273,7 +285,7 @@ impl HostLayer {
     }
 
     /// Updates the editor viewport's shared predicted residency source.
-    pub(super) fn update_spatial_source(&mut self) {
+    pub(super) fn update_spatial_source(&mut self, dt: TimeSpan) {
         const EDITOR_VIEW_SOURCE: SpatialSourceId = SpatialSourceId(1);
         let camera_position = self
             .editor
@@ -286,8 +298,10 @@ impl HostLayer {
             WorldPosition::from_render_relative(camera_position, WorldPosition::origin())
         else {
             self.spatial.remove_source(EDITOR_VIEW_SOURCE);
+            self.spatial_motion.reset();
             return;
         };
+        let velocity_mps = self.spatial_motion.observe(position, f64::from(dt.seconds));
         // The viewpoint claims render + editing data always. In play it additionally claims the
         // facets the simulation consumes near the camera: physics collision proxies and the
         // navigation contributions a consumer rebuilds from. Edit mode simulates nothing, so
@@ -302,6 +316,12 @@ impl HostLayer {
         let revision = ticks
             .into_iter()
             .flat_map(|value| value.to_le_bytes())
+            .chain(
+                velocity_mps
+                    .to_array()
+                    .into_iter()
+                    .flat_map(|value| value.to_bits().to_le_bytes()),
+            )
             .chain(std::iter::once(facets.bits()))
             .fold(0xcbf2_9ce4_8422_2325_u64, |hash, byte| {
                 (hash ^ u64::from(byte)).wrapping_mul(0x0000_0100_0000_01b3)
@@ -310,7 +330,7 @@ impl HostLayer {
             id: EDITOR_VIEW_SOURCE,
             revision,
             position,
-            velocity_mps: glam::DVec3::ZERO,
+            velocity_mps,
             prediction_seconds: 0.25,
             levels: vec![
                 SourceLevel {

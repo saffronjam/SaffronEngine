@@ -40,7 +40,7 @@ impl HostLayer {
         let uploader = self.uploader.as_ref().expect("uploader present");
         let assets = &mut self.assets;
         let mirror = &mut self.gpu_scene_mirror;
-        for job in &jobs {
+        for (index, job) in jobs.iter().enumerate() {
             let subject = match job.kind {
                 PreviewRenderKind::Material(id) => PreviewSubject::Material(id),
                 PreviewRenderKind::TextureRole { tid, role } => {
@@ -73,7 +73,17 @@ impl HostLayer {
                         tracing::warn!("preview thumbnail cache write: {err}");
                     }
                 }
-                Err(err) => tracing::error!("preview thumbnail render: {err}"),
+                Err(err) => {
+                    tracing::error!("preview thumbnail render: {err}");
+                    // The failed render left the frame ring mid-flight; the rest of the budget
+                    // would drive it further before the loop closes the slot. Release every
+                    // remaining job's in-flight marker so a later request re-enqueues it, and
+                    // give the tick back.
+                    for abandoned in &jobs[index..] {
+                        assets.finish_preview_render(&abandoned.cache_path);
+                    }
+                    return;
+                }
             }
             assets.finish_preview_render(&job.cache_path);
         }
@@ -109,7 +119,7 @@ impl HostLayer {
         // Fold the shared wind field's frame words (authored settings + the monotonic
         // clock) before render_scene writes the light UBO.
         {
-            let sources = self.editor.active_scene().local_wind_sources();
+            let sources = self.editor.active_scene().local_wind_source_field();
             let wind = self.editor.active_scene().environment.wind;
             if let Err(err) = renderer.set_wind(
                 &saffron_rendering::SceneWind {

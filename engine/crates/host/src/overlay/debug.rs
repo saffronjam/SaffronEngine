@@ -214,8 +214,8 @@ pub(super) fn build_vegetation_overlays(
     }
 }
 
-/// The viewport debug overlays (`set-debug-overlays`): per-entity bounds (the exact box
-/// `pick_entity` tests, static + skinned joint-union), the whole-scene AABB the shadow fit
+/// The viewport debug overlays (`set-debug-overlays`): per-entity bounds (the exact box the
+/// surface ray tests, static + skinned joint-union), the whole-scene AABB the shadow fit
 /// uses, and point/spot light volumes. Depth-tested, Edit-only.
 pub(super) fn build_debug_overlays(
     editor: &mut SceneEditContext,
