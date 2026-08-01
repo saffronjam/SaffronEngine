@@ -372,6 +372,10 @@ pub enum GraphClusterMode {
 }
 
 impl GraphCombineOperation {
+    /// Complete operation inventory in stable wire order. The GPU qualification corpus is required
+    /// to execute every entry, so a new one without corpus coverage fails qualification.
+    pub const ALL: &'static [Self] = &[Self::Add, Self::Multiply, Self::Minimum, Self::Maximum];
+
     pub(super) const fn as_wire(self) -> &'static str {
         match self {
             Self::Add => "add",

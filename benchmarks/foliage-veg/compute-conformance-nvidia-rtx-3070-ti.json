@@ -46,11 +46,11 @@
   "graphProgram": {
     "abiVersion": 1,
     "abiSha256": "83677153a77a50cf9eb39cef25d311a8e9df432beb1bdde1231ef88e322071b7",
-    "corpusProgramCount": 4,
-    "corpusInvocationCount": 13,
-    "corpusSha256": "5107c1f52569bec6922ec09edde5fb0382c4ccaf156fda134860da2a86ed615c",
-    "rustReferenceSha256": "fb44dca41ee59d11c2fe72549225270a024fba00cd86ede101dd19bd7586c19e",
-    "slangSha256": "fb44dca41ee59d11c2fe72549225270a024fba00cd86ede101dd19bd7586c19e",
+    "corpusProgramCount": 7,
+    "corpusInvocationCount": 30,
+    "corpusSha256": "e72393bf7725a265a5a2cc377b04c9c0e0ca2e368bf1e4b0092cfc5f1e9a5b30",
+    "rustReferenceSha256": "89ae9f1af68cd8040823f2a5cddb79887e717643c68423fb1ebddc14bd7843fc",
+    "slangSha256": "89ae9f1af68cd8040823f2a5cddb79887e717643c68423fb1ebddc14bd7843fc",
     "shaderArtifact": {
       "shader": "vegetation_graph",
       "source": "vegetation_graph.slang",

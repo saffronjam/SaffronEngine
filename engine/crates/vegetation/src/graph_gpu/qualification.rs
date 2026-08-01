@@ -236,6 +236,160 @@ pub fn qualification_corpus() -> Vec<GraphGpuQualificationBatch> {
             .unwrap();
     }
 
+    let extrema = GraphGpuProgram::new(
+        vec![scalar, scalar, mask],
+        vec![
+            GraphGpuInstruction::Combine {
+                destination: GraphGpuRegister(3),
+                left: GraphGpuRegister(0),
+                right: GraphGpuRegister(1),
+                operation: GraphCombineOperation::Minimum,
+            },
+            GraphGpuInstruction::Combine {
+                destination: GraphGpuRegister(4),
+                left: GraphGpuRegister(0),
+                right: GraphGpuRegister(1),
+                operation: GraphCombineOperation::Maximum,
+            },
+            GraphGpuInstruction::FieldImportance {
+                destination: GraphGpuRegister(5),
+                candidates: GraphGpuRegister(2),
+                weights: GraphGpuRegister(3),
+                threshold: 32_768,
+            },
+        ],
+        Some(GraphGpuRegister(4)),
+        GraphGpuRegister(5),
+    )
+    .unwrap();
+    let extrema_inputs = [
+        (10_000, 20_000, true),
+        (65_536, -65_536, true),
+        (i32::MIN, i32::MAX, true),
+        (40_000, 40_000, true),
+        (0, 0, false),
+    ];
+    let mut extrema_batch =
+        GraphGpuInvocationBatch::with_capacity(&extrema, extrema_inputs.len()).unwrap();
+    for (left, right, live) in extrema_inputs {
+        extrema_batch
+            .push(
+                [
+                    GraphGpuValue::FixedScalar(left),
+                    GraphGpuValue::FixedScalar(right),
+                    GraphGpuValue::CandidateMask(live),
+                ]
+                .map(Ok),
+            )
+            .unwrap();
+    }
+
+    // A zero-scale ramp answers its bias without touching position, so the extreme tick pair that
+    // would overflow a scaled ramp must stay valid. The program publishes no value register, which
+    // is the other terminal form the ABI allows.
+    let constant = GraphGpuProgram::new(
+        vec![
+            world_tick, world_tick, world_tick, world_tick, world_tick, world_tick, mask,
+        ],
+        vec![
+            GraphGpuInstruction::Gradient {
+                destination: GraphGpuRegister(7),
+                position: [
+                    GraphGpuRegister(0),
+                    GraphGpuRegister(1),
+                    GraphGpuRegister(2),
+                ],
+                exact_origin: [
+                    GraphGpuRegister(3),
+                    GraphGpuRegister(4),
+                    GraphGpuRegister(5),
+                ],
+                direction: [65_536, 0, 0],
+                scale: 0,
+                bias: 4_096,
+            },
+            GraphGpuInstruction::FieldImportance {
+                destination: GraphGpuRegister(8),
+                candidates: GraphGpuRegister(6),
+                weights: GraphGpuRegister(7),
+                threshold: 4_096,
+            },
+        ],
+        None,
+        GraphGpuRegister(8),
+    )
+    .unwrap();
+    let constant_inputs = [
+        ([0_i128; 3], [0_i128; 3], true),
+        ([i128::MAX, i128::MIN, 0], [i128::MIN, i128::MAX, 0], true),
+        ([1_i128, 2, 3], [4_i128, 5, 6], false),
+    ];
+    let mut constant_batch =
+        GraphGpuInvocationBatch::with_capacity(&constant, constant_inputs.len()).unwrap();
+    for (position, origin, live) in constant_inputs {
+        constant_batch
+            .push(
+                [
+                    GraphGpuValue::WorldTick(position[0]),
+                    GraphGpuValue::WorldTick(position[1]),
+                    GraphGpuValue::WorldTick(position[2]),
+                    GraphGpuValue::WorldTick(origin[0]),
+                    GraphGpuValue::WorldTick(origin[1]),
+                    GraphGpuValue::WorldTick(origin[2]),
+                    GraphGpuValue::CandidateMask(live),
+                ]
+                .map(Ok),
+            )
+            .unwrap();
+    }
+
+    let curve_edges = GraphGpuProgram::new(
+        vec![scalar, mask],
+        vec![
+            GraphGpuInstruction::Curve {
+                destination: GraphGpuRegister(2),
+                input: GraphGpuRegister(0),
+                points: vec![(16_384, 12_345)],
+            },
+            GraphGpuInstruction::Curve {
+                destination: GraphGpuRegister(3),
+                input: GraphGpuRegister(0),
+                points: vec![(16_384, -65_536), (32_768, 0), (49_152, 65_536)],
+            },
+            GraphGpuInstruction::Combine {
+                destination: GraphGpuRegister(4),
+                left: GraphGpuRegister(2),
+                right: GraphGpuRegister(3),
+                operation: GraphCombineOperation::Add,
+            },
+            GraphGpuInstruction::FieldImportance {
+                destination: GraphGpuRegister(5),
+                candidates: GraphGpuRegister(1),
+                weights: GraphGpuRegister(4),
+                threshold: 12_345,
+            },
+        ],
+        Some(GraphGpuRegister(4)),
+        GraphGpuRegister(5),
+    )
+    .unwrap();
+    let curve_edge_inputs = [
+        -1_000, 0, 16_384, 20_000, 32_768, 40_000, 49_152, 65_535, 200_000,
+    ];
+    let mut curve_edge_batch =
+        GraphGpuInvocationBatch::with_capacity(&curve_edges, curve_edge_inputs.len()).unwrap();
+    for input in curve_edge_inputs {
+        curve_edge_batch
+            .push(
+                [
+                    GraphGpuValue::FixedScalar(input),
+                    GraphGpuValue::CandidateMask(true),
+                ]
+                .map(Ok),
+            )
+            .unwrap();
+    }
+
     vec![
         GraphGpuQualificationBatch {
             program: chain,
@@ -252,6 +406,18 @@ pub fn qualification_corpus() -> Vec<GraphGpuQualificationBatch> {
         GraphGpuQualificationBatch {
             program: multiply,
             invocation_batch: multiply_batch,
+        },
+        GraphGpuQualificationBatch {
+            program: extrema,
+            invocation_batch: extrema_batch,
+        },
+        GraphGpuQualificationBatch {
+            program: constant,
+            invocation_batch: constant_batch,
+        },
+        GraphGpuQualificationBatch {
+            program: curve_edges,
+            invocation_batch: curve_edge_batch,
         },
     ]
 }
@@ -346,17 +512,19 @@ mod tests {
         }
     }
 
+    /// Qualification mints evidence per operator, so an operator branch the corpus never drove
+    /// would ship licensed by a run that skipped it. Coverage is asserted over each operator's
+    /// behaviour, not just its opcode.
     #[test]
-    fn corpus_covers_every_declared_dual_domain_operator_with_resident_programs() {
+    fn corpus_drives_every_dual_domain_operator_branch() {
         let corpus = qualification_corpus();
         assert!(
             corpus
                 .iter()
                 .any(|batch| batch.program.instructions.len() > 1)
         );
-        let covered = corpus
-            .iter()
-            .flat_map(|batch| batch.program.instructions())
+        let instructions = || corpus.iter().flat_map(|batch| batch.program.instructions());
+        let covered = instructions()
             .map(GraphGpuInstruction::operator)
             .collect::<BTreeSet<_>>();
         for operator in GraphOperator::ALL {
@@ -368,6 +536,49 @@ mod tests {
                 );
             }
         }
+
+        let combines = instructions()
+            .filter_map(|instruction| match instruction {
+                GraphGpuInstruction::Combine { operation, .. } => Some(*operation),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        for operation in GraphCombineOperation::ALL {
+            assert!(
+                combines.contains(operation),
+                "combine {operation:?} lacks corpus coverage"
+            );
+        }
+
+        let gradient_scales = instructions()
+            .filter_map(|instruction| match instruction {
+                GraphGpuInstruction::Gradient { scale, .. } => Some(*scale),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            gradient_scales.contains(&0),
+            "the constant ramp is undriven"
+        );
+        assert!(gradient_scales.iter().any(|scale| *scale != 0));
+
+        let curve_lengths = instructions()
+            .filter_map(|instruction| match instruction {
+                GraphGpuInstruction::Curve { points, .. } => Some(points.len()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            curve_lengths.contains(&1),
+            "the single-point curve is undriven"
+        );
+        assert!(curve_lengths.iter().any(|length| *length > 2));
+
+        assert!(
+            corpus.iter().any(|batch| batch.program.output().is_none()),
+            "the value-free terminal form is undriven"
+        );
+        assert!(corpus.iter().any(|batch| batch.program.output().is_some()));
     }
 
     #[test]
@@ -387,17 +598,17 @@ mod tests {
         assert_eq!(
             qualification_corpus_hash(),
             [
-                0x51, 0x07, 0xc1, 0xf5, 0x25, 0x69, 0xbe, 0xc6, 0x92, 0x2e, 0xc0, 0x9e, 0xdd, 0xe5,
-                0xfb, 0x03, 0x82, 0xc4, 0xcc, 0xaf, 0x15, 0x6f, 0xda, 0x13, 0x48, 0x60, 0xda, 0x2a,
-                0x86, 0xed, 0x61, 0x5c,
+                0xe7, 0x23, 0x93, 0xbf, 0x77, 0x25, 0xa2, 0x65, 0xa5, 0xa2, 0xcc, 0x37, 0x7b, 0x04,
+                0xc9, 0xc0, 0xe0, 0xca, 0x2e, 0x36, 0x8b, 0xf1, 0xe4, 0xb0, 0x09, 0x2c, 0xfc, 0x5f,
+                0x1e, 0x9a, 0x5b, 0x30,
             ]
         );
         assert_eq!(
             qualification_reference_hash(),
             [
-                0xfb, 0x44, 0xdc, 0xa4, 0x1e, 0xe5, 0x9d, 0x11, 0xc2, 0xfe, 0x72, 0x54, 0x92, 0x25,
-                0x27, 0x0a, 0x02, 0x4f, 0xba, 0x00, 0xcd, 0x86, 0xed, 0xe1, 0x01, 0xdd, 0x19, 0xbd,
-                0x75, 0x86, 0xc1, 0x9e,
+                0x89, 0xae, 0x9f, 0x1a, 0xf6, 0x8c, 0xd8, 0x04, 0x08, 0x23, 0xf2, 0xa5, 0xcd, 0xdb,
+                0x79, 0x88, 0x7e, 0x71, 0x76, 0x43, 0xc6, 0x84, 0x23, 0xfb, 0x1e, 0xbd, 0xdc, 0x14,
+                0xbd, 0x78, 0x43, 0xfc,
             ]
         );
     }

@@ -11,15 +11,17 @@ use saffron_vegetation::{
 use saffron_rendering::{Device, SurfaceSource, validation_issue_count};
 use saffron_vegetation_gpu::VulkanGraphComputeExecutor;
 
+/// This gate is the only evidence the device path works, so an unreachable adapter fails rather
+/// than returns: a silently skipped run reads as a passing one.
+fn device() -> Device {
+    Device::new(&SurfaceSource::Offscreen).expect(
+        "no Vulkan device: source tools/gpu-driver.sh so the loader finds this platform's driver",
+    )
+}
+
 #[test]
 fn every_resident_program_matches_rust_and_is_qualified_on_the_exact_artifact() {
-    let device = match Device::new(&SurfaceSource::Offscreen) {
-        Ok(device) => Arc::new(device),
-        Err(error) => {
-            eprintln!("skipping: no Vulkan device obtainable ({error})");
-            return;
-        }
-    };
+    let device = Arc::new(device());
     let before = validation_issue_count();
     let executor = VulkanGraphComputeExecutor::new(Arc::clone(&device))
         .expect("resident vegetation graph qualification");
@@ -70,13 +72,7 @@ fn every_resident_program_matches_rust_and_is_qualified_on_the_exact_artifact() 
 
 #[test]
 fn resident_program_chunks_invocations_and_preserves_order() {
-    let device = match Device::new(&SurfaceSource::Offscreen) {
-        Ok(device) => Arc::new(device),
-        Err(error) => {
-            eprintln!("skipping: no Vulkan device obtainable ({error})");
-            return;
-        }
-    };
+    let device = Arc::new(device());
     let before = validation_issue_count();
     let executor = VulkanGraphComputeExecutor::new(Arc::clone(&device))
         .expect("resident vegetation graph qualification");

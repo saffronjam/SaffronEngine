@@ -1,10 +1,60 @@
 use super::*;
 
+const CORDIC_SWEEP_DIGEST: [u8; 32] = [
+    0x40, 0xae, 0x9f, 0xe3, 0x6c, 0xea, 0x4a, 0x1c, 0x2c, 0x9a, 0xfd, 0x8e, 0x8a, 0xd4, 0xba, 0x14,
+    0x1c, 0xb9, 0xde, 0x20, 0x9e, 0xb2, 0x35, 0x37, 0xc3, 0x52, 0x2a, 0x02, 0xd9, 0x26, 0x1d, 0x1d,
+];
+
 #[test]
 fn stable_ordinal_streaming_hash_is_pinned() {
     assert_eq!(
         stable_ordinal(&[b"a", b"bc", b""]).unwrap(),
         0xc5db_f3ec_4ecc_a82f
+    );
+}
+
+/// The Q30 CORDIC is the second integer trigonometry routine that reaches cooked bytes, through
+/// the orientation column and the random-direction path. Its whole sweep is pinned by digest so a
+/// different target cannot answer one bit differently and still cook.
+///
+/// The stride is an odd multiplier, not a power of two: the random-direction caller feeds a whole
+/// 32-bit Philox lane, and it is the angle's low bits that decide the late rotations. A
+/// power-of-two stride holds them at zero and leaves the tail of the table unexercised.
+#[test]
+fn cordic_sweep_is_byte_pinned() {
+    assert_eq!(cordic_sin_cos(0), (1_073_741_822, -18_890));
+
+    let mut bytes = Vec::new();
+    for step in 0..8_192_u32 {
+        let (cosine, sine) = cordic_sin_cos(step.wrapping_mul(0x9E37_79B9));
+        bytes.extend_from_slice(&cosine.to_be_bytes());
+        bytes.extend_from_slice(&sine.to_be_bytes());
+    }
+    assert_eq!(bytes.len(), 131_072);
+    assert_eq!(sha256(&bytes), CORDIC_SWEEP_DIGEST);
+}
+
+/// The orientation column a cooked point carries is the CORDIC's output after quantization, so the
+/// swept quaternion lanes are pinned as the bytes an artifact actually stores.
+#[test]
+fn cooked_yaw_orientation_sweep_is_byte_pinned() {
+    let mut bytes = Vec::new();
+    let mut yaw = 0_u32;
+    while yaw <= u32::from(u16::MAX) {
+        let orientation = yaw_orientation(UnitInterval::from_bits(yaw as u16)).unwrap();
+        for lane in orientation.bits() {
+            bytes.extend_from_slice(&lane.to_be_bytes());
+        }
+        yaw += 251;
+    }
+    assert_eq!(bytes.len(), 2_096);
+    assert_eq!(
+        sha256(&bytes),
+        [
+            0x12, 0x3a, 0x49, 0xb0, 0xa7, 0xe4, 0xa5, 0xcf, 0xaf, 0x22, 0x60, 0x52, 0xf5, 0xa0,
+            0x80, 0xa4, 0xe8, 0xa3, 0x86, 0xb2, 0xad, 0x83, 0xbf, 0xbd, 0x88, 0x41, 0xa8, 0xe0,
+            0x3c, 0xba, 0x01, 0x23,
+        ]
     );
 }
 
@@ -493,4 +543,59 @@ fn rejection_facet_summary_validates_the_complete_payload() {
         vegetation_rejection_totals(&bytes),
         Err(Error::ArtifactFormat { field, .. }) if field == "trailingBytes"
     ));
+}
+
+#[test]
+fn micro_density_texels_linearize_with_z_fastest() {
+    // Non-square dimensions: a square grid hides a transposed linearization behind a symmetric
+    // relabel, so only an asymmetric grid pins the order the reconstruction decodes.
+    const DIMENSIONS: [u32; 3] = [4, 1, 2];
+    let ticks = |meters: i128| meters * i128::from(LOCAL_TICKS_PER_METER);
+    // Texel (3, 0, 0) of the base cell: 16 m of X per texel against 32 m of Z.
+    let authored = WorldPosition::from_global_ticks([ticks(52), 0, ticks(8)]).unwrap();
+
+    let graph = Arc::new(compile_document(explicit_micro_document(DIMENSIONS)));
+    let mut inputs = input(WorldCellKey::base(0, 0, 0), graph.required_halo(0));
+    inputs.anchors = vec![explicit_point(0, 42, authored)];
+    let result = BiomeGraphEvaluator::new(Arc::clone(&graph), 1)
+        .unwrap()
+        .evaluate(job(vec![inputs]), &GraphCancellationToken::default())
+        .unwrap()
+        .cells
+        .pop()
+        .unwrap();
+
+    let tile = &result.micro_fields[0];
+    assert_eq!(tile.dimensions, DIMENSIONS);
+    let occupied = tile
+        .density
+        .iter()
+        .enumerate()
+        .filter(|(_, density)| **density > 0)
+        .map(|(index, _)| index)
+        .collect::<Vec<_>>();
+    assert_eq!(occupied.len(), 1);
+
+    // The reconstruction's decode, verbatim: Z runs fastest, then Y, then X. A blade must
+    // rebuild in the texel its candidate was authored in.
+    let index = occupied[0];
+    let decoded = [
+        index / (DIMENSIONS[2] as usize * DIMENSIONS[1] as usize),
+        (index / DIMENSIONS[2] as usize) % DIMENSIONS[1] as usize,
+        index % DIMENSIONS[2] as usize,
+    ];
+    assert_eq!(decoded, [3, 0, 0]);
+
+    let cell = WorldCellKey::base(0, 0, 0).bounds();
+    let point = authored.global_ticks();
+    for (axis, coordinate) in decoded.into_iter().enumerate() {
+        let edge = (cell.max_ticks_exclusive()[axis] - cell.min_ticks()[axis])
+            / i128::from(DIMENSIONS[axis]);
+        let base = cell.min_ticks()[axis] + coordinate as i128 * edge;
+        assert!(
+            point[axis] >= base && point[axis] < base + edge,
+            "axis {axis}: {} is outside texel {coordinate}",
+            point[axis]
+        );
+    }
 }

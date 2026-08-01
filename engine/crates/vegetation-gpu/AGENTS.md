@@ -15,7 +15,12 @@ MoltenVK indirect-draw workaround people come looking for is there too — `Exec
 |---|---|
 | `executor.rs` | `VulkanGraphComputeExecutor`, the only implementation of `saffron_vegetation::GraphComputeExecutor` |
 | `conformance.rs` | `ComputeConformanceEvidence` — the profile, spatial-numeric, graph-program, and validation record |
+| `tests/conformance_records.rs` | Holds every checked-in record in `benchmarks/foliage-veg/` to the current corpus, ABI, and shader input |
+| `tests/baseline_records.rs` | Holds the phase-1 performance records in `benchmarks/foliage-veg/` to their own derivation, device identity, and absence rules |
 | `lib.rs` | The crate `Error` enum and re-exports |
+
+Both `tests/*_records.rs` files are this crate's custody of `benchmarks/foliage-veg/`. Neither needs
+a GPU, and both fail rather than skip when a checked-in record stops describing this tree.
 
 The GPU half of the contract is `engine/assets/shaders/vegetation_graph.slang`, which imports
 `spatial_numeric.slang`. Concept documentation is
@@ -27,7 +32,10 @@ The GPU half of the contract is `engine/assets/shaders/vegetation_graph.slang`, 
   a non-physical device, then qualifies the *entire* canonical corpus against the Rust reference
   under `QUALIFICATION_TIMEOUT` before returning. An executor that exists has already proven
   byte-equality for every operator. Do not add a "skip qualification" path, a lazy mode, or a
-  partial corpus — the value of the type is that holding one is proof.
+  partial corpus — the value of the type is that holding one is proof. Evidence is minted per
+  operator, so the corpus has to drive each operator's *branches*, not just its opcode: adding a
+  combine operation, a ramp form, or a curve shape without a corpus invocation licenses a path no
+  run ever executed. `corpus_drives_every_dual_domain_operator_branch` enforces what is enumerable.
 - **The shader contract is a frozen const declaring its own source closure.**
   `VEGETATION_GRAPH_ARTIFACT` names the module, the source, the SPIR-V, and every source file that
   contributes. The closure is declared, not discovered, so adding an `import` to the shader without
@@ -56,5 +64,10 @@ cargo run -p saffron-vegetation-gpu --example compute_conformance
 ```
 
 It emits the evidence JSON checked into `benchmarks/foliage-veg/`, one file per validated platform.
-`tests/vegetation_graph.rs` is the real-device integration test; without the Vulkan environment
-exported, `cargo test` skips it silently, so a green run proves nothing about the device path.
+A record certifies exactly one corpus, so moving the corpus, the ABI, or the shader source closure
+means re-running the recipe on every platform that carries a record, in the same change —
+`tests/conformance_records.rs` fails on a record left behind.
+`tests/vegetation_graph.rs` is the real-device integration test, and it is the only evidence the
+device path works. It fails rather than skips when no adapter is reachable or the one it gets is
+software, so source `tools/gpu-driver.sh` before `cargo test` — a green run without it would be a
+run that proved nothing.

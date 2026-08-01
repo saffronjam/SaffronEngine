@@ -35,6 +35,11 @@ pub(super) fn encode_world_position<S: CanonicalSink>(
     Ok(())
 }
 
+/// The frozen tile linearization every packed grid in this crate uses: Z runs fastest and X
+/// slowest, `(x * dims[1] + y) * dims[2] + z`. The authored `AuthoredFieldTile::values` payload
+/// and the cooked `MicroFieldTile::density` payload are both packed in this order, and every
+/// reader — `EvaluationFieldTile::sample_index`, `query_micro_ray`, and the micro reconstruction
+/// in `scene_micro_common.slang` — decodes it the same way.
 pub(super) fn tile_index(
     position: WorldPosition,
     bounds: WorldBounds,

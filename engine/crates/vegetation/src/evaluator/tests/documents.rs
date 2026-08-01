@@ -226,6 +226,10 @@ pub(super) fn micro_document() -> BiomeGraphDocument {
 }
 
 pub(super) fn explicit_family_micro_document() -> BiomeGraphDocument {
+    explicit_micro_document([2, 1, 1])
+}
+
+pub(super) fn explicit_micro_document(dimensions: [u32; 3]) -> BiomeGraphDocument {
     let mut anchors = node(1, GraphOperator::ExplicitAnchors, 0);
     anchors
         .parameters
@@ -236,7 +240,7 @@ pub(super) fn explicit_family_micro_document() -> BiomeGraphDocument {
         .insert("reconstruction".to_owned(), 13);
     output.parameters.insert(
         "dimensions".to_owned(),
-        GraphParameterValue::U32Vec3([2, 1, 1]),
+        GraphParameterValue::U32Vec3(dimensions),
     );
     output.parameters.insert(
         "attributeChannels".to_owned(),

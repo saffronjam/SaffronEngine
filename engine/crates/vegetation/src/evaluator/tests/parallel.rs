@@ -254,33 +254,114 @@ fn branched_resident_subgraph_dispatches_once_and_matches_reference() {
     );
 }
 
+/// Uniqueness and spacing both get *easier* to satisfy as points disappear, so a seam needs an
+/// oracle for the missing direction too: every candidate a cell rejects as `ForeignOwner` has to
+/// come back published by the cell that owns it, and the pinned per-cell counts fail on any drop
+/// the halo swallows on both sides.
 #[test]
-fn halo_faces_and_corners_publish_unique_spaced_owned_points() {
+fn halo_faces_and_corners_publish_every_owned_point_exactly_once() {
     let graph = compile_fixture(0);
     let halo = graph.required_halo(0);
+    assert!(
+        halo > DecisionScalar::from_bits(0),
+        "a graph without a halo cannot exercise a seam"
+    );
+    let seam_counts = BTreeMap::from([
+        (WorldCellKey::base(0, 0, 0), (65_u64, 14_u64)),
+        (WorldCellKey::base(1, 0, 0), (60, 13)),
+        (WorldCellKey::base(0, 0, 1), (69, 11)),
+        (WorldCellKey::base(1, 0, 1), (63, 16)),
+    ]);
+    let cells = seam_counts.keys().copied().collect::<Vec<_>>();
+    let block = seam_counts.keys().copied().collect::<BTreeSet<_>>();
     let results = evaluate_job(
         &graph,
-        job(vec![
-            input(WorldCellKey::base(0, 0, 0), halo),
-            input(WorldCellKey::base(1, 0, 0), halo),
-            input(WorldCellKey::base(0, 0, 1), halo),
-            input(WorldCellKey::base(1, 0, 1), halo),
-        ]),
+        job(cells.iter().map(|cell| input(*cell, halo)).collect()),
         4,
         &GraphCancellationToken::default(),
         None,
     )
     .unwrap()
     .cells;
+    assert_eq!(
+        results
+            .iter()
+            .map(|result| result.cell)
+            .collect::<BTreeSet<_>>(),
+        block
+    );
+
     let mut ids = BTreeSet::new();
     let mut positions = Vec::new();
+    let mut published = BTreeSet::new();
     for result in &results {
         for row in 0..result.macro_points.row_count().unwrap() {
             assert_eq!(result.macro_points.owner_cells[row], result.cell);
             assert!(ids.insert(result.macro_points.ids[row]));
             positions.push(position(&result.macro_points, row));
+            assert!(published.insert((result.cell, result.macro_points.candidates[row])));
         }
     }
+    assert_eq!(
+        results
+            .iter()
+            .map(|result| (
+                result.cell,
+                (
+                    result.diagnostics.candidate_count,
+                    result.diagnostics.accepted_count,
+                    result.macro_points.row_count().unwrap() as u64,
+                )
+            ))
+            .collect::<BTreeMap<_, _>>(),
+        seam_counts
+            .iter()
+            .map(|(cell, (candidates, accepted))| (*cell, (*candidates, *accepted, *accepted)))
+            .collect::<BTreeMap<_, _>>()
+    );
+
+    let mut foreign = 0_usize;
+    for result in &results {
+        for rejected in &result.diagnostics.rejected {
+            if rejected.reason != CandidateRejectionReason::ForeignOwner {
+                continue;
+            }
+            let owner = rejected.position.cell();
+            if !block.contains(&owner) {
+                continue;
+            }
+            foreign += 1;
+            assert!(
+                published.contains(&(owner, rejected.candidate.ordinal)),
+                "{owner:?} candidate {} vanished at a seam: {:?} rejected it as foreign and its \
+                 owner never published it",
+                rejected.candidate.ordinal,
+                result.cell
+            );
+        }
+    }
+    assert!(
+        foreign > 0,
+        "the seam oracle needs at least one cross-cell halo candidate"
+    );
+
+    // Partitioning may not move a decision: the same cells evaluated one at a time have to agree
+    // byte for byte with the four-worker block.
+    for result in &results {
+        let reference = evaluate_cell_reference(
+            &graph,
+            &input(result.cell, halo),
+            &GraphCancellationToken::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            result.canonical_bytes().unwrap(),
+            reference.canonical_bytes().unwrap(),
+            "{:?} differs between the partitioned block and a single-cell evaluation",
+            result.cell
+        );
+    }
+
     let required = i128::from(2 * LOCAL_TICKS_PER_METER);
     for left in 0..positions.len() {
         for right in left + 1..positions.len() {

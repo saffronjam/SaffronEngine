@@ -1,0 +1,75 @@
+{
+  "schemaVersion": 1,
+  "recordedAt": "2026-08-01T10:32:13.053Z",
+  "fixture": {
+    "name": "phase-1-heterogeneous-mesh-baseline",
+    "primitiveInstances": 512,
+    "primitiveCycle": [
+      "cube",
+      "plane",
+      "sphere"
+    ],
+    "pointLights": 1,
+    "spotLights": 1,
+    "starterDirectionalLights": 1,
+    "captureFrames": 32,
+    "viewport": [
+      1280,
+      720
+    ]
+  },
+  "platform": {
+    "os": "linux",
+    "osRelease": "7.1.4-204.fc44.x86_64",
+    "architecture": "x64",
+    "cpu": "13th Gen Intel(R) Core(TM) i7-13700K",
+    "rustc": "rustc 1.96.0 (ac68faa20 2026-05-25) (Fedora 1.96.0-1.fc43)\nbinary: rustc\ncommit-hash: ac68faa20c58cbccd01ee7208bf3b6e93a7d7f96\ncommit-date: 2026-05-25\nhost: x86_64-unknown-linux-gnu\nrelease: 1.96.0\nLLVM version: 21.1.8",
+    "revision": "f6296a162253c46ce7537cd1525ed4eaf11abf12",
+    "workingTreeDirty": true,
+    "gpu": "NVIDIA GeForce RTX 3070 Ti",
+    "softwareGpu": false,
+    "rtSupported": true,
+    "profilerMode": "timestamps",
+    "timestampsSupported": true
+  },
+  "observed": {
+    "sceneGatherMs": {
+      "p50": 0.010710000060498714,
+      "p95": 0.017296001315116882,
+      "p99": 0.017296001315116882,
+      "max": 0.017296001315116882
+    },
+    "cpuFrameMs": {
+      "p50": 15.483319282531738,
+      "p95": 15.757892608642578,
+      "p99": 162.96286010742188,
+      "max": 162.96286010742188
+    },
+    "gpuFrameMs": {
+      "p50": 6.28326416015625,
+      "p95": 6.473728179931641,
+      "p99": 6.518784046173096,
+      "max": 6.518784046173096
+    },
+    "drawCalls": 1064,
+    "batches": 2,
+    "instances": 360,
+    "triangles": 83848,
+    "instanceUploadBytes": 0,
+    "shadowDrawCalls": 128,
+    "rtInstances": 513,
+    "retainedMeshCpuBytes": 256552,
+    "vramUsageBytes": 1989869568,
+    "vramBudgetBytes": 7195787264
+  },
+  "budgets": {
+    "derivation": "Anima steady-state p95 plus 25% or an absolute noise floor, whichever is larger",
+    "sceneGatherP95Ms": 0.067,
+    "cpuFrameP95Ms": 19.697,
+    "gpuFrameP95Ms": 8.092,
+    "drawCallsMax": 1064,
+    "instanceUploadBytesMax": 0,
+    "retainedMeshCpuBytesMax": 256552
+  },
+  "validationErrors": []
+}

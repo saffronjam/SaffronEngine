@@ -32,6 +32,8 @@ authored plants, silent density reduction, unstable identity, or a lower-quality
 
 Every numeric performance ceiling comes from the repeatable Anima fixture on the named hardware and
 driver in the adjacent JSON record. The Phase 1 record establishes CPU scene gather, GPU and CPU frame
-time, draw and shadow submission, exact instance traffic, RT participation, and retained mesh-query
-memory before the renderer cutover. NVIDIA, AMD, and MoltenVK keep separate records; a result from one
-class is not relabelled as another class's acceptance threshold.
+time, draw and shadow submission, exact instance traffic, RT participation, retained mesh-query memory,
+and device-local memory against the driver's budget. NVIDIA, AMD, and MoltenVK keep separate records; a
+result from one class is not relabelled as another class's acceptance threshold. A zero in a capability
+column is an absence, not a measurement: the RT and memory legs are read from the record whose device
+reports them.

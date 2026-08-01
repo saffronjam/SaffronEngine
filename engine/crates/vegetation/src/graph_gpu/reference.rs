@@ -261,4 +261,57 @@ mod tests {
         assert_eq!(gradient[3].value as i32, 1_024);
         assert!(!gradient[4].valid);
     }
+
+    #[test]
+    fn extrema_constant_ramp_and_curve_edges_preserve_exact_semantics() {
+        let corpus = qualification_corpus();
+        let extrema =
+            evaluate_gpu_program_reference(&corpus[4].program, &corpus[4].invocation_batch)
+                .unwrap();
+        assert!(extrema.iter().all(|output| output.valid));
+        // The terminal value is the maximum; the mask thresholds the minimum.
+        assert_eq!(
+            extrema
+                .iter()
+                .map(|output| output.value as i32)
+                .collect::<Vec<_>>(),
+            [20_000, 65_536, i32::MAX, 40_000, 0]
+        );
+        assert_eq!(
+            extrema
+                .iter()
+                .map(|output| output.candidate_mask)
+                .collect::<Vec<_>>(),
+            [false, false, false, true, false]
+        );
+
+        // A zero-scale ramp answers its bias, so tick extremes that would overflow a scaled ramp
+        // stay valid.
+        let constant =
+            evaluate_gpu_program_reference(&corpus[5].program, &corpus[5].invocation_batch)
+                .unwrap();
+        assert!(constant.iter().all(|output| output.valid));
+        assert!(
+            constant
+                .iter()
+                .all(|output| output.value_type.is_none() && output.value == 0)
+        );
+        assert_eq!(
+            constant
+                .iter()
+                .map(|output| output.candidate_mask)
+                .collect::<Vec<_>>(),
+            [true, true, false]
+        );
+
+        let curve = evaluate_gpu_program_reference(&corpus[6].program, &corpus[6].invocation_batch)
+            .unwrap();
+        assert!(curve.iter().all(|output| output.valid));
+        // A one-point curve is constant; the three-point curve clamps at both ends.
+        assert_eq!(curve[0].value as i32, 12_345 - 65_536);
+        assert_eq!(curve[0].value, curve[2].value);
+        assert_eq!(curve[7].value as i32, 12_345 + 65_536);
+        assert_eq!(curve[7].value, curve[8].value);
+        assert_eq!(curve[4].value as i32, 12_345);
+    }
 }
