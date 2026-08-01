@@ -80,6 +80,17 @@ impl Renderer {
         self.rt.tessellated_blas_count()
     }
 
+    /// Placed uses whose wind-deformed geometry this frame materialized for their bottom-level
+    /// structures (rt-stats).
+    ///
+    /// Reported apart from `skinnedBlasCount`, which counts the refits: the two scale with
+    /// different content, and a windy scene that materialized nothing is the case where ray
+    /// shadows show a rest pose every raster pass has already left.
+    #[must_use]
+    pub fn rt_wind_deformed(&self) -> u32 {
+        self.rt_deform_jobs.len() as u32
+    }
+
     /// Whether cluster acceleration structures are enabled on this device.
     pub fn cluster_as_supported(&self) -> bool {
         self.device.cluster_as_supported()
@@ -132,6 +143,16 @@ impl Renderer {
     #[must_use]
     pub fn rt_omm_classes(&self) -> (u64, u64, u64) {
         self.rt.omm_classes()
+    }
+
+    /// Cooked micromaps uploaded meshes carried this session, and the micro-triangles their
+    /// derivation settled opaque, settled transparent, and left unknown (rt-stats).
+    ///
+    /// Read from the cooked hierarchies rather than from device structures, so it reports the
+    /// derivation on a target that cannot attach a micromap.
+    #[must_use]
+    pub fn rt_omm_derived(&self) -> (u64, u64, u64, u64) {
+        self.device.resources().derived_micromaps()
     }
 
     /// What those structures would occupy uncompacted (rt-stats).

@@ -47,8 +47,6 @@ pub struct PtlasInstance {
     pub key: PtlasKey,
     /// Row-major 3×4 world transform, the same packing the KHR instance uses.
     pub transform: [f32; 12],
-    /// The GPU-scene instance slot a hit resolves through.
-    pub custom_index: u32,
     pub mask: u32,
     pub flags: u32,
     /// The bottom-level structure this instance places. Held rather than reduced to its
@@ -408,12 +406,16 @@ impl Ptlas {
     /// Diffs `instances` against the newest structure and plans the build that reaches
     /// them. Returns `None` when the plan cannot be prepared, leaving the structure and the
     /// tracked state untouched.
+    ///
+    /// The slot each input landed in comes back with the build, in input order: it is the
+    /// instance id a candidate resolves through, so the caller writes its resolution record
+    /// at that index rather than at the instance's position in the list.
     pub fn plan(
         &mut self,
         resources: &std::sync::Arc<DeviceResources>,
         frame: usize,
         instances: &[PtlasInstance],
-    ) -> Option<PtlasBuildOp> {
+    ) -> Option<(PtlasBuildOp, Vec<u32>)> {
         let needed = u32::try_from(instances.len()).ok()?;
         if needed > self.instance_capacity {
             let mut capacity = self.instance_capacity.max(INITIAL_INSTANCE_CAPACITY);
@@ -443,14 +445,20 @@ impl Ptlas {
         let mut updates: Vec<nvx::UpdateInstanceDataNV> = Vec::new();
         let mut seen: BTreeMap<PtlasKey, u32> = BTreeMap::new();
         let mut partitions: std::collections::BTreeSet<u32> = std::collections::BTreeSet::new();
+        let mut assigned: Vec<u32> = Vec::with_capacity(instances.len());
         for instance in instances {
             let index = self.slot_for(instance.key);
+            assigned.push(index);
             seen.insert(instance.key, index);
             partitions.insert(instance.partition);
             let desired = nvx::WriteInstanceDataNV {
                 transform: instance.transform,
                 explicit_aabb: [0.0; 6],
-                instance_id: instance.custom_index,
+                // The candidate-resolution index is the structure's own slot, not the
+                // instance's position in this frame's list: a positional id changes for
+                // every instance after an insertion, and the diff would then rewrite the
+                // tail of the table for a scene that gained one object.
+                instance_id: index,
                 instance_mask: instance.mask,
                 instance_contribution_to_hit_group_index: 0,
                 instance_flags: instance.flags,
@@ -578,10 +586,20 @@ impl Ptlas {
             src_infos_count: self.frames[frame].ops_count_address,
         };
         self.newest = Some(frame);
-        Some(PtlasBuildOp {
-            dispatch: self.dispatch.clone(),
-            info,
-        })
+        Some((
+            PtlasBuildOp {
+                dispatch: self.dispatch.clone(),
+                info,
+            },
+            assigned,
+        ))
+    }
+
+    /// Slots the table spans, live and free alike — the bound a slot-indexed side table
+    /// must cover, since a reused slot keeps its index rather than compacting.
+    #[must_use]
+    pub fn slot_count(&self) -> u32 {
+        self.placed.len() as u32
     }
 }
 

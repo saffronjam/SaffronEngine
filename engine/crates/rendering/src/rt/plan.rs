@@ -21,22 +21,46 @@ impl Rt {
         frame: usize,
         deformed: &[DeformedRtInstance],
         deformed_buffer: Option<vk::Buffer>,
+        micro: &[crate::MicroRtTile],
         cut_view: RtCutView,
     ) -> Option<TlasBuildPlan> {
         self.tlas_ready = false;
         self.skinned_blas_count = 0;
         self.tessellated_blas_count = 0;
-        if !self.supported || (self.scene.instances.is_empty() && deformed.is_empty()) {
+        if !self.supported
+            || (self.scene.instances.is_empty() && deformed.is_empty() && micro.is_empty())
+        {
             return None;
         }
         let dispatch = self.dispatch.clone()?;
 
+        // Every structure over minted topology — an amplified instance's dice output and a
+        // materialized field tile's blades alike — takes the same full-`BUILD` path, because
+        // variable topology every frame forbids the in-place `UPDATE` a refit uses.
+        let generated: Vec<GeneratedRtGeometry> = deformed
+            .iter()
+            .filter_map(|inst| {
+                inst.tess.map(|slice| GeneratedRtGeometry {
+                    key: inst.entity,
+                    slice,
+                    world_transform: inst.world_transform,
+                })
+            })
+            .chain(micro.iter().map(|tile| GeneratedRtGeometry {
+                key: tile.key,
+                slice: tile.slice,
+                // The materialized blades are world-space, as compute skinning's are.
+                world_transform: Mat4::IDENTITY,
+            }))
+            .collect();
+
         // Plan each deforming BLAS: skinned/morph refit (create-once then in-place `UPDATE`) +
-        // tessellated full `BUILD` (variable topology), both sizing the shared build scratch.
+        // the generated-topology full `BUILD`s, both sizing the shared build scratch.
         let mut blas_ops =
             self.plan_skinned_blas_refits(device, &dispatch, frame, deformed, deformed_buffer);
         let skinned_op_count = blas_ops.len() as u32;
-        let tess_ops = self.plan_tessellated_blas_builds(device, &dispatch, frame, deformed);
+        let (tess_ops, generated_placed) =
+            self.plan_generated_blas_builds(device, &dispatch, frame, &generated);
         let tess_op_count = tess_ops.len() as u32;
         blas_ops.extend(tess_ops);
 
@@ -122,24 +146,21 @@ impl Rt {
                 blas: crate::RtBlas::Khr(Arc::clone(blas)),
             });
         }
-        // A deforming instance references its BLAS at its `world_transform`: identity for a skinned
-        // (or skin+morph) instance — the deformed vertices are already in world space — and the node
-        // world matrix for an unskinned-morph / tessellated instance, whose vertices are mesh-local.
-        // A tessellated instance resolves to its full-rebuild `tessellated_blas`; every other to its
-        // refit `skinned_blas`.
+        // A refit instance references its BLAS at its `world_transform`: identity for a skinned
+        // (or skin+morph) instance — the deformed vertices are already in world space — and the
+        // node world matrix for an unskinned-morph instance, whose vertices are mesh-local. Its
+        // structure carries the same per-submesh opacity classes and submesh span its static
+        // sibling does, so a masked leaf card surfaces candidates for the coverage classifier here
+        // too rather than committing as a solid quad.
         for inst in deformed {
-            let accel = if inst.tess.is_some() {
-                self.frames[frame]
-                    .tessellated_blas
-                    .get(&inst.entity)
-                    .map(|slot| Arc::clone(&slot.accel))
-            } else {
-                self.frames[frame]
-                    .skinned_blas
-                    .get(&inst.entity)
-                    .map(|slot| Arc::clone(&slot.accel))
-            };
-            let Some(accel) = accel else {
+            if inst.tess.is_some() {
+                continue;
+            }
+            let Some(accel) = self.frames[frame]
+                .skinned_blas
+                .get(&inst.entity)
+                .map(|slot| Arc::clone(&slot.accel))
+            else {
                 continue;
             };
             placements.push(Placement {
@@ -148,10 +169,28 @@ impl Rt {
                     sub: 0,
                 },
                 rows: transform_rows(&inst.world_transform),
+                instance_slot: inst.instance_slot,
+                first_submesh: inst.first_submesh,
+                opacity: instance_opacity_flags(inst.opacity_override),
+                blas: crate::RtBlas::Khr(accel),
+            });
+        }
+        // Generated topology names no submesh — amplification merges the base submeshes into one
+        // stream and a materialized field tile mints its blades outright — so no candidate on one
+        // resolves against a scene record. Both forms are real closed geometry rather than a
+        // coverage-masked card (a blade is a tapered strip, a diced patch is displaced surface), so
+        // forcing them opaque commits exactly the hits their triangles already describe.
+        for planned in &generated_placed {
+            placements.push(Placement {
+                key: crate::rt_ptlas::PtlasKey {
+                    primary: DEFORMED_PRIMARY_BASE | planned.key,
+                    sub: 0,
+                },
+                rows: transform_rows(&planned.world_transform),
                 instance_slot: RT_UNMIRRORED_INSTANCE,
                 first_submesh: 0,
                 opacity: vk::GeometryInstanceFlagsKHR::FORCE_OPAQUE,
-                blas: crate::RtBlas::Khr(accel),
+                blas: crate::RtBlas::Khr(Arc::clone(&planned.accel)),
             });
         }
 
@@ -238,6 +277,7 @@ impl Rt {
         self.skinned_blas_count = skinned_op_count;
         self.tessellated_blas_count = tess_op_count;
         self.aggregate_instance_count = aggregate_count;
+        self.resolvable_instance_count = resolvable_placements(&placements);
         // Sum the bottom-level storage before the TLAS joins `retained`, so the two tiers stay
         // separable in the telemetry. Structures are deduplicated by device address for the same
         // reason `distinct_blas_count` is: instances of one mesh share a structure, and counting
@@ -299,12 +339,26 @@ impl Rt {
         }
         let deformed_base = device.buffer_device_address(deformed);
         let vertex_stride = size_of::<Vertex>() as vk::DeviceSize;
+        // Retire the materialized-wind structures this frame did not ask for. A skinned entity's
+        // structure is bounded by the entities that exist, but a materialized use's key names a
+        // scene slot, and a camera crossing a vegetated world would otherwise accumulate one per
+        // plant it ever passed. The frame slot's fence was waited before it was reused, so nothing
+        // in flight still traces these.
+        let wanted: std::collections::HashSet<u64> = instances
+            .iter()
+            .filter(|inst| inst.entity & WIND_BLAS_KEY_BASE != 0)
+            .map(|inst| inst.entity)
+            .collect();
+        self.frames[frame]
+            .skinned_blas
+            .retain(|key, _| *key & WIND_BLAS_KEY_BASE == 0 || wanted.contains(key));
 
         let mut ops: Vec<BlasRefitOp> = Vec::with_capacity(instances.len());
         let mut scratch_needed: vk::DeviceSize = 0;
         for inst in instances {
-            // A tessellated instance takes the full-BUILD path (`plan_tessellated_blas_builds`);
-            // variable topology every frame forbids the in-place `UPDATE` this refit path uses.
+            // A generated-topology instance takes the full-BUILD path
+            // (`plan_generated_blas_builds`): variable topology every frame forbids the in-place
+            // `UPDATE` this refit path uses.
             if skinned_refit_skips(
                 inst.vertex_count,
                 inst.index_count,
@@ -313,21 +367,38 @@ impl Rt {
             ) {
                 continue;
             }
-            let triangle_count = inst.index_count / 3;
-            let vertex_data =
-                deformed_base + vk::DeviceAddress::from(inst.deformed_offset) * vertex_stride;
+            let geometries = refit_geometries(inst);
+            if geometries.is_empty() {
+                continue;
+            }
+            // The slice mirrors the mesh's vertices from `vertex_base` on while the index stream
+            // addresses them absolutely, so the build's vertex base is rebased by that much. The
+            // allocator never places a slice below its own base, which is what keeps this address
+            // inside the buffer.
+            let vertex_data = deformed_base
+                + vk::DeviceAddress::from(inst.deformed_offset - inst.vertex_base) * vertex_stride;
+            let max_vertex = inst.vertex_base + inst.vertex_count - 1;
             let index_data = device.buffer_device_address(inst.mesh.index_buffer());
 
-            let inputs = GeometryInputs::new(
-                vertex_data,
-                vertex_stride,
-                inst.vertex_count,
-                index_data,
-                true,
-                None,
-            );
-            let geom = inputs.geometry();
-            let geoms = [geom];
+            let inputs: Vec<GeometryInputs<'_>> = geometries
+                .iter()
+                .map(|geometry| {
+                    GeometryInputs::new(
+                        vertex_data,
+                        vertex_stride,
+                        max_vertex + 1,
+                        index_data,
+                        geometry.opaque,
+                        None,
+                    )
+                })
+                .collect();
+            let geoms: Vec<vk::AccelerationStructureGeometryKHR<'_>> =
+                inputs.iter().map(GeometryInputs::geometry).collect();
+            let triangle_counts: Vec<u32> = geometries
+                .iter()
+                .map(|geometry| geometry.triangle_count)
+                .collect();
             let size_info = vk::AccelerationStructureBuildGeometryInfoKHR::default()
                 .ty(vk::AccelerationStructureTypeKHR::BOTTOM_LEVEL)
                 .flags(
@@ -337,12 +408,12 @@ impl Rt {
                 .mode(vk::BuildAccelerationStructureModeKHR::BUILD)
                 .geometries(&geoms);
             let mut sizes = vk::AccelerationStructureBuildSizesInfoKHR::default();
-            // SAFETY: the ash seam. `geometry_count == max_primitive_counts.len()` (1).
+            // SAFETY: the ash seam. `geometry_count == max_primitive_counts.len()`.
             unsafe {
                 dispatch.get_acceleration_structure_build_sizes(
                     vk::AccelerationStructureBuildTypeKHR::DEVICE,
                     &size_info,
-                    &[triangle_count],
+                    &triangle_counts,
                     &mut sizes,
                 );
             }
@@ -389,9 +460,9 @@ impl Rt {
                 dst: accel.handle(),
                 vertex_data,
                 vertex_stride,
-                max_vertex: inst.vertex_count - 1,
+                max_vertex,
                 index_data,
-                triangle_count,
+                geometries,
                 update,
             });
         }
@@ -406,28 +477,32 @@ impl Rt {
         ops
     }
 
-    /// Plans a full `MODE_BUILD` for each tessellated instance's BLAS over its slice of the amplified
-    /// transient VB/IB. Unlike the skinned refit there is no create-once/`UPDATE` gate: variable topology
-    /// every frame demands a full rebuild, so the AS is sized to the worst-case primitive count and
-    /// recreated only when that bound changes (never on the per-frame GPU-packed count). The build range
-    /// runs the worst-case count too — the emit kernel degenerate-pads the index tail, so the extra
-    /// triangles collapse to points the builder discards, giving a watertight, portable floor with no
-    /// GPU-count readback. Shares the frame's build scratch (grown to the max, serialized by the recorder).
-    pub(super) fn plan_tessellated_blas_builds(
+    /// Plans a full `MODE_BUILD` for each generated-topology structure over its slice of a
+    /// transient arena — an amplified instance's dice output and a materialized micro-field tile's
+    /// blades alike. Unlike the skinned refit there is no create-once/`UPDATE` gate: variable
+    /// topology every frame demands a full rebuild, so the AS is sized to the worst-case primitive
+    /// count and recreated only when that bound changes (never on the per-frame GPU-packed count).
+    /// The build range runs the worst-case count too — the producing kernel degenerate-pads the
+    /// index tail, so the extra triangles collapse to points the builder discards, giving a
+    /// watertight, portable floor with no GPU-count readback. Shares the frame's build scratch
+    /// (grown to the max, serialized by the recorder).
+    ///
+    /// Returns the build ops beside the structures they target, one entry each, so the top level
+    /// places exactly the set this frame rebuilds.
+    pub(super) fn plan_generated_blas_builds(
         &mut self,
         device: &Device,
         dispatch: &accel::Device,
         frame: usize,
-        instances: &[DeformedRtInstance],
-    ) -> Vec<BlasRefitOp> {
+        geometries: &[GeneratedRtGeometry],
+    ) -> (Vec<BlasRefitOp>, Vec<PlannedGeneratedBlas>) {
         let vertex_stride = size_of::<Vertex>() as vk::DeviceSize;
         let mut ops: Vec<BlasRefitOp> = Vec::new();
+        let mut placed: Vec<PlannedGeneratedBlas> = Vec::new();
         let mut scratch_needed: vk::DeviceSize = 0;
-        for inst in instances {
-            let Some(tess) = inst.tess else {
-                continue;
-            };
-            if inst.entity == 0 || tess.worst_case_prims == 0 || tess.worst_case_verts == 0 {
+        for geometry in geometries {
+            let tess = geometry.slice;
+            if geometry.key == 0 || tess.worst_case_prims == 0 || tess.worst_case_verts == 0 {
                 continue;
             }
             let vertex_data = device.buffer_device_address(tess.vertex_buffer)
@@ -462,7 +537,7 @@ impl Rt {
             }
 
             // Reuse the AS while its worst-case bound holds; recreate it (never `UPDATE`) otherwise.
-            let accel = match self.frames[frame].tessellated_blas.get(&inst.entity) {
+            let accel = match self.frames[frame].tessellated_blas.get(&geometry.key) {
                 Some(slot)
                     if tess_blas_reuse(Some(slot.worst_case_prims), tess.worst_case_prims) =>
                 {
@@ -477,7 +552,7 @@ impl Rt {
                     Ok(accel) => {
                         let accel = Arc::new(accel);
                         self.frames[frame].tessellated_blas.insert(
-                            inst.entity,
+                            geometry.key,
                             TessellatedBlas {
                                 accel: Arc::clone(&accel),
                                 worst_case_prims: tess.worst_case_prims,
@@ -486,30 +561,41 @@ impl Rt {
                         accel
                     }
                     Err(err) => {
-                        tracing::error!("rt: tessellated BLAS create failed: {err}");
+                        tracing::error!("rt: generated-geometry BLAS create failed: {err}");
                         continue;
                     }
                 },
             };
             scratch_needed = scratch_needed.max(sizes.build_scratch_size);
+            placed.push(PlannedGeneratedBlas {
+                key: geometry.key,
+                world_transform: geometry.world_transform,
+                accel: Arc::clone(&accel),
+            });
             ops.push(BlasRefitOp {
                 dst: accel.handle(),
                 vertex_data,
                 vertex_stride,
                 max_vertex: tess.worst_case_verts - 1,
                 index_data,
-                triangle_count: tess.worst_case_prims,
+                // One geometry: the producer mints its own topology, so no submesh slice
+                // describes the stream it emits.
+                geometries: vec![RefitGeometry {
+                    first_index: 0,
+                    triangle_count: tess.worst_case_prims,
+                    opaque: true,
+                }],
                 update: false,
             });
         }
         if ops.is_empty() {
-            return Vec::new();
+            return (Vec::new(), Vec::new());
         }
         if let Err(err) = self.ensure_blas_scratch(frame, scratch_needed) {
-            tracing::error!("rt: tessellated BLAS scratch grow failed: {err}");
-            return Vec::new();
+            tracing::error!("rt: generated-geometry BLAS scratch grow failed: {err}");
+            return (Vec::new(), Vec::new());
         }
-        ops
+        (ops, placed)
     }
 
     /// Plans the partitioned structure's advance: assigns each placement its stable slot,
@@ -525,14 +611,11 @@ impl Rt {
         retained: &[crate::RtBlas],
         context: PlanContext,
     ) -> Option<TlasBuildPlan> {
-        self.write_ray_instances(frame, placements);
         let instances: Vec<crate::rt_ptlas::PtlasInstance> = placements
             .iter()
-            .enumerate()
-            .map(|(index, placement)| crate::rt_ptlas::PtlasInstance {
+            .map(|placement| crate::rt_ptlas::PtlasInstance {
                 key: placement.key,
                 transform: placement.rows,
-                custom_index: index as u32,
                 mask: 0xFF,
                 flags: crate::rt_ptlas::instance_flags(
                     vk::GeometryInstanceFlagsKHR::TRIANGLE_FACING_CULL_DISABLE | placement.opacity,
@@ -552,7 +635,8 @@ impl Rt {
             })
             .collect();
         let resources = Arc::clone(&self.resources);
-        let op = self.ptlas.as_mut()?.plan(&resources, frame, &instances)?;
+        let (op, slots) = self.ptlas.as_mut()?.plan(&resources, frame, &instances)?;
+        self.write_ray_instances_at(frame, placements, &slots);
         let ptlas = self.ptlas.as_ref()?;
         let address = ptlas.current_address()?;
         let structure_bytes = ptlas.structure_bytes();
@@ -568,6 +652,7 @@ impl Rt {
         self.skinned_blas_count = context.skinned_op_count;
         self.tessellated_blas_count = context.tess_op_count;
         self.aggregate_instance_count = context.aggregate_count;
+        self.resolvable_instance_count = resolvable_placements(placements);
         self.blas_count = distinct_blas_count(retained);
         let (blas_bytes, blas_built_bytes) = distinct_blas_bytes(retained);
         self.blas_bytes = blas_bytes;
@@ -722,8 +807,20 @@ impl Rt {
 
     /// The most placements this frame's captured scene can expand into: an assembly contributes
     /// its whole use table (no combination selects more), everything else one, plus one per
-    /// deforming instance. The bound the ray-instance table is sized from.
+    /// deforming instance and one per materialized micro-field tile. The bound the ray-instance
+    /// table is sized from.
+    ///
+    /// The tile term is unconditional because the table is sized when the frame's address block is
+    /// published, which is before the materialization decides how many tiles it reserves.
+    ///
+    /// A partitioned structure addresses the table by its own slot rather than by position, and a
+    /// slot freed by a departed instance keeps its index, so the table also has to reach the whole
+    /// slot table — which only ever grew because that many instances were live at once.
     pub(super) fn placement_upper_bound(&self, deformed_count: usize) -> u32 {
+        let slots = self
+            .ptlas
+            .as_ref()
+            .map_or(0, crate::rt_ptlas::Ptlas::slot_count);
         let statics: usize = self
             .scene
             .instances
@@ -736,7 +833,13 @@ impl Rt {
                     .map_or(1, |assembly| assembly.uses.len().max(1))
             })
             .sum();
-        u32::try_from(statics.saturating_add(deformed_count)).unwrap_or(u32::MAX)
+        u32::try_from(
+            statics
+                .saturating_add(deformed_count)
+                .saturating_add(crate::MICRO_RT_MAX_TILES as usize),
+        )
+        .unwrap_or(u32::MAX)
+        .max(slots)
     }
 
     /// Ensures `frame`'s ray-instance identity table holds `count` records (host-visible + BDA),
@@ -782,12 +885,39 @@ impl Rt {
         let records: Vec<GpuRayInstanceRecord> = placements
             .iter()
             .take(capacity)
-            .map(|placement| GpuRayInstanceRecord {
-                instance_slot: placement.instance_slot,
-                first_submesh: placement.first_submesh,
-                reserved: [0; 2],
-            })
+            .map(ray_instance_record)
             .collect();
+        let bytes = bytemuck::cast_slice(&records);
+        dst[..bytes.len()].copy_from_slice(bytes);
+    }
+
+    /// Copies the placements' identity records into `frame`'s ray-instance table at the
+    /// partitioned structure's own slots, one per placement in `slots`.
+    ///
+    /// The table is addressed by instance id, and the partitioned structure's ids are its
+    /// stable slots rather than a dense range, so the whole table is rewritten with the
+    /// unresolvable record first: a slot no live instance holds must read as unmirrored,
+    /// not as whatever the instance that used to hold it resolved to.
+    pub(super) fn write_ray_instances_at(
+        &mut self,
+        frame: usize,
+        placements: &[Placement],
+        slots: &[u32],
+    ) {
+        let capacity = self.frames[frame].ray_instance_capacity as usize;
+        let Some(buffer) = self.frames[frame].ray_instances.as_mut() else {
+            return;
+        };
+        let Some(dst) = buffer.mapped_bytes() else {
+            return;
+        };
+        let mut records = vec![GpuRayInstanceRecord::unmirrored(); capacity];
+        for (placement, slot) in placements.iter().zip(slots) {
+            let Some(record) = records.get_mut(*slot as usize) else {
+                continue;
+            };
+            *record = ray_instance_record(placement);
+        }
         let bytes = bytemuck::cast_slice(&records);
         dst[..bytes.len()].copy_from_slice(bytes);
     }

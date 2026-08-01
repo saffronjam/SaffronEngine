@@ -3,15 +3,29 @@
 
 use super::*;
 
-/// One skinned BLAS refit recorded by [`record_tlas_build_plan`]: the AS to (re)build over
-/// a device-address vertex + index stream, and whether it is an in-place `UPDATE`.
+/// One geometry of a refit structure: a slice of the index stream and the opacity class its
+/// triangles carry.
+#[derive(Clone, Copy)]
+pub struct RefitGeometry {
+    /// First index of the slice within the mesh's stream.
+    pub(super) first_index: u32,
+    /// Triangles the slice spans.
+    pub(super) triangle_count: u32,
+    /// Whether every triangle classifies opaque; a non-opaque geometry surfaces ray candidates
+    /// for the coverage classifier.
+    pub(super) opaque: bool,
+}
+
+/// One deforming BLAS refit recorded by [`record_tlas_build_plan`]: the AS to (re)build over a
+/// device-address vertex stream and one geometry per submesh of the index stream, and whether it
+/// is an in-place `UPDATE`.
 pub struct BlasRefitOp {
     pub(super) dst: vk::AccelerationStructureKHR,
     pub(super) vertex_data: vk::DeviceAddress,
     pub(super) vertex_stride: vk::DeviceSize,
     pub(super) max_vertex: u32,
     pub(super) index_data: vk::DeviceAddress,
-    pub(super) triangle_count: u32,
+    pub(super) geometries: Vec<RefitGeometry>,
     pub(super) update: bool,
 }
 
@@ -70,9 +84,8 @@ pub fn record_tlas_build_plan(
 
 /// The per-frame BLAS refits, split out so they carry their own timestamp scope.
 ///
-/// Refits and the TLAS build share one graph pass and so shared one timing until now; they are
-/// different work with different scaling — refits grow with deforming instances, the TLAS with
-/// total instance count — and one number could not say which moved.
+/// Refits grow with deforming instances and the TLAS with total instance count, so one number
+/// over the shared pass could not say which of them moved.
 pub(super) fn record_blas_refits(raw: &ash::Device, cmd: vk::CommandBuffer, plan: &TlasBuildPlan) {
     let dispatch = &plan.dispatch;
     let scratch_barrier = accel_scratch_barrier();
@@ -83,16 +96,22 @@ pub(super) fn record_blas_refits(raw: &ash::Device, cmd: vk::CommandBuffer, plan
             // SAFETY: the ash seam. A memory barrier on the active command buffer.
             unsafe { raw.cmd_pipeline_barrier2(cmd, &dep) };
         }
-        let inputs = GeometryInputs::new(
-            op.vertex_data,
-            op.vertex_stride,
-            op.max_vertex + 1,
-            op.index_data,
-            true,
-            None,
-        );
-        let geom = inputs.geometry();
-        let geoms = [geom];
+        let inputs: Vec<GeometryInputs<'_>> = op
+            .geometries
+            .iter()
+            .map(|geometry| {
+                GeometryInputs::new(
+                    op.vertex_data,
+                    op.vertex_stride,
+                    op.max_vertex + 1,
+                    op.index_data,
+                    geometry.opaque,
+                    None,
+                )
+            })
+            .collect();
+        let geoms: Vec<vk::AccelerationStructureGeometryKHR<'_>> =
+            inputs.iter().map(GeometryInputs::geometry).collect();
         let build_info = vk::AccelerationStructureBuildGeometryInfoKHR::default()
             .ty(vk::AccelerationStructureTypeKHR::BOTTOM_LEVEL)
             .flags(
@@ -114,11 +133,19 @@ pub(super) fn record_blas_refits(raw: &ash::Device, cmd: vk::CommandBuffer, plan
             .scratch_data(vk::DeviceOrHostAddressKHR {
                 device_address: plan.blas_scratch_addr,
             });
-        let range = vk::AccelerationStructureBuildRangeInfoKHR::default()
-            .primitive_count(op.triangle_count);
-        let ranges = [range];
+        // A submesh owns a slice of the shared index stream, so its geometry starts at its own
+        // first index. `primitive_offset` counts BYTES.
+        let ranges: Vec<vk::AccelerationStructureBuildRangeInfoKHR> = op
+            .geometries
+            .iter()
+            .map(|geometry| {
+                vk::AccelerationStructureBuildRangeInfoKHR::default()
+                    .primitive_count(geometry.triangle_count)
+                    .primitive_offset(geometry.first_index * size_of::<u32>() as u32)
+            })
+            .collect();
         // SAFETY: the ash seam. One build info; the range slice length equals its
-        // `geometry_count` (1). The vertex/index/scratch addresses reference live buffers.
+        // `geometry_count`. The vertex/index/scratch addresses reference live buffers.
         unsafe {
             dispatch.cmd_build_acceleration_structures(cmd, &[build_info], &[&ranges]);
         }
@@ -188,8 +215,95 @@ pub(super) struct Placement {
     pub(super) blas: crate::RtBlas,
 }
 
+/// One structure over minted topology: the key its per-frame rebuild is cached under, the
+/// transient arena slice its geometry occupies, and where the structure sits in the world.
+///
+/// An amplified instance and a materialized micro-field tile are the same thing from the builder's
+/// side — variable topology every frame, no submesh naming any of it — so both arrive here.
+pub(super) struct GeneratedRtGeometry {
+    pub(super) key: u64,
+    pub(super) slice: crate::TessRtSlice,
+    pub(super) world_transform: Mat4,
+}
+
+/// A generated-topology structure the frame planned a build for, and the transform its placement
+/// carries.
+///
+/// The planner hands these back so the top level places exactly what it planned to rebuild: a
+/// structure held over from an earlier frame at the same slot holds that frame's topology, and
+/// placing it in a frame whose build was skipped would trace geometry the arena no longer
+/// describes.
+pub(super) struct PlannedGeneratedBlas {
+    pub(super) key: u64,
+    pub(super) world_transform: Mat4,
+    pub(super) accel: Arc<AccelerationStructure>,
+}
+
+/// One placement's identity record: the scene slot and submesh span it resolves candidates
+/// against, plus the cluster tables when its structure is cluster-composed.
+pub(super) fn ray_instance_record(placement: &Placement) -> GpuRayInstanceRecord {
+    let (cluster_records, cluster_corners, cluster_count) =
+        placement.blas.cluster_resolution().unwrap_or((0, 0, 0));
+    GpuRayInstanceRecord {
+        instance_slot: placement.instance_slot,
+        first_submesh: placement.first_submesh,
+        cluster_count,
+        reserved: 0,
+        cluster_records,
+        cluster_corners,
+    }
+}
+
+/// Placements whose identity names a live GPU-scene slot: a non-opaque candidate on one of these
+/// reaches the coverage classifier, where an unmirrored placement commits unconditionally.
+pub(super) fn resolvable_placements(placements: &[Placement]) -> u32 {
+    placements
+        .iter()
+        .filter(|placement| placement.instance_slot != RT_UNMIRRORED_INSTANCE)
+        .count() as u32
+}
+
+/// The geometries a deforming instance's refit structure covers: one per submesh of its run,
+/// each with its own slice of the mesh's index stream and its cooked opacity class.
+pub(super) fn refit_geometries(inst: &DeformedRtInstance) -> Vec<RefitGeometry> {
+    let first = inst.first_submesh as usize;
+    let end = first.saturating_add(inst.submesh_count as usize);
+    let Some(submeshes) = inst
+        .mesh
+        .submeshes
+        .get(first..end.min(inst.mesh.submeshes.len()))
+    else {
+        return Vec::new();
+    };
+    submeshes
+        .iter()
+        .enumerate()
+        .filter(|(_, submesh)| submesh.index_count >= 3)
+        .map(|(offset, submesh)| RefitGeometry {
+            first_index: submesh.first_index,
+            triangle_count: submesh.index_count / 3,
+            opaque: inst
+                .mesh
+                .submesh_opaque
+                .get(first + offset)
+                .copied()
+                .unwrap_or(false),
+        })
+        .collect()
+}
+
 /// Marks a deforming instance's key, whose primary is an entity rather than a scene slot.
 pub(super) const DEFORMED_PRIMARY_BASE: u64 = 1 << 62;
+
+/// Marks a materialized wind use's refit-BLAS key, which names a scene slot and a use ordinal
+/// rather than an entity — vegetation never enters the ECS, so it has no entity id to key on.
+pub(crate) const WIND_BLAS_KEY_BASE: u64 = 1 << 63;
+
+/// The stable refit-BLAS key of one materialized use: the same slot and ordinal every frame, so
+/// the structure is built once and refit in place afterwards.
+pub(crate) fn wind_blas_key(instance_slot: u32, use_index: u32) -> u64 {
+    WIND_BLAS_KEY_BASE | (u64::from(instance_slot) << 20) | u64::from(use_index & 0xF_FFFF)
+}
 
 /// Marks a static instance the GPU scene does not mirror, whose primary is its position in
 /// the gather rather than a stable slot.
@@ -572,7 +686,7 @@ pub(super) fn tess_blas_reuse(cached_prims: Option<u32>, wanted_prims: u32) -> b
 
 /// Whether the skinned-refit planner skips an instance: a degenerate / untracked instance (no
 /// geometry, no triangle, or entity 0), or a **tessellated** one — the latter takes the full-BUILD
-/// path (`plan_tessellated_blas_builds`) because variable topology forbids the in-place `UPDATE` the
+/// path (`plan_generated_blas_builds`) because variable topology forbids the in-place `UPDATE` the
 /// refit relies on. This is the sole discriminator between the two BLAS paths.
 pub(super) fn skinned_refit_skips(
     vertex_count: u32,

@@ -95,18 +95,41 @@ pub const RT_UNMIRRORED_INSTANCE: u32 = u32::MAX;
 /// record, so this table is what turns the pair into one. `first_submesh` is the geometry's submesh
 /// element for geometry index 0 — zero for a plain mesh, the span start for an assembly prototype,
 /// whose structure holds one geometry per submesh of ITS span rather than of the family's table.
+///
+/// A cluster-composed structure additionally carries its resolution tables: its geometry index is a
+/// cluster ordinal and its primitive index is cluster-local, so neither addresses the shared index
+/// stream on its own.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, bytemuck::Pod, bytemuck::Zeroable)]
-#[repr(C, align(4))]
+#[repr(C, align(8))]
 pub struct GpuRayInstanceRecord {
     /// The GPU-scene instance slot, or [`RT_UNMIRRORED_INSTANCE`].
     pub instance_slot: u32,
     /// The referenced structure's geometry-0 submesh element within the prototype geometry.
     pub first_submesh: u32,
-    /// Reserved ABI words.
-    pub reserved: [u32; 2],
+    /// Clusters the referenced structure composes, or zero for a triangle build.
+    pub cluster_count: u32,
+    /// Reserved ABI word.
+    pub reserved: u32,
+    /// Device address of the per-cluster `{submesh element, first corner, triangle count}`
+    /// table, indexed by the candidate's geometry index. Zero for a triangle build.
+    pub cluster_records: u64,
+    /// Device address of the flat corner stream those records slice. Zero for a triangle build.
+    pub cluster_corners: u64,
 }
 
-const _: () = assert!(size_of::<GpuRayInstanceRecord>() == 16);
+const _: () = assert!(size_of::<GpuRayInstanceRecord>() == 32);
+
+impl GpuRayInstanceRecord {
+    /// The record a table entry no live instance holds must read as: a candidate on it commits
+    /// without resolution rather than against whatever last occupied the slot.
+    #[must_use]
+    pub fn unmirrored() -> Self {
+        Self {
+            instance_slot: RT_UNMIRRORED_INSTANCE,
+            ..Self::default()
+        }
+    }
+}
 
 /// One static TLAS instance: its world transform, the mesh supplying the BLAS, the stable
 /// GPU-scene instance slot, and its opacity class.
@@ -131,6 +154,14 @@ pub struct RtInstanceInput {
     /// index the raster path resolves. Selects which placed uses are active, and therefore
     /// which TLAS instances this input expands into. Ignored by a plain mesh.
     pub combination: u32,
+    /// Whether the instance carries the wind flag, so every raster pass displaces it from the
+    /// wind prepass record.
+    ///
+    /// Under a moving field such an instance's rest-pose structure disagrees with every raster
+    /// pass, so the frame materializes its deformed geometry for the structure instead
+    /// ([`crate::plan_wind_deformation`]) as far as the budget reaches. Under a field at rest the
+    /// two agree exactly and the rest-pose structure stands.
+    pub wind: bool,
 }
 
 /// The camera cut parameters TLAS packing projects representation selection through — the
@@ -154,7 +185,7 @@ pub struct RtCutView {
 /// `(appearanceTotal / 65536) * instanceScale * projScale / distance`; at or under the
 /// threshold the traversal draws the root's voxel bricks, so the ray representation places
 /// the matching aggregate structure.
-fn aggregate_stands_in(
+pub(crate) fn aggregate_stands_in(
     input: &RtInstanceInput,
     view: &RtCutView,
 ) -> Option<Arc<AccelerationStructure>> {
@@ -234,6 +265,10 @@ pub struct Rt {
     /// TLAS instances placed through the aggregate-representation structure this frame — a
     /// family that packed one coarse instance instead of its per-use expansion (rt-stats).
     aggregate_instance_count: u32,
+    /// TLAS instances this frame whose identity record names a live GPU-scene slot, so a
+    /// non-opaque candidate on them reaches the canonical coverage classifier (rt-stats). The
+    /// rest carry [`RT_UNMIRRORED_INSTANCE`] and commit unconditionally.
+    resolvable_instance_count: u32,
     /// Distinct cluster-composed bottom-level structures referenced this frame (rt-stats).
     /// Zero everywhere `VK_NV_cluster_acceleration_structure` is absent.
     cluster_blas_count: u32,
@@ -286,6 +321,7 @@ impl Rt {
             blas_bytes: 0,
             blas_built_bytes: 0,
             aggregate_instance_count: 0,
+            resolvable_instance_count: 0,
             cluster_blas_count: 0,
             clas_count: 0,
             omm_micromaps: 0,
@@ -369,6 +405,12 @@ impl Rt {
         self.aggregate_instance_count
     }
 
+    /// TLAS instances whose identity record names a live GPU-scene slot, so their non-opaque
+    /// candidates reach the coverage classifier instead of committing unconditionally.
+    pub fn resolvable_instance_count(&self) -> u32 {
+        self.resolvable_instance_count
+    }
+
     /// Distinct cluster-composed bottom-level structures referenced this frame.
     pub fn cluster_blas_count(&self) -> u32 {
         self.cluster_blas_count
@@ -417,9 +459,19 @@ impl Rt {
         self.build_pending = self.supported && (self.use_rt_shadows || self.use_rt_reflections);
     }
 
-    /// Whether this frame has any RT instances (static or deforming) to build a TLAS over.
-    pub fn has_instances(&self, deformed: &[DeformedRtInstance]) -> bool {
-        !self.scene.instances.is_empty() || !deformed.is_empty()
+    /// This frame's captured static instances, as [`Rt::set_rt_scene`] left them.
+    pub fn scene_instances(&self) -> &[RtInstanceInput] {
+        &self.scene.instances
+    }
+
+    /// Whether this frame has any RT instances — static, deforming, or materialized micro-field
+    /// tiles — to build a TLAS over.
+    pub fn has_instances(
+        &self,
+        deformed: &[DeformedRtInstance],
+        micro: &[crate::MicroRtTile],
+    ) -> bool {
+        !self.scene.instances.is_empty() || !deformed.is_empty() || !micro.is_empty()
     }
 
     /// Grows `frame`'s ray-instance identity table to cover every placement this frame could pack,
@@ -480,6 +532,7 @@ impl Rt {
         self.blas_count = 0;
         self.skinned_blas_count = 0;
         self.aggregate_instance_count = 0;
+        self.resolvable_instance_count = 0;
         self.cluster_blas_count = 0;
         self.clas_count = 0;
         self.blas_bytes = 0;

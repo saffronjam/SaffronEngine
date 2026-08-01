@@ -16,24 +16,47 @@ use crate::vk_nv_cluster as nvx;
 use crate::{Buffer, DeviceResources, Error, Result};
 
 /// One cluster's build input, in canonical cooked terms: cluster-local `f32` positions and
-/// 8-bit corner indices, with the prototype-relative submesh as its geometry index.
+/// 8-bit corner indices, plus what a ray candidate on this cluster must resolve back to.
 pub struct ClusterBuildInput {
     pub cluster_id: u32,
-    /// Prototype-relative submesh index — the ray-query geometry index, matching the KHR
-    /// path's one-geometry-per-submesh layout so material resolution is representation-blind.
-    pub geometry_index: u32,
+    /// Prototype-relative submesh this cluster's triangles came from — the material record a
+    /// resolved candidate reads.
+    pub submesh_element: u32,
     /// The submesh's cooked opacity; a non-opaque cluster surfaces ray candidates for the
     /// coverage classifier exactly as the KHR geometry flag does.
     pub opaque: bool,
     pub positions: Vec<[f32; 3]>,
     pub local_indices: Vec<u8>,
+    /// Geometry-local vertex index per triangle corner, parallel to `local_indices`. A cluster's
+    /// own vertex and index streams are cluster-local and its triangles are a cache-optimized
+    /// permutation of the submesh's, so nothing in the shared index stream addresses them; this
+    /// is what a candidate's cluster-local primitive index resolves through.
+    pub corners: Vec<u32>,
 }
+
+/// What a ray candidate on one cluster resolves to: its prototype-relative submesh and its run
+/// in the structure's corner stream.
+#[derive(Clone, Copy, Debug, Default, bytemuck::Pod, bytemuck::Zeroable)]
+#[repr(C, align(4))]
+pub struct ClusterResolutionRecord {
+    pub submesh_element: u32,
+    pub first_corner: u32,
+    pub triangle_count: u32,
+    pub reserved: u32,
+}
+
+const _: () = assert!(size_of::<ClusterResolutionRecord>() == 16);
 
 /// The finished cluster-composed bottom-level structure: the CLAS pool and the
 /// bottom-level implicit data it references, addressed like any BLAS.
 pub struct ClusterBlas {
     clas_data: Buffer,
     blas_data: Buffer,
+    /// Retained so the resolution tables outlive every candidate that reads them by address.
+    _resolution: Buffer,
+    _corners: Buffer,
+    resolution_address: vk::DeviceAddress,
+    corners_address: vk::DeviceAddress,
     address: vk::DeviceAddress,
     size: vk::DeviceSize,
     cluster_count: u32,
@@ -44,6 +67,20 @@ impl ClusterBlas {
     #[must_use]
     pub fn address(&self) -> vk::DeviceAddress {
         self.address
+    }
+
+    /// The per-cluster resolution table's device address, indexed by a candidate's geometry
+    /// index (each CLAS is built with its ordinal as its geometry index).
+    #[must_use]
+    pub fn resolution_address(&self) -> vk::DeviceAddress {
+        self.resolution_address
+    }
+
+    /// The corner stream's device address: three geometry-local vertex indices per triangle,
+    /// in cluster order.
+    #[must_use]
+    pub fn corners_address(&self) -> vk::DeviceAddress {
+        self.corners_address
     }
 
     /// Bytes of bottom-level structure storage actually used.
@@ -70,6 +107,10 @@ impl ClusterBlas {
 /// host-readable address/size words the finish step consumes.
 pub struct ClusterBlasPlan {
     cluster_count: u32,
+    resolution: Buffer,
+    corners: Buffer,
+    resolution_address: vk::DeviceAddress,
+    corners_address: vk::DeviceAddress,
     triangle_input: Box<nvx::TriangleClusterInputNV>,
     bottom_input: Box<nvx::ClustersBottomLevelInputNV>,
     _vertices: Buffer,
@@ -146,13 +187,16 @@ impl ClusterBlasBuilder {
             let triangles = cluster.local_indices.len() / 3;
             !cluster.positions.is_empty()
                 && cluster.local_indices.len() % 3 == 0
+                && cluster.corners.len() == cluster.local_indices.len()
                 && triangles <= self.max_triangles as usize
                 && cluster.positions.len() <= self.max_vertices as usize
                 && triangles < (1 << 9)
                 && cluster.positions.len() < (1 << 9)
-                && cluster.geometry_index < (1 << 24)
         });
-        if !fits {
+        // Each CLAS carries its ordinal as its geometry index, which is what lets a candidate
+        // name the cluster it hit: the primitive index a cluster build reports is cluster-local,
+        // so the submesh alone cannot place the triangle.
+        if !fits || cluster_count >= (1 << 24) {
             return Ok(None);
         }
 
@@ -183,13 +227,44 @@ impl ClusterBlasBuilder {
         let vertices_address = resources.buffer_device_address(vertices.handle());
         let indices_address = resources.buffer_device_address(indices.handle());
 
+        // The candidate-resolution side of the same layout: one record per cluster, addressed by
+        // the ordinal the CLAS carries as its geometry index, over a flat corner stream in the
+        // same cluster order.
+        let mut resolution_records = Vec::with_capacity(clusters.len());
+        let mut corner_stream: Vec<u32> = Vec::new();
+        for cluster in clusters {
+            resolution_records.push(ClusterResolutionRecord {
+                submesh_element: cluster.submesh_element,
+                first_corner: u32::try_from(corner_stream.len()).map_err(|_| {
+                    Error::InvalidUploadData("cluster corner stream exceeds u32".to_owned())
+                })?,
+                triangle_count: (cluster.local_indices.len() / 3) as u32,
+                reserved: 0,
+            });
+            corner_stream.extend_from_slice(&cluster.corners);
+        }
+        let resolution_usage =
+            vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS;
+        let resolution = Buffer::from_slice_with_usage(
+            resources,
+            bytemuck::cast_slice(&resolution_records),
+            resolution_usage,
+        )?;
+        let corners = Buffer::from_slice_with_usage(
+            resources,
+            bytemuck::cast_slice(&corner_stream),
+            resolution_usage,
+        )?;
+        let resolution_address = resources.buffer_device_address(resolution.handle());
+        let corners_address = resources.buffer_device_address(corners.handle());
+
         let mut src_infos = Vec::with_capacity(clusters.len());
         for (index, cluster) in clusters.iter().enumerate() {
             let (counts, geometry) = nvx::pack_triangle_cluster_words(
                 (cluster.local_indices.len() / 3) as u32,
                 cluster.positions.len() as u32,
                 nvx::INDEX_FORMAT_8BIT,
-                cluster.geometry_index,
+                index as u32,
                 if cluster.opaque {
                     nvx::GEOMETRY_OPAQUE_BIT
                 } else {
@@ -244,11 +319,7 @@ impl ClusterBlasBuilder {
             .sum();
         let triangle_input = Box::new(nvx::TriangleClusterInputNV {
             vertex_format: vk::Format::R32G32B32_SFLOAT,
-            max_geometry_index_value: clusters
-                .iter()
-                .map(|cluster| cluster.geometry_index)
-                .max()
-                .unwrap_or(0),
+            max_geometry_index_value: cluster_count.saturating_sub(1),
             max_cluster_unique_geometry_count: 1,
             max_cluster_triangle_count: max_triangle_count,
             max_cluster_vertex_count: max_vertex_count,
@@ -372,6 +443,10 @@ impl ClusterBlasBuilder {
 
         Ok(Some(ClusterBlasPlan {
             cluster_count,
+            resolution,
+            corners,
+            resolution_address,
+            corners_address,
             src_infos_address: resources.buffer_device_address(src_infos.handle()),
             src_count_address: resources.buffer_device_address(src_count.handle()),
             clas_data_address: resources.buffer_device_address(clas_data.handle()),
@@ -535,6 +610,10 @@ impl ClusterBlasBuilder {
         Ok(ClusterBlas {
             clas_data: plan.clas_data,
             blas_data: plan.blas_data,
+            _resolution: plan.resolution,
+            _corners: plan.corners,
+            resolution_address: plan.resolution_address,
+            corners_address: plan.corners_address,
             address,
             size: u64::from(size),
             cluster_count: plan.cluster_count,

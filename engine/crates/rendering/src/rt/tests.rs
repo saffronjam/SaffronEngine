@@ -130,6 +130,17 @@ fn identity_rows_is_the_3x4_identity() {
 
 /// A two-buffer [`GpuMesh`] with no BLAS, enough for scene-capture bookkeeping tests.
 fn test_mesh(device: &Device) -> Arc<crate::GpuMesh> {
+    test_mesh_parts(device, None, None, Vec::new())
+}
+
+/// The same mesh carrying its own structure, or an assembly table plus one bottom-level structure
+/// per prototype — what TLAS packing expands into one placement per active use.
+fn test_mesh_parts(
+    device: &Device,
+    blas: Option<Arc<crate::AccelerationStructure>>,
+    assembly: Option<crate::MeshAssembly>,
+    assembly_blas: Vec<crate::RtBlas>,
+) -> Arc<crate::GpuMesh> {
     use vk_mem::Alloc;
     let make_buffer = |size: vk::DeviceSize, usage: vk::BufferUsageFlags| {
         let alloc_info = vk_mem::AllocationCreateInfo {
@@ -149,7 +160,7 @@ fn test_mesh(device: &Device) -> Arc<crate::GpuMesh> {
     Arc::new(crate::GpuMesh::from_parts(
         device.resources(),
         crate::GpuMeshParts {
-            cooked_opaque: true,
+            submesh_opaque: vec![true],
             micromaps: Vec::new(),
             vertex: make_buffer(96, vk::BufferUsageFlags::VERTEX_BUFFER),
             index: make_buffer(48, vk::BufferUsageFlags::INDEX_BUFFER),
@@ -164,14 +175,304 @@ fn test_mesh(device: &Device) -> Arc<crate::GpuMesh> {
             cpu_vertices: Vec::new(),
             cpu_indices: Vec::new(),
             cpu_skin: Vec::new(),
-            blas: None,
-            assembly_blas: Vec::new(),
+            blas,
+            assembly_blas,
             aggregate_blas: None,
             sdfs: Vec::new(),
             hierarchy_pages: Vec::new(),
-            assembly: None,
+            assembly,
         },
     ))
+}
+
+/// A two-prototype assembly table: three uses (prototype 0, 1, 0), one combination selecting the
+/// first two, and prototype spans starting at family submesh 0 and 4. The spans differ because
+/// they are what rebases a traced candidate's geometry index onto the family's submesh table.
+fn test_assembly() -> crate::MeshAssembly {
+    let use_record = |prototype: u32| crate::GpuAssemblyUseRecord {
+        transform: [
+            1.0, 0.0, 0.0, 0.0, //
+            0.0, 1.0, 0.0, 0.0, //
+            0.0, 0.0, 1.0, 0.0,
+        ],
+        prototype,
+        reserved: [0; 3],
+    };
+    crate::MeshAssembly {
+        prototypes: vec![crate::GpuAssemblyPrototypeRecord::default(); 2],
+        uses: vec![use_record(0), use_record(1), use_record(0)],
+        combinations: vec![(0, 0)],
+        masks: vec![0b011],
+        prototype_slices: vec![
+            crate::AssemblyPrototypeSlice {
+                first_submesh: 0,
+                submesh_count: 4,
+                first_index: 0,
+                index_count: 12,
+                first_vertex: 0,
+                vertex_count: 8,
+            },
+            crate::AssemblyPrototypeSlice {
+                first_submesh: 4,
+                submesh_count: 2,
+                first_index: 12,
+                index_count: 6,
+                first_vertex: 8,
+                vertex_count: 4,
+            },
+        ],
+    }
+}
+
+/// Every TLAS placement gets an identity record at its own `instanceCustomIndex`, and the table is
+/// sized for every placement the captured scene can expand into before the frame's address block
+/// names it.
+///
+/// This is the whole basis of ray-candidate resolution: a candidate carries a structure and a
+/// geometry index, and only this table says which scene slot and which submesh span they belong
+/// to. An assembly's placements must each carry THEIR prototype's span start, not the family's.
+#[test]
+fn ray_instance_table_records_every_placement_identity() {
+    let Some((device, _descriptors, mut rt, _before)) = rt_or_skip() else {
+        return;
+    };
+    if !rt.supported() {
+        return;
+    }
+    let dispatch = rt
+        .dispatch
+        .clone()
+        .expect("accel dispatch present on an RT device");
+    let structure = || {
+        Arc::new(
+            crate::AccelerationStructure::create(
+                &rt.resources,
+                &dispatch,
+                256,
+                vk::AccelerationStructureTypeKHR::BOTTOM_LEVEL,
+            )
+            .expect("bottom level"),
+        )
+    };
+    let assembly_mesh = test_mesh_parts(
+        &device,
+        None,
+        Some(test_assembly()),
+        vec![
+            crate::RtBlas::Khr(structure()),
+            crate::RtBlas::Khr(structure()),
+        ],
+    );
+    let plain_mesh = test_mesh_parts(&device, Some(structure()), None, Vec::new());
+
+    rt.set_rt_shadows(true);
+    rt.set_rt_scene(Arc::from([
+        RtInstanceInput {
+            model: Mat4::IDENTITY,
+            mesh: assembly_mesh,
+            instance_slot: 11,
+            opacity_override: None,
+            combination: 0,
+            wind: false,
+        },
+        RtInstanceInput {
+            model: Mat4::IDENTITY,
+            mesh: plain_mesh,
+            instance_slot: 3,
+            opacity_override: None,
+            combination: 0,
+            wind: false,
+        },
+    ]));
+    // The bound covers the assembly's WHOLE use table plus one per plain and per deforming
+    // instance, and the micro-field tile reservation: the table is sized before the plan runs, so
+    // it can depend neither on which combination the frame ends up selecting nor on how many tiles
+    // the materialization reserves.
+    let tiles = crate::MICRO_RT_MAX_TILES;
+    assert_eq!(rt.placement_upper_bound(0), 4 + tiles);
+    assert_eq!(rt.placement_upper_bound(2), 6 + tiles);
+
+    let (address, capacity) = rt.ensure_frame_ray_instances(&device, 0, 0);
+    assert_ne!(address, 0, "the frame's address block names a live table");
+    assert!(capacity >= 4, "the table covers the placement bound");
+
+    let plan = rt
+        .prepare_tlas_build(&device, 0, &[], None, &[], test_cut_view())
+        .expect("a build plan");
+    assert_eq!(
+        rt.frame_instance_count(),
+        3,
+        "two active assembly uses plus the plain mesh"
+    );
+
+    let table = rt.frames[0]
+        .ray_instances
+        .as_mut()
+        .expect("ray instance table");
+    let bytes = table.mapped_bytes().expect("host-visible table");
+    let records: &[GpuRayInstanceRecord] =
+        bytemuck::cast_slice(&bytes[..3 * size_of::<GpuRayInstanceRecord>()]);
+    assert_eq!(records[0].instance_slot, 11);
+    assert_eq!(
+        records[0].first_submesh, 0,
+        "use 0 places prototype 0's span"
+    );
+    assert_eq!(records[1].instance_slot, 11);
+    assert_eq!(
+        records[1].first_submesh, 4,
+        "use 1 places prototype 1's span"
+    );
+    assert_eq!(records[2].instance_slot, 3);
+    assert_eq!(records[2].first_submesh, 0, "a plain mesh spans from zero");
+    for record in records {
+        assert_eq!(
+            record.cluster_count, 0,
+            "a KHR structure resolves through the shared index stream"
+        );
+        assert_eq!(record.cluster_records, 0);
+        assert_eq!(record.cluster_corners, 0);
+    }
+
+    drop(plan);
+    drop(rt);
+    device.wait_idle().expect("wait_idle");
+}
+
+/// A wind-flagged family materializes one deformed slice per ACTIVE placed use, leaves the static
+/// list, and every slice carries its own prototype's vertex run and submesh span.
+///
+/// This is the whole of wind reaching a bottom-level structure: traversal has no vertex stage, so
+/// an instance left in the static list casts and reflects its rest pose while every raster pass
+/// sways it. The static half of the assertion is the load-bearing one — a materialized plant that
+/// stays in the static list is placed twice, once swaying and once not.
+#[test]
+fn a_wind_flagged_family_materializes_one_slice_per_active_use() {
+    let Some((device, _descriptors, rt, _before)) = rt_or_skip() else {
+        return;
+    };
+    if !rt.supported() {
+        return;
+    }
+    let dispatch = rt
+        .dispatch
+        .clone()
+        .expect("accel dispatch present on an RT device");
+    let structure = || {
+        Arc::new(
+            crate::AccelerationStructure::create(
+                &rt.resources,
+                &dispatch,
+                256,
+                vk::AccelerationStructureTypeKHR::BOTTOM_LEVEL,
+            )
+            .expect("bottom level"),
+        )
+    };
+    let assembly_mesh = test_mesh_parts(
+        &device,
+        None,
+        Some(test_assembly()),
+        vec![
+            crate::RtBlas::Khr(structure()),
+            crate::RtBlas::Khr(structure()),
+        ],
+    );
+    let plain_mesh = test_mesh_parts(&device, Some(structure()), None, Vec::new());
+    let scene = [
+        RtInstanceInput {
+            model: Mat4::IDENTITY,
+            mesh: Arc::clone(&assembly_mesh),
+            instance_slot: 11,
+            opacity_override: None,
+            combination: 0,
+            wind: true,
+        },
+        RtInstanceInput {
+            model: Mat4::IDENTITY,
+            mesh: Arc::clone(&plain_mesh),
+            instance_slot: 3,
+            opacity_override: None,
+            combination: 0,
+            wind: false,
+        },
+    ];
+
+    let plan = crate::plan_wind_deformation(&scene, &test_cut_view(), 6.0, 0)
+        .expect("the wind-flagged family materializes");
+    // Combination 0's mask is 0b011: uses 0 and 1, not use 2.
+    assert_eq!(plan.jobs.len(), 2, "one dispatch per active use");
+    assert_eq!(plan.instances.len(), 2);
+    assert_eq!(
+        plan.statics.len(),
+        1,
+        "the materialized family leaves the static list"
+    );
+    assert_eq!(
+        plan.statics[0].instance_slot, 3,
+        "the instance left behind is the one that does not sway"
+    );
+    // Use 0 places prototype 0 (vertices 0..8, submeshes 0..4), use 1 places prototype 1
+    // (vertices 8..12, submeshes 4..6) — the same spans the static per-prototype structures
+    // build over, so a candidate resolves to the same submesh either way.
+    assert_eq!(plan.instances[0].vertex_base, 0);
+    assert_eq!(plan.instances[0].vertex_count, 8);
+    assert_eq!(plan.instances[0].first_submesh, 0);
+    assert_eq!(plan.instances[0].submesh_count, 4);
+    assert_eq!(plan.instances[1].vertex_base, 8);
+    assert_eq!(plan.instances[1].vertex_count, 4);
+    assert_eq!(plan.instances[1].first_submesh, 4);
+    assert_eq!(plan.instances[1].submesh_count, 2);
+    for (job, instance) in plan.jobs.iter().zip(&plan.instances) {
+        assert_eq!(job.first_vertex, instance.vertex_base);
+        assert_eq!(job.vertex_count, instance.vertex_count);
+        assert_eq!(job.instance_slot, 11);
+        assert_eq!(job.assembly, 1, "a family applies its use transform");
+        // The build rebases the vertex address by the run's base, so a slice below its own base
+        // would address memory before the buffer.
+        assert!(
+            instance.deformed_offset >= instance.vertex_base,
+            "a slice is never placed below the run it mirrors"
+        );
+        assert_eq!(
+            instance.world_transform,
+            Mat4::IDENTITY,
+            "materialized vertices are world-space"
+        );
+    }
+    assert!(
+        plan.instances[1].deformed_offset
+            >= plan.instances[0].deformed_offset + plan.instances[0].vertex_count,
+        "the slices do not overlap"
+    );
+    assert!(plan.high_water >= plan.instances[1].deformed_offset + 4);
+    // The refit key names the slot and the use ordinal — the same key every frame, so the
+    // structure is built once and refit in place afterwards.
+    assert_eq!(plan.instances[0].entity, (1 << 63) | (11 << 20));
+    assert_eq!(plan.instances[1].entity, (1 << 63) | (11 << 20) | 1);
+
+    // Nothing sways: the frame keeps the captured scene untouched rather than publishing a copy.
+    // Either half is enough on its own — no instance carries the flag, or the field is at rest and
+    // every term it drives is zero, which is what leaves a wind-flagged plant on the cluster-
+    // composed structure its upload built.
+    let calm: Vec<RtInstanceInput> = scene
+        .iter()
+        .cloned()
+        .map(|mut input| {
+            input.wind = false;
+            input
+        })
+        .collect();
+    assert!(
+        crate::plan_wind_deformation(&calm, &test_cut_view(), 6.0, 0).is_none(),
+        "an unwindy scene materializes nothing"
+    );
+    assert!(
+        crate::plan_wind_deformation(&scene, &test_cut_view(), 0.0, 0).is_none(),
+        "a field at rest materializes nothing"
+    );
+
+    drop(rt);
+    device.wait_idle().expect("wait_idle");
 }
 
 /// `make_instance` packs the custom index + 0xFF mask, the triangle-cull-disable flag
@@ -237,7 +538,7 @@ fn rt_inert_on_software_device_validation_clean() {
     assert!(!rt.build_pending());
 
     // The build path is a no-op: it produces no plan and leaves tlas_ready false.
-    let plan = rt.prepare_tlas_build(&device, 0, &[], None, test_cut_view());
+    let plan = rt.prepare_tlas_build(&device, 0, &[], None, &[], test_cut_view());
     assert!(plan.is_none());
     assert!(!rt.tlas_ready());
 
@@ -289,6 +590,7 @@ fn begin_frame_clears_scene_and_ready_flags() {
             instance_slot: RT_UNMIRRORED_INSTANCE,
             opacity_override: Some(true),
             combination: 0,
+            wind: false,
         },
         RtInstanceInput {
             model: Mat4::IDENTITY,
@@ -296,14 +598,15 @@ fn begin_frame_clears_scene_and_ready_flags() {
             instance_slot: 5,
             opacity_override: Some(false),
             combination: 0,
+            wind: false,
         },
     ]));
-    assert!(rt.has_instances(&[]));
+    assert!(rt.has_instances(&[], &[]));
     rt.begin_frame();
     assert!(!rt.build_pending());
     assert!(!rt.tlas_ready());
     // The scene capture is cleared, so a build with no fresh scene has no instances.
-    assert!(!rt.has_instances(&[]));
+    assert!(!rt.has_instances(&[], &[]));
 
     drop(rt);
     device.wait_idle().expect("wait_idle");
@@ -329,7 +632,7 @@ fn tlas_build_over_static_instance_is_validation_clean() {
         // No RT extensions: the build path is a verified no-op (covered above). The GPU
         // TLAS build is DEFERRED-NEEDS-HARDWARE on a software device.
         assert!(
-            rt.prepare_tlas_build(&device, 0, &[], None, test_cut_view())
+            rt.prepare_tlas_build(&device, 0, &[], None, &[], test_cut_view())
                 .is_none()
         );
         drop(rt);
@@ -380,10 +683,11 @@ fn tlas_build_over_static_instance_is_validation_clean() {
         instance_slot: RT_UNMIRRORED_INSTANCE,
         opacity_override: Some(true),
         combination: 0,
+        wind: false,
     }]));
     assert!(rt.build_pending());
     let plan = rt
-        .prepare_tlas_build(&device, 0, &[], None, test_cut_view())
+        .prepare_tlas_build(&device, 0, &[], None, &[], test_cut_view())
         .expect("a build plan for one static instance");
     assert!(rt.tlas_ready());
     assert_eq!(
