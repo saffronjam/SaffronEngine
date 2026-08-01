@@ -704,3 +704,62 @@ fn the_component_dto_aggregate_matches_the_scene_registry() {
         "every registered component needs a saffron_protocol::Components field, in registry order"
     );
 }
+
+/// The pick command's whole vocabulary comes from one GPU selection-ID answer: a drawn entity
+/// selects, a macro plant returns its stable identity and selects nothing, a micro blade returns
+/// a bare point with no identity at all, and a pixel the frame drew nothing at is a miss.
+#[test]
+fn pick_translates_every_selection_id_answer() {
+    let reg = registry();
+    let plant = saffron_vegetation::PlantId::runtime([0x11; 16]).unwrap();
+    let cell = saffron_spatial::WorldCellKey::base(0, 0, 0);
+
+    let mut renderer = StubRenderer {
+        selection_pick: Some(crate::SelectionPick::Plant {
+            cell,
+            plant,
+            position: [1.0, 2.0, 3.0],
+            normal: [0.0, 1.0, 0.0],
+        }),
+        ..StubRenderer::default()
+    };
+    with_stub(&mut renderer, |ctx| {
+        let reply = reg.dispatch(
+            ctx,
+            &json!({ "cmd": "pick", "params": { "u": 0.5, "v": 0.5 } }),
+        );
+        assert_eq!(reply["ok"], json!(true));
+        assert_eq!(reply["result"]["kind"], json!("vegetation"));
+        assert_eq!(reply["result"]["plant"], json!(plant.to_string()));
+        assert_eq!(reply["result"]["id"], json!(null));
+        assert_eq!(reply["result"]["position"], json!([1.0, 2.0, 3.0]));
+    });
+
+    let mut renderer = StubRenderer {
+        selection_pick: Some(crate::SelectionPick::Micro {
+            position: [4.0, 0.0, 5.0],
+            normal: [0.0, 1.0, 0.0],
+        }),
+        ..StubRenderer::default()
+    };
+    with_stub(&mut renderer, |ctx| {
+        let reply = reg.dispatch(
+            ctx,
+            &json!({ "cmd": "pick", "params": { "u": 0.5, "v": 0.5 } }),
+        );
+        assert_eq!(reply["result"]["kind"], json!("micro-vegetation"));
+        assert_eq!(reply["result"]["plant"], json!(null));
+        assert_eq!(reply["result"]["id"], json!(null));
+        assert_eq!(reply["result"]["position"], json!([4.0, 0.0, 5.0]));
+    });
+
+    let mut renderer = StubRenderer::default();
+    with_stub(&mut renderer, |ctx| {
+        let reply = reg.dispatch(
+            ctx,
+            &json!({ "cmd": "pick", "params": { "u": 0.5, "v": 0.5 } }),
+        );
+        assert_eq!(reply["result"]["hit"], json!(false));
+        assert_eq!(reply["result"]["kind"], json!(null));
+    });
+}

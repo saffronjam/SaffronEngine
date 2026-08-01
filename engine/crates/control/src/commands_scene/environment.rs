@@ -876,17 +876,42 @@ pub(crate) fn register_environment(reg: &mut CommandRegistry) {
             };
             let scene = ctx.scene_edit.active_scene();
             let profile = scene.environment.wind.profile();
-            let sources = scene.local_wind_sources();
-            let sampled = saffron_wind::sample_composed(
-                &profile,
-                &sources,
-                saffron_geometry::glam::DVec3::from_array(params.position_m),
-                time,
-            );
+            let placed = scene.local_wind_sources();
+            let sources: Vec<saffron_wind::LocalWindSource> =
+                placed.iter().map(|entry| entry.source).collect();
+            let position = saffron_geometry::glam::DVec3::from_array(params.position_m);
+            let sampled = saffron_wind::sample_composed(&profile, &sources, position, time);
+            // The spectrum is the global field taken apart, so it describes the mean and the
+            // turbulence the local sources then compose over rather than the composed total.
+            let spectrum = saffron_wind::sample_decomposed(&profile, position, time);
             Ok(saffron_protocol::SampleWindResult {
                 velocity_mps: sampled.velocity.to_array(),
                 gust_front: sampled.gust_front,
                 time_s: time,
+                mean_mps: spectrum.mean.to_array(),
+                turbulence_mps: spectrum.turbulence().to_array(),
+                octaves: (0..spectrum.octave_count as usize)
+                    .map(|octave| saffron_protocol::WindOctaveDto {
+                        octave: octave as u32,
+                        wavelength_m: spectrum.octave_wavelengths_m[octave],
+                        velocity_mps: spectrum.octave_velocity(octave).to_array(),
+                    })
+                    .collect(),
+                sources: placed
+                    .iter()
+                    .map(|entry| {
+                        let influence =
+                            saffron_wind::source_influence(&profile, &entry.source, position);
+                        saffron_protocol::WindSourceInfluenceDto {
+                            entity: entry.entity.to_string(),
+                            kind: entry.source.kind.name().to_owned(),
+                            distance_m: influence.distance,
+                            weight: influence.weight,
+                            added_mps: influence.added.to_array(),
+                            global_scale: influence.global_scale,
+                        }
+                    })
+                    .collect(),
             })
         },
     );

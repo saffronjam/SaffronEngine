@@ -200,19 +200,21 @@ pub(crate) fn register_picking(reg: &mut CommandRegistry) {
 
     reg.register::<PickParams, PickResult>(
         "pick",
-        "pick {u=0.5, v=0.5} — pick at viewport UV (0,0 = top-left); tests billboards then mesh AABBs",
+        "pick {u=0.5, v=0.5} — pick at viewport UV (0,0 = top-left); tests billboards, then the \
+         GPU selection-ID readback over the frame's drawn geometry",
         |ctx, params| {
             let u = params.u.unwrap_or(0.5);
             let v = params.v.unwrap_or(0.5);
-            // The eye the frame was rendered with, so a click during play ray-casts from the
-            // game camera, not the parked fly-cam.
+            // The eye the frame was rendered with, so a click during play tests against the
+            // game camera's image, not the parked fly-cam.
             let cam = ctx.scene_edit.render_camera_view();
             let width = ctx.renderer.viewport_width();
             let height = ctx.renderer.viewport_height();
             let mouse = Vec2::new(u * width as f32, v * height as f32);
 
-            // Billboards first (light/camera glyphs aren't in the mesh AABB set), then the
-            // mesh ray-pick. The glyph hit rect mirrors the overlay's ~12px half-size.
+            // Billboards first: a light/camera glyph is overlay art with no geometry in the
+            // scene, so no selection-ID record exists for it. The glyph hit rect mirrors the
+            // overlay's ~12px half-size.
             let billboard = pick_billboard(ctx.scene_edit, &cam, width, height, mouse);
             if billboard != Entity::NULL {
                 ctx.scene_edit.set_selection(billboard);
@@ -229,83 +231,15 @@ pub(crate) fn register_picking(reg: &mut CommandRegistry) {
                 });
             }
 
-            // pick_scene_surface flips proj[1][1] to match the renderer's clip space, so it
-            // expects y-down NDC: v=0 (viewport top) maps to ndc.y=-1.
-            let ndc = Vec2::new(u * 2.0 - 1.0, v * 2.0 - 1.0);
-            let assets = &mut *ctx.assets;
-            let viewport = (width, height);
-            let mut hit_result = Ok(None);
-            // The borrow split: the surface pick needs the upload seam + the active scene +
-            // the asset server at once. The scene is borrowed from scene_edit; take it inside
-            // the upload closure so the renderer borrow does not overlap it.
-            ctx.renderer.with_gpu_uploader(&mut |gpu| {
-                hit_result = saffron_assets::pick_scene_surface(
-                    gpu,
-                    viewport,
-                    ctx.scene_edit.active_scene(),
-                    assets,
-                    &cam,
-                    ndc,
-                );
-            });
-            let surface_hit = hit_result.map_err(Error::command)?;
-            // The same viewport ray tests the resident macro vegetation; the nearest of the
-            // two vocabularies wins. Plants resolve through the CPU cell snapshot to their
-            // stable identity — never a GPU slot.
-            let pick_ray = saffron_assets::viewport_pick_ray(viewport, &cam, ndc);
-            let plant_hit = ctx
-                .vegetation
-                .as_ref()
-                .zip(pick_ray)
-                .and_then(|(world, ray)| {
-                    world
-                        .query_ray(ray, &saffron_vegetation::VegetationQueryFilter::default())
-                        .ok()?
-                        .into_iter()
-                        .next()
-                })
-                .filter(|plant| {
-                    surface_hit
-                        .as_ref()
-                        .is_none_or(|hit| plant.distance_m < hit.surface.distance_m)
-                });
-            if let Some(nearest) = plant_hit {
-                ctx.scene_edit.set_selection(Entity::NULL);
-                return Ok(PickResult {
-                    hit: true,
-                    id: None,
-                    name: None,
-                    kind: Some(PickKind::Vegetation),
-                    plant: Some(saffron_protocol::PlantId(nearest.plant.plant.to_string())),
-                    position: None,
-                    normal: None,
-                });
-            }
-            // A micro-field ground hit is nonpersistent paint feedback: it never beats
-            // an entity surface or a macro plant, and it carries no identity.
-            let micro_hit = ctx
-                .vegetation
-                .as_ref()
-                .zip(pick_ray)
-                .and_then(|(world, ray)| world.query_micro_ray(ray))
-                .filter(|micro| {
-                    surface_hit
-                        .as_ref()
-                        .is_none_or(|hit| micro.distance_m < hit.surface.distance_m)
-                });
-            if let Some(micro) = micro_hit {
-                ctx.scene_edit.set_selection(Entity::NULL);
-                return Ok(PickResult {
-                    hit: true,
-                    id: None,
-                    name: None,
-                    kind: Some(PickKind::MicroVegetation),
-                    plant: None,
-                    position: Some(micro.position.to_array()),
-                    normal: None,
-                });
-            }
-            let Some(surface) = surface_hit else {
+            // Everything the frame drew — meshes, macro plants, micro blades — answers from the
+            // one selection-ID readback, so what the user clicked is what the user sees.
+            let picked = ctx
+                .renderer
+                .pick_selection_id(u, v)
+                .map_err(Error::command)?;
+            // The wire carries world meters as f64; the selection targets store them single.
+            let widen = |v: [f32; 3]| v.map(f64::from);
+            let Some(picked) = picked else {
                 ctx.scene_edit.set_selection(Entity::NULL);
                 return Ok(PickResult {
                     hit: false,
@@ -317,22 +251,60 @@ pub(crate) fn register_picking(reg: &mut CommandRegistry) {
                     normal: None,
                 });
             };
-            let hit = surface.entity;
-            // A model instance is a single subtree; a click anywhere in it selects the whole
-            // model (its container root), not the bare mesh/bone node the ray hit.
-            let selected = ctx.scene_edit.active_scene().model_root_of(hit);
-            ctx.scene_edit.set_selection(selected);
-            let scene = ctx.scene_edit.active_scene();
-            let r = entity_ref_dto(scene, selected);
-            Ok(PickResult {
-                hit: true,
-                id: Some(r.id),
-                name: Some(r.name),
-                kind: Some(PickKind::Mesh),
-                plant: None,
-                position: Some(surface.surface.position.world_meters().to_array()),
-                normal: Some(surface.surface.frame.normal.to_array()),
-            })
+            match picked {
+                crate::SelectionPick::Entity {
+                    entity,
+                    position,
+                    normal,
+                } => {
+                    // A model instance is a single subtree; a click anywhere in it selects the
+                    // whole model (its container root), not the bare mesh/bone node drawn there.
+                    let selected = ctx.scene_edit.active_scene().model_root_of(entity);
+                    ctx.scene_edit.set_selection(selected);
+                    let scene = ctx.scene_edit.active_scene();
+                    let r = entity_ref_dto(scene, selected);
+                    Ok(PickResult {
+                        hit: true,
+                        id: Some(r.id),
+                        name: Some(r.name),
+                        kind: Some(PickKind::Mesh),
+                        plant: None,
+                        position: Some(widen(position)),
+                        normal: Some(normal),
+                    })
+                }
+                crate::SelectionPick::Plant {
+                    plant,
+                    position,
+                    normal,
+                    ..
+                } => {
+                    ctx.scene_edit.set_selection(Entity::NULL);
+                    Ok(PickResult {
+                        hit: true,
+                        id: None,
+                        name: None,
+                        kind: Some(PickKind::Vegetation),
+                        plant: Some(saffron_protocol::PlantId(plant.to_string())),
+                        position: Some(widen(position)),
+                        normal: Some(normal),
+                    })
+                }
+                // A micro hit is nonpersistent paint feedback: a blade is regenerated from its
+                // field every frame, so it carries a point and no identity.
+                crate::SelectionPick::Micro { position, normal } => {
+                    ctx.scene_edit.set_selection(Entity::NULL);
+                    Ok(PickResult {
+                        hit: true,
+                        id: None,
+                        name: None,
+                        kind: Some(PickKind::MicroVegetation),
+                        plant: None,
+                        position: Some(widen(position)),
+                        normal: Some(normal),
+                    })
+                }
+            }
         },
     );
 
