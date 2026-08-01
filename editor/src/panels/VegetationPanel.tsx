@@ -24,7 +24,14 @@ import {
   useEditorStore,
   type VegetationPaintTarget,
 } from "../state/store";
-import { VEGETATION_TOOLS, isBrushTool } from "./vegetationTools";
+import {
+  VEGETATION_TOOLS,
+  isBrushTool,
+  isRuntimeTool,
+  isStrokeTool,
+  usesFalloff,
+  usesTargetDensity,
+} from "./vegetationTools";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import {
@@ -244,7 +251,9 @@ function useVegetationCook(): VegetationCookStatusDto | null {
   return status;
 }
 
-/// The paint target a layer row resolves to (paintable = density/scalar-field).
+/// The paint target a layer row resolves to. A density/scalar-field layer takes brush strokes into
+/// its field tiles; a blocker layer takes them into the signed-blocker slot the evaluator reads;
+/// a volume/spline layer takes an analytic shape instead and has no tile channel.
 function paintTarget(
   map: string,
   chunkLevel: number,
@@ -252,8 +261,20 @@ function paintTarget(
 ): VegetationPaintTarget {
   const operator = layer.operator;
   const channel =
-    operator.kind === "density" || operator.kind === "scalar-field" ? operator.channel : null;
-  return { map, layer: layer.id, channel, chunkLevel, locked: layer.locked };
+    operator.kind === "density" || operator.kind === "scalar-field"
+      ? operator.channel
+      : operator.kind === "blocker"
+        ? ({ kind: "signed-blocker" } as const)
+        : null;
+  return {
+    map,
+    layer: layer.id,
+    operator: operator.kind,
+    channel,
+    slot: operator.kind === "blocker" ? "blocker" : "field",
+    chunkLevel,
+    locked: layer.locked,
+  };
 }
 
 /// Polls the vegetation render population at 1 Hz while the panel is visible
@@ -374,8 +395,12 @@ export function VegetationPanel() {
     })();
   };
   const pushEdit = useEditorStore((s) => s.pushEdit);
+  const editing = useEditorStore((s) => s.playState === "edit");
   const activeLayer = useEditorStore((s) => s.vegetationActiveLayer);
   const setActiveLayer = useEditorStore((s) => s.setVegetationActiveLayer);
+  // The layer row a drag picked up, and the row it currently hovers (the drop indicator).
+  const dragLayer = useRef<string | null>(null);
+  const [dropIndex, setDropIndex] = useState<number | null>(null);
 
   // Keeps the stroke target current: a lock/mute edit, a map change, or a deleted
   // layer re-derives (or clears) the stored target; the identity-stable setter
@@ -482,31 +507,40 @@ export function VegetationPanel() {
       .catch((err: unknown) => notifyError(errorText(err)));
   };
 
-  /// Swaps the layer's order with its neighbor in evaluation order — one two-row
-  /// transaction; a swap is its own inverse, so undo replays the same swap.
-  const moveLayer = (target: VegetationLayerDto, direction: -1 | 1): void => {
+  /// Moves one layer to `toIndex` in evaluation order and renumbers the run it passed through —
+  /// one transaction over every row whose order changed. Both the drag gesture and the up/down
+  /// buttons come here; undo replays the captured prior order set.
+  const reorderLayer = (layerId: string, toIndex: number): void => {
     const sorted = [...layers].sort((a, b) => a.order - b.order);
-    const neighbor = sorted[sorted.findIndex((row) => row.id === target.id) + direction];
-    if (!neighbor) {
+    const fromIndex = sorted.findIndex((row) => row.id === layerId);
+    if (fromIndex < 0 || toIndex < 0 || toIndex >= sorted.length || fromIndex === toIndex) {
       return;
     }
-    const swap = () =>
-      commitLayersPatch((rows) => {
-        const a = rows.find((row) => row.id === target.id);
-        const b = rows.find((row) => row.id === neighbor.id);
-        if (!a || !b) {
-          return new Map();
-        }
-        return new Map([
-          [a.id, { order: b.order }],
-          [b.id, { order: a.order }],
-        ]);
-      });
-    void swap()
-      .then(() => pushEdit({ label: "Reorder layer", undo: swap, redo: swap }))
+    const moved = [...sorted];
+    moved.splice(toIndex, 0, moved.splice(fromIndex, 1)[0]!);
+    const before = new Map(sorted.map((row): [string, number] => [row.id, row.order]));
+    const after = new Map(moved.map((row, index): [string, number] => [row.id, index]));
+    const apply = (orders: ReadonlyMap<string, number>) => () =>
+      commitLayersPatch(
+        (rows) =>
+          new Map(
+            rows
+              .filter((row) => orders.has(row.id) && orders.get(row.id) !== row.order)
+              .map((row): [string, Partial<VegetationLayerDto>] => [
+                row.id,
+                { order: orders.get(row.id)! },
+              ]),
+          ),
+      );
+    void apply(after)()
+      .then(() => pushEdit({ label: "Reorder layer", undo: apply(before), redo: apply(after) }))
       .catch((err: unknown) => notifyError(errorText(err)));
   };
   const brushTool = isBrushTool(tool);
+  const falloffTool = usesFalloff(tool);
+  const strokeTool = isStrokeTool(tool);
+  const densityTool = usesTargetDensity(tool);
+  const orderedLayers = [...layers].sort((a, b) => a.order - b.order);
 
   return (
     <div className="flex h-full min-h-0 flex-col bg-background text-foreground">
@@ -515,23 +549,29 @@ export function VegetationPanel() {
           <div className="flex flex-col gap-1.5">
             <SectionLabel>Tools</SectionLabel>
             <div className="grid grid-cols-5 gap-1">
-              {VEGETATION_TOOLS.map(({ tool: id, label, icon: Icon }) => (
-                <Tooltip key={id}>
-                  <TooltipTrigger asChild>
-                    <Button
-                      size="icon"
-                      variant={tool === id ? "default" : "ghost"}
-                      aria-pressed={tool === id}
-                      aria-label={label}
-                      className="h-7 w-full"
-                      onClick={() => setTool(id)}
-                    >
-                      <Icon className="h-3.5 w-3.5" />
-                    </Button>
-                  </TooltipTrigger>
-                  <TooltipContent side="bottom">{label}</TooltipContent>
-                </Tooltip>
-              ))}
+              {VEGETATION_TOOLS.map(({ tool: id, label, icon: Icon }) => {
+                const disabled = !editing && !isRuntimeTool(id);
+                return (
+                  <Tooltip key={id}>
+                    <TooltipTrigger asChild>
+                      <Button
+                        size="icon"
+                        variant={tool === id ? "default" : "ghost"}
+                        aria-pressed={tool === id}
+                        aria-label={label}
+                        className="h-7 w-full"
+                        disabled={disabled}
+                        onClick={() => setTool(id)}
+                      >
+                        <Icon className="h-3.5 w-3.5" />
+                      </Button>
+                    </TooltipTrigger>
+                    <TooltipContent side="bottom">
+                      {disabled ? `${label} authors the map — stop play to use it` : label}
+                    </TooltipContent>
+                  </Tooltip>
+                );
+              })}
             </div>
           </div>
 
@@ -547,51 +587,72 @@ export function VegetationPanel() {
                   onChange={(radius) => setBrush({ radius })}
                 />
               </BrushField>
-              <BrushField label="Falloff">
+              {falloffTool && (
+                <BrushField label="Falloff">
+                  <SliderField
+                    value={brush.falloff}
+                    min={0}
+                    max={1}
+                    step={0.01}
+                    onChange={(falloff) => setBrush({ falloff })}
+                  />
+                </BrushField>
+              )}
+              {strokeTool && (
+                <>
+                  <BrushField label="Spacing (m)">
+                    <SliderField
+                      value={brush.spacing}
+                      min={0.1}
+                      max={16}
+                      step={0.1}
+                      onChange={(spacing) => setBrush({ spacing })}
+                    />
+                  </BrushField>
+                  <BrushField label="Projection">
+                    <Select
+                      value={brush.projection}
+                      onValueChange={(projection) =>
+                        setBrush({ projection: projection as "view" | "down" })
+                      }
+                    >
+                      <SelectTrigger size="sm" className="h-6 w-full text-[11px]">
+                        <SelectValue />
+                      </SelectTrigger>
+                      <SelectContent>
+                        <SelectItem value="view" className="text-[11px]">
+                          View ray
+                        </SelectItem>
+                        <SelectItem value="down" className="text-[11px]">
+                          Straight down
+                        </SelectItem>
+                      </SelectContent>
+                    </Select>
+                  </BrushField>
+                  <BrushField label="Max slope (°)">
+                    <SliderField
+                      value={brush.maxSlopeDeg}
+                      min={0}
+                      max={90}
+                      step={1}
+                      onChange={(maxSlopeDeg) => setBrush({ maxSlopeDeg })}
+                    />
+                  </BrushField>
+                </>
+              )}
+            </div>
+          )}
+
+          {densityTool && (
+            <div className="flex flex-col gap-1.5">
+              <SectionLabel>Target density</SectionLabel>
+              <BrushField label="Level">
                 <SliderField
-                  value={brush.falloff}
+                  value={brush.density}
                   min={0}
                   max={1}
                   step={0.01}
-                  onChange={(falloff) => setBrush({ falloff })}
-                />
-              </BrushField>
-              <BrushField label="Spacing (m)">
-                <SliderField
-                  value={brush.spacing}
-                  min={0.1}
-                  max={16}
-                  step={0.1}
-                  onChange={(spacing) => setBrush({ spacing })}
-                />
-              </BrushField>
-              <BrushField label="Projection">
-                <Select
-                  value={brush.projection}
-                  onValueChange={(projection) =>
-                    setBrush({ projection: projection as "view" | "down" })
-                  }
-                >
-                  <SelectTrigger size="sm" className="h-6 w-full text-[11px]">
-                    <SelectValue />
-                  </SelectTrigger>
-                  <SelectContent>
-                    <SelectItem value="view" className="text-[11px]">
-                      View ray
-                    </SelectItem>
-                    <SelectItem value="down" className="text-[11px]">
-                      Straight down
-                    </SelectItem>
-                  </SelectContent>
-                </Select>
-              </BrushField>
-              <BrushField label="Max slope (°)">
-                <SliderField
-                  value={brush.maxSlopeDeg}
-                  min={0}
-                  max={90}
-                  step={1}
-                  onChange={(maxSlopeDeg) => setBrush({ maxSlopeDeg })}
+                  onChange={(density) => setBrush({ density })}
                 />
               </BrushField>
             </div>
@@ -662,108 +723,133 @@ export function VegetationPanel() {
               <p className="text-[11px] text-muted-foreground">The bound map has no layers.</p>
             ) : (
               <div className="flex flex-col gap-0.5">
-                {[...layers]
-                  .sort((a, b) => a.order - b.order)
-                  .map((layer, index, ordered) => (
-                    <div
-                      key={layer.id}
-                      className={`flex items-center justify-between gap-2 rounded px-1.5 py-1 ${
-                        activeLayer?.layer === layer.id ? "bg-primary/20" : "bg-card"
-                      }`}
+                {orderedLayers.map((layer, index, ordered) => (
+                  <div
+                    key={layer.id}
+                    draggable
+                    onDragStart={(event) => {
+                      dragLayer.current = layer.id;
+                      event.dataTransfer.effectAllowed = "move";
+                    }}
+                    onDragOver={(event) => {
+                      if (dragLayer.current === null || dragLayer.current === layer.id) {
+                        return;
+                      }
+                      event.preventDefault();
+                      event.dataTransfer.dropEffect = "move";
+                      setDropIndex(index);
+                    }}
+                    onDragLeave={() => setDropIndex((at) => (at === index ? null : at))}
+                    onDragEnd={() => {
+                      dragLayer.current = null;
+                      setDropIndex(null);
+                    }}
+                    onDrop={(event) => {
+                      event.preventDefault();
+                      const dragged = dragLayer.current;
+                      dragLayer.current = null;
+                      setDropIndex(null);
+                      if (dragged !== null) {
+                        reorderLayer(dragged, index);
+                      }
+                    }}
+                    className={`flex items-center justify-between gap-2 rounded px-1.5 py-1 ${
+                      dropIndex === index ? "outline outline-1 outline-primary" : ""
+                    } ${activeLayer?.layer === layer.id ? "bg-primary/20" : "bg-card"}`}
+                  >
+                    <button
+                      type="button"
+                      aria-pressed={activeLayer?.layer === layer.id}
+                      className="min-w-0 flex-1 truncate text-left text-[11px] hover:text-foreground"
+                      onClick={() =>
+                        chunkLevel !== null &&
+                        map !== null &&
+                        setActiveLayer(
+                          activeLayer?.layer === layer.id
+                            ? null
+                            : paintTarget(map, chunkLevel, layer),
+                        )
+                      }
                     >
-                      <button
-                        type="button"
-                        aria-pressed={activeLayer?.layer === layer.id}
-                        className="min-w-0 flex-1 truncate text-left text-[11px] hover:text-foreground"
-                        onClick={() =>
-                          chunkLevel !== null &&
-                          map !== null &&
-                          setActiveLayer(
-                            activeLayer?.layer === layer.id
-                              ? null
-                              : paintTarget(map, chunkLevel, layer),
-                          )
-                        }
-                      >
-                        {layer.name}
-                      </button>
-                      <span className="flex shrink-0 items-center gap-1">
-                        {dirtyLayers.has(layer.id) && (
-                          <Tooltip>
-                            <TooltipTrigger asChild>
-                              <span
-                                aria-label="Uncooked edits"
-                                className="h-1.5 w-1.5 rounded-full bg-amber-500"
-                              />
-                            </TooltipTrigger>
-                            <TooltipContent side="bottom">
-                              Authored edits not yet cooked
-                            </TooltipContent>
-                          </Tooltip>
-                        )}
-                        <span className="font-mono text-[10px] text-muted-foreground">
-                          #{layer.order}
-                        </span>
-                        <Button
-                          size="icon"
-                          variant="ghost"
-                          aria-label="Move layer earlier"
-                          className="h-5 w-5"
-                          disabled={index === 0}
-                          onClick={() => moveLayer(layer, -1)}
-                        >
-                          <ChevronUp className="h-3 w-3" />
-                        </Button>
-                        <Button
-                          size="icon"
-                          variant="ghost"
-                          aria-label="Move layer later"
-                          className="h-5 w-5"
-                          disabled={index === ordered.length - 1}
-                          onClick={() => moveLayer(layer, 1)}
-                        >
-                          <ChevronDown className="h-3 w-3" />
-                        </Button>
-                        <Button
-                          size="icon"
-                          variant="ghost"
-                          aria-label="Solo layer"
-                          className="h-5 w-5"
-                          onClick={() => soloLayer(layer)}
-                        >
-                          <Headphones className="h-3 w-3" />
-                        </Button>
-                        <Button
-                          size="icon"
-                          variant={layer.muted ? "default" : "ghost"}
-                          aria-pressed={layer.muted}
-                          aria-label={layer.muted ? "Unmute layer" : "Mute layer"}
-                          className="h-5 w-5"
-                          onClick={() => toggleLayerFlag(layer, "muted")}
-                        >
-                          {layer.muted ? (
-                            <VolumeX className="h-3 w-3" />
-                          ) : (
-                            <Volume2 className="h-3 w-3" />
-                          )}
-                        </Button>
-                        <Button
-                          size="icon"
-                          variant={layer.locked ? "default" : "ghost"}
-                          aria-pressed={layer.locked}
-                          aria-label={layer.locked ? "Unlock layer" : "Lock layer"}
-                          className="h-5 w-5"
-                          onClick={() => toggleLayerFlag(layer, "locked")}
-                        >
-                          {layer.locked ? (
-                            <Lock className="h-3 w-3" />
-                          ) : (
-                            <LockOpen className="h-3 w-3" />
-                          )}
-                        </Button>
+                      {layer.name}
+                    </button>
+                    <span className="flex shrink-0 items-center gap-1">
+                      {dirtyLayers.has(layer.id) && (
+                        <Tooltip>
+                          <TooltipTrigger asChild>
+                            <span
+                              aria-label="Uncooked edits"
+                              className="h-1.5 w-1.5 rounded-full bg-amber-500"
+                            />
+                          </TooltipTrigger>
+                          <TooltipContent side="bottom">
+                            Authored edits not yet cooked
+                          </TooltipContent>
+                        </Tooltip>
+                      )}
+                      <span className="font-mono text-[10px] text-muted-foreground">
+                        #{layer.order}
                       </span>
-                    </div>
-                  ))}
+                      <Button
+                        size="icon"
+                        variant="ghost"
+                        aria-label="Move layer earlier"
+                        className="h-5 w-5"
+                        disabled={index === 0}
+                        onClick={() => reorderLayer(layer.id, index - 1)}
+                      >
+                        <ChevronUp className="h-3 w-3" />
+                      </Button>
+                      <Button
+                        size="icon"
+                        variant="ghost"
+                        aria-label="Move layer later"
+                        className="h-5 w-5"
+                        disabled={index === ordered.length - 1}
+                        onClick={() => reorderLayer(layer.id, index + 1)}
+                      >
+                        <ChevronDown className="h-3 w-3" />
+                      </Button>
+                      <Button
+                        size="icon"
+                        variant="ghost"
+                        aria-label="Solo layer"
+                        className="h-5 w-5"
+                        onClick={() => soloLayer(layer)}
+                      >
+                        <Headphones className="h-3 w-3" />
+                      </Button>
+                      <Button
+                        size="icon"
+                        variant={layer.muted ? "default" : "ghost"}
+                        aria-pressed={layer.muted}
+                        aria-label={layer.muted ? "Unmute layer" : "Mute layer"}
+                        className="h-5 w-5"
+                        onClick={() => toggleLayerFlag(layer, "muted")}
+                      >
+                        {layer.muted ? (
+                          <VolumeX className="h-3 w-3" />
+                        ) : (
+                          <Volume2 className="h-3 w-3" />
+                        )}
+                      </Button>
+                      <Button
+                        size="icon"
+                        variant={layer.locked ? "default" : "ghost"}
+                        aria-pressed={layer.locked}
+                        aria-label={layer.locked ? "Unlock layer" : "Lock layer"}
+                        className="h-5 w-5"
+                        onClick={() => toggleLayerFlag(layer, "locked")}
+                      >
+                        {layer.locked ? (
+                          <Lock className="h-3 w-3" />
+                        ) : (
+                          <LockOpen className="h-3 w-3" />
+                        )}
+                      </Button>
+                    </span>
+                  </div>
+                ))}
               </div>
             )}
           </div>

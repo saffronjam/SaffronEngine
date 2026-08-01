@@ -42,7 +42,36 @@ export const VEGETATION_TOOLS: VegetationToolDef[] = [
   { tool: "promote", label: "Promote", icon: Anchor, command: "vegetation.tool.promote" },
 ];
 
-/// Tools that read the brush parameters (the HUD shows radius/falloff for these).
+/// Tools whose gesture rasterizes brush stamps into the active layer's authored tiles.
+const STROKE_TOOLS = new Set<VegetationTool>(["paint", "erase", "density", "reapply", "exclude"]);
+
+/// Tools that read the brush radius: the stroke tools stamp at it, Spline sweeps its influence at
+/// it, and Volume raises its box by it.
 export function isBrushTool(tool: VegetationTool): boolean {
-  return tool !== "select" && tool !== "lasso" && tool !== "pin";
+  return STROKE_TOOLS.has(tool) || tool === "spline" || tool === "volume";
+}
+
+/// Whether a press with `tool` rasterizes stamps into authored tiles. Only these sample along the
+/// pointer path, so only they read the spacing, the projection, and the slope limit.
+export function isStrokeTool(tool: VegetationTool): boolean {
+  return STROKE_TOOLS.has(tool);
+}
+
+/// Tools that read the brush falloff: a stroke's stamp edge and a volume's soft boundary. A spline
+/// carries one influence radius with no edge profile, so it does not.
+export function usesFalloff(tool: VegetationTool): boolean {
+  return STROKE_TOOLS.has(tool) || tool === "volume";
+}
+
+/// Tools that read the brush's target density: the level a Density stroke drives texels to and the
+/// level a Fill lays across a whole tile. An Exclude stroke accumulates like Paint and an analytic
+/// volume carries no per-texel level, so neither reads it and neither shows the control.
+export function usesTargetDensity(tool: VegetationTool): boolean {
+  return tool === "density" || tool === "fill";
+}
+
+/// Tools whose gesture authors nothing and so stays live while the world is playing: viewport
+/// selection and the promotion of a bulk plant to an entity view.
+export function isRuntimeTool(tool: VegetationTool): boolean {
+  return tool === "select" || tool === "lasso" || tool === "promote";
 }

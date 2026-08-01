@@ -2,8 +2,8 @@
 
 Every dockable panel body plus the helper modules a few of them need. Read `editor/AGENTS.md` first:
 its "Rules that are easy to break" bind here in full, and this file only adds what is specific to
-panels. Vegetation is the largest area — twelve files, five registered panels — and its engine-side
-contracts live in `engine/crates/vegetation/AGENTS.md`.
+panels. Vegetation is the largest area — eleven registered panels plus their helper modules — and
+its engine-side contracts live in `engine/crates/vegetation/AGENTS.md`.
 
 ## Registration and islands
 
@@ -15,9 +15,9 @@ A panel body is not reachable until it is registered. Three places, all in one c
 - the body itself, here.
 
 The two dockspace islands are disjoint and stay that way — a scene panel and an asset-editor panel
-share no ids. Vegetation spans both: `vegetation` and `ecologyTimeline` are scene panels;
-`vegSummary`, `plantGraph`, `plantWind`, `plantAtlas`, `plantHierarchy`, `plantSeason`,
-`plantProxies`, and `biomeGraph` live in the asset-editor island.
+share no ids. Vegetation spans both: `vegetation`, `ecologyTimeline`, and `vegetationTelemetry` are
+scene panels; `vegSummary`, `plantGraph`, `plantWind`, `plantAtlas`, `plantHierarchy`,
+`plantSeason`, `plantProxies`, and `biomeGraph` live in the asset-editor island.
 
 ## Rules that are easy to break
 
@@ -36,7 +36,9 @@ share no ids. Vegetation spans both: `vegetation` and `ecologyTimeline` are scen
   derived primitive, referentially stable props, and one shared context menu per surface rather than
   a Radix root per row. Verify with the dev-mode `logRender` counters.
 - **Every mutating action records its inverse** via `pushEdit`. Undo is editor-only, reconstructed
-  from paired control calls; an action with no `pushEdit` is silently un-undoable.
+  from paired control calls; an action with no `pushEdit` is silently un-undoable. Vegetation is the
+  exception to the composing half: `vegetationGesture.ts` applies a batch and pushes the inverse the
+  engine replies with, which flips each time it is applied, so no panel reconstructs a preimage.
 - **Panel surfaces use the semantic theme tokens** (`bg-background`, `bg-card`, `text-foreground`,
   `border-border`), never raw `neutral-*`.
 - **Ids are strings end-to-end.** Entity ids are u64 and `PlantId` is u128 in the engine. Never
@@ -49,8 +51,10 @@ share no ids. Vegetation spans both: `vegetation` and `ecologyTimeline` are scen
 | `VegetationPanel.tsx` | The main scene panel: layers, brushes, cook and evaluation state |
 | `VegetationViewportToolbar.tsx`, `vegetationTools.ts` | The viewport tool strip and its tool vocabulary |
 | `vegetationPainting.ts`, `vegetationPlanting.ts` | The brush interaction model and single-plant placement |
+| `vegetationShapes.ts` | The Volume and Spline gestures, which write a layer's analytic operator |
 | `EcologyTimelinePanel.tsx` | Step and run over the world's biological clock |
-| `PlantGraphPanel.tsx` | The botanical graph, its variations, and validation |
+| `VegetationTelemetryPanel.tsx` | The running world's vegetation counters and budgets |
+| `PlantGraphPanel/` | The botanical graph on a node canvas, its operator parameters, the structure it grows, and validation |
 | `PlantWindPanel.tsx` | Wind and interaction preview: drives the real fields the previewed plant stands in |
 | `PlantAtlasPanel.tsx` | The packed coverage atlas the family samples, with a scrubbable mip level |
 | `PlantHierarchyPanel.tsx` | The cooked cut and its declared errors, with the cut pinnable so the preview draws either representation |
@@ -69,12 +73,21 @@ share no ids. Vegetation spans both: `vegetation` and `ecologyTimeline` are scen
   one status.
 - **A native family's structure is derived, so the graph panel does not edit it.** Parts,
   dimensions, spines, phenotypes, and proxies all come out of growing the graph. The panel edits the
-  graph document and the variation list and reads everything else back. One recorded edit is one
-  semantic operation, and its inverse is the previous graph document replayed through the same
-  single write path — nothing reconstructs old parts by hand.
-- **A graph write must not carry derived fields forward.** `plant-graph-set` sends the graph and the
-  family's own grafts; sending `variations`, `phenotypes`, `collision_proxies`, or
-  `navigation_proxies` back creates a second truth about geometry the engine is about to re-derive.
+  graph document, its module bindings, and the variation list, and reads everything else back. One
+  recorded edit is one semantic operation, and its inverse is the previous document replayed through
+  the same single write path — nothing reconstructs old parts by hand.
+- **A graph write must not carry derived fields forward.** `plant-graph-set` sends the graph, the
+  family's own grafts, and its module bindings; sending `variations`, `phenotypes`,
+  `collision_proxies`, or `navigation_proxies` back creates a second truth about geometry the engine
+  is about to re-derive.
+- **A module call and its binding move together.** The family validator checks both directions — a
+  `module-call` node whose GUID names no reference, or a reference no node calls, is refused — so
+  adding one mints the call GUID, the node, and the reference in a single document edit, and
+  removing one takes both out. The add palette therefore does not offer a bare `module-call`.
+- **A parameter scrub is one edit, not one per keystroke.** Field changes edit a local document and
+  write once the typing settles; a structural gesture that lands mid-burst folds the burst into
+  itself rather than recording a second entry. Writes queue on one promise chain so a later reply
+  can never publish an older document.
 - **An imported family has no botanical graph.** That is a fact about the asset, not a failed
   operation, so the panel says so in place rather than raising a toast.
 - **Vegetation shortcuts are scoped to the open panel.** `CommandScope` has a dedicated
