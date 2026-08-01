@@ -72,6 +72,15 @@ impl Entity {
     }
 }
 
+/// One resolved local wind source and the entity that placed it.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct PlacedWindSource {
+    /// The stable id of the entity carrying the [`WindSource`](crate::WindSource).
+    pub entity: Uuid,
+    /// The source as the shared field composes it.
+    pub source: saffron_wind::LocalWindSource,
+}
+
 /// The scene: the ECS world, the environment, and a borrowed asset catalog.
 ///
 /// `catalog` is an `Option<Arc<AssetCatalog>>` (a read-shared handle the asset layer
@@ -258,30 +267,48 @@ impl Scene {
     }
 
     /// The resolved local wind sources: every enabled [`WindSource`](crate::WindSource) entity,
-    /// anchored at its world position with its world +Z as the forward axis.
+    /// anchored at its world position with its world +Z as the forward axis, each paired with
+    /// the entity that placed it so an inspector can name what it is reading.
     #[must_use]
-    pub fn local_wind_sources(&mut self) -> Vec<saffron_wind::LocalWindSource> {
+    pub fn local_wind_sources(&mut self) -> Vec<PlacedWindSource> {
         let mut sources = Vec::new();
-        self.for_each::<(&crate::WindSource, &crate::WorldTransform), _>(|_, (source, world)| {
+        self.for_each::<(
+            &crate::WindSource,
+            &crate::WorldTransform,
+            &crate::IdComponent,
+        ), _>(|_, (source, world, id)| {
             if !source.enabled {
                 return;
             }
             let position = world.matrix.w_axis.truncate();
             let forward = world.matrix.z_axis.truncate().normalize_or_zero();
-            sources.push(saffron_wind::LocalWindSource {
-                kind: source.kind,
-                position: glam::DVec3::new(
-                    f64::from(position.x),
-                    f64::from(position.y),
-                    f64::from(position.z),
-                ),
-                direction: forward,
-                strength: source.strength,
-                radius: source.radius,
-                falloff: source.falloff,
+            sources.push(PlacedWindSource {
+                entity: id.id,
+                source: saffron_wind::LocalWindSource {
+                    kind: source.kind,
+                    position: glam::DVec3::new(
+                        f64::from(position.x),
+                        f64::from(position.y),
+                        f64::from(position.z),
+                    ),
+                    direction: forward,
+                    strength: source.strength,
+                    radius: source.radius,
+                    falloff: source.falloff,
+                },
             });
         });
         sources
+    }
+
+    /// The composed field's local sources alone, in the same order, for a consumer that only
+    /// samples them.
+    #[must_use]
+    pub fn local_wind_source_field(&mut self) -> Vec<saffron_wind::LocalWindSource> {
+        self.local_wind_sources()
+            .into_iter()
+            .map(|placed| placed.source)
+            .collect()
     }
 
     /// Iterates every entity carrying the query components, invoking `f` with the entity handle and

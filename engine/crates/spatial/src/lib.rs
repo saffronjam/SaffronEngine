@@ -28,7 +28,7 @@ pub use plant_identity::{PlantId, PlantIdNamespace};
 pub use random::{PHILOX4X32_ZERO_VECTOR, RandomDomain, RandomStream, philox4x32_10};
 pub use residency::{
     DEFAULT_SOURCE_CLAIM_BUDGET, FACET_COUNT, GenerationSlot, GenerationToken, ResidencyFacet,
-    ResidencyManager, ResidencyMask, ResidencySnapshot, SourceLevel, SpatialSource,
+    ResidencyManager, ResidencyMask, ResidencySnapshot, SourceLevel, SourceMotion, SpatialSource,
     SpatialSourceId,
 };
 pub use surface::{

@@ -152,6 +152,61 @@ impl SpatialSource {
     }
 }
 
+/// Derives a source's world velocity from successive observed positions.
+///
+/// A viewpoint has no rigidbody to read a velocity from, so the prediction horizon on
+/// [`SpatialSource`] has nothing to lead with unless the motion is measured here. A raw
+/// frame-to-frame difference is too noisy to lead a claim cube with — one long frame doubles the
+/// apparent speed and drags the claim centre a cell ahead and back — so the estimate is
+/// exponentially smoothed over [`Self::SMOOTHING_SECONDS`] and clamped to [`Self::MAX_SPEED_MPS`].
+/// A teleport (a jump farther than the horizon could explain) restarts the estimate at rest rather
+/// than reporting the jump as speed.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct SourceMotion {
+    previous: Option<WorldPosition>,
+    velocity: DVec3,
+}
+
+impl SourceMotion {
+    /// Time constant of the exponential smoothing.
+    pub const SMOOTHING_SECONDS: f64 = 0.25;
+    /// Speed above which an observation is treated as a teleport rather than travel.
+    pub const MAX_SPEED_MPS: f64 = 400.0;
+
+    /// Folds one observed position into the estimate and returns the smoothed velocity.
+    ///
+    /// `delta_seconds` is the wall interval since the previous observation; a non-positive or
+    /// non-finite interval leaves the estimate untouched.
+    pub fn observe(&mut self, position: WorldPosition, delta_seconds: f64) -> DVec3 {
+        let Some(previous) = self.previous.replace(position) else {
+            return self.velocity;
+        };
+        if !delta_seconds.is_finite() || delta_seconds <= 0.0 {
+            return self.velocity;
+        }
+        let instantaneous = (position.world_meters() - previous.world_meters()) / delta_seconds;
+        if !instantaneous.is_finite() || instantaneous.length() > Self::MAX_SPEED_MPS {
+            self.velocity = DVec3::ZERO;
+            return self.velocity;
+        }
+        let blend = (delta_seconds / Self::SMOOTHING_SECONDS).clamp(0.0, 1.0);
+        self.velocity += (instantaneous - self.velocity) * blend;
+        self.velocity
+    }
+
+    /// The current smoothed velocity without folding in a new observation.
+    #[must_use]
+    pub fn velocity(&self) -> DVec3 {
+        self.velocity
+    }
+
+    /// Drops the tracked history so the next observation restarts the estimate at rest.
+    pub fn reset(&mut self) {
+        self.previous = None;
+        self.velocity = DVec3::ZERO;
+    }
+}
+
 /// One cell's resolved reference counts and scheduling priority.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ResidencySnapshot {
@@ -436,6 +491,8 @@ impl<T> GenerationSlot<T> {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Barrier;
+
     use super::*;
 
     fn source(id: u64, position: WorldPosition) -> SpatialSource {
@@ -453,6 +510,29 @@ mod tests {
             facets: ResidencyMask::one(ResidencyFacet::Render),
             priority: id as i32,
         }
+    }
+
+    fn resident_cells(manager: &ResidencyManager) -> BTreeSet<WorldCellKey> {
+        manager
+            .snapshots()
+            .unwrap()
+            .into_iter()
+            .map(|snapshot| snapshot.cell)
+            .collect()
+    }
+
+    /// Number of separate resident runs each cell goes through across an ordered walk. One run is
+    /// hysteresis working; two or more is load/unload thrash.
+    fn resident_runs(history: &[BTreeSet<WorldCellKey>]) -> BTreeMap<WorldCellKey, usize> {
+        let mut runs: BTreeMap<WorldCellKey, usize> = BTreeMap::new();
+        let mut previous = BTreeSet::new();
+        for step in history {
+            for cell in step.difference(&previous) {
+                *runs.entry(*cell).or_default() += 1;
+            }
+            previous = step.clone();
+        }
+        runs
     }
 
     #[test]
@@ -485,14 +565,201 @@ mod tests {
     }
 
     #[test]
-    fn late_generation_is_rejected_without_partial_publication() {
-        let slot = GenerationSlot::new(WorldCellKey::base(0, 0, 0), Arc::new(vec![1, 2, 3]));
-        let old = slot.begin(10).unwrap();
-        let current = slot.begin(11).unwrap();
-        assert!(!slot.try_publish(old, Arc::new(vec![4])).unwrap());
-        assert_eq!(&*slot.read(), &[1, 2, 3]);
-        assert!(slot.try_publish(current, Arc::new(vec![5, 6])).unwrap());
-        assert_eq!(&*slot.read(), &[5, 6]);
+    fn observed_motion_converges_on_the_travelled_velocity() {
+        let mut motion = SourceMotion::default();
+        let step = 0.05;
+        let mut x = 0.0;
+        let mut velocity = DVec3::ZERO;
+        for _ in 0..64 {
+            x += 12.0 * step;
+            velocity = motion.observe(
+                WorldPosition::from_world_meters(DVec3::X * x).unwrap(),
+                step,
+            );
+        }
+        assert!(
+            (velocity.x - 12.0).abs() < 0.1,
+            "smoothed velocity {velocity:?} did not converge on 12 m/s"
+        );
+        assert!(velocity.y.abs() < 1e-6 && velocity.z.abs() < 1e-6);
+    }
+
+    #[test]
+    fn observed_motion_smooths_a_single_long_frame() {
+        let mut motion = SourceMotion::default();
+        motion.observe(WorldPosition::origin(), 0.016);
+        let jumped = motion.observe(
+            WorldPosition::from_world_meters(DVec3::X * 1.6).unwrap(),
+            0.016,
+        );
+        // 100 m/s instantaneous, blended in at 0.016 / SMOOTHING_SECONDS.
+        assert!(
+            (jumped.x - 6.4).abs() < 0.05,
+            "one 1.6 m frame reported {jumped:?}, not the smoothed 6.4 m/s"
+        );
+    }
+
+    #[test]
+    fn a_teleport_restarts_the_estimate_at_rest() {
+        let mut motion = SourceMotion::default();
+        for step in 1..16 {
+            motion.observe(
+                WorldPosition::from_world_meters(DVec3::X * f64::from(step) * 0.2).unwrap(),
+                0.05,
+            );
+        }
+        assert!(motion.velocity().x > 1.0);
+        let after = motion.observe(
+            WorldPosition::from_world_meters(DVec3::X * 100_000.0).unwrap(),
+            0.05,
+        );
+        assert_eq!(after, DVec3::ZERO);
+    }
+
+    #[test]
+    fn a_non_advancing_clock_leaves_the_estimate_untouched() {
+        let mut motion = SourceMotion::default();
+        motion.observe(WorldPosition::origin(), 0.05);
+        motion.observe(
+            WorldPosition::from_world_meters(DVec3::X * 0.5).unwrap(),
+            0.05,
+        );
+        let before = motion.velocity();
+        let held = motion.observe(
+            WorldPosition::from_world_meters(DVec3::X * 5.0).unwrap(),
+            0.0,
+        );
+        assert_eq!(held, before);
+    }
+
+    #[test]
+    fn moving_sources_hold_refcounts_without_load_unload_thrash() {
+        let moving = |id: u64, x: f64, velocity: f64| {
+            let mut source = source(id, WorldPosition::from_world_meters(DVec3::X * x).unwrap());
+            source.velocity_mps = DVec3::X * velocity;
+            source.prediction_seconds = 0.5;
+            source.levels[0].load_radius_cells = 1;
+            source.levels[0].cleanup_radius_cells = 2;
+            source
+        };
+
+        // The prediction horizon picks the centre cell: the same exact position resolved without
+        // velocity lands one cell lower.
+        let mut still = moving(1, 60.0, 8.0);
+        still.velocity_mps = DVec3::ZERO;
+        let mut without_prediction = ResidencyManager::new();
+        without_prediction.update_source(still).unwrap();
+        let mut with_prediction = ResidencyManager::new();
+        with_prediction.update_source(moving(1, 60.0, 8.0)).unwrap();
+        assert_ne!(
+            resident_cells(&with_prediction),
+            resident_cells(&without_prediction)
+        );
+
+        let mut manager = ResidencyManager::new();
+        let mut history = Vec::new();
+        let mut steady = Vec::new();
+        // Both sources ping-pong across a cell face inside the hysteresis band, and their claim
+        // cubes overlap so the shared cells carry two references.
+        for step in 0..8 {
+            let offset = f64::from(step % 2) * 8.0;
+            manager
+                .update_source(moving(1, 56.0 + offset, 8.0))
+                .unwrap();
+            manager
+                .update_source(moving(2, 200.0 - offset, -8.0))
+                .unwrap();
+            history.push(resident_cells(&manager));
+            if step == 1 {
+                steady = manager.snapshots().unwrap();
+            } else if step > 1 {
+                assert_eq!(
+                    manager.snapshots().unwrap(),
+                    steady,
+                    "oscillating inside the cleanup band moved a reference count"
+                );
+            }
+        }
+        let shared = steady
+            .iter()
+            .filter(|snapshot| snapshot.reference_counts[ResidencyFacet::Render.index()] == 2)
+            .count();
+        assert_eq!(shared, 18, "the two claim cubes must overlap");
+
+        // Walking both sources away releases each cell once and never reclaims it.
+        for step in 1..12 {
+            let distance = 64.0 * f64::from(step);
+            manager
+                .update_source(moving(1, 56.0 + distance, 8.0))
+                .unwrap();
+            manager
+                .update_source(moving(2, 200.0 + distance, -8.0))
+                .unwrap();
+            history.push(resident_cells(&manager));
+        }
+        for (cell, runs) in resident_runs(&history) {
+            assert_eq!(runs, 1, "{cell:?} was loaded {runs} separate times");
+        }
+    }
+
+    #[test]
+    fn late_generation_is_rejected_under_concurrent_publication() {
+        const WRITERS: u64 = 8;
+        const WIDTH: usize = 4096;
+
+        let cell = WorldCellKey::base(0, 0, 0);
+        let slot = Arc::new(GenerationSlot::new(cell, Arc::new(vec![0_u64; WIDTH])));
+        let mut published = 0_u64;
+        for _ in 0..16 {
+            let opened = Arc::new(Barrier::new(WRITERS as usize + 1));
+            let staged = Arc::new(Barrier::new(WRITERS as usize + 1));
+            let writers = (1..=WRITERS)
+                .map(|revision| {
+                    let slot = Arc::clone(&slot);
+                    let opened = Arc::clone(&opened);
+                    let staged = Arc::clone(&staged);
+                    std::thread::spawn(move || {
+                        let token = slot.begin(revision).unwrap();
+                        opened.wait();
+                        let value = Arc::new(vec![token.generation; WIDTH]);
+                        staged.wait();
+                        (token, slot.try_publish(token, value).unwrap())
+                    })
+                })
+                .collect::<Vec<_>>();
+            opened.wait();
+            staged.wait();
+            // Racing the publications: every read must see one whole generation, never a mix and
+            // never a generation older than one already observed.
+            for _ in 0..WIDTH {
+                let value = slot.read();
+                let generation = value[0];
+                assert!(value.iter().all(|entry| *entry == generation));
+                assert!(generation >= published);
+                published = generation;
+            }
+            let results = writers
+                .into_iter()
+                .map(|writer| writer.join().unwrap())
+                .collect::<Vec<_>>();
+            let current = results
+                .iter()
+                .map(|(token, _)| token.generation)
+                .max()
+                .unwrap();
+            assert_eq!(
+                results.iter().filter(|(_, accepted)| *accepted).count(),
+                1,
+                "exactly the newest generation may publish"
+            );
+            assert!(
+                results
+                    .iter()
+                    .all(|(token, accepted)| *accepted == (token.generation == current))
+            );
+            assert_eq!(&*slot.read(), &vec![current; WIDTH]);
+            published = current;
+        }
     }
 
     #[test]

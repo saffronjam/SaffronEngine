@@ -421,13 +421,29 @@ mod tests {
         assert_eq!(parity_occupancy(1.0, 1.0), 0.0);
     }
 
+    /// The shader declares the coefficient once, in `mdf_brick.slang`; every march imports it from
+    /// there. A divergence between the two declarations shifts brightness wherever aggregate matter
+    /// is marched, which no image comparison attributes back to a constant.
     #[test]
     fn the_extinction_coefficient_matches_the_shader() {
-        let source = include_str!("../../../assets/shaders/sdf.slang");
-        let needle = format!("exp(-{AGGREGATE_EXTINCTION_PER_METER:.1} * max(occupancy, 0.0)");
-        assert!(
-            source.contains(&needle),
-            "sdf.slang's extinction step does not use {AGGREGATE_EXTINCTION_PER_METER} per metre"
+        let source = include_str!("../../../assets/shaders/mdf_brick.slang");
+        let declared = source
+            .lines()
+            .find_map(|line| {
+                line.split_once("const float AGGREGATE_EXTINCTION_PER_METER")?
+                    .1
+                    .split_once('=')?
+                    .1
+                    .split_once(';')?
+                    .0
+                    .trim()
+                    .parse::<f32>()
+                    .ok()
+            })
+            .expect("mdf_brick.slang declares AGGREGATE_EXTINCTION_PER_METER");
+        assert_eq!(
+            declared, AGGREGATE_EXTINCTION_PER_METER,
+            "mdf_brick.slang marches {declared} per metre, this crate resolves {AGGREGATE_EXTINCTION_PER_METER}"
         );
     }
 }

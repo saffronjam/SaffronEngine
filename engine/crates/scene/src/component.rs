@@ -462,6 +462,12 @@ pub struct Rigidbody {
     pub angular_damping: f32,
     /// Gravity scale (`0` = float, `1` = full gravity).
     pub gravity_factor: f32,
+    /// Aerodynamic coupling to the wind field, scaling the cross-section derived from the
+    /// collider (`0` = inert to wind, `1` = the collider's own cross-section, higher for a
+    /// sail). A collision proxy is not an aerodynamic profile, so the coupling is authored
+    /// rather than assumed; the default leaves the body driven by contacts and gravity alone,
+    /// which is what keeps its trajectory bit-exact across targets.
+    pub wind_factor: f32,
     /// Freeze X/Y/Z translation.
     pub lock_position: BVec3,
     /// Freeze X/Y/Z rotation.
@@ -478,6 +484,7 @@ impl Default for Rigidbody {
             linear_damping: 0.05,
             angular_damping: 0.05,
             gravity_factor: 1.0,
+            wind_factor: 0.0,
             lock_position: BVec3::FALSE,
             lock_rotation: BVec3::FALSE,
             collision_layer: 0,
@@ -1048,6 +1055,7 @@ mod tests {
         assert_eq!(r.linear_damping, 0.05);
         assert_eq!(r.angular_damping, 0.05);
         assert_eq!(r.gravity_factor, 1.0);
+        assert_eq!(r.wind_factor, 0.0);
         assert_eq!(r.lock_position, BVec3::FALSE);
         assert_eq!(r.lock_rotation, BVec3::FALSE);
         assert_eq!(r.collision_layer, 0);

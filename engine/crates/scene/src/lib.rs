@@ -48,7 +48,7 @@ pub use registry::{
     BUILTIN_COMPONENT_NAMES, ComponentRegistry, ComponentTraits, SceneSerialize,
     register_builtin_components,
 };
-pub use scene::{Component, Entity, Query, Scene};
+pub use scene::{Component, Entity, PlacedWindSource, Query, Scene};
 pub use script_input::{ScriptInputState, derive_script_input_edges};
 pub use serde::{environment_from_json, environment_to_json};
 pub use starter::seed_starter_scene;

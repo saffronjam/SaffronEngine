@@ -74,6 +74,32 @@ pub enum WindSourceKind {
     Volume,
 }
 
+impl WindSourceKind {
+    /// The kind's spelled name — the one the scene document, the wire, and the inspector use.
+    #[must_use]
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Directional => "directional",
+            Self::Point => "point",
+            Self::Vortex => "vortex",
+            Self::Wake => "wake",
+            Self::Volume => "volume",
+        }
+    }
+
+    /// The kind a spelled name selects; an unknown name is directional.
+    #[must_use]
+    pub fn from_name(name: &str) -> Self {
+        match name {
+            "point" => Self::Point,
+            "vortex" => Self::Vortex,
+            "wake" => Self::Wake,
+            "volume" => Self::Volume,
+            _ => Self::Directional,
+        }
+    }
+}
+
 /// One resolved local wind source, composited over the global field.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct LocalWindSource {
@@ -104,6 +130,65 @@ fn source_weight(source: &LocalWindSource, distance: f32) -> f32 {
     }
 }
 
+/// What one local source contributes at a position: its edge weight, the velocity it adds,
+/// and the factor it scales the global term by (`Volume` sources shelter, the rest add).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct WindSourceInfluence {
+    /// Distance to the source in metres.
+    pub distance: f32,
+    /// The 0..1 edge weight at that distance.
+    pub weight: f32,
+    /// The velocity this source adds, in metres per second.
+    pub added: Vec3,
+    /// The factor this source scales the global term by; 1 when it adds instead.
+    pub global_scale: f32,
+}
+
+/// One local source's contribution at a world position. This is the term
+/// [`sample_composed`] folds, so an inspector reading it sees exactly what the field used.
+#[must_use]
+pub fn source_influence(
+    profile: &WindProfile,
+    source: &LocalWindSource,
+    position: DVec3,
+) -> WindSourceInfluence {
+    let offset = position - source.position;
+    let distance = offset.length() as f32;
+    let weight = source_weight(source, distance);
+    let mut influence = WindSourceInfluence {
+        distance,
+        weight,
+        added: Vec3::ZERO,
+        global_scale: 1.0,
+    };
+    if weight <= 0.0 {
+        return influence;
+    }
+    match source.kind {
+        WindSourceKind::Directional => {
+            influence.added = source.direction.normalize_or_zero() * source.strength * weight;
+        }
+        WindSourceKind::Point => {
+            influence.added = Vec3::new(offset.x as f32, offset.y as f32, offset.z as f32)
+                .normalize_or_zero()
+                * source.strength
+                * weight;
+        }
+        WindSourceKind::Vortex => {
+            let planar = Vec3::new(offset.x as f32, 0.0, offset.z as f32);
+            influence.added =
+                Vec3::new(-planar.z, 0.0, planar.x).normalize_or_zero() * source.strength * weight;
+        }
+        WindSourceKind::Wake => {
+            influence.added = -direction(profile.orientation) * source.strength * weight;
+        }
+        WindSourceKind::Volume => {
+            influence.global_scale = 1.0 + (source.strength - 1.0) * weight;
+        }
+    }
+    influence
+}
+
 /// Samples the composed field: the global profile plus every local source. `Volume`
 /// sources scale the global term; the rest add their own velocities. Equal inputs
 /// sample equal velocities — determinism carries through composition.
@@ -117,34 +202,10 @@ pub fn sample_composed(
     let global = sample(profile, position, time);
     let mut global_scale = 1.0_f32;
     let mut added = Vec3::ZERO;
-    let mean_direction = direction(profile.orientation);
     for source in sources {
-        let offset = position - source.position;
-        let weight = source_weight(source, offset.length() as f32);
-        if weight <= 0.0 {
-            continue;
-        }
-        match source.kind {
-            WindSourceKind::Directional => {
-                added += source.direction.normalize_or_zero() * source.strength * weight;
-            }
-            WindSourceKind::Point => {
-                let radial = Vec3::new(offset.x as f32, offset.y as f32, offset.z as f32)
-                    .normalize_or_zero();
-                added += radial * source.strength * weight;
-            }
-            WindSourceKind::Vortex => {
-                let planar = Vec3::new(offset.x as f32, 0.0, offset.z as f32);
-                let tangent = Vec3::new(-planar.z, 0.0, planar.x).normalize_or_zero();
-                added += tangent * source.strength * weight;
-            }
-            WindSourceKind::Wake => {
-                added -= mean_direction * source.strength * weight;
-            }
-            WindSourceKind::Volume => {
-                global_scale *= 1.0 + (source.strength - 1.0) * weight;
-            }
-        }
+        let influence = source_influence(profile, source, position);
+        global_scale *= influence.global_scale;
+        added += influence.added;
     }
     WindSample {
         velocity: global.velocity * global_scale.max(0.0) + added,
@@ -191,15 +252,82 @@ pub fn shear_factor(profile: &WindProfile, height_m: f32) -> f32 {
         .powf(profile.height_exponent)
 }
 
+/// The greatest turbulence octave count a profile evaluates. The shader mirror carries the
+/// same cap, so a profile above it samples identically on both sides.
+pub const MAX_TURBULENCE_OCTAVES: usize = 8;
+
+/// One sample taken apart into the terms that produced it: the mean advection, the gust-front
+/// envelope, and each turbulence octave's own contribution to the velocity.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct WindDecomposition {
+    /// The mean advection term including its gust-front boost, in metres per second.
+    pub mean: Vec3,
+    /// The gust-front envelope 0..1 at this position and time.
+    pub gust_front: f32,
+    /// The wavelength in metres of each evaluated octave.
+    pub octave_wavelengths_m: [f32; MAX_TURBULENCE_OCTAVES],
+    /// Each evaluated octave's unnormalized gradient, before the amplitude sum divides it.
+    pub octave_gradients: [Vec3; MAX_TURBULENCE_OCTAVES],
+    /// How many entries of the octave arrays are evaluated.
+    pub octave_count: u32,
+    /// The summed per-octave amplitude the gradients normalize by.
+    pub octave_amplitude_total: f32,
+    /// The turbulent speed the normalized gradient scales to, in metres per second.
+    pub gust_speed: f32,
+}
+
+impl WindDecomposition {
+    /// The turbulence term: the summed gradients, normalized and scaled to the gust speed.
+    ///
+    /// The sum happens before the normalization, which is the order [`sample`] and the shader
+    /// mirror both evaluate. Scaling each octave first and summing after is the same value in
+    /// exact arithmetic and a different one in floating point, which would put the CPU and the
+    /// GPU a rounding step apart.
+    #[must_use]
+    pub fn turbulence(&self) -> Vec3 {
+        let mut sum = Vec3::ZERO;
+        for octave in 0..self.octave_count as usize {
+            sum += self.octave_gradients[octave];
+        }
+        if self.octave_amplitude_total > 0.0 {
+            sum /= self.octave_amplitude_total;
+        }
+        sum * self.gust_speed
+    }
+
+    /// One octave's own share of the turbulence, in metres per second — the spectrum a debug
+    /// view reads. Out-of-range octaves are zero.
+    #[must_use]
+    pub fn octave_velocity(&self, octave: usize) -> Vec3 {
+        if octave >= self.octave_count as usize || self.octave_amplitude_total <= 0.0 {
+            return Vec3::ZERO;
+        }
+        self.octave_gradients[octave] / self.octave_amplitude_total * self.gust_speed
+    }
+
+    /// The velocity the decomposed terms add up to — what [`sample`] returns.
+    #[must_use]
+    pub fn velocity(&self) -> Vec3 {
+        self.mean + self.turbulence()
+    }
+}
+
 /// Samples the field at a world position (metres) and monotonic simulation time
-/// (seconds). Pure and deterministic: equal inputs sample equal velocities.
+/// (seconds), keeping every term separate. [`sample`] is this summed, so a spectrum view
+/// and a velocity can never disagree.
 #[must_use]
-pub fn sample(profile: &WindProfile, position: DVec3, time: f64) -> WindSample {
+pub fn sample_decomposed(profile: &WindProfile, position: DVec3, time: f64) -> WindDecomposition {
+    let mut decomposition = WindDecomposition {
+        mean: Vec3::ZERO,
+        gust_front: 0.0,
+        octave_wavelengths_m: [0.0; MAX_TURBULENCE_OCTAVES],
+        octave_gradients: [Vec3::ZERO; MAX_TURBULENCE_OCTAVES],
+        octave_count: 0,
+        octave_amplitude_total: 0.0,
+        gust_speed: 0.0,
+    };
     if profile.speed <= 0.0 {
-        return WindSample {
-            velocity: Vec3::ZERO,
-            gust_front: 0.0,
-        };
+        return decomposition;
     }
     let mean_direction = direction(profile.orientation);
     let mean_speed = profile.speed * shear_factor(profile, position.y as f32);
@@ -213,7 +341,9 @@ pub fn sample(profile: &WindProfile, position: DVec3, time: f64) -> WindSample {
 
     // Multiscale turbulence: fixed-phase sinusoid gradients advected with the mean
     // flow, amplitudes decaying by the roughness ratio per octave.
-    let mut turbulence = Vec3::ZERO;
+    let octave_count = profile
+        .turbulence_octaves
+        .min(MAX_TURBULENCE_OCTAVES as u32);
     let mut amplitude = 1.0_f32;
     let mut total = 0.0_f32;
     let advected = Vec3::new(
@@ -221,12 +351,14 @@ pub fn sample(profile: &WindProfile, position: DVec3, time: f64) -> WindSample {
         position.y as f32,
         position.z as f32 - mean_direction.z * mean_speed * TURBULENCE_ADVECTION * time as f32,
     );
-    for octave in 0..profile.turbulence_octaves {
-        let frequency = core::f32::consts::TAU / (BASE_WAVELENGTH_M / (1 << octave) as f32);
+    for octave in 0..octave_count {
+        let wavelength = BASE_WAVELENGTH_M / (1 << octave) as f32;
+        let frequency = core::f32::consts::TAU / wavelength;
         let px = octave_phase(profile.seed, octave, 0);
         let py = octave_phase(profile.seed, octave, 1);
         let pz = octave_phase(profile.seed, octave, 2);
-        turbulence += amplitude
+        decomposition.octave_wavelengths_m[octave as usize] = wavelength;
+        decomposition.octave_gradients[octave as usize] = amplitude
             * Vec3::new(
                 (advected.z * frequency + px).sin() * (advected.y * frequency * 0.31 + pz).cos(),
                 0.35 * (advected.x * frequency * 0.83 + py).sin()
@@ -236,16 +368,22 @@ pub fn sample(profile: &WindProfile, position: DVec3, time: f64) -> WindSample {
         total += amplitude;
         amplitude *= profile.turbulence_roughness.clamp(0.0, 1.0);
     }
-    if total > 0.0 {
-        turbulence /= total;
-    }
+    decomposition.mean = mean_direction * mean_speed * (1.0 + profile.gust * 0.5 * gust_front);
+    decomposition.gust_front = gust_front;
+    decomposition.octave_count = octave_count;
+    decomposition.octave_amplitude_total = total;
+    decomposition.gust_speed = mean_speed * profile.gust;
+    decomposition
+}
 
-    let gust_speed = mean_speed * profile.gust;
-    let velocity = mean_direction * mean_speed * (1.0 + profile.gust * 0.5 * gust_front)
-        + turbulence * gust_speed;
+/// Samples the field at a world position (metres) and monotonic simulation time
+/// (seconds). Pure and deterministic: equal inputs sample equal velocities.
+#[must_use]
+pub fn sample(profile: &WindProfile, position: DVec3, time: f64) -> WindSample {
+    let decomposition = sample_decomposed(profile, position, time);
     WindSample {
-        velocity,
-        gust_front,
+        velocity: decomposition.velocity(),
+        gust_front: decomposition.gust_front,
     }
 }
 
@@ -341,6 +479,111 @@ mod tests {
         let mid = source_weight(&source, 7.5);
         assert!(mid > 0.0 && mid < 1.0);
         assert_eq!(source_weight(&source, 10.0), 0.0);
+    }
+
+    #[test]
+    fn the_decomposition_sums_bit_for_bit_to_the_sample() {
+        let gusty = WindProfile {
+            turbulence_octaves: 5,
+            gust: 0.6,
+            ..profile()
+        };
+        for position in [
+            DVec3::new(0.0, 1.0, 0.0),
+            DVec3::new(31.5, 12.0, -8.25),
+            DVec3::new(-140.0, 60.0, 77.0),
+        ] {
+            for time in [0.0, 3.75, 91.5] {
+                let decomposed = sample_decomposed(&gusty, position, time);
+                let sampled = sample(&gusty, position, time);
+                assert_eq!(
+                    decomposed.velocity(),
+                    sampled.velocity,
+                    "{position} @ {time}"
+                );
+                assert_eq!(decomposed.gust_front, sampled.gust_front);
+                assert_eq!(decomposed.octave_count, 5);
+            }
+        }
+    }
+
+    #[test]
+    fn each_octave_is_shorter_and_weaker_than_the_one_before() {
+        let decomposed = sample_decomposed(
+            &WindProfile {
+                turbulence_octaves: 4,
+                turbulence_roughness: 0.5,
+                ..profile()
+            },
+            DVec3::new(11.0, 6.0, -3.0),
+            2.0,
+        );
+        for octave in 1..decomposed.octave_count as usize {
+            assert!(
+                decomposed.octave_wavelengths_m[octave]
+                    < decomposed.octave_wavelengths_m[octave - 1],
+                "octave {octave} is the finer scale"
+            );
+        }
+        // The spectrum is the falloff, not the sampled gradient: a gradient can be near zero
+        // wherever its sinusoid crosses, so the amplitude envelope is what decays monotonically.
+        // At roughness 0.5 over four octaves the envelope sums to 1 + ½ + ¼ + ⅛; four octaves
+        // of equal weight would sum to 4.
+        assert!(
+            (decomposed.octave_amplitude_total - 1.875).abs() < 1e-6,
+            "the amplitude envelope decays by the roughness: {}",
+            decomposed.octave_amplitude_total
+        );
+        let sum: Vec3 = (0..decomposed.octave_count as usize)
+            .map(|octave| decomposed.octave_velocity(octave))
+            .fold(Vec3::ZERO, |sum, velocity| sum + velocity);
+        assert!(
+            (sum - decomposed.turbulence()).length() < 1e-4,
+            "the per-octave shares account for the turbulence term"
+        );
+    }
+
+    #[test]
+    fn octaves_beyond_the_cap_do_not_change_the_sample() {
+        let capped = WindProfile {
+            turbulence_octaves: MAX_TURBULENCE_OCTAVES as u32,
+            ..profile()
+        };
+        let beyond = WindProfile {
+            turbulence_octaves: MAX_TURBULENCE_OCTAVES as u32 + 5,
+            ..profile()
+        };
+        let position = DVec3::new(4.0, 3.0, 2.0);
+        assert_eq!(
+            sample(&capped, position, 1.0).velocity,
+            sample(&beyond, position, 1.0).velocity
+        );
+    }
+
+    #[test]
+    fn source_influence_is_the_term_the_composition_folds() {
+        let vortex = LocalWindSource {
+            kind: WindSourceKind::Vortex,
+            position: DVec3::new(3.0, 0.0, 3.0),
+            direction: Vec3::Z,
+            strength: 4.0,
+            radius: 12.0,
+            falloff: 0.25,
+        };
+        let calm = WindProfile {
+            speed: 0.0,
+            ..profile()
+        };
+        let position = DVec3::new(6.0, 1.0, 3.0);
+        let influence = source_influence(&calm, &vortex, position);
+        assert!(influence.weight > 0.0 && influence.distance > 0.0);
+        assert_eq!(
+            sample_composed(&calm, &[vortex], position, 0.0).velocity,
+            influence.added
+        );
+        let outside = source_influence(&calm, &vortex, DVec3::new(80.0, 0.0, 0.0));
+        assert_eq!(outside.weight, 0.0);
+        assert_eq!(outside.added, Vec3::ZERO);
     }
 
     #[test]

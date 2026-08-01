@@ -442,15 +442,8 @@ impl SceneSerialize for FogVolume {
 
 impl SceneSerialize for WindSource {
     fn to_json(&self) -> Value {
-        let kind = match self.kind {
-            saffron_wind::WindSourceKind::Directional => "directional",
-            saffron_wind::WindSourceKind::Point => "point",
-            saffron_wind::WindSourceKind::Vortex => "vortex",
-            saffron_wind::WindSourceKind::Wake => "wake",
-            saffron_wind::WindSourceKind::Volume => "volume",
-        };
         object([
-            ("kind", Value::String(kind.to_string())),
+            ("kind", Value::String(self.kind.name().to_string())),
             ("strength", f32_value(self.strength)),
             ("radius", f32_value(self.radius)),
             ("falloff", f32_value(self.falloff)),
@@ -459,13 +452,11 @@ impl SceneSerialize for WindSource {
     }
 
     fn load_json(&mut self, value: &Value) -> Result<()> {
-        self.kind = match json_string_or(value, "kind", "directional".to_string()).as_str() {
-            "point" => saffron_wind::WindSourceKind::Point,
-            "vortex" => saffron_wind::WindSourceKind::Vortex,
-            "wake" => saffron_wind::WindSourceKind::Wake,
-            "volume" => saffron_wind::WindSourceKind::Volume,
-            _ => saffron_wind::WindSourceKind::Directional,
-        };
+        self.kind = saffron_wind::WindSourceKind::from_name(&json_string_or(
+            value,
+            "kind",
+            "directional".to_string(),
+        ));
         self.strength = json_f32_or(value, "strength", 5.0);
         self.radius = json_f32_or(value, "radius", 20.0);
         self.falloff = json_f32_or(value, "falloff", 0.5);
@@ -703,6 +694,7 @@ impl SceneSerialize for Rigidbody {
             ("linearDamping", f32_value(self.linear_damping)),
             ("angularDamping", f32_value(self.angular_damping)),
             ("gravityFactor", f32_value(self.gravity_factor)),
+            ("windFactor", f32_value(self.wind_factor)),
             ("lockPosition", bvec3_to_json(self.lock_position)),
             ("lockRotation", bvec3_to_json(self.lock_rotation)),
             ("collisionLayer", Value::from(self.collision_layer)),
@@ -719,6 +711,7 @@ impl SceneSerialize for Rigidbody {
         self.linear_damping = json_f32_or(value, "linearDamping", 0.05);
         self.angular_damping = json_f32_or(value, "angularDamping", 0.05);
         self.gravity_factor = json_f32_or(value, "gravityFactor", 1.0);
+        self.wind_factor = json_f32_or(value, "windFactor", 0.0);
         self.lock_position = bvec3_from_json(&object_field(value, "lockPosition"));
         self.lock_rotation = bvec3_from_json(&object_field(value, "lockRotation"));
         self.collision_layer = json_i32_or(value, "collisionLayer", 0);

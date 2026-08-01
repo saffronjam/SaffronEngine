@@ -81,8 +81,8 @@ const EXPECT_REFPROBE_DEFAULT: &str = r#"{"boxExtent":{"x":10.0,"y":10.0,"z":10.
 const EXPECT_SKINNED: &str = r#"{"bones":["100","200"],"inverseBind":[[1.0,0.0,0.0,0.0,0.0,1.0,0.0,0.0,0.0,0.0,1.0,0.0,0.0,0.0,0.0,1.0]],"mesh":"11","rootBone":"22"}"#;
 const EXPECT_FOOTIK: &str = r#"{"chains":[{"end":2,"mid":1,"poleVector":{"x":0.0,"y":0.0,"z":1.0},"upper":0}],"enabled":true,"groundHeight":0.5}"#;
 const EXPECT_BONEPHYS: &str = r#"{"bones":[{"driveDamping":0.20000000298023224,"driveMaxForce":100.0,"driveStiffness":1.0,"joint":"swingtwist","mass":2.0,"shapeHalfExtents":{"x":0.10000000149011612,"y":0.20000000298023224,"z":0.30000001192092896},"swingTwistLimits":{"x":0.5,"y":0.6000000238418579,"z":0.699999988079071}}]}"#;
-const EXPECT_RIGIDBODY_DEFAULT: &str = r#"{"angularDamping":0.05000000074505806,"collisionLayer":0,"gravityFactor":1.0,"linearDamping":0.05000000074505806,"lockPosition":{"x":false,"y":false,"z":false},"lockRotation":{"x":false,"y":false,"z":false},"mass":1.0,"motion":"dynamic"}"#;
-const EXPECT_RIGIDBODY_KIN: &str = r#"{"angularDamping":0.20000000298023224,"collisionLayer":3,"gravityFactor":0.0,"linearDamping":0.10000000149011612,"lockPosition":{"x":true,"y":false,"z":true},"lockRotation":{"x":false,"y":true,"z":false},"mass":5.0,"motion":"kinematic"}"#;
+const EXPECT_RIGIDBODY_DEFAULT: &str = r#"{"angularDamping":0.05000000074505806,"collisionLayer":0,"gravityFactor":1.0,"linearDamping":0.05000000074505806,"lockPosition":{"x":false,"y":false,"z":false},"lockRotation":{"x":false,"y":false,"z":false},"mass":1.0,"motion":"dynamic","windFactor":0.0}"#;
+const EXPECT_RIGIDBODY_KIN: &str = r#"{"angularDamping":0.20000000298023224,"collisionLayer":3,"gravityFactor":0.0,"linearDamping":0.10000000149011612,"lockPosition":{"x":true,"y":false,"z":true},"lockRotation":{"x":false,"y":true,"z":false},"mass":5.0,"motion":"kinematic","windFactor":1.5}"#;
 const EXPECT_COLLIDER_DEFAULT: &str = r#"{"halfExtents":{"x":0.5,"y":0.5,"z":0.5},"isSensor":false,"material":{"friction":0.5,"restitution":0.0},"offset":{"x":0.0,"y":0.0,"z":0.0},"shape":"box","sourceMesh":"0"}"#;
 const EXPECT_COLLIDER_CAPSULE: &str = r#"{"halfExtents":{"x":0.30000001192092896,"y":1.0,"z":0.30000001192092896},"isSensor":true,"material":{"friction":0.800000011920929,"restitution":0.4000000059604645},"offset":{"x":0.0,"y":0.5,"z":0.0},"shape":"capsule","sourceMesh":"77"}"#;
 const EXPECT_COLLIDER_SPHERE: &str = r#"{"halfExtents":{"x":0.5,"y":0.5,"z":0.5},"isSensor":false,"material":{"friction":0.8999999761581421,"restitution":0.5},"offset":{"x":0.0,"y":0.0,"z":0.0},"shape":"sphere","sourceMesh":"0"}"#;
@@ -338,6 +338,7 @@ fn rigidbody_matches_cpp() {
         linear_damping: 0.1,
         angular_damping: 0.2,
         gravity_factor: 0.0,
+        wind_factor: 1.5,
         lock_position: BVec3::new(true, false, true),
         lock_rotation: BVec3::new(false, true, false),
         collision_layer: 3,
