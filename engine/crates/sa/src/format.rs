@@ -48,6 +48,7 @@ pub(crate) fn format_text(cmd: &str, result: &Value) -> Vec<String> {
         "vegetation-promote" | "vegetation-demote" | "vegetation-fell" => {
             vec![format_promotion(result)]
         }
+        "vegetation-plant-vitals" => vec![format_plant_vitals(result)],
         "vegetation-telemetry" => format_vegetation_telemetry(result),
         "plant-elements" => format_plant_elements(result),
         "plant-create" | "plant-graph" | "plant-graph-set" | "plant-growth" => {
@@ -297,10 +298,11 @@ pub(crate) fn format_clip(clip: &Value, prefix: &str, name_width: usize) -> Stri
     )
 }
 
-/// The `render-stats` one-liner.
+/// The `render-stats` one-liner; the device-local memory reads `used/budget` in MiB.
 pub(crate) fn format_render_stats(result: &Value) -> String {
+    const MIB: f64 = 1024.0 * 1024.0;
     format!(
-        "cpu={:.2}ms  gpu={:.2}ms  wait={:.2}ms  fps={:.0}  draws={}  tris={}  binds={}  pso+={}{}",
+        "cpu={:.2}ms  gpu={:.2}ms  wait={:.2}ms  fps={:.0}  draws={}  tris={}  binds={}  pso+={}  vram={:.0}/{:.0}MiB{}",
         field_f64(result, "cpuFrameMs"),
         field_f64(result, "gpuFrameMs"),
         field_f64(result, "cpuWaitMs"),
@@ -309,6 +311,8 @@ pub(crate) fn format_render_stats(result: &Value) -> String {
         field_i64(result, "triangles"),
         field_i64(result, "descriptorBinds"),
         field_i64(result, "pipelinesCreated"),
+        field_u64(result, "vramUsageBytes") as f64 / MIB,
+        field_u64(result, "vramBudgetBytes") as f64 / MIB,
         software_gpu_suffix(result),
     )
 }
@@ -504,12 +508,18 @@ pub(crate) fn format_vegetation_telemetry(result: &Value) -> Vec<String> {
             stages(result.get("average").unwrap_or(&null))
         ),
         format!(
-            "  syncs={}  queries={} (hits {})  mutations={} ({} bytes)  snapshots={} ({} bytes)  ecologyTicks={}",
+            "  syncs={}  queries={} (hits {}, cells {}, nodes {}, rows {})  mutations={} ({} bytes)",
             field_str(work, "synchronizations"),
             field_str(work, "queries"),
             field_str(work, "queryHits"),
+            field_str(work, "queryGenerationsVisited"),
+            field_str(work, "queryNodesVisited"),
+            field_str(work, "queryRowsTested"),
             field_str(work, "mutations"),
             field_str(work, "mutationBytes"),
+        ),
+        format!(
+            "  snapshots={} ({} bytes)  ecologyTicks={}",
             field_str(work, "snapshots"),
             field_str(work, "snapshotBytes"),
             field_str(work, "ecologyTicks"),
@@ -560,7 +570,7 @@ pub(crate) fn format_plant_elements(result: &Value) -> Vec<String> {
     for element in field_array(result, "elements") {
         let position = field_array(&element, "positionBits");
         lines.push(format!(
-            "  elem {:>34}  {:<8} at=({:.2}, {:.2}, {:.2})  size={:.3}  slot={}",
+            "  elem {:>34}  {:<8} at=({:.2}, {:.2}, {:.2})  size={:.3}  slot={}  axis={}",
             field_str(&element, "id"),
             field_str(&element, "element"),
             q16(position.first().and_then(Value::as_i64).unwrap_or(0)),
@@ -568,6 +578,7 @@ pub(crate) fn format_plant_elements(result: &Value) -> Vec<String> {
             q16(position.get(2).and_then(Value::as_i64).unwrap_or(0)),
             q16(field_i64(&element, "sizeBits")),
             field_u64(&element, "materialSlot"),
+            field_str(&element, "axis"),
         ));
     }
     lines
@@ -792,6 +803,20 @@ pub(crate) fn format_promotion(result: &Value) -> String {
     format!(
         "plant={}  state={label}{entity}",
         field_str(result, "plant")
+    )
+}
+
+/// The `vegetation-plant-vitals` line: the live biology of one promoted plant's entity view.
+pub(crate) fn format_plant_vitals(result: &Value) -> String {
+    format!(
+        "plant={}  entity={}  lifecycle={}  health={}  moisture={}  fuel={}  tick={}",
+        field_str(result, "plant"),
+        field_str(result, "entity"),
+        field_str(result, "lifecycle"),
+        field_u64(result, "health"),
+        field_u64(result, "moisture"),
+        field_u64(result, "fuel"),
+        field_str(result, "ecologyTick"),
     )
 }
 

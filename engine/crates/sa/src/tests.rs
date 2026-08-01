@@ -480,12 +480,13 @@ fn format_render_stats_line() {
     let result = json!({
         "cpuFrameMs": 4.5, "gpuFrameMs": 3.25, "cpuWaitMs": 0.5, "fps": 144.0,
         "drawCalls": 120, "triangles": 50000, "descriptorBinds": 12, "pipelinesCreated": 2,
+        "vramUsageBytes": 1_610_612_736u64, "vramBudgetBytes": 8_589_934_592u64,
         "softwareGpu": true,
     });
     assert_eq!(
         format_text("render-stats", &result),
         vec![
-            "cpu=4.50ms  gpu=3.25ms  wait=0.50ms  fps=144  draws=120  tris=50000  binds=12  pso+=2  [software-gpu]"
+            "cpu=4.50ms  gpu=3.25ms  wait=0.50ms  fps=144  draws=120  tris=50000  binds=12  pso+=2  vram=1536/8192MiB  [software-gpu]"
         ]
     );
 }
@@ -496,7 +497,7 @@ fn format_render_stats_omits_software_suffix() {
     let lines = format_text("render-stats", &result);
     assert!(lines[0].starts_with("cpu=0.00ms"));
     assert!(!lines[0].contains("software-gpu"));
-    assert!(lines[0].ends_with("pso+=0"));
+    assert!(lines[0].ends_with("vram=0/0MiB"));
 }
 
 #[test]
@@ -773,19 +774,45 @@ fn format_vegetation_nav_counts_obstacles_per_cell() {
     );
 }
 
+/// The traversal terms are the only reason a query's cost is legible, so the counter block prints
+/// each of them rather than the hit count alone.
+#[test]
+fn format_vegetation_telemetry_prints_every_query_traversal_term() {
+    let result = json!({
+        "last": {"residencyUs": 420, "promotionUs": 0, "collisionUs": 110, "navigationUs": 30,
+                 "ecologyUs": 180, "totalUs": 740},
+        "average": {"residencyUs": 390, "promotionUs": 10, "collisionUs": 90, "navigationUs": 40,
+                    "ecologyUs": 60, "totalUs": 590},
+        "work": {
+            "synchronizations": "1284", "queries": "17", "queryHits": "402",
+            "queryGenerationsVisited": "34", "queryNodesVisited": "511", "queryRowsTested": "1980",
+            "mutations": "3", "mutationBytes": "612",
+            "snapshots": "1", "snapshotBytes": "48210", "ecologyTicks": "96",
+        },
+        "collisionBodies": "142", "navigationContributions": "88", "promoted": "1",
+    });
+    let lines = format_text("vegetation-telemetry", &result);
+    assert_eq!(
+        lines[2],
+        "  syncs=1284  queries=17 (hits 402, cells 34, nodes 511, rows 1980)  mutations=3 (612 bytes)"
+    );
+    assert_eq!(lines[3], "  snapshots=1 (48210 bytes)  ecologyTicks=96");
+    assert_eq!(lines[4], "  bodies=142  navContributions=88  promoted=1");
+}
+
 #[test]
 fn format_vegetation_events_lists_transitions_then_the_cursor() {
     let result = json!({
         "events": [
             {
                 "seq": "7", "transaction": "12",
-                "cell": {"x": "0", "y": "0", "z": "0", "level": 0},
+                "cell": {"coordinates": ["0", "0", "0"], "level": 0},
                 "plant": "40aabbccddeeff00112233445566778899",
                 "transition": {"kind": "damaged", "amount": 16000, "health": 40000},
             },
             {
                 "seq": "8", "transaction": "12",
-                "cell": {"x": "0", "y": "0", "z": "0", "level": 0},
+                "cell": {"coordinates": ["0", "0", "0"], "level": 0},
                 "transition": {"kind": "disturbed", "categories": 3},
             },
         ],
