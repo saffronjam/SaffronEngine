@@ -656,7 +656,8 @@ async function runContract(): Promise<number> {
     if (help.envelope.ok !== true || !Array.isArray(help.envelope.result?.commands)) {
       errors.push("help: expected ok:true with result.commands");
     } else {
-      const live = new Set(help.envelope.result.commands.map((command: any) => command.name));
+      const liveCommands = help.envelope.result.commands as { name: string }[];
+      const live = new Set(liveCommands.map((command) => command.name));
       const known = new Set([
         ...manifest.commands.map((command) => command.name),
         ...manifest.skips.map((skip) => skip.name),

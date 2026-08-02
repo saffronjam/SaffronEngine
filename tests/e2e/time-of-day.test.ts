@@ -4,10 +4,7 @@
 
 import { afterAll, beforeAll, expect, test } from "bun:test";
 import { Engine } from "./harness.ts";
-import type {
-  SetTimeOfDayParams,
-  Vec3,
-} from "@saffron/protocol";
+import type { SetTimeOfDayParams, Vec3 } from "@saffron/protocol";
 import { bootEngine, captureViewport, Cleaner, prepareScene, trackEntity } from "./test-utils.ts";
 
 let engine: Engine;

@@ -8,11 +8,7 @@
 import { afterAll, afterEach, beforeAll, expect, test } from "bun:test";
 import type { Engine } from "./harness.ts";
 import { Cleaner } from "./test-utils.ts";
-import {
-  attachScripts,
-  bootScriptEngine,
-  stopIfPlaying,
-} from "./script-utils.ts";
+import { attachScripts, bootScriptEngine, stopIfPlaying } from "./script-utils.ts";
 
 const SCRIPTS = {
   // Writes derive only from never-written fields, so every tick is idempotent.
@@ -323,8 +319,7 @@ test("key edges (is_key_pressed) fire once per press; mouse position + buttons r
   await engine.call("script-input", { keys: [], mouseX: 3, mouseY: 4, mouseButtons: ["left"] });
   await engine.call("play");
   await engine.settle(150);
-  const t = (await engine.call("inspect", { entity: mouse.id })).components.Transform!
-    .translation;
+  const t = (await engine.call("inspect", { entity: mouse.id })).components.Transform!.translation;
   expect(t.x).toBeCloseTo(3);
   expect(t.y).toBeCloseTo(4);
   expect(t.z).toBeCloseTo(1); // left button down

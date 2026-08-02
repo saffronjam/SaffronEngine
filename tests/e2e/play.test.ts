@@ -123,7 +123,9 @@ test("scene/project swaps are blocked during play", async () => {
   await engine.call("play");
   await expect(engine.call("load-scene", { path: "nope.json" })).rejects.toThrow(/stop play first/);
   await expect(engine.call("load-project", { path: "nope" })).rejects.toThrow(/stop play first/);
-  await expect(engine.call("delete-asset", { asset: "anything" })).rejects.toThrow(/stop play first/);
+  await expect(engine.call("delete-asset", { asset: "anything" })).rejects.toThrow(
+    /stop play first/,
+  );
   await engine.call("stop");
 });
 

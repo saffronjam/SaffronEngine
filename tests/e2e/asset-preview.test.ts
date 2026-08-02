@@ -72,7 +72,9 @@ test("play during preview is rejected; enter during play is rejected", async () 
   await engine.call("exit-asset-preview");
 
   await engine.call("play");
-  await expect(engine.call("enter-asset-preview", { asset: legModel })).rejects.toThrow(/stop play/);
+  await expect(engine.call("enter-asset-preview", { asset: legModel })).rejects.toThrow(
+    /stop play/,
+  );
   await engine.call("stop");
 });
 

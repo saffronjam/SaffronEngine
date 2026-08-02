@@ -6,7 +6,6 @@
 import { afterAll, beforeAll, expect, test } from "bun:test";
 import { Engine } from "./harness.ts";
 
-
 let engine: Engine;
 const stats = () => engine.call("render-stats");
 

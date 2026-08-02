@@ -32,11 +32,7 @@ beforeAll(async () => {
   engine = await bootEngine(cleaner, { SAFFRON_SCRATCH_PROJECT: "1" });
   await prepareScene(engine, { camera: CAMERA });
   trackEntity(cleaner, engine, await engine.call("add-entity", { preset: "plane" }));
-  const caster = trackEntity(
-    cleaner,
-    engine,
-    await engine.call("add-entity", { preset: "cube" }),
-  );
+  const caster = trackEntity(cleaner, engine, await engine.call("add-entity", { preset: "cube" }));
   await engine.call("set-component", {
     entity: caster.id,
     component: "Transform",
@@ -94,7 +90,6 @@ test("the atlas converges back to its settled image after wind and camera churn"
   expect(stats.vsm.overflow).toBe(0);
   expect(engine.validationErrors()).toEqual([]);
 });
-
 
 test("a starved page budget still reconverges to the reference image", async () => {
   // Throttling the atlas to ONE page a frame means the dirty set outruns the refresh, which is the

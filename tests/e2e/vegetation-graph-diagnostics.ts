@@ -38,7 +38,10 @@ export async function castSurfaceRay(engine: Engine): Promise<void> {
     translation: { x: 500, y: 0, z: 500 },
   });
   await engine.settle(100);
-  const cast = await engine.call("query-surface-ray", { originM: [500, 100, 500], direction: [0, -1, 0] });
+  const cast = await engine.call("query-surface-ray", {
+    originM: [500, 100, 500],
+    direction: [0, -1, 0],
+  });
   expect(cast.hit).toBe(true);
   expect(cast.position![1]).toBeLessThan(100);
   expect(cast.normal![1]).toBeGreaterThan(0.5);

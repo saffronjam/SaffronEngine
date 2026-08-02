@@ -2,7 +2,12 @@ import { $ } from "bun";
 import { stat } from "node:fs/promises";
 import { join } from "node:path";
 
-const RESOURCES = ["icudtl.dat", "resources.pak", "v8_context_snapshot.bin", "chrome_100_percent.pak"];
+const RESOURCES = [
+  "icudtl.dat",
+  "resources.pak",
+  "v8_context_snapshot.bin",
+  "chrome_100_percent.pak",
+];
 
 async function sizeOf(path: string): Promise<number> {
   return stat(path)
@@ -21,7 +26,10 @@ async function intact(cefDir: string): Promise<boolean> {
 /// An interrupted cef-dll-sys extraction leaves 0-byte icudtl.dat/*.pak that it never re-provisions
 /// (it only downloads when the dir is absent), and CEF aborts with "Couldn't mmap icu data file".
 /// Purge and rebuild once on a truncated resource; throw if it recurs.
-export async function verifyCefRuntime(shellDir: string, profile: "release" | "debug"): Promise<void> {
+export async function verifyCefRuntime(
+  shellDir: string,
+  profile: "release" | "debug",
+): Promise<void> {
   const cefDir = join(shellDir, "target", profile);
   if (await intact(cefDir)) return;
 

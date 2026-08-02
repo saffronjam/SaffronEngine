@@ -100,5 +100,4 @@ test("an exported package carries its cooked vegetation and no authored sources"
   expect(files.some((file) => file.endsWith(".sbiome"))).toBe(false);
   expect(files.some((file) => file.endsWith(".svegmap"))).toBe(false);
   expect(engine.validationErrors()).toEqual([]);
-
 });

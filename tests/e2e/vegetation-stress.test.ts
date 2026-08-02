@@ -21,7 +21,12 @@ import type {
 } from "@saffron/protocol";
 import type { Engine } from "./harness.ts";
 import { Cleaner, bootEngine, trackEntity } from "./test-utils.ts";
-import { authoredAssets, awaitCook, installPlantSources, type VegetationFixture } from "./vegetation-utils.ts";
+import {
+  authoredAssets,
+  awaitCook,
+  installPlantSources,
+  type VegetationFixture,
+} from "./vegetation-utils.ts";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const STRESS_FIXTURES = [
@@ -58,9 +63,10 @@ function plantSummary(result: VegetationAssetSummaryResult): PlantAssetSummaryDt
 // is modelled contributes nothing to pack. `plant-atlas` refuses a family that packed none, so
 // the serration row must return one and the two geometry-first rows must not.
 async function assertCoverageAtlas(engine: Engine, fixture: VegetationFixture) {
-  const atlas = await engine
-    .call("plant-atlas", { plant: fixture.plant, level: 0 })
-    .then((result) => result, (error: Error) => error);
+  const atlas = await engine.call("plant-atlas", { plant: fixture.plant, level: 0 }).then(
+    (result) => result,
+    (error: Error) => error,
+  );
   if (fixture.stress === "serration") {
     expect(atlas).not.toBeInstanceOf(Error);
     const packed = atlas as PlantAtlasResult;

@@ -6,11 +6,7 @@
 import { afterAll, beforeAll, expect, test } from "bun:test";
 import type { Engine } from "./harness.ts";
 import { Cleaner, bootEngine } from "./test-utils.ts";
-import {
-  authoredAssets,
-  loadFixture,
-  type VegetationFixture,
-} from "./vegetation-utils.ts";
+import { authoredAssets, loadFixture, type VegetationFixture } from "./vegetation-utils.ts";
 import {
   cancelPreparedEvaluation,
   bindWorld,

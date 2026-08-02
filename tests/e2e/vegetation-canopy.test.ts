@@ -12,11 +12,7 @@
 // mutation re-mirrors its cell.
 
 import { afterAll, beforeAll, expect, test } from "bun:test";
-import type {
-  PlantId,
-  VegetationMutationRecordDto,
-  WorldCellDto,
-} from "@saffron/protocol";
+import type { PlantId, VegetationMutationRecordDto, WorldCellDto } from "@saffron/protocol";
 import type { Engine } from "./harness.ts";
 import { decodeRgb8Png, meanAbsoluteDifference } from "./image.ts";
 import { Cleaner, bootEngine, captureViewport, prepareScene } from "./test-utils.ts";
@@ -117,8 +113,7 @@ test("a confirmed phenotype flip re-mirrors the cell and masks the crown's recor
   // geometry passes the record assertion while the image never changes).
   await engine.call("set-hierarchy-cut", { cut: "fine" });
   await engine.settle(1500);
-  const records = async () =>
-    (await engine.call("gpu-scene-stats")).visibility.records;
+  const records = async () => (await engine.call("gpu-scene-stats")).visibility.records;
   const healthy = await records();
   const healthyFrame = decodeRgb8Png(await captureViewport(engine, cleaner, "canopy-healthy"));
 

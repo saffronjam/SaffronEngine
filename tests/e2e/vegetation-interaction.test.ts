@@ -93,7 +93,9 @@ async function assertOneOwnerPerPlant(macro: number) {
   expect(Number(status.collision!.residentBodies) + promoted).toBe(macro);
 
   // Navigation: every plant declares, and a promoted one declares dynamic rather than static.
-  const declaring = new Set(nav.cells.flatMap((cell) => cell.contributions).map((row) => row.plant));
+  const declaring = new Set(
+    nav.cells.flatMap((cell) => cell.contributions).map((row) => row.plant),
+  );
   expect(declaring.size).toBe(macro);
   const dynamic = new Set(
     nav.cells
@@ -185,7 +187,6 @@ test("a resident cell drives collision, promotion, felling, events, and navigati
         break;
       }
       if (Date.now() >= deadline) {
-        const status = await available();
         throw new Error(
           `timeout waiting for vegetation collision bodies: ${JSON.stringify({
             collision: status.collision,
@@ -788,7 +789,8 @@ async function ownerCounts() {
     views: entities.entities.filter((entity) => entity.name.startsWith("Plant ")).length,
     bulkInstances: render.cells.reduce((total, row) => total + Number(row.plants), 0),
     bodies: Number(status.collision!.residentBodies),
-    declaring: new Set(nav.cells.flatMap((cell) => cell.contributions).map((row) => row.plant)).size,
+    declaring: new Set(nav.cells.flatMap((cell) => cell.contributions).map((row) => row.plant))
+      .size,
   };
 }
 
@@ -880,9 +882,7 @@ test("a generation change under a promotion abandons the view without a write-ba
   const carried = await engine.call("vegetation-runtime-inspect", { plant: removedPlant });
   expect(carried.persistent.some((entry) => entry.tombstoned)).toBe(true);
   expect(
-    (await queryPlants(engine, BOUNDS, 4096)).hits.some(
-      (hit) => hit.plant.plant === removedPlant,
-    ),
+    (await queryPlants(engine, BOUNDS, 4096)).hits.some((hit) => hit.plant.plant === removedPlant),
   ).toBe(false);
 
   await engine.call("stop");

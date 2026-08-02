@@ -44,7 +44,9 @@ test("move-asset places an asset in a folder and rejects an unknown one", async 
   await engine.call("create-asset-folder", { folder: "a/b" });
   await engine.call("move-asset", { asset: modelId, folder: "a/b" });
   expect(await folderOf(modelId)).toBe("a/b");
-  await expect(engine.call("move-asset", { asset: modelId, folder: "does/not/exist" })).rejects.toThrow();
+  await expect(
+    engine.call("move-asset", { asset: modelId, folder: "does/not/exist" }),
+  ).rejects.toThrow();
 });
 
 test("rename-asset-folder cascades to descendant folders and the assets under them", async () => {

@@ -39,8 +39,8 @@ afterAll(async () => {
 });
 
 // Creates a family from the starter graph. A zero seed derives one from the name.
-function createPlant(name: string, materials: string[], folder = "") {
-  return engine.call("plant-create", { name, folder, seed: "0", materials });
+function createPlant(name: string, slotMaterials: string[], folder = "") {
+  return engine.call("plant-create", { name, folder, seed: "0", materials: slotMaterials });
 }
 
 // Two materials for the graph's slots: bark and leaves.
@@ -97,13 +97,9 @@ test("two families created the same way are two different individuals", async ()
   expect(first.growth.graph).not.toBe(second.growth.graph);
 
   // A family with no materials for its slots is refused rather than binding slot zero twice.
-  await expect(
-    createPlant("E2E native short", [bark]),
-  ).rejects.toThrow();
+  await expect(createPlant("E2E native short", [bark])).rejects.toThrow();
   // And an empty name is refused.
-  await expect(
-    createPlant("  ", [String(bark), String(leaf)]),
-  ).rejects.toThrow();
+  await expect(createPlant("  ", [String(bark), String(leaf)])).rejects.toThrow();
   expect(engine.validationErrors()).toEqual([]);
 });
 
@@ -240,7 +236,9 @@ test("a graft declares its hero mesh on the family and the graph names it", asyn
     plant,
     graph: {
       ...read.graph,
-      edits: [{ target: target.id, action: { kind: "graft", source, selector: { kind: "whole" } } }],
+      edits: [
+        { target: target.id, action: { kind: "graft", source, selector: { kind: "whole" } } },
+      ],
     },
     grafts: [graft],
     modules: [],

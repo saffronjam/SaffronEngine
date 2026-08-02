@@ -531,7 +531,7 @@ export function InspectorPanel() {
       // Weights are canonical 0..1 end-to-end (no /100). Each scrub coalesces into one
       // `set-morph-weights` per edit-burst and gates the reconcile poll via `dragActive`.
       const weights = Array.isArray(dto.weights) ? (dto.weights as number[]) : [];
-      const names = Array.isArray(dto.names) ? (dto.names as string[]) : [];
+      const targetNames = Array.isArray(dto.names) ? (dto.names as string[]) : [];
       if (weights.length === 0) {
         return <span className="text-[11px] text-muted-foreground">No morph targets.</span>;
       }
@@ -546,7 +546,7 @@ export function InspectorPanel() {
           {weights.map((weight, k) => (
             <div key={k} className="grid grid-cols-[78px_1fr] items-center gap-1.5">
               <Label className="truncate text-[11px] font-normal text-muted-foreground">
-                {names[k] ?? `Target ${k}`}
+                {targetNames[k] ?? `Target ${k}`}
               </Label>
               <div className="min-w-0">
                 <SliderField

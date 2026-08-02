@@ -17,7 +17,12 @@ async function collider(name: string, y: number, half: Vec3): Promise<string> {
   const id = (await engine.call("create-entity", { name })).id;
   await engine.call("set-transform", { entity: id, translation: { x: 0, y, z: 0 } });
   await engine.call("add-component", { entity: id, component: "Collider" });
-  await engine.call("set-component-field", { entity: id, component: "Collider", field: "halfExtents", value: half });
+  await engine.call("set-component-field", {
+    entity: id,
+    component: "Collider",
+    field: "halfExtents",
+    value: half,
+  });
   return id;
 }
 

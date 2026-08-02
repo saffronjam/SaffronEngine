@@ -4,11 +4,7 @@
 import { afterAll, afterEach, beforeAll, expect, test } from "bun:test";
 import type { Engine } from "./harness.ts";
 import { Cleaner } from "./test-utils.ts";
-import {
-  attachScripts,
-  bootScriptEngine,
-  stopIfPlaying,
-} from "./script-utils.ts";
+import { attachScripts, bootScriptEngine, stopIfPlaying } from "./script-utils.ts";
 
 const SCRIPTS = {
   "pusher.lua": `local Pusher = {}

@@ -136,11 +136,7 @@ export async function bindVegetationField(
   fixture: VegetationFixture,
   name: string,
 ): Promise<EntityRef> {
-  const world = trackEntity(
-    cleaner,
-    engine,
-    await engine.call("create-entity", { name }),
-  );
+  const world = trackEntity(cleaner, engine, await engine.call("create-entity", { name }));
   await engine.call("add-component", { entity: world.id, component: "VegetationField" });
   await engine.call("set-component", {
     entity: world.id,

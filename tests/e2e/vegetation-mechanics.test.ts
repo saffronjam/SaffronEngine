@@ -118,9 +118,7 @@ test("wind moves the plant and the prepass records it", () => {
 test("a still field leaves the recorded sway at rest", () => {
   // The response scales the field; with no field there is nothing to scale, which is the
   // control that separates "the response is applied" from "the numbers are noise".
-  expect(Math.hypot(...stillRecord.swayCurrentM)).toBeLessThan(
-    Math.hypot(...record.swayCurrentM),
-  );
+  expect(Math.hypot(...stillRecord.swayCurrentM)).toBeLessThan(Math.hypot(...record.swayCurrentM));
   expect(stillRecord.branchAmplitudeM).toBeLessThan(record.branchAmplitudeM);
 });
 
@@ -163,8 +161,7 @@ test("a camera jump across a cascade edge marks the plants reactive; standing st
   //
   // The counter is a running total on purpose. A reset is an event lasting one frame, and no
   // caller can time a stats query to the frame the camera crossed an edge.
-  const resets = async () =>
-    (await engine.call("gpu-scene-stats")).visibility.interactionResets;
+  const resets = async () => (await engine.call("gpu-scene-stats")).visibility.interactionResets;
 
   const idle = await resets();
   await engine.settle(500);

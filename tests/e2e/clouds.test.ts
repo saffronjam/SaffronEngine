@@ -2,10 +2,7 @@
 // resources, lit march, temporal reconstruction, and lasting density debugger.
 
 import { afterAll, beforeAll, expect, test } from "bun:test";
-import type {
-  SetCloudsParams,
-  SetWindParams,
-} from "@saffron/protocol";
+import type { SetCloudsParams, SetWindParams } from "@saffron/protocol";
 import { Engine } from "./harness.ts";
 import { bootEngine, captureViewport, Cleaner, prepareScene } from "./test-utils.ts";
 

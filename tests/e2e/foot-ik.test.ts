@@ -41,7 +41,11 @@ beforeAll(async () => {
   await engine.call("set-component", {
     entity: rigId,
     component: "FootIk",
-    json: { enabled: false, groundHeight: 0, chains: [{ upper: 0, mid: 1, end: 2, poleVector: { x: -1, y: 0, z: 0 } }] },
+    json: {
+      enabled: false,
+      groundHeight: 0,
+      chains: [{ upper: 0, mid: 1, end: 2, poleVector: { x: -1, y: 0, z: 0 } }],
+    },
   });
   // Enter Play and bend the knee, then freeze (playing=false) at a bent pose: the ankle is now
   // below full reach, so it has slack for the IK to lift, and the readings compare one pose.
@@ -75,7 +79,11 @@ test("raising the ground lifts the ankle's world Y to track the ground target", 
 });
 
 test("disabling foot IK reverts the ankle to its animated position", async () => {
-  await engine.call("set-foot-ik", { entity: rigId, enabled: true, groundHeight: (await worldY(ankleId)) + 0.08 });
+  await engine.call("set-foot-ik", {
+    entity: rigId,
+    enabled: true,
+    groundHeight: (await worldY(ankleId)) + 0.08,
+  });
   await engine.settle(300);
   const lifted = await worldY(ankleId);
   await engine.call("set-foot-ik", { entity: rigId, enabled: false });

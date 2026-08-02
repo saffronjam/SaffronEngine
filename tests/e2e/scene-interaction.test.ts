@@ -31,11 +31,7 @@ afterEach(async () => {
 });
 
 async function makeCube(name: string, translation: Vec3): Promise<EntityRef> {
-  const ref = trackEntity(
-    caseCleaner,
-    engine,
-    await engine.call("add-entity", { args: ["cube"] }),
-  );
+  const ref = trackEntity(caseCleaner, engine, await engine.call("add-entity", { args: ["cube"] }));
   await engine.call("rename-entity", { entity: ref.id, name });
   await engine.call("set-transform", { entity: ref.id, translation });
   return ref;
@@ -155,7 +151,7 @@ test("gizmo drag on a parented child moves it in world space and rebases the loc
   await engine.call("save-scene", { path });
   await engine.call("load-scene", { path });
   await engine.settle();
-  const reloaded = await engine.call("inspect", { entity: "g-child", });
+  const reloaded = await engine.call("inspect", { entity: "g-child" });
   const rt = reloaded.components.Transform!.translation;
   expect(rt.x).toBeCloseTo(t.x, 4);
   expect(rt.y).toBeCloseTo(t.y, 4);
@@ -191,7 +187,7 @@ test("set-parent preserves world position, keeps the selection, and detaches cle
 
   // Detach restores the original local translation (world preserved both ways).
   await engine.call("set-parent", { entity: child.id, parent: "0" });
-  const detached = await engine.call("inspect", { entity: child.id, });
+  const detached = await engine.call("inspect", { entity: child.id });
   expect(detached.components.Transform!.translation.x).toBeCloseTo(-1, 4);
   expect(detached.components.Transform!.translation.y).toBeCloseTo(0.5, 4);
   expect(detached.components.Transform!.translation.z).toBeCloseTo(3, 4);

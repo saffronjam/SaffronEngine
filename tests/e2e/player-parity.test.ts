@@ -64,11 +64,7 @@ beforeAll(async () => {
 
   // Something to render, and a scene camera for the player to render it through.
   trackEntity(cleaner, engine, await engine.call("add-entity", { preset: "plane" }));
-  const cube = trackEntity(
-    cleaner,
-    engine,
-    await engine.call("add-entity", { preset: "cube" }),
-  );
+  const cube = trackEntity(cleaner, engine, await engine.call("add-entity", { preset: "cube" }));
   await engine.call("set-component", {
     entity: cube.id,
     component: "Transform",
@@ -111,50 +107,46 @@ afterAll(async () => {
   await cleaner.cleanup();
 });
 
-test(
-  "the exported player's frame matches the host's play-mode frame",
-  async () => {
-    expect(existsSync(playerBinary)).toBe(true);
+test("the exported player's frame matches the host's play-mode frame", async () => {
+  expect(existsSync(playerBinary)).toBe(true);
 
-    // The editor-camera frame, captured before play so it is the pose `prepareScene` set.
-    const editFrame = decodeRgb8Png(await captureViewport(engine, cleaner, "parity-edit"));
+  // The editor-camera frame, captured before play so it is the pose `prepareScene` set.
+  const editFrame = decodeRgb8Png(await captureViewport(engine, cleaner, "parity-edit"));
 
-    // Play switches the host to the scene's primary camera — the same one the player uses.
-    await engine.call("play");
-    await engine.settle(1200);
-    const playFrame = decodeRgb8Png(await captureViewport(engine, cleaner, "parity-play"));
+  // Play switches the host to the scene's primary camera — the same one the player uses.
+  await engine.call("play");
+  await engine.settle(1200);
+  const playFrame = decodeRgb8Png(await captureViewport(engine, cleaner, "parity-play"));
 
-    const capture = join(tmpdir(), `saffron-parity-${process.pid}.png`);
-    cleaner.defer(() => rmSync(capture, { force: true }));
-    rmSync(capture, { force: true });
-    const run = spawnSync(playerBinary, [], {
-      cwd: playerBinary.replace(/\/[^/]+$/, ""),
-      env: {
-        ...process.env,
-        SAFFRON_EDITOR_NATIVE_VIEWPORT: "1",
-        SAFFRON_EXIT_AFTER_FRAMES: "48",
-        SAFFRON_CAPTURE_FRAME: capture,
-      },
-      encoding: "utf8",
-      timeout: 120_000,
-    });
-    // A packaged player must exit cleanly. Teardown is where it historically did not: the
-    // GPU-scene mirror's retained handles kept the device alive into `vkDestroyInstance`, which
-    // faulted inside the driver, so a nonzero status here is a real regression and not noise.
-    expect(run.status).toBe(0);
-    expect(existsSync(capture)).toBe(true);
+  const capture = join(tmpdir(), `saffron-parity-${process.pid}.png`);
+  cleaner.defer(() => rmSync(capture, { force: true }));
+  rmSync(capture, { force: true });
+  const run = spawnSync(playerBinary, [], {
+    cwd: playerBinary.replace(/\/[^/]+$/, ""),
+    env: {
+      ...process.env,
+      SAFFRON_EDITOR_NATIVE_VIEWPORT: "1",
+      SAFFRON_EXIT_AFTER_FRAMES: "48",
+      SAFFRON_CAPTURE_FRAME: capture,
+    },
+    encoding: "utf8",
+    timeout: 120_000,
+  });
+  // A packaged player must exit cleanly. Teardown is where it historically did not: the
+  // GPU-scene mirror's retained handles kept the device alive into `vkDestroyInstance`, which
+  // faulted inside the driver, so a nonzero status here is a real regression and not noise.
+  expect(run.status).toBe(0);
+  expect(existsSync(capture)).toBe(true);
 
-    const playerFrame = decodeRgb8Png(readFileSync(capture));
-    const parity = meanAbsoluteDifference(playerFrame, playFrame);
+  const playerFrame = decodeRgb8Png(readFileSync(capture));
+  const parity = meanAbsoluteDifference(playerFrame, playFrame);
 
-    // Prove the metric discriminates before trusting it: the edit-mode frame is the same scene
-    // through the editor camera, and it must score far above the parity budget. Without this the
-    // parity assertion could pass against a metric blind to everything.
-    const control = meanAbsoluteDifference(playerFrame, editFrame);
-    expect(control).toBeGreaterThan(PARITY_TOLERANCE * 3);
+  // Prove the metric discriminates before trusting it: the edit-mode frame is the same scene
+  // through the editor camera, and it must score far above the parity budget. Without this the
+  // parity assertion could pass against a metric blind to everything.
+  const control = meanAbsoluteDifference(playerFrame, editFrame);
+  expect(control).toBeGreaterThan(PARITY_TOLERANCE * 3);
 
-    expect(parity).toBeLessThan(PARITY_TOLERANCE);
-    expect(engine.validationErrors()).toEqual([]);
-  },
-  180_000,
-);
+  expect(parity).toBeLessThan(PARITY_TOLERANCE);
+  expect(engine.validationErrors()).toEqual([]);
+}, 180_000);

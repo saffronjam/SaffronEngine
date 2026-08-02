@@ -98,11 +98,7 @@ beforeAll(async () => {
   }
   // A receiver to catch the shadow, and a blocker between it and the sun.
   trackEntity(cleaner, engine, await engine.call("add-entity", { preset: "plane" }));
-  const cube = trackEntity(
-    cleaner,
-    engine,
-    await engine.call("add-entity", { preset: "cube" }),
-  );
+  const cube = trackEntity(cleaner, engine, await engine.call("add-entity", { preset: "cube" }));
   blocker = cube.id;
   await engine.call("set-component", {
     entity: blocker,

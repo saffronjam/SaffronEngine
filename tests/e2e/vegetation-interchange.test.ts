@@ -102,9 +102,7 @@ function instancedGltf(name: string) {
   const rotation = floats([0, 0, 0, 1, 0, 0, 0, 1]);
   const scale = floats([1, 1, 1, 2, 2, 2]);
   const id = uints([101, 102]);
-  const blob = new Uint8Array(
-    translation.length + rotation.length + scale.length + id.length,
-  );
+  const blob = new Uint8Array(translation.length + rotation.length + scale.length + id.length);
   let cursor = 0;
   const views: { byteOffset: number; byteLength: number }[] = [];
   for (const part of [translation, rotation, scale, id]) {
@@ -220,12 +218,12 @@ test("instanced points import as anchors and export back addressing the same pla
   // A USD PointInstancer says it a third way, and a USD export reads back through the same door.
   {
     const usdaOut = join(scratch, "plants.usda");
-    const written = await engine.call("vegetation-export-points", {
+    const exportedUsd = await engine.call("vegetation-export-points", {
       map: fixture.map,
       layer: fixture.authoredLayer,
       path: usdaOut,
     });
-    expect(written.instances).toBeGreaterThan(0);
+    expect(exportedUsd.instances).toBeGreaterThan(0);
     const stage = readFileSync(usdaOut, "utf8");
     expect(stage).toContain("def PointInstancer");
     expect(stage).toContain("int64[] ids");
@@ -240,7 +238,7 @@ test("instanced points import as anchors and export back addressing the same pla
       prototypes: [{ name: exportedName!, family: fixture.plant }],
       expectedGeneration: vegetationMap(summary).generation,
     });
-    expect(roundTripped.anchors).toBe(written.instances);
+    expect(roundTripped.anchors).toBe(exportedUsd.instances);
     expect(roundTripped.unsupported).toEqual([]);
   }
 

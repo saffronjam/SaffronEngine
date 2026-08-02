@@ -60,8 +60,7 @@ export async function readTrunkRects(engine: Engine): Promise<TrunkRect[]> {
 // an autumn date scrub, which must also keep frames validation-clean through the season-keyed
 // cell rebuild.
 export async function assertPhenologyHoldsAcrossSeasons(engine: Engine): Promise<void> {
-  const query = async () =>
-    queryPlants(engine, BOUNDS, 8);
+  const query = async () => queryPlants(engine, BOUNDS, 8);
   for (const hit of (await query()).hits) {
     expect(hit.plant.renderedPhenotype).toBe(hit.plant.phenotype);
   }
@@ -122,7 +121,13 @@ export async function pickGroundClearOfTrunks(
     if (attempts >= 24) {
       break;
     }
-    if (spot.x < 1 || spot.x >= 63 || spot.z < 1 || spot.z >= 63 || !clearOfTrunks(spot.x, spot.z)) {
+    if (
+      spot.x < 1 ||
+      spot.x >= 63 ||
+      spot.z < 1 ||
+      spot.z >= 63 ||
+      !clearOfTrunks(spot.x, spot.z)
+    ) {
       continue;
     }
     attempts += 1;
@@ -204,10 +209,7 @@ async function awaitMacroCount(engine: Engine, expected: number, what: string): 
 // Editing a generated plant writes a typed mutation through the reducer: the tombstone removes
 // the picked plant persistently — the runtime row disappears and the same viewport ray no longer
 // returns its identity. Returns the cell's macro population from before the removal.
-export async function tombstonePickedPlant(
-  engine: Engine,
-  picked: PickedPlant,
-): Promise<number> {
+export async function tombstonePickedPlant(engine: Engine, picked: PickedPlant): Promise<number> {
   const before = await engine.call("vegetation-runtime-cell", {
     cell: CELL,
   });

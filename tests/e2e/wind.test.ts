@@ -38,12 +38,12 @@ test("set-wind merges the extended deterministic parameters and validates ranges
   const read = await engine.call("get-environment");
   expect(read.wind.turbulenceOctaves).toBe(4);
 
-  await expect(
-    engine.call("set-wind", { json: { turbulenceOctaves: 99 } }),
-  ).rejects.toThrow(/octaves/i);
-  await expect(
-    engine.call("set-wind", { json: { turbulenceRoughness: 1.5 } }),
-  ).rejects.toThrow(/roughness/i);
+  await expect(engine.call("set-wind", { json: { turbulenceOctaves: 99 } })).rejects.toThrow(
+    /octaves/i,
+  );
+  await expect(engine.call("set-wind", { json: { turbulenceRoughness: 1.5 } })).rejects.toThrow(
+    /roughness/i,
+  );
 });
 
 test("a WindSource component round-trips through the registry", async () => {

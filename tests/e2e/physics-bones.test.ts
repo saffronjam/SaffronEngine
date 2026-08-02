@@ -14,8 +14,7 @@ const suiteCleaner = new Cleaner();
 const LEG = join(REPO, "tests", "e2e", "fixtures", "leg.gltf");
 
 const worldY = async (entity: string): Promise<number> =>
-  (await engine.call("get-world-transform", { entity })).translation
-    .y;
+  (await engine.call("get-world-transform", { entity })).translation.y;
 
 async function spawn(name: string): Promise<string> {
   const id = (await engine.call("create-entity", { name })).id;

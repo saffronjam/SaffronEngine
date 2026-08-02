@@ -126,4 +126,3 @@ test("trampling the canopy and releasing it leaves the frame where it started", 
   expect(stats.vsm.overflow).toBe(0);
   expect(engine.validationErrors()).toEqual([]);
 }, 180_000);
-

@@ -6,11 +6,7 @@ import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import type { Engine } from "./harness.ts";
 import { Cleaner } from "./test-utils.ts";
-import {
-  attachScripts,
-  bootScriptEngine,
-  stopIfPlaying,
-} from "./script-utils.ts";
+import { attachScripts, bootScriptEngine, stopIfPlaying } from "./script-utils.ts";
 
 // Declared fields: defaults live in the .lua; the scene stores only overrides. `weird` is
 // deliberately uninferable (2 numbers, not a vec3) and must be skipped.
@@ -98,8 +94,8 @@ test("declared defaults drive the script; an override on the slot wins", async (
   await engine.call("play");
   await engine.settle(400);
   expect((await engine.call("get-play-state")).state).toBe("playing");
-  const overriddenX = (await engine.call("inspect", { entity: cube.id })).components
-    .Transform!.translation.x;
+  const overriddenX = (await engine.call("inspect", { entity: cube.id })).components.Transform!
+    .translation.x;
   await engine.call("stop");
   expect(overriddenX).toBeGreaterThan(defaultX * 2); // 5x the rate, generous margin
 

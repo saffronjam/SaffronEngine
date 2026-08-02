@@ -143,9 +143,7 @@ test("the world simulation clock ages biology while play runs, and the telemetry
   expect(configured.workers).toBeGreaterThan(0);
 
   const before = await status();
-  const ticksBefore = Number(
-    (await engine.call("vegetation-telemetry")).work.ecologyTicks,
-  );
+  const ticksBefore = Number((await engine.call("vegetation-telemetry")).work.ecologyTicks);
 
   await engine.call("play");
   await engine.settle(600);

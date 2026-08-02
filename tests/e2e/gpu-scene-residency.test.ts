@@ -158,69 +158,61 @@ test("wind-bound stress widens the cull spheres without losing the instance", as
     await engine.call("set-wind", storm);
     await new Promise((resolve) => setTimeout(resolve, 150));
     expectWholeCut(
-      await awaitStats(
-        (sample) => sample.visibility.visible > 0 && sample.visibility.records > 0,
-      ),
+      await awaitStats((sample) => sample.visibility.visible > 0 && sample.visibility.records > 0),
     );
   }
   await engine.call("set-wind", { speed: 0, gust: 0 });
   expect(engine.validationErrors()).toEqual([]);
 });
 
-test(
-  "page churn recycles table slots and arena bytes without aliasing",
-  async () => {
-    // Import a multi-node model, place it, then remove it from the project — repeatedly.
-    // Every import registers each mesh's pages and streams their payloads into the arena;
-    // every removal unregisters them, retires their arena ranges, and frees the table slots
-    // for the next round to take back at a bumped generation. A retire that gave the wrong
-    // bytes back drifts `residentBytes` off its baseline; a record that kept a handle across
-    // the recycle reads another mesh's payload, which the arena's own range checks and the
-    // validation layers catch.
-    const baseline = await awaitStats((sample) => sample.pageResidency.resident > 0);
-    expect(baseline.visibility.records).toBeGreaterThan(0);
+test("page churn recycles table slots and arena bytes without aliasing", async () => {
+  // Import a multi-node model, place it, then remove it from the project — repeatedly.
+  // Every import registers each mesh's pages and streams their payloads into the arena;
+  // every removal unregisters them, retires their arena ranges, and frees the table slots
+  // for the next round to take back at a bumped generation. A retire that gave the wrong
+  // bytes back drifts `residentBytes` off its baseline; a record that kept a handle across
+  // the recycle reads another mesh's payload, which the arena's own range checks and the
+  // validation layers catch.
+  const baseline = await awaitStats((sample) => sample.pageResidency.resident > 0);
+  expect(baseline.visibility.records).toBeGreaterThan(0);
 
-    for (let round = 0; round < 3; round += 1) {
-      const model = await engine.call("import-model", { path: CHURN_MODEL });
-      const placed = await engine.call("instantiate-model", { asset: model.id });
-      const grown = await awaitStats(
-        (sample) => sample.pageResidency.registered > baseline.pageResidency.registered,
-        20_000,
-      );
-      expect(grown.pageResidency.registered).toBeGreaterThan(baseline.pageResidency.registered);
-      expect(grown.pageResidency.residentBytes).toBeGreaterThan(
-        baseline.pageResidency.residentBytes,
-      );
-      expect(grown.visibility.overflowFlags).toBe(0);
-
-      await engine.call("destroy-entity", { entity: placed.id });
-      // An import lands one mesh asset per node inside a container model. The pages belong
-      // to the meshes, so removing the model alone retires nothing — the whole container
-      // goes, which is what removing an imported model from a project means.
-      const { assets } = await engine.call("list-assets");
-      const imported = assets.filter(
-        (asset) => asset.id === model.id || asset.container === model.id,
-      );
-      expect(imported.filter((asset) => asset.type === "mesh").length).toBeGreaterThan(1);
-      for (const asset of imported) {
-        await engine.call("delete-asset", { asset: asset.id });
-      }
-      const shrunk = await awaitStats(
-        (sample) => sample.pageResidency.registered === baseline.pageResidency.registered,
-        20_000,
-      );
-      expect(shrunk.pageResidency.registered).toBe(baseline.pageResidency.registered);
-      expect(shrunk.pageResidency.residentBytes).toBe(baseline.pageResidency.residentBytes);
-    }
-
-    // Back to the one cube: the churn left exactly the pages it started with resident and
-    // the cut it started with on screen.
-    const after = await awaitStats(
-      (sample) => sample.visibility.records === baseline.visibility.records,
+  for (let round = 0; round < 3; round += 1) {
+    const model = await engine.call("import-model", { path: CHURN_MODEL });
+    const placed = await engine.call("instantiate-model", { asset: model.id });
+    const grown = await awaitStats(
+      (sample) => sample.pageResidency.registered > baseline.pageResidency.registered,
+      20_000,
     );
-    expect(after.visibility.records).toBe(baseline.visibility.records);
-    expectWholeCut(after);
-    expect(engine.validationErrors()).toEqual([]);
-  },
-  120_000,
-);
+    expect(grown.pageResidency.registered).toBeGreaterThan(baseline.pageResidency.registered);
+    expect(grown.pageResidency.residentBytes).toBeGreaterThan(baseline.pageResidency.residentBytes);
+    expect(grown.visibility.overflowFlags).toBe(0);
+
+    await engine.call("destroy-entity", { entity: placed.id });
+    // An import lands one mesh asset per node inside a container model. The pages belong
+    // to the meshes, so removing the model alone retires nothing — the whole container
+    // goes, which is what removing an imported model from a project means.
+    const { assets } = await engine.call("list-assets");
+    const imported = assets.filter(
+      (asset) => asset.id === model.id || asset.container === model.id,
+    );
+    expect(imported.filter((asset) => asset.type === "mesh").length).toBeGreaterThan(1);
+    for (const asset of imported) {
+      await engine.call("delete-asset", { asset: asset.id });
+    }
+    const shrunk = await awaitStats(
+      (sample) => sample.pageResidency.registered === baseline.pageResidency.registered,
+      20_000,
+    );
+    expect(shrunk.pageResidency.registered).toBe(baseline.pageResidency.registered);
+    expect(shrunk.pageResidency.residentBytes).toBe(baseline.pageResidency.residentBytes);
+  }
+
+  // Back to the one cube: the churn left exactly the pages it started with resident and
+  // the cut it started with on screen.
+  const after = await awaitStats(
+    (sample) => sample.visibility.records === baseline.visibility.records,
+  );
+  expect(after.visibility.records).toBe(baseline.visibility.records);
+  expectWholeCut(after);
+  expect(engine.validationErrors()).toEqual([]);
+}, 120_000);

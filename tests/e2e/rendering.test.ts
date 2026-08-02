@@ -5,8 +5,6 @@
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { Engine } from "./harness.ts";
 
-
-
 let engine: Engine;
 beforeAll(async () => {
   // import-model needs a loaded project; SAFFRON_SCRATCH_PROJECT makes one (under the harness temp appdata dir).

@@ -6,11 +6,7 @@
 import { afterAll, afterEach, beforeAll, expect, test } from "bun:test";
 import type { Engine } from "./harness.ts";
 import { Cleaner } from "./test-utils.ts";
-import {
-  attachScripts,
-  bootScriptEngine,
-  stopIfPlaying,
-} from "./script-utils.ts";
+import { attachScripts, bootScriptEngine, stopIfPlaying } from "./script-utils.ts";
 
 const SCRIPTS = {
   "move.lua": `local Mover = {}
@@ -112,8 +108,8 @@ test("script input exposes held keys to Lua", async () => {
   expect(moved.components.Transform!.translation.x).toBeGreaterThan(1.05);
 
   await engine.call("script-input", { keys: [] });
-  const stoppedAt = (await engine.call("inspect", { entity: cube.id })).components
-    .Transform!.translation.x;
+  const stoppedAt = (await engine.call("inspect", { entity: cube.id })).components.Transform!
+    .translation.x;
   await engine.settle(300);
   const stopped = await engine.call("inspect", { entity: cube.id });
   expect(stopped.components.Transform!.translation.x).toBeCloseTo(stoppedAt);

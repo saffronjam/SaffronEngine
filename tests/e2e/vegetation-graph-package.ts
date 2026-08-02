@@ -302,7 +302,7 @@ export async function cancelPreparedEvaluation(
   const cancelled = await engine.call("vegetation-cancel-evaluation", { job: prepared.job });
   expect(cancelled.state).toBe("cancelled");
   expect(cancelled.preflight).toEqual(prepared.preflight);
-  await expect(
-    engine.call("vegetation-start-evaluation", { job: prepared.job }),
-  ).rejects.toThrow(/not prepared/);
+  await expect(engine.call("vegetation-start-evaluation", { job: prepared.job })).rejects.toThrow(
+    /not prepared/,
+  );
 }

@@ -54,26 +54,26 @@ async function awaitRenderedPages(timeoutMs = 20_000) {
 
 test("the page atlas serves directional, spot, and point shadow casters", async () => {
   // A receiver to cast onto, plus one light of each shadow-casting family.
-  const floor = trackEntity(
-    cleaner,
-    engine,
-    await engine.call("add-entity", { preset: "plane" }),
-  );
+  const floor = trackEntity(cleaner, engine, await engine.call("add-entity", { preset: "plane" }));
   await engine.call("set-component", {
     entity: floor.id,
     component: "Transform",
-    json: { translation: { x: 0, y: 0, z: 0 }, scale: { x: 20, y: 1, z: 20 }, rotation: { x: 0, y: 0, z: 0 } },
+    json: {
+      translation: { x: 0, y: 0, z: 0 },
+      scale: { x: 20, y: 1, z: 20 },
+      rotation: { x: 0, y: 0, z: 0 },
+    },
   });
-  const caster = trackEntity(
-    cleaner,
-    engine,
-    await engine.call("add-entity", { preset: "cube" }),
-  );
+  const caster = trackEntity(cleaner, engine, await engine.call("add-entity", { preset: "cube" }));
   await engine.call("rename-entity", { entity: caster.id, name: "VSM caster" });
   await engine.call("set-component", {
     entity: caster.id,
     component: "Transform",
-    json: { translation: { x: 0, y: 2, z: 0 }, scale: { x: 1, y: 1, z: 1 }, rotation: { x: 0, y: 0, z: 0 } },
+    json: {
+      translation: { x: 0, y: 2, z: 0 },
+      scale: { x: 1, y: 1, z: 1 },
+      rotation: { x: 0, y: 0, z: 0 },
+    },
   });
 
   const spot = trackEntity(
@@ -85,7 +85,11 @@ test("the page atlas serves directional, spot, and point shadow casters", async 
   await engine.call("set-component", {
     entity: spot.id,
     component: "Transform",
-    json: { translation: { x: 4, y: 6, z: 4 }, scale: { x: 1, y: 1, z: 1 }, rotation: { x: -1, y: 0.6, z: 0 } },
+    json: {
+      translation: { x: 4, y: 6, z: 4 },
+      scale: { x: 1, y: 1, z: 1 },
+      rotation: { x: -1, y: 0.6, z: 0 },
+    },
   });
 
   const point = trackEntity(
@@ -97,7 +101,11 @@ test("the page atlas serves directional, spot, and point shadow casters", async 
   await engine.call("set-component", {
     entity: point.id,
     component: "Transform",
-    json: { translation: { x: -4, y: 5, z: -2 }, scale: { x: 1, y: 1, z: 1 }, rotation: { x: 0, y: 0, z: 0 } },
+    json: {
+      translation: { x: -4, y: 5, z: -2 },
+      scale: { x: 1, y: 1, z: 1 },
+      rotation: { x: 0, y: 0, z: 0 },
+    },
   });
 
   await engine.call("set-camera", { position: { x: 0, y: 6, z: 12 }, yaw: 0, pitch: -20 });

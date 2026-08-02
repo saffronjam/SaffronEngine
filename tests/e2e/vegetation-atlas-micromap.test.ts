@@ -268,12 +268,7 @@ test("a micromap removes classifier work without changing coverage", () => {
   for (const [x, y] of flipped) {
     expect({
       pixel: [x, y],
-      neighbours: [
-        differs(x - 1, y),
-        differs(x + 1, y),
-        differs(x, y - 1),
-        differs(x, y + 1),
-      ],
+      neighbours: [differs(x - 1, y), differs(x + 1, y), differs(x, y - 1), differs(x, y + 1)],
     }).toEqual({ pixel: [x, y], neighbours: [false, false, false, false] });
   }
   expect(flipped.length).toBeLessThanOrEqual(8);
