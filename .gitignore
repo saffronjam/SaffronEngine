@@ -4,6 +4,10 @@
 /install/
 /appdata/
 engine/target/
+editor/dist/
+# oxfmt reads only the repo-root ignore file, so every generated tree it must skip lives here.
+node_modules/
+*.log
 # Private per-agent target dirs (CARGO_TARGET_DIR=engine/target-<name>).
 engine/target-*/
 # Vendored Jolt source, compiled by saffron-physics-sys/build.rs.

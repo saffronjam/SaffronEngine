@@ -1,0 +1,30 @@
+{
+  "$schema": "https://raw.githubusercontent.com/oxc-project/oxc/main/npm/oxlint/configuration_schema.json",
+  "plugins": ["react", "typescript"],
+  "categories": {
+    "correctness": "error",
+    "suspicious": "error",
+    "perf": "error"
+  },
+  "rules": {
+    "react/react-in-jsx-scope": "off",
+    // Every loop that awaits here polls the engine until a condition holds, so the next iteration
+    // depends on the previous reply and `Promise.all` cannot express it.
+    "no-await-in-loop": "off",
+    // Slot lists (material slots, script slots, morph targets) are addressed by index across the
+    // control plane, so the index is the element's identity rather than a stand-in for one.
+    "react/no-array-index-key": "off",
+    // The shell injects `window.__saffronShellEvent`; the dunder name is the bridge contract with
+    // editor/shell.
+    "no-underscore-dangle": ["error", { "allow": ["__saffronShellEvent"] }]
+  },
+  "ignorePatterns": [
+    "**/node_modules/**",
+    "**/dist/**",
+    "**/target/**",
+    "editor/src/protocol/sa-types.ts",
+    "engine/crates/protocol/bindings/**",
+    "third_party/**",
+    "docs/themes/**"
+  ]
+}

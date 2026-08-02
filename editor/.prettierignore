@@ -1,7 +1,0 @@
-# Read by oxfmt (it honours .prettierignore by default).
-dist/
-node_modules/
-src/protocol/
-shell/target/
-*.css
-*.md

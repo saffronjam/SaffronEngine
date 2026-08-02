@@ -1,0 +1,26 @@
+{
+  "compilerOptions": {
+    "target": "ESNext",
+    "module": "ESNext",
+    "moduleResolution": "bundler",
+    "types": ["bun"],
+    "allowImportingTsExtensions": true,
+    "resolveJsonModule": true,
+    "strict": true,
+    "noUnusedLocals": true,
+    "noUnusedParameters": true,
+    "noEmit": true,
+    "skipLibCheck": true,
+    "baseUrl": ".",
+    "paths": {
+      "@saffron/protocol": ["./editor/src/protocol/index.ts"]
+    }
+  },
+  "include": [
+    "tools/**/*.ts",
+    "tests/e2e/**/*.ts",
+    "packager/**/*.ts",
+    "editor/scripts/**/*.ts",
+    "editor/vite.config.ts"
+  ]
+}
