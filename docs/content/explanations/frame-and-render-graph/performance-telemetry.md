@@ -173,12 +173,13 @@ Every timing number above is measured after the work completes, which makes them
 failure they matter most for: a submission that never completes. A fence wait is unbounded, so the
 thread that would print the number is itself blocked.
 
-A watchdog inverts that. Each submission registers a name — a one-off's label, or the frame serial
-— before it waits, and unregisters when it returns. A background thread wakes twice a second and
-reports anything registered longer than three seconds, once per elapsed second:
+A watchdog inverts that. Each submission registers what it is waiting on — a one-off's static
+label, or a frame-ring slot — before it waits, and unregisters when it returns. A background thread
+wakes twice a second and reports anything registered longer than three seconds, once per elapsed
+second:
 
 ```text
-ERROR rendering  GPU submission is still in flight — a hang, not a slow frame  submission="one-off 'bake_material_thumbnail'" seconds=4
+ERROR rendering  GPU submission 'bake_material_thumbnail' has been in flight 4s — a hang, not a slow frame
 ```
 
 The thread only sleeps and reads, so it keeps reporting while every other thread is blocked on a
@@ -190,6 +191,30 @@ debugger, and that log line is the whole diagnosis. Its cost is one uncontended 
 and a scan of sixteen fixed slots per submission — no allocation, nothing growable, and nothing
 formatted until a report is actually due. A seventeenth concurrent submission goes untracked rather
 than allocating.
+
+### Naming the wedged batch
+
+A frame is a sequence of submissions, so its name alone is a coarse answer. Every frame therefore
+publishes what it submitted: the prefix, one entry per render-graph batch, and the tail, each
+carrying the timeline point it reserved and the run of passes it covers (`first…last`). A report
+reads that record back, asks the device for each timeline's current counter, and names the frontier
+— the first entry whose point has not signalled. That entry is the batch the GPU is inside:
+
+```text
+ERROR rendering  GPU frame ring slot 0 has been in flight 4s — frame 167 is wedged in render-graph batch 6/14 'gbuffer…ssgi', whose timeline point 41 has not signalled (counter 40)
+```
+
+`vkGetSemaphoreCounterValue` is what makes this legal at hang time. It never blocks, carries no
+external-synchronization requirement, and works on a live device, so the watchdog thread reads
+counters while the render thread is stuck in `vkWaitForFences`. The tail signals a point of its own
+alongside the slot fence, so "every point signalled" is a real answer rather than a gap: it means
+the work finished and only the fence did not.
+
+The record reaches the watchdog through a seqlock over plain atomics, one per frame-ring slot, with
+the batch labels inline as fixed 64-byte fields. Publishing takes no lock the watchdog could be
+stuck behind and allocates nothing; a read torn by a concurrent publish fails its sequence check
+and retries rather than being a data race. The frame ring clears the records before it destroys its
+semaphores, so a stale handle can never reach the counter query.
 
 When the hang matures into an `ERROR_DEVICE_LOST`, two diagnostic extensions turn the bare code
 into a named culprit. With `VK_NV_device_diagnostic_checkpoints`, every render-graph pass and
@@ -205,13 +230,13 @@ ERROR rendering  device loss checkpoint: 'wind-deform' reached TOP_OF_PIPE
 ERROR rendering  device fault address: READ_INVALID at 0xf744246000 (precision 0x1000)
 ```
 
-Each watchdog report asks for those diagnostics too, so a hang names its pass from the watchdog's
-own thread rather than only from whichever thread the loss surfaces on. Both queries read valid
-data only while the device is in the lost state, so the report asks again every second and prints
-the checkpoint lines the moment the answer is yes; until then it is the submission name and the age
-alone. The watchdog reaches the device weakly and takes the queue's external-synchronization lock
-without blocking on it — a wedged `vkDeviceWaitIdle` holds that lock for the length of the hang,
-which is exactly when the report has to come out.
+Each watchdog report asks for those diagnostics too, so a loss narrows the batch to a single pass
+from the watchdog's own thread rather than only from whichever thread the loss surfaces on. Both
+queries read valid data only while the device is in the lost state, so the report asks again every
+second and prints the checkpoint lines the moment the answer is yes; until then the batch name from
+the timeline counters is the answer. The watchdog reaches the device weakly and takes the queue's
+external-synchronization lock without blocking on it — a wedged `vkDeviceWaitIdle` holds that lock
+for the length of the hang, which is exactly when the report has to come out.
 
 ## Modes and capability
 
@@ -275,7 +300,8 @@ recorded.
 | Per-pass and nested scopes | `render_graph.rs`, `nested_scopes.rs` | `record_submission_plan_profiled`, `ProfileRecorders`, `NestedScopeRecorder` |
 | Draw-path counters | `draw_list.rs` | `RenderStats` |
 | Device-local memory sample | `resources/`, `device/` | `VramUsage`, `DeviceResources::vram_usage`, `create_allocator` |
-| Hang watchdog | `watchdog.rs`, `upload.rs`, `renderer.rs` | `watch`, `InFlight`, `attach_device`, `with_one_off_commands`, `begin_offscreen_frame` |
+| Hang watchdog | `watchdog.rs`, `upload.rs`, `renderer.rs` | `watch`, `watch_frame`, `InFlight`, `attach_device`, `with_one_off_commands`, `begin_offscreen_frame` |
+| Wedged-batch naming | `watchdog.rs`, `renderer.rs`, `render_graph.rs`, `device.rs`, `frame.rs` | `PublishedSlot`, `SubmittedBatch`, `BatchPoint`, `publish_frame`, `clear_frames`, `wedged_batch`, `frame_wedge`, `Renderer::publish_frame_submission`, `RgRecordedBatch::label`, `Device::timeline_counter` |
 | Device-loss diagnostics | `checkpoints.rs`, `device.rs`, `upload.rs`, `render_graph.rs` | `Checkpoints`, `DeviceFault`, `Device::log_hang_diagnostics`, `Device::log_device_loss_checkpoints`, `GpuQueue::reports_device_lost`, `Error::is_device_loss` |
 | Frame ring, percentiles, stutter, config | `frame_history.rs` | `FrameHistory`, `FrameSample`, `FrameHistoryStats`, `PerfConfig`, `FRAME_HISTORY_CAPACITY` |
 | HUD grading | `editor/src/lib/perfThresholds.ts` | `frameTimeStatus`, `vramStatus` |

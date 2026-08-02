@@ -21,7 +21,7 @@ layers add their own passes to the cull → scene → UI frame.
 | [Cross-frame layouts](cross-frame-layouts/) | the external-layout slot write-back, imported images, seeded source scope | `render_graph.rs` |
 | [Adding passes](who-can-add-passes/) | engine passes in `begin_frame_graph` vs. layer `on_render_graph` | `app/src/lib.rs`, `renderer.rs` |
 | [Limits](limits-and-seams/) | queue fallback, graph buffers, image tracking, declaration-order limits | `render_graph.rs`, `transient.rs` |
-| [Performance telemetry](performance-telemetry/) | CPU/GPU split, per-pass GPU timestamps, throughput counters, VRAM budget, the profiler mode gate | `renderer.rs`, `profiler.rs` |
+| [Performance telemetry](performance-telemetry/) | CPU/GPU split, per-pass GPU timestamps, throughput counters, VRAM budget, the profiler mode gate, naming the batch a hang is wedged in | `renderer.rs`, `profiler.rs`, `watchdog.rs` |
 | [Performance alarms](performance-alarms/) | EMA + hysteresis + debounce, MAD-spike / burn-rate detectors, severity, the non-blocking `drain-alarms` seq cursor | `frame_history.rs`, `renderer.rs` |
 | [Renderer profiling](renderer-profiling/) | the capture model (merged CPU+GPU spans, nesting, calibration), timestamp caveats, capture modes, Chrome-Trace + Perfetto export, pipeline statistics, software-GPU honesty | `profiler.rs`, `render_graph.rs` |
 | [Compute skinning](compute-skinning/) | deform-once into a base-layout buffer, the deformed buffer + per-instance dispatch, compute→vertex barrier | `skin.slang`, `skinning.rs` |
