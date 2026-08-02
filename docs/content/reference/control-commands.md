@@ -6,7 +6,7 @@ math = false
 
 # Control commands
 
-The control plane exposes 256 typed commands over its local Unix socket. This table follows the frozen order in `saffron_protocol::COMMANDS`; the generated OpenRPC methods use the same names, parameter DTOs, and result DTOs.
+The control plane exposes 257 typed commands over its local Unix socket. This table follows the frozen order in `saffron_protocol::COMMANDS`; the generated OpenRPC methods use the same names, parameter DTOs, and result DTOs.
 
 `register_builtin_commands` installs `ping`, the reflective `help` command, and the render, scene, animation, physics, and asset handlers. The host adds `get-script-schema` because its handler depends on the script crate. A registry test compares the registered names with `COMMANDS` as sets, with that host-owned command accounted for explicitly.
 
@@ -277,7 +277,6 @@ sa -o json set-transform --entity 42 --translation '{"x":0,"y":1,"z":0}'
 | `material-get` | `MaterialGetParams` | `MaterialGetResult` | material-get {id\|name} |
 | `material-schema` | `MaterialSchemaParams` | `MaterialSchemaResult` | material-schema {id\|name} — the material's exposed override parameters |
 | `material-update` | `MaterialUpdateParams` | `MaterialUpdateResult` | material-update {id} [fields] |
-| `preview-render` | `PreviewRenderParams` | `PreviewRenderResult` | preview-render {material} [size] |
 | `material-set-graph` | `MaterialSetGraphParams` | `MaterialSetGraphResult` | material-set-graph {material, graph} |
 | `material-create-instance` | `MaterialCreateInstanceParams` | `MaterialCreateResult` | material-create-instance {parent} [name] |
 | `material-set-override` | `MaterialSetOverrideParams` | `MaterialSetOverrideResult` | material-set-override {material, field, value} |

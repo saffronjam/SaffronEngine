@@ -82,9 +82,9 @@ The cache is capped at 1 GiB. A write above the cap removes the oldest files unt
 | Folder hierarchy | `editor/src/panels/AssetFolderTree.tsx` | `AssetFolderTree`, `buildFolderTree`, `folderAncestorPaths` |
 | Tile preview, rename, and drag payload | `editor/src/components/AssetTile.tsx` | `AssetTile`, `ASSET_DND_MIME`, `FOLDER_DND_MIME` |
 | File metadata dialog | `editor/src/components/AssetDetailsDialog.tsx` | `AssetDetailsDialog` |
-| Webview thumbnail cache | `editor/src/state/store.ts` | `getCachedThumbnailUrl`, `getThumbnailUrl`, `invalidateThumbnails` |
+| Webview thumbnail cache | `editor/src/state/store/thumbnails.ts` | `getCachedThumbnailUrl`, `getThumbnailUrl`, `invalidateThumbnails` |
 | Thumbnail classification and disk cache | `engine/crates/assets/src/thumbnail/` | `request_thumbnail`, `write_thumbnail_cache`, `THUMBNAIL_CACHE_VERSION` |
-| Main-graph preview drain | `engine/crates/host/src/layer/` | `drive_preview_render_queue`, `render_preview_scene_to_png` |
+| Main-graph preview drain | `engine/crates/host/src/layer/` | `drive_preview_render_queue`, `start_preview_job`, `advance_preview_job` |
 | Control commands | `engine/crates/control/src/commands_asset/` | `get-thumbnail`, `view-asset`, `probe-asset`, `asset-usages` |
 
 ## Related

@@ -124,8 +124,9 @@ and occlusion both target the packed `ormTexture` field. Passing `0` clears the 
 
 The `material-*` commands operate on native `.smat` assets. They cover creation, folder import,
 catalog listing, parameter updates, entity assignment, graph replacement, instances, typed
-overrides, shader compilation, and project-wide cooking. `preview-render` renders one material to an
-inline PNG. See [native materials](../../materials-and-pipelines/native-materials/) and
+overrides, shader compilation, and project-wide cooking. A material's studio-sphere render is a
+thumbnail request like any other asset's — `get-thumbnail` answers with an inline PNG, or `pending`
+while the host converges the tile, so the caller repolls. See [native materials](../../materials-and-pipelines/native-materials/) and
 [node-graph code generation](../../materials-and-pipelines/node-graph-codegen/) for the data and
 shader paths behind these commands.
 
