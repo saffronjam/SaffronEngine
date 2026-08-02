@@ -33,6 +33,7 @@ mod manifest;
 mod memory;
 mod merge;
 mod mutation;
+mod network;
 mod plant_compile;
 mod point;
 mod runtime_world;
@@ -64,13 +65,15 @@ pub use layer::*;
 pub use manifest::*;
 pub use merge::*;
 pub use mutation::*;
+pub use network::*;
 pub use plant_compile::*;
 pub use point::*;
 pub use runtime_world::*;
 pub use saffron_material::*;
 pub use saffron_spatial::QuantizedOrientation;
 pub use season::{
-    resolve_rendered_phenotype, role_season_window, season_in_window, season_phase_mille,
+    PhenologyState, band_weight_mille, phenotype_weight_mille, resolve_rendered_phenotype,
+    role_default_response, season_phase_mille, season_weight_mille,
 };
 pub use virtual_hierarchy::*;
 

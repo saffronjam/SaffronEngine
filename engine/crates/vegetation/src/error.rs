@@ -214,6 +214,9 @@ pub enum Error {
         /// Renderer or output-contract failure.
         reason: String,
     },
+    /// A network session envelope violates the sequencing, interest, or binding contract.
+    #[error("invalid vegetation network envelope: {0}")]
+    Network(String),
     /// A nested shared spatial operation failed.
     #[error("spatial error: {0}")]
     Spatial(#[from] saffron_spatial::Error),
