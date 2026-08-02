@@ -20,13 +20,19 @@ use saffron_runtime::RuntimeSession;
 
 use saffron_core::TimeSpan;
 use saffron_protocol::{GetScriptSchemaParams, GetScriptSchemaResult, ScriptFieldDto};
-use saffron_rendering::Uploader;
+use saffron_rendering::{Renderer, Uploader, cpu_now_ns};
 use saffron_scene::{Entity, Mesh};
 use saffron_sceneedit::{PlayState, ProjectPhase, SceneEditContext};
 use saffron_signal::SubscriptionId;
 use saffron_window::Window;
 
 use crate::viewport_shm::ViewportShmPublisher;
+
+/// Closes a CPU profile span opened by a `cpu_now_ns()` read at `start`, so a capture attributes
+/// the update hooks instead of leaving them as a gap. A no-op when the profiler is off.
+fn mark(renderer: &mut Renderer, name: &str, start: u64) {
+    renderer.record_cpu_span(name, start, cpu_now_ns().saturating_sub(start));
+}
 
 /// The host's apex layer: the editor session plus the wired subsystems.
 pub struct HostLayer {
@@ -356,6 +362,7 @@ impl Layer for HostLayer {
         app.redraw.request_redraw();
     }
 
+    #[allow(clippy::too_many_lines)]
     fn on_update(&mut self, app: &mut App, dt: TimeSpan) {
         let current_ppid = self.current_ppid();
         // The monotonic simulation clock wind and other evolution sample; the calendar never
@@ -366,7 +373,9 @@ impl Layer for HostLayer {
         // `window` are distinct `App` fields, so they borrow disjointly.
         let mut mutated = false;
         if let Some(renderer) = app.frame_host.renderer_mut() {
+            let t = cpu_now_ns();
             self.update_spatial_source(dt);
+            mark(renderer, "update-spatial-source", t);
             // Publish mode: the editor owns the render size (set-viewport-size); the hidden
             // window's size is meaningless. Present mode tracks the window.
             if !self.shm_publish
@@ -380,15 +389,26 @@ impl Layer for HostLayer {
             // event loop.
             let mut headless = Window::headless();
             let window = app.window.as_mut().unwrap_or(&mut headless);
+            let t = cpu_now_ns();
             mutated = self.poll_control(window, renderer);
+            mark(renderer, "poll-control", t);
+            let t = cpu_now_ns();
             self.drive_preview_render_queue(renderer);
+            mark(renderer, "preview-render-queue", t);
             // One bounded step, so a load never stalls the drain + publish loop.
+            let t = cpu_now_ns();
             if self.advance_project_load(renderer) {
                 mutated = true;
             }
+            mark(renderer, "advance-project-load", t);
         }
 
-        if self.update_session(dt, current_ppid) == ParentWatch::ParentDied {
+        let t = cpu_now_ns();
+        let watch = self.update_session(dt, current_ppid);
+        if let Some(renderer) = app.frame_host.renderer_mut() {
+            mark(renderer, "update-session", t);
+        }
+        if watch == ParentWatch::ParentDied {
             app.running = false;
             return;
         }

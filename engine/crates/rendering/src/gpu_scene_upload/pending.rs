@@ -124,7 +124,7 @@ pub fn record_pending_global_uploads(
         return Ok(());
     }
     let enqueue_growth =
-        |growth: Option<crate::GpuArenaGrowth>, name: &str, graph: &mut RenderGraph| {
+        |growth: Option<crate::GpuArenaGrowth>, name: &'static str, graph: &mut RenderGraph| {
             if let Some(growth) = growth {
                 growth.enqueue(graph, device, name);
             }

@@ -46,7 +46,7 @@ fn pipeline_statistics_are_reserved_only_for_graphics_batches() {
     ));
 }
 
-fn async_compute(name: &str) -> RgPass {
+fn async_compute(name: &'static str) -> RgPass {
     RgPass::compute(name).queue(RgQueuePreference::AsyncCompute)
 }
 
@@ -1137,7 +1137,7 @@ impl RgPass {
     /// dropped). Lets a test re-derive barriers without consuming the graph's pass.
     fn clone_for_test(&self) -> RgPass {
         RgPass {
-            name: self.name.clone(),
+            name: self.name,
             kind: self.kind,
             queue: self.queue,
             accesses: self.accesses.clone(),

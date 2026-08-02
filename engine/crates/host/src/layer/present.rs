@@ -249,6 +249,7 @@ impl HostLayer {
         if let Some(uploader) = self.uploader.as_ref() {
             let world = renderer.active_view_id().gpu_scene_world();
             let vegetation = vegetation_cell.borrow();
+            let t = cpu_now_ns();
             match self.gpu_scene_mirror.sync_renderer_world(
                 world,
                 self.editor.active_scene(),
@@ -261,6 +262,8 @@ impl HostLayer {
                 Err(error) => tracing::error!("gpu scene mirror sync: {error}"),
             }
             drop(vegetation);
+            mark(renderer, "gpu-scene-mirror-sync", t);
+            let t = cpu_now_ns();
             let mut driver = RendererScene::new(renderer, uploader, skinning);
             let scene: &mut Scene = self.editor.active_scene();
             render_scene(
@@ -271,9 +274,12 @@ impl HostLayer {
                 &cam,
                 options,
             );
+            mark(renderer, "render-scene-gather", t);
         }
 
+        let t = cpu_now_ns();
         self.submit_scene_edit_overlay(renderer, &cam, view_width, view_height);
+        mark(renderer, "scene-edit-overlay", t);
 
         // Tell the renderer whether to fold the active view's BGRA8 shm readback into this
         // frame's command buffer, so it records the blit/copy inline — no separate submit, no
@@ -291,7 +297,9 @@ impl HostLayer {
             return vegetation_mutated;
         }
         if self.shm_publish {
+            let t = cpu_now_ns();
             self.publish_pipelined_view(renderer);
+            mark(renderer, "publish-view", t);
         }
         vegetation_mutated
     }

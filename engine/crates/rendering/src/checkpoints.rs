@@ -5,19 +5,31 @@
 //! reached — naming the submission that wedged the GPU — and the fault query adds the driver's
 //! fault kind and faulting GPU addresses.
 
+use std::collections::HashMap;
 use std::ffi::c_void;
-use std::sync::Mutex;
+use std::sync::RwLock;
 
 use ash::vk;
 
 /// The `VK_NV_device_diagnostic_checkpoints` dispatch plus the marker-name registry.
 ///
 /// A checkpoint marker is an opaque pointer-sized value the driver hands back verbatim. The
-/// registry interns each name once and encodes its 1-based index as the marker, so the post-loss
-/// query maps markers back to names without keeping raw string pointers alive across frames.
+/// registry keys each name by its hash and uses that hash as the marker, so the post-loss query
+/// maps markers back to names without keeping raw string pointers alive across frames.
+///
+/// Every pass marks on every frame, so the hot path is a read lock and one hash lookup: the name
+/// set is fixed after the first frame and the write lock is never taken again.
 pub struct Checkpoints {
     dispatch: ash::nv::device_diagnostic_checkpoints::Device,
-    names: Mutex<Vec<String>>,
+    names: RwLock<HashMap<u64, String>>,
+}
+
+/// FNV-1a over the name, used as the checkpoint marker. Collisions only mis-name a post-loss
+/// report, never affect rendering.
+fn marker_of(name: &str) -> u64 {
+    name.bytes().fold(0xcbf2_9ce4_8422_2325_u64, |hash, byte| {
+        (hash ^ u64::from(byte)).wrapping_mul(0x0000_0100_0000_01b3)
+    })
 }
 
 impl Checkpoints {
@@ -25,23 +37,25 @@ impl Checkpoints {
     pub(crate) fn new(instance: &ash::Instance, device: &ash::Device) -> Self {
         Self {
             dispatch: ash::nv::device_diagnostic_checkpoints::Device::new(instance, device),
-            names: Mutex::new(Vec::new()),
+            names: RwLock::new(HashMap::new()),
         }
     }
 
     /// Records a named checkpoint on `cmd`.
     pub(crate) fn mark(&self, cmd: vk::CommandBuffer, name: &str) {
-        let index = {
-            let mut names = self.names.lock().expect("checkpoint name registry");
-            match names.iter().position(|known| known == name) {
-                Some(index) => index,
-                None => {
-                    names.push(name.to_owned());
-                    names.len() - 1
-                }
-            }
-        };
-        let marker = (index + 1) as *const c_void;
+        let key = marker_of(name);
+        if !self
+            .names
+            .read()
+            .expect("checkpoint name registry")
+            .contains_key(&key)
+        {
+            self.names
+                .write()
+                .expect("checkpoint name registry")
+                .insert(key, name.to_owned());
+        }
+        let marker = key as *const c_void;
         // SAFETY: the ash seam. `cmd` is recording; the marker is an opaque value the driver
         // returns verbatim from the post-loss query.
         unsafe { (self.dispatch.fp().cmd_set_checkpoint_nv)(cmd, marker) };
@@ -59,12 +73,11 @@ impl Checkpoints {
         // SAFETY: the ash seam. `data` holds `count` records with their `sType` set.
         unsafe { fp(queue, &mut count, data.as_mut_ptr()) };
         data.truncate(count as usize);
-        let names = self.names.lock().expect("checkpoint name registry");
+        let names = self.names.read().expect("checkpoint name registry");
         data.iter()
             .map(|entry| {
-                let name = (entry.p_checkpoint_marker as usize)
-                    .checked_sub(1)
-                    .and_then(|index| names.get(index))
+                let name = names
+                    .get(&(entry.p_checkpoint_marker as u64))
                     .map_or("<unknown marker>", String::as_str);
                 format!("'{name}' reached {:?}", entry.stage)
             })

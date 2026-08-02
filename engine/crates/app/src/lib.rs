@@ -10,7 +10,7 @@
 use std::time::{Duration, Instant};
 
 use saffron_core::TimeSpan;
-use saffron_rendering::{RenderGraph, Renderer, SurfaceSource};
+use saffron_rendering::{RenderGraph, Renderer, SurfaceSource, cpu_now_ns};
 use saffron_window::{
     ActiveEventLoop, ApplicationHandler, ControlFlow, EventLoop, Window, WindowConfig, WindowEvent,
     WindowId,
@@ -505,7 +505,9 @@ fn step_frame(app: &mut App, limits: LoopLimits, clock: &mut FrameClock) {
     // The CPU busy window opens here and closes after `run_frame`; the GPU fence-wait inside
     // `begin_frame` is the wait split.
     let busy_start = Instant::now();
-    run_hook(app, |layer, app| layer.on_update(app, dt));
+    phase(app, "on-update", |app| {
+        run_hook(app, |layer, app| layer.on_update(app, dt));
+    });
 
     let (width, height) = app.frame_host.viewport_size();
     let minimized = width == 0 || height == 0;
@@ -516,7 +518,7 @@ fn step_frame(app: &mut App, limits: LoopLimits, clock: &mut FrameClock) {
         // Only rendered frames advance the frame delta, so idle does not pollute the fps EMA.
         app.frame_host.record_frame_timing(dt.seconds);
         let before_begin = Instant::now();
-        match app.frame_host.begin_frame() {
+        match phase(app, "begin-frame-wait", |app| app.frame_host.begin_frame()) {
             Ok(true) => {
                 // `begin_frame` blocks on the slot's in-flight fence (the GPU-bound wait).
                 wait_seconds = before_begin.elapsed().as_secs_f32();
@@ -674,8 +676,12 @@ impl ApplicationHandler for WindowedApp {
 /// The render/ui/graph hook pass for one accepted frame. The render graph is owned here for the
 /// pass and moved into `end_frame`, which executes it.
 fn run_frame(app: &mut App) {
-    run_hook(app, |layer, app| layer.on_render(app));
-    run_hook(app, |layer, app| layer.on_ui(app));
+    phase(app, "on-render", |app| {
+        run_hook(app, |layer, app| layer.on_render(app));
+    });
+    phase(app, "on-ui", |app| {
+        run_hook(app, |layer, app| layer.on_ui(app));
+    });
 
     let mut graph = RenderGraph::new();
     app.frame_host.begin_frame_graph(&mut graph);
@@ -684,6 +690,19 @@ fn run_frame(app: &mut App) {
         tracing::error!("end_frame failed: {err}");
         app.running = false;
     }
+}
+
+/// Times `body` and records it as a top-level CPU span, so a profiler capture accounts for the
+/// whole frame instead of only the render-graph window. A no-op beyond two clock reads when the
+/// profiler is off.
+fn phase<R>(app: &mut App, name: &str, body: impl FnOnce(&mut App) -> R) -> R {
+    let start = cpu_now_ns();
+    let out = body(app);
+    let elapsed = cpu_now_ns().saturating_sub(start);
+    if let Some(renderer) = app.frame_host.renderer_mut() {
+        renderer.record_cpu_span(name, start, elapsed);
+    }
+    out
 }
 
 /// Dispatches one hook across every attached layer.

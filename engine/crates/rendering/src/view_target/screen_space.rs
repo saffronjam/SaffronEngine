@@ -137,7 +137,7 @@ impl ViewTarget {
         };
         let ao_raw = Image::new(
             resources,
-            &ImageDesc::color_2d(half_extent, AO_FORMAT, storage_sampled),
+            &ImageDesc::color_2d(half_extent, AO_RAW_FORMAT, storage_sampled),
         )?;
         let ao_map = Image::new(
             resources,

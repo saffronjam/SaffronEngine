@@ -418,7 +418,10 @@ type PassBody = Box<dyn FnOnce(vk::CommandBuffer, &mut NestedScopeRecorder<'_>)>
 /// aggregate), and recording is single-threaded, so it need not be `Send`.
 pub struct RgPass {
     /// A human-readable name (used for capture-tool labels and profiler scopes).
-    pub name: String,
+    ///
+    /// `&'static str`, not `String`: the graph is rebuilt every frame, and every pass in the tree
+    /// names itself with a literal, so owning the name would allocate once per pass per frame.
+    pub name: &'static str,
     /// Whether this is a graphics or compute pass.
     pub kind: RgPassKind,
     /// Preferred queue; resolved against the device topology without changing the pass.
@@ -440,9 +443,9 @@ impl RgPass {
     /// A graphics pass with the given name and render area, no accesses or
     /// attachments yet. Chain [`RgPass::access`] / [`RgPass::color`] /
     /// [`RgPass::depth_attachment`] / [`RgPass::body`] to fill it in.
-    pub fn graphics(name: impl Into<String>, render_area: vk::Extent2D) -> Self {
+    pub fn graphics(name: &'static str, render_area: vk::Extent2D) -> Self {
         Self {
-            name: name.into(),
+            name,
             kind: RgPassKind::Graphics,
             queue: RgQueuePreference::Graphics,
             accesses: Vec::new(),
@@ -462,9 +465,9 @@ impl RgPass {
     /// the cross-queue release/acquire pair — a pass whose consumers reach its output some
     /// other way has no such handoff, and naming a graphics stage from a compute-only queue
     /// is invalid besides.
-    pub fn compute(name: impl Into<String>) -> Self {
+    pub fn compute(name: &'static str) -> Self {
         Self {
-            name: name.into(),
+            name,
             kind: RgPassKind::Compute,
             queue: RgQueuePreference::Graphics,
             accesses: Vec::new(),
@@ -511,9 +514,9 @@ impl RgPass {
     }
 
     /// Graphics commands that manage multiple dynamic-rendering scopes in one body.
-    pub fn graphics_commands(name: impl Into<String>) -> Self {
+    pub fn graphics_commands(name: &'static str) -> Self {
         Self {
-            name: name.into(),
+            name,
             kind: RgPassKind::GraphicsCommands,
             queue: RgQueuePreference::Graphics,
             accesses: Vec::new(),

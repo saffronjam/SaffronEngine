@@ -237,10 +237,22 @@ struct Claim {
     facet: ResidencyFacet,
 }
 
+/// One source's resolved claims, keyed by everything that determines them.
+///
+/// The key is what lets a source that has not crossed a cell boundary keep its claims instead of
+/// rebuilding an identical set: a viewpoint's smoothed velocity changes every frame by a hair, so
+/// comparing the source itself would never match, while the cells it claims stay put.
+struct SourceClaims {
+    claims: BTreeSet<Claim>,
+    centres: Vec<WorldCellKey>,
+    levels: Vec<SourceLevel>,
+    facets: ResidencyMask,
+}
+
 /// Deterministically resolves multiple predicted sources into per-facet cell reference counts.
 pub struct ResidencyManager {
     sources: BTreeMap<SpatialSourceId, SpatialSource>,
-    claims: BTreeMap<SpatialSourceId, BTreeSet<Claim>>,
+    claims: BTreeMap<SpatialSourceId, SourceClaims>,
     source_claim_budget: NonZeroUsize,
 }
 
@@ -271,36 +283,59 @@ impl ResidencyManager {
     /// Adds or replaces one source, applying load and cleanup hysteresis exactly.
     pub fn update_source(&mut self, source: SpatialSource) -> Result<()> {
         source.validate()?;
-        let center = source.predicted_position()?;
-        let previous = self.claims.get(&source.id).cloned().unwrap_or_default();
+        let centre = source.predicted_position()?;
+        let centres = source
+            .levels
+            .iter()
+            .map(|level| centre.cell().ancestor(level.level))
+            .collect::<Result<Vec<_>>>()?;
+        // A source whose centre cells, levels, and facets all match claims exactly what it already
+        // claims. Only `priority` and `revision` can still differ, and neither selects cells.
+        if let Some(resolved) = self.claims.get(&source.id)
+            && resolved.centres == centres
+            && resolved.levels == source.levels
+            && resolved.facets == source.facets
+        {
+            self.sources.insert(source.id, source);
+            return Ok(());
+        }
+
+        let previous = self
+            .claims
+            .get(&source.id)
+            .map(|resolved| resolved.claims.clone())
+            .unwrap_or_default();
         let mut next = BTreeSet::new();
-        for level in &source.levels {
-            let center_cell = center.cell().ancestor(level.level)?;
+        for (level, centre_cell) in source.levels.iter().zip(&centres) {
             let load = cells_in_cube(
-                center_cell,
+                *centre_cell,
                 level.load_radius_cells,
                 self.source_claim_budget.get(),
             )?;
-            let cleanup = cells_in_cube(
-                center_cell,
-                level.cleanup_radius_cells,
-                self.source_claim_budget.get(),
-            )?;
+            cube_cardinality(level.cleanup_radius_cells, self.source_claim_budget.get())?;
             for facet in source.facets.iter() {
                 next.extend(load.iter().copied().map(|cell| Claim { cell, facet }));
                 next.extend(previous.iter().copied().filter(|claim| {
                     claim.facet == facet
                         && claim.cell.level() == level.level
-                        && cleanup.contains(&claim.cell)
+                        && within_cube(*centre_cell, claim.cell, level.cleanup_radius_cells)
                 }));
             }
             if next.len() > self.source_claim_budget.get() {
                 return Err(Error::ResidencyBudgetExceeded);
             }
         }
-        self.claims.insert(source.id, next);
+        self.claims.insert(
+            source.id,
+            SourceClaims {
+                claims: next,
+                centres,
+                levels: source.levels.clone(),
+                facets: source.facets,
+            },
+        );
         self.sources.insert(source.id, source);
-        self.validate_counts()
+        Ok(())
     }
 
     /// Removes a source and all its references.
@@ -319,9 +354,9 @@ impl ResidencyManager {
     /// Resolved non-empty cell snapshots in canonical key order.
     pub fn snapshots(&self) -> Result<Vec<ResidencySnapshot>> {
         let mut result: BTreeMap<WorldCellKey, ResidencySnapshot> = BTreeMap::new();
-        for (source_id, claims) in &self.claims {
+        for (source_id, resolved) in &self.claims {
             let source = &self.sources[source_id];
-            for claim in claims {
+            for claim in &resolved.claims {
                 let entry = result.entry(claim.cell).or_insert(ResidencySnapshot {
                     cell: claim.cell,
                     reference_counts: [0; FACET_COUNT],
@@ -336,18 +371,10 @@ impl ResidencyManager {
         }
         Ok(result.into_values().collect())
     }
-
-    fn validate_counts(&self) -> Result<()> {
-        let _ = self.snapshots()?;
-        Ok(())
-    }
 }
 
-fn cells_in_cube(
-    center: WorldCellKey,
-    radius: u32,
-    cell_budget: usize,
-) -> Result<BTreeSet<WorldCellKey>> {
+/// The cell count a cube of `radius` materializes, rejected when it exceeds `cell_budget`.
+fn cube_cardinality(radius: u32, cell_budget: usize) -> Result<u128> {
     let diameter = u128::from(radius)
         .checked_mul(2)
         .and_then(|value| value.checked_add(1))
@@ -358,12 +385,40 @@ fn cells_in_cube(
     if cardinality > cell_budget as u128 {
         return Err(Error::ResidencyBudgetExceeded);
     }
+    Ok(cardinality)
+}
+
+/// Whether `cell` lies within the Chebyshev `radius` cube around `centre`, both at the same level.
+///
+/// The retention test the cleanup radius performs, answered arithmetically. Materializing the
+/// cleanup cube to call `contains` costs a tree node per cell for a question that is three
+/// comparisons.
+fn within_cube(centre: WorldCellKey, cell: WorldCellKey, radius: u32) -> bool {
+    if cell.level() != centre.level() {
+        return false;
+    }
+    let origin = centre.coordinates();
+    let target = cell.coordinates();
+    let radius = u64::from(radius);
+    (0..3).all(|axis| {
+        target[axis]
+            .checked_sub(origin[axis])
+            .is_some_and(|delta| delta.unsigned_abs() <= radius)
+    })
+}
+
+fn cells_in_cube(
+    centre: WorldCellKey,
+    radius: u32,
+    cell_budget: usize,
+) -> Result<BTreeSet<WorldCellKey>> {
+    cube_cardinality(radius, cell_budget)?;
     let radius = i64::from(radius);
     let mut cells = BTreeSet::new();
     for z in -radius..=radius {
         for y in -radius..=radius {
             for x in -radius..=radius {
-                cells.insert(center.neighbour([x, y, z])?);
+                cells.insert(centre.neighbour([x, y, z])?);
             }
         }
     }
@@ -811,6 +866,51 @@ mod tests {
         );
         assert!(manager.sources().is_empty());
         assert!(manager.snapshots().unwrap().is_empty());
+    }
+
+    #[test]
+    fn restating_a_source_is_a_fixed_point() {
+        // The claim recurrence is `load ∪ (previous ∩ cleanup)`, and `load ⊆ cleanup`, so one
+        // update settles it. Holding a stationary source's claims instead of rebuilding them is
+        // only sound while that is true — a cleanup radius that stopped covering load, or a
+        // recurrence that accumulated, would break here first.
+        let mut manager = ResidencyManager::new();
+        let origin = WorldPosition::origin();
+        let moved =
+            WorldPosition::from_render_relative(glam::Vec3::new(320.0, 0.0, 0.0), origin).unwrap();
+
+        manager.update_source(source(1, moved)).unwrap();
+        manager.update_source(source(1, origin)).unwrap();
+        let settled = manager.snapshots().unwrap();
+        assert!(!settled.is_empty());
+
+        for revision in 2..8_u64 {
+            let mut restated = source(1, origin);
+            restated.revision = revision;
+            manager.update_source(restated).unwrap();
+            assert_eq!(manager.snapshots().unwrap(), settled);
+        }
+    }
+
+    #[test]
+    fn a_held_source_still_republishes_its_priority() {
+        // Priority does not select cells, so it must survive the stationary-source hold — a hold
+        // that skipped the source write would pin the old scheduling order forever.
+        let mut manager = ResidencyManager::new();
+        let origin = WorldPosition::origin();
+        manager.update_source(source(1, origin)).unwrap();
+
+        let mut raised = source(1, origin);
+        raised.priority = 77;
+        manager.update_source(raised).unwrap();
+
+        assert!(
+            manager
+                .snapshots()
+                .unwrap()
+                .iter()
+                .all(|snapshot| snapshot.priority == 77)
+        );
     }
 
     #[test]

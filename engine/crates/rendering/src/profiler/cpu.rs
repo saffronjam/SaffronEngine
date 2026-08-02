@@ -3,21 +3,26 @@
 
 use super::*;
 
-/// Interns scope names to stable integer ids so a [`CpuSpan`] stays string-free. Names
-/// recur every frame, so the table grows once and then holds; lookup is a linear scan.
+/// Interns scope names to stable integer ids so a [`CpuSpan`] stays string-free.
+///
+/// Every pass interns on every frame and the name set is fixed after the first, so the hot path is
+/// one hash lookup — a linear scan over the table would be quadratic in the pass count.
 #[derive(Default)]
 pub struct CpuMarkerRegistry {
     pub(super) names: Vec<String>,
+    ids: std::collections::HashMap<String, u32>,
 }
 
 impl CpuMarkerRegistry {
     /// Maps a name to its stable id, interning it on first sight.
     pub fn id(&mut self, name: &str) -> u32 {
-        if let Some(i) = self.names.iter().position(|n| n == name) {
-            return i as u32;
+        if let Some(id) = self.ids.get(name) {
+            return *id;
         }
+        let id = u32::try_from(self.names.len()).expect("profile marker count fits u32");
         self.names.push(name.to_string());
-        (self.names.len() - 1) as u32
+        self.ids.insert(name.to_string(), id);
+        id
     }
 
     /// The name for an id.

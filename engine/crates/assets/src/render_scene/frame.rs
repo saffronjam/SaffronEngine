@@ -35,7 +35,9 @@ pub fn render_scene<R: SceneRenderer>(
     // Flatten the hierarchy once per frame before any consumer reads: every loop below
     // (lights, meshes, probes) and the between-frame pick/gizmo paths read the world-
     // transform cache this writes.
+    let t = cpu_now_ns();
     scene.update_world_transforms();
+    renderer.record_cpu_span("world-transforms", t, cpu_now_ns().saturating_sub(t));
 
     let time_of_day = drive_time_of_day(scene);
     if let Some(exposure) = time_of_day.exposure {
@@ -152,6 +154,7 @@ pub fn render_scene<R: SceneRenderer>(
         cloud_shadow_strength: c.cloud_shadow_strength,
         cloud_shadow_on_surface_strength: c.cloud_shadow_on_surface_strength,
     });
+    let lighting_started = cpu_now_ns();
     if let Err(err) = renderer.set_scene_lighting(&SceneLighting {
         direction: light_dir,
         color: light_color,
@@ -168,9 +171,15 @@ pub fn render_scene<R: SceneRenderer>(
     }) {
         tracing::error!("set_scene_lighting: {err}");
     }
+    renderer.record_cpu_span(
+        "scene-lighting",
+        lighting_started,
+        cpu_now_ns().saturating_sub(lighting_started),
+    );
 
     // Drive the environment bake. Equirect (a loaded panorama) wins, then the atmosphere,
     // then the procedural gradient — the sun derived from the directional light.
+    let t = cpu_now_ns();
     let sky_panorama = drive_env_bake(
         renderer,
         scene,
@@ -179,6 +188,7 @@ pub fn render_scene<R: SceneRenderer>(
         &moon,
         time_of_day.moon_illuminated_fraction,
     );
+    renderer.record_cpu_span("env-bake", t, cpu_now_ns().saturating_sub(t));
 
     renderer.set_cluster_camera(ClusterCamera {
         view,
@@ -194,10 +204,12 @@ pub fn render_scene<R: SceneRenderer>(
     renderer.set_show_grid(options.show_grid);
 
     renderer.record_scene_gather(scene_gather_elapsed, entities_derived);
+    let t = cpu_now_ns();
     if let Err(err) = renderer.submit_deformations(view_projection, &work, &frame_joints) {
         tracing::error!("submit_deformations: {err}");
     }
     renderer.patch_frame_deformations(scene, mirror);
+    renderer.record_cpu_span("deformations", t, cpu_now_ns().saturating_sub(t));
 
     // Resolve the scene environment into the visible-sky settings.
     let env = &scene.environment;

@@ -57,7 +57,7 @@ impl GpuArenaGrowth {
     /// Enqueues the preservation copy and the zero-fill of the fresh tail beyond it as one
     /// fully declared render-graph transfer pass. The two ranges are disjoint, so the pass
     /// needs no intra-pass hazard ordering.
-    pub fn enqueue(self, graph: &mut RenderGraph, device: &Device, name: impl Into<String>) {
+    pub fn enqueue(self, graph: &mut RenderGraph, device: &Device, name: &'static str) {
         let source = graph.register_buffer(RgBufferResource {
             buffer: self.source,
             size: self.source_size,
@@ -107,7 +107,7 @@ impl GpuArenaGrowth {
 
 impl GpuBufferUpload {
     /// Enqueues this upload as a fully declared render-graph transfer pass.
-    pub fn enqueue(self, graph: &mut RenderGraph, device: &Device, name: impl Into<String>) {
+    pub fn enqueue(self, graph: &mut RenderGraph, device: &Device, name: &'static str) {
         let source = graph.register_buffer(RgBufferResource {
             buffer: self.source,
             size: self.source_size,

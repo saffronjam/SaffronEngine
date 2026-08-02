@@ -27,8 +27,8 @@ impl Renderer {
         let build_span = if profile_cpu {
             let pending = std::mem::take(&mut self.pending_cpu_spans);
             let CpuProfiler { registry, buffers } = &mut self.cpu_profiler;
-            // Spans measured outside this crate — the vegetation sync's stages — land here, in the
-            // slot they belong to, so a capture shows them beside the passes rather than as a gap.
+            // Spans measured outside this crate land here, in the slot they belong to, so a
+            // capture shows them beside the passes rather than as a gap.
             for (name, start_ns, duration_ns) in pending {
                 let index = buffers[frame].begin_span(registry, &name, start_ns);
                 buffers[frame].end_span(index, start_ns.saturating_add(duration_ns));

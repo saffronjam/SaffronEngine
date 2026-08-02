@@ -24,6 +24,7 @@ use saffron_rendering::{
     CloudRenderSettings, ClusterCamera, CoverageSourceKind, EnvSource, FOG_SHAPE_BOX,
     FOG_SHAPE_SPHERE, FogRenderSettings, FogVolumeUpload, GpuLight, GpuMesh, MAX_FOG_VOLUMES,
     MAX_REFLECTION_PROBES, ReflectionProbeUpload, SceneLighting, SkyRenderSettings, SkygenParams,
+    cpu_now_ns,
 };
 use saffron_scene::{
     AtmosphereRole, Camera, CameraView, DirectionalLight, Entity, FogShape, FogVolume, IdComponent,
@@ -172,6 +173,9 @@ pub trait SceneRenderer: GpuUploader {
     fn set_show_grid(&mut self, enabled: bool);
     /// Records the frame scene gather duration.
     fn record_scene_gather(&mut self, elapsed: Duration, entities: u32);
+    /// Records an already-measured CPU span into this frame's profiler, so a capture attributes
+    /// the scene drive instead of leaving it as a gap. Default no-op.
+    fn record_cpu_span(&mut self, _name: &str, _start_ns: u64, _duration_ns: u64) {}
     /// Whether displacement tessellation is built and on; the gather derives displace
     /// facts only when it is.
     fn displacement_enabled(&self) -> bool {
@@ -416,6 +420,10 @@ impl SceneRenderer for RendererScene<'_> {
 
     fn record_scene_gather(&mut self, elapsed: Duration, entities: u32) {
         self.renderer.record_scene_gather(elapsed, entities);
+    }
+
+    fn record_cpu_span(&mut self, name: &str, start_ns: u64, duration_ns: u64) {
+        self.renderer.record_cpu_span(name, start_ns, duration_ns);
     }
 
     fn patch_frame_deformations(&mut self, scene: &Scene, mirror: &crate::GpuSceneMirror) {

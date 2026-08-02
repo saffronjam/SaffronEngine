@@ -19,6 +19,14 @@ pub const G_NORMAL_FORMAT: vk::Format = vk::Format::R16G16B16A16_SFLOAT;
 /// The AO + contact single-channel map format.
 pub const AO_FORMAT: vk::Format = vk::Format::R8_UNORM;
 
+/// The half-res raw GTAO format: `r` = ambient occlusion, `g` = the view-Z it was traced at.
+///
+/// Carrying the depth beside the value is what lets the bilateral denoise weight a tap from the
+/// sample it already fetched, matching the rgba16f traces whose alpha does the same — so every
+/// half-res trace this frame shares one format. Two channels would do, but `R16G16_SFLOAT` is a
+/// storage image only under `shaderStorageImageExtendedFormats`, while this one is mandatory.
+pub const AO_RAW_FORMAT: vk::Format = vk::Format::R16G16B16A16_SFLOAT;
+
 /// The thin G-buffer's second target: per-pixel roughness (∈ [0,1]). `R8_UNORM` is a mandatory
 /// color-attachment + sampled format, so no device feature is required.
 pub const ROUGHNESS_FORMAT: vk::Format = vk::Format::R8_UNORM;

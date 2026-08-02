@@ -16,7 +16,9 @@ use crate::frame::MAX_FRAMES_IN_FLIGHT;
 use crate::pipelines::{DEPTH_FORMAT, OFFSCREEN_COLOR_FORMAT};
 use crate::resources::{Buffer, Image, ImageDesc};
 use crate::restir::RestirView;
-use crate::ssao::{AO_FORMAT, G_NORMAL_FORMAT, ROUGHNESS_FORMAT, Ssao, mesh_set_layout};
+use crate::ssao::{
+    AO_FORMAT, AO_RAW_FORMAT, G_NORMAL_FORMAT, ROUGHNESS_FORMAT, Ssao, mesh_set_layout,
+};
 use crate::{Device, Result};
 
 use screen_space::*;

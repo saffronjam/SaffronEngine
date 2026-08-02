@@ -1,12 +1,13 @@
 // Horizon-based ambient occlusion (GTAO-lite) on the thin G-buffer. For each pixel it
 // reconstructs the view-space position from the stored view-Z, then for a few azimuth
 // slices marches a few steps each side searching for the largest horizon angle, and
-// integrates the visible cosine cone. Output is a single AO factor in [0,1] (1 = open).
+// integrates the visible cosine cone. Output is `r` = AO factor in [0,1] (1 = open), `g` = the
+// view-Z it was traced at, which the bilateral denoise weights its taps by.
 // Set 0: binding 0 = G-buffer (viewNormal.xyz, viewZ in .a) sampler; binding 1 = AO out.
 
 [[vk::binding(0, 0)]] Sampler2D gbuffer;
-[[vk::image_format("r8")]]
-[[vk::binding(1, 0)]] RWTexture2D<float> aoOut;
+[[vk::image_format("rgba16f")]]
+[[vk::binding(1, 0)]] RWTexture2D<float4> aoOut;
 
 struct Push
 {
@@ -47,7 +48,7 @@ void computeMain(uint3 tid : SV_DispatchThreadID)
     // Background (no geometry: viewZ ~ 0 from the clear) is fully open.
     if (viewZ > -1e-4)
     {
-        aoOut[tid.xy] = 1.0;
+        aoOut[tid.xy] = float4(1.0, viewZ, 0.0, 0.0);
         return;
     }
     float3 n = normalize(g.xyz);
@@ -99,5 +100,5 @@ void computeMain(uint3 tid : SV_DispatchThreadID)
     }
     occlusion = total > 0.0 ? occlusion / total : 0.0;
     float ao = saturate(1.0 - occlusion * pc.params.y);
-    aoOut[tid.xy] = ao;
+    aoOut[tid.xy] = float4(ao, viewZ, 0.0, 0.0);
 }

@@ -647,29 +647,35 @@ impl RenderGraph {
                     .take()
                     .expect("each render-graph pass belongs to one batch");
                 if let Some(checkpoints) = device.resources().checkpoints() {
-                    checkpoints.mark(command_buffer, &pass.name);
+                    checkpoints.mark(command_buffer, pass.name);
                 }
                 let barriers = &plan.passes[pass_index];
                 let gpu_timestamps_supported = batch.queue == RgQueueAssignment::Graphics
                     || device
                         .compute_timestamp_valid_bits
                         .is_some_and(|bits| bits != 0);
-                let cpu_index = recorders.cpu.as_mut().map(|(registry, buffer)| {
-                    buffer.begin_span(registry, &pass.name, cpu_now_ns())
-                });
+                let cpu_index = recorders
+                    .cpu
+                    .as_mut()
+                    .map(|(registry, buffer)| buffer.begin_span(registry, pass.name, cpu_now_ns()));
                 let gpu_index = gpu_timestamps_supported
                     .then(|| {
                         recorders.gpu.as_mut().and_then(|timestamps| {
-                            timestamps.begin_scope(raw, command_buffer, &pass.name)
+                            timestamps.begin_scope(raw, command_buffer, pass.name)
                         })
                     })
                     .flatten();
+                let barrier_start = cpu_now_ns();
                 emit_barriers(
                     raw,
                     command_buffer,
                     &barriers.before_images,
                     &barriers.before_buffers,
                 );
+                if let Some((registry, buffer)) = recorders.cpu.as_mut() {
+                    let i = buffer.begin_span(registry, "rg:barriers-before", barrier_start);
+                    buffer.end_span(i, cpu_now_ns());
+                }
                 if records_pipeline_statistics(batch.queue)
                     && let (Some(index), Some(timestamps)) = (gpu_index, recorders.gpu.as_mut())
                 {
@@ -677,6 +683,7 @@ impl RenderGraph {
                         u64::from(pass.render_area.width) * u64::from(pass.render_area.height);
                     let _ = timestamps.reserve_stats_slot(index, pixels);
                 }
+                let body_start = cpu_now_ns();
                 {
                     let gpu = if gpu_timestamps_supported {
                         recorders.gpu.as_deref_mut()
@@ -700,12 +707,21 @@ impl RenderGraph {
                         }
                     }
                 }
+                if let Some((registry, buffer)) = recorders.cpu.as_mut() {
+                    let i = buffer.begin_span(registry, "rg:body", body_start);
+                    buffer.end_span(i, cpu_now_ns());
+                }
+                let after_start = cpu_now_ns();
                 emit_barriers(
                     raw,
                     command_buffer,
                     &barriers.after_images,
                     &barriers.after_buffers,
                 );
+                if let Some((registry, buffer)) = recorders.cpu.as_mut() {
+                    let i = buffer.begin_span(registry, "rg:barriers-after", after_start);
+                    buffer.end_span(i, cpu_now_ns());
+                }
                 if gpu_timestamps_supported && let Some(timestamps) = recorders.gpu.as_mut() {
                     timestamps.end_scope(raw, command_buffer, gpu_index);
                 }
@@ -921,7 +937,7 @@ pub(super) fn batch_label(passes: &[Option<RgPass>], range: std::ops::Range<usiz
         passes
             .get(index)
             .and_then(Option::as_ref)
-            .map(|pass| pass.name.as_str())
+            .map(|pass| pass.name)
     };
     // A synthetic prologue batch records queue-ownership releases over no passes at all.
     if range.is_empty() {

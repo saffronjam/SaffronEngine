@@ -469,7 +469,7 @@ impl GpuSceneUploader {
         gpu_data: &mut GlobalGpuData,
     ) -> Result<u32> {
         let mut growths = 0;
-        let mut push = |growth: Option<crate::GpuArenaGrowth>, name: &str| {
+        let mut push = |growth: Option<crate::GpuArenaGrowth>, name: &'static str| {
             if let Some(growth) = growth {
                 growth.enqueue(graph, device, name);
                 growths += 1;
@@ -501,15 +501,14 @@ impl GpuSceneUploader {
             gpu_data.prototype_sdfs.prepare_growth(device)?,
             "prototype-sdfs grow",
         );
-        for (world, tables) in &mut self.worlds {
+        // One stable name per table rather than one per world: the growth pass is rare and the
+        // profile reads better aggregated than split across a name per world id.
+        for tables in self.worlds.values_mut() {
             push(
                 tables.instances.prepare_growth(device)?,
-                &format!("scene-instances[{world}] grow"),
+                "scene-instances grow",
             );
-            push(
-                tables.lights.prepare_growth(device)?,
-                &format!("scene-lights[{world}] grow"),
-            );
+            push(tables.lights.prepare_growth(device)?, "scene-lights grow");
         }
         Ok(growths)
     }

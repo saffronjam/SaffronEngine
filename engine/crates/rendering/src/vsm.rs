@@ -325,6 +325,14 @@ impl VsmResidency {
     pub fn tile(&self, key: VsmPageKey) -> Option<u32> {
         self.pages.get(&key).map(|state| state.tile)
     }
+
+    /// Every resident page and its tile, in arbitrary order.
+    ///
+    /// The page table is dense and residency is sparse, so publication scatters from this rather
+    /// than probing the map once per table slot.
+    pub fn resident_pages(&self) -> impl Iterator<Item = (VsmPageKey, u32)> + '_ {
+        self.pages.iter().map(|(key, state)| (*key, state.tile))
+    }
 }
 
 /// One directional clip level's snapped window: the light-space origin of its
@@ -671,34 +679,12 @@ impl VsmGpu {
         frame: usize,
         residency: &VsmResidency,
     ) -> u64 {
+        // A non-resident slot encodes as zero, so the zeroed array is already the whole
+        // non-resident table and only the resident pages need writing.
         let mut entries = [0_u32; VSM_TABLE_ENTRIES];
-        for level in 0..VSM_DIRECTIONAL_LEVELS {
-            for y in 0..VSM_LEVEL_PAGES {
-                for x in 0..VSM_LEVEL_PAGES {
-                    let key = VsmPageKey::Directional { level, x, y };
-                    let index = (level * VSM_LEVEL_PAGES * VSM_LEVEL_PAGES
-                        + y * VSM_LEVEL_PAGES
-                        + x) as usize;
-                    entries[index] = vsm_table_entry(residency.tile(key));
-                }
-            }
-        }
-        for y in 0..VSM_SPOT_PAGES {
-            for x in 0..VSM_SPOT_PAGES {
-                let index = (VSM_SPOT_TABLE_BASE + y * VSM_SPOT_PAGES + x) as usize;
-                entries[index] = vsm_table_entry(residency.tile(VsmPageKey::Spot { x, y }));
-            }
-        }
-        for face in 0..VSM_POINT_FACES {
-            for y in 0..VSM_POINT_FACE_PAGES {
-                for x in 0..VSM_POINT_FACE_PAGES {
-                    let index = (VSM_POINT_TABLE_BASE
-                        + face * VSM_POINT_FACE_PAGES * VSM_POINT_FACE_PAGES
-                        + y * VSM_POINT_FACE_PAGES
-                        + x) as usize;
-                    entries[index] =
-                        vsm_table_entry(residency.tile(VsmPageKey::PointFace { face, x, y }));
-                }
+        for (key, tile) in residency.resident_pages() {
+            if let Some(index) = vsm_table_index(key) {
+                entries[index as usize] = vsm_table_entry(Some(tile));
             }
         }
         let buffer = &self.table_ring[frame];
@@ -999,6 +985,31 @@ pub fn vsm_demand_key(index: u32) -> Option<VsmPageKey> {
     }
 }
 
+/// The page table slot a key occupies, or `None` when the key is out of range.
+///
+/// The exact inverse of [`vsm_demand_key`], which is what lets publication scatter resident pages
+/// into the dense table instead of probing residency once per slot.
+#[must_use]
+pub fn vsm_table_index(key: VsmPageKey) -> Option<u32> {
+    match key {
+        VsmPageKey::Directional { level, x, y } => {
+            (level < VSM_DIRECTIONAL_LEVELS && x < VSM_LEVEL_PAGES && y < VSM_LEVEL_PAGES)
+                .then(|| level * VSM_LEVEL_PAGES * VSM_LEVEL_PAGES + y * VSM_LEVEL_PAGES + x)
+        }
+        VsmPageKey::Spot { x, y } => (x < VSM_SPOT_PAGES && y < VSM_SPOT_PAGES)
+            .then(|| VSM_SPOT_TABLE_BASE + y * VSM_SPOT_PAGES + x),
+        VsmPageKey::PointFace { face, x, y } => (face < VSM_POINT_FACES
+            && x < VSM_POINT_FACE_PAGES
+            && y < VSM_POINT_FACE_PAGES)
+            .then(|| {
+                VSM_POINT_TABLE_BASE
+                    + face * VSM_POINT_FACE_PAGES * VSM_POINT_FACE_PAGES
+                    + y * VSM_POINT_FACE_PAGES
+                    + x
+            }),
+    }
+}
+
 /// Packs one page-table entry.
 pub fn vsm_table_entry(tile: Option<u32>) -> u32 {
     match tile {
@@ -1010,6 +1021,49 @@ pub fn vsm_table_entry(tile: Option<u32>) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Publication scatters resident pages through `vsm_table_index`, while the GPU demand bitmap
+    /// is decoded through `vsm_demand_key`. They address the same table, so a disagreement would
+    /// publish a page's tile into a slot nothing samples — and the shadow would simply be missing.
+    #[test]
+    fn every_table_slot_round_trips_through_both_mappings() {
+        for index in 0..VSM_TABLE_ENTRIES as u32 {
+            let key = vsm_demand_key(index).expect("every slot below the table size decodes");
+            assert_eq!(
+                vsm_table_index(key),
+                Some(index),
+                "slot {index} decoded to {key:?}, which re-encodes elsewhere"
+            );
+        }
+        assert_eq!(vsm_demand_key(VSM_TABLE_ENTRIES as u32), None);
+    }
+
+    #[test]
+    fn an_out_of_range_page_has_no_table_slot() {
+        assert_eq!(
+            vsm_table_index(VsmPageKey::Directional {
+                level: VSM_DIRECTIONAL_LEVELS,
+                x: 0,
+                y: 0
+            }),
+            None
+        );
+        assert_eq!(
+            vsm_table_index(VsmPageKey::Spot {
+                x: VSM_SPOT_PAGES,
+                y: 0
+            }),
+            None
+        );
+        assert_eq!(
+            vsm_table_index(VsmPageKey::PointFace {
+                face: VSM_POINT_FACES,
+                x: 0,
+                y: 0
+            }),
+            None
+        );
+    }
 
     /// The dirty page rectangle is the box's own light-plane extent, so a caster's aspect decides
     /// how many pages re-rasterize.
