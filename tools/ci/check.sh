@@ -28,9 +28,11 @@
 #   6. control-schema contract   check-control-schema/check.ts against the live host
 #   7. project startup smoke     check-projects/check.sh against the live host
 #   8. performance budgets       bench-foliage-phase1/check.ts vs this device's recorded ceilings
-#   9. e2e                       tsc --noEmit over tests/e2e, then the bun suite against the host
+#   9. e2e                       tsc --noEmit over every TypeScript program, then the bun suite
+#                                against the host
 #  10. frontend                  editor/ bun run build + bun test
-#  11. lint                      cargo fmt --check + cargo clippy --workspace -- -D warnings
+#  11. lint                      cargo fmt --check + cargo clippy --workspace -- -D warnings +
+#                                oxfmt --check + oxlint --deny-warnings over every .ts/.tsx
 #
 # A step whose prerequisite this environment lacks DEFERS with a reason instead of failing.
 set -uo pipefail
@@ -266,18 +268,20 @@ else
   rm -f "$budget_log"
 fi
 
-step "9. e2e (tsc --noEmit over the suite, then the tests/e2e bun suite against the Rust host)"
+step "9. e2e (tsc --noEmit over every TypeScript program, then the tests/e2e bun suite against the Rust host)"
 if ! command -v bun >/dev/null; then
   defer_step "9. e2e" "e2e — bun not on PATH (add /var/home/saffronjam/.bun/bin)"
 else
   rm -f /tmp/saffron-e2e-*.sock 2>/dev/null || true
   # `bun test` strips types without checking them, so the suite's assertions only stay bound to the
   # generated @saffron/protocol types while `tsc` runs over them here. It needs no host, so it runs
-  # ahead of the boot probe and reports a type error even when nothing can execute.
-  if ! ( cd "$REPO/tests/e2e" && bun install --frozen-lockfile ); then
-    fail_step "9. e2e" "tests/e2e dependency install (bun install --frozen-lockfile)"
-  elif ! ( cd "$REPO/tests/e2e" && bun run typecheck ); then
-    fail_step "9. e2e" "tests/e2e typecheck"
+  # ahead of the boot probe and reports a type error even when nothing can execute. The same run
+  # covers tools/, packager/, and the editor app — every .ts/.tsx in the tree belongs to one of the
+  # two programs.
+  if ! ( cd "$REPO" && bun install --frozen-lockfile ); then
+    fail_step "9. e2e" "workspace dependency install (bun install --frozen-lockfile)"
+  elif ! ( cd "$REPO" && bun run typecheck ); then
+    fail_step "9. e2e" "TypeScript typecheck"
   elif ! host_ready; then
     fail_step "9. e2e" "the Rust host did not boot + answer ping (see probe log)"
   elif ( cd "$REPO/tests/e2e" && SAFFRON_ANIMA_BIN="$RUST_HOST" bun test --timeout 30000 --max-concurrency 4 ); then
@@ -290,8 +294,8 @@ fi
 step "10. frontend: gen @saffron/protocol + tsc --noEmit + vite build + unit tests"
 if ! command -v bun >/dev/null; then
   defer_step "10. frontend" "frontend build — bun not on PATH (add /var/home/saffronjam/.bun/bin)"
-elif [ ! -x "$REPO/editor/node_modules/.bin/tsc" ]; then
-  defer_step "10. frontend" "frontend build — editor deps not installed (run \`cd editor && bun install\`)"
+elif [ ! -x "$REPO/node_modules/.bin/tsc" ]; then
+  defer_step "10. frontend" "frontend build — workspace deps not installed (run \`bun install\`)"
 else
   if ( cd "$REPO/editor" && bun run build && bun test ); then
     pass_step "10. frontend"
@@ -300,11 +304,17 @@ else
   fi
 fi
 
-step "11. lint (cargo fmt --check + cargo clippy --workspace -- -D warnings)"
+step "11. lint (cargo fmt --check + cargo clippy -D warnings + oxfmt --check + oxlint over all TypeScript)"
 lint_ok=0
 ( cd "$ENGINE" && cargo fmt --check ) || lint_ok=1
 ( cd "$ENGINE" && cargo clippy --workspace -- -D warnings ) || lint_ok=1
-if [ "$lint_ok" -eq 0 ]; then pass_step "11. lint"; else fail_step "11. lint" "cargo fmt --check / cargo clippy --workspace -- -D warnings"; fi
+if ! command -v bun >/dev/null; then
+  defer "11. lint (TypeScript half) — bun not on PATH (add /var/home/saffronjam/.bun/bin)"
+else
+  ( cd "$REPO" && bun install --frozen-lockfile && bun run format:check ) || lint_ok=1
+  ( cd "$REPO" && bun run lint ) || lint_ok=1
+fi
+if [ "$lint_ok" -eq 0 ]; then pass_step "11. lint"; else fail_step "11. lint" "cargo fmt --check / cargo clippy --workspace -- -D warnings / oxfmt --check / oxlint"; fi
 
 echo
 echo "=== per-step verdict ==="

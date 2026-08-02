@@ -28,11 +28,13 @@ summary ending in a clear `ALL GATES PASSED` / `SOME GATES FAILED` verdict.
    and grades the fresh p95s and counters against `benchmarks/foliage-veg/phase-1-<device>.json`
    for *this* device. Hardware with no record of its own defers rather than borrowing another
    class's ceiling; a breach must reproduce before it fails.
-9. **e2e** — the `tests/e2e` bun suite against the host (`SAFFRON_ANIMA_BIN` repointed at
-   `engine/target/debug/saffron-host`).
+9. **e2e** — `bun run typecheck` (`tsc --noEmit` over both TypeScript programs: the bun-side tree
+   and the editor app), then the `tests/e2e` bun suite against the host (`SAFFRON_ANIMA_BIN`
+   repointed at `engine/target/debug/saffron-host`).
 10. **frontend** — `editor/` `bun run build` (gen `@saffron/protocol` → `tsc` → `vite build`) +
    `bun test`.
-11. **lint** — `cargo fmt --check` + `cargo clippy --workspace -- -D warnings`.
+11. **lint** — `cargo fmt --check` + `cargo clippy --workspace -- -D warnings`, then
+   `bun run format:check` + `bun run lint` (oxfmt and oxlint over every `.ts`/`.tsx` in the tree).
 
 The five standing gates are *in* the sequence, not adjacent to it: validation-clean (step 5),
 the control-schema contract (step 6), the recorded performance budgets (step 8, with the records'
@@ -46,8 +48,8 @@ You need, all at once:
 
 - the toolbox (Rust toolchain via `rust-toolchain.toml`, Vulkan 1.4 headers/loader/validation/
   tools, SDL3/winit display deps, slang) — see `AGENTS.md`;
-- the **host bun** on `PATH` (steps 6–10 — the contract test, the budget grading, e2e, and
-  frontend);
+- the **host bun** on `PATH` (steps 6–11 — the contract test, the budget grading, e2e, the
+  frontend build, and the TypeScript half of lint);
 - a **display** — steps 5–9 open a Vulkan swapchain, so run a headless weston compositor and
   point SDL at it.
 

@@ -199,15 +199,15 @@ schema: engine
     {{gpu_driver}}
     cd "{{repo}}/tools/check-control-schema" && bun run check.ts
 
-# typecheck the e2e suite against the generated @saffron/protocol types
-e2e-typecheck:
+# tsc --noEmit over every TypeScript program in the tree (the bun-side tree and the editor app)
+typecheck:
     #!/usr/bin/env bash
     set -euo pipefail
-    RECIPE=e2e-typecheck; {{reenter}}
-    cd "{{repo}}/tests/e2e" && bun install --frozen-lockfile && bun run typecheck
+    RECIPE=typecheck; {{reenter}}
+    cd "{{repo}}" && bun install --frozen-lockfile && bun run typecheck
 
 # end-to-end tests driving a headless engine over the control plane (bun test)
-e2e: engine e2e-typecheck
+e2e: engine typecheck
     #!/usr/bin/env bash
     set -euo pipefail
     RECIPE=e2e; {{reenter}}
@@ -442,8 +442,8 @@ package target="":
     #!/usr/bin/env bash
     set -euo pipefail
     RECIPE=package; {{reenter}}
+    cd "{{repo}}" && bun install --silent
     cd "{{repo}}/packager"
-    bun install --silent
     exec bun run index.ts {{target}}
 
 # the host-runnable control CLI; `just sa ping`, `just sa help`
@@ -453,22 +453,22 @@ sa *args:
     RECIPE=sa; {{reenter}}
     cd "{{engine}}" && cargo run --bin sa -- {{args}}
 
-# cargo fmt the Rust workspace + oxfmt the editor TypeScript
+# cargo fmt the Rust workspace + oxfmt every TypeScript file in the tree
 format:
     #!/usr/bin/env bash
     set -euo pipefail
     RECIPE=format; {{reenter}}
     cd "{{engine}}" && cargo fmt
-    cd "{{editor}}" && bun run format
+    cd "{{repo}}" && bun install --silent && bun run format
 
-# cargo fmt --check + clippy (deny warnings) on the workspace + oxlint the editor
+# cargo fmt --check + clippy (deny warnings) on the workspace + oxfmt --check and oxlint on all TypeScript
 lint:
     #!/usr/bin/env bash
     set -euo pipefail
     RECIPE=lint; {{reenter}}
     cd "{{engine}}" && cargo fmt --check
     cd "{{engine}}" && cargo clippy --workspace -- -D warnings
-    cd "{{editor}}" && bun run lint
+    cd "{{repo}}" && bun install --silent && bun run format:check && bun run lint
 
 # format everything, then lint
 prepare-for-commit:
