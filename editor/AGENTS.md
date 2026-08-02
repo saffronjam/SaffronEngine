@@ -45,13 +45,14 @@ shell/         the CEF/Rust editor shell (`saffron-editor-shell`): a winit tople
 Stack (see `package.json` + `shell/Cargo.toml`): CEF (Chromium 149) OSR shell, React 19, Zustand 5, Vite 7, Tailwind v4
 (`@tailwindcss/vite`), shadcn/ui (Radix), `react-resizable-panels` (docking), `@xyflow/react`
 (material node graph), `flame-chart-js` + `uplot` (profiler / frame-time stats), `react-colorful`,
-`lucide-react` (icons), and `sonner` (toasts). Lint/format via **oxc** (`oxlint` + `oxfmt`, configs in
-`.oxlintrc.json` / `.oxfmtrc.json`).
+`lucide-react` (icons), and `sonner` (toasts). Lint/format via **oxc** (`oxlint` + `oxfmt`), configured
+once at the repo root (`.oxlintrc.json` / `.oxfmtrc.json`) for every TypeScript file in the tree — run
+them with `just lint` / `just format`.
 
 ## Workflow
 
 ```sh
-bun install
+bun install      # at the repo root: one Bun workspace installs editor/, tools/, tests/e2e/, packager/
 bun run check    # gen:protocol + tsc --noEmit
 bun run build    # gen:protocol + tsc + vite build
 just run         # from the repo root: builds the host + the CEF shell, starts Vite, launches the shell
@@ -192,8 +193,8 @@ user confirms it against real output — say "this should fix it, please verify 
   invokes otherwise pile into the engine's per-frame drain and trip the 5 s read timeout
   ("read control reply: Resource temporarily unavailable (os error 11)"). On the UI side never
   fire a control call per keystroke/scrub-tick: buffer through a `makeCoalescer` (one
-  `preview-render` per edit-burst, not one per field) and keep the heavy GPU calls
-  (`preview-render`, thumbnail readback) off the hot path.
+  `get-thumbnail` per edit-burst, not one per field) and keep the heavy GPU calls
+  (thumbnail render + readback) off the hot path.
 - **A large list re-renders only the rows that changed, never the whole list.** A grid/tree
   whose rows number in the hundreds (Assets tiles, Hierarchy rows) follows three rules so a
   selection click costs two row renders, not N (verify with the dev-mode `logRender` counters

@@ -7,7 +7,7 @@ control plane — the same wire the editor and `sa` CLI use. The driver is plain
 
 ```sh
 just e2e                       # from anywhere — auto-enters the toolbox
-just e2e-typecheck             # tsc --noEmit alone, no engine needed
+just typecheck                 # tsc --noEmit alone, no engine needed
 cd tests/e2e && bun test       # inside the toolbox (host bun on PATH)
 ```
 
@@ -35,8 +35,9 @@ cd tests/e2e && bun test       # inside the toolbox (host bun on PATH)
   back, and compare buffers directly (`Buffer.equals`, no image-diff dep) — see the `*_render.test.ts`
   files. Golden-image baselines are not wired up yet.
 - **The suite is typechecked, and `bun test` is not the thing that does it.** `bun test` strips
-  types without checking them, so `tsc --noEmit` (`bun run typecheck`, `just e2e-typecheck`) runs in
-  the gate's e2e step. A type error there fails the gate; keep it at zero.
+  types without checking them, so `tsc --noEmit` (`just typecheck`, gate step 9) runs over it. The
+  suite belongs to the repo-root `tsconfig.json` program together with `tools/` and `packager/`;
+  there is no tsconfig here. A type error fails the gate; keep it at zero.
 - **`call` types itself from the command name — never pass a type argument.**
   `engine.call("render-stats")` resolves to `CommandResultMap["render-stats"]` and its params to
   `CommandParamsMap["render-stats"]`, both generated from the `saffron-protocol` DTOs. So a renamed

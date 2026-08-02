@@ -36,7 +36,7 @@ just run      # start the editor, which spawns the host
 
 Under the hood the engine builds with `cargo build --workspace` (from `engine/`); shaders compile via `cargo run -p xtask -- shaders`.
 
-Other convenience recipes (`just --list` for the full set): `just run-engine` boots only the present-only host, `just test` runs the workspace tests, `just e2e` drives a headless engine over the control plane, `just run-docs` serves the docs site, and `just format` / `just lint` cover style (`cargo fmt` + `cargo clippy -- -D warnings` for Rust, oxfmt + oxlint for the editor TypeScript). `just check` runs the reproducible gate (engine build + shaders → headless smoke → control-schema contract → frontend bun build).
+Other convenience recipes (`just --list` for the full set): `just run-engine` boots only the present-only host, `just test` runs the workspace tests, `just e2e` drives a headless engine over the control plane, `just run-docs` serves the docs site, and `just format` / `just lint` cover style (`cargo fmt` + `cargo clippy -- -D warnings` for Rust, oxfmt + oxlint for every TypeScript file in the tree). `just check` runs the reproducible gate (engine build + shaders → headless smoke → control-schema contract → frontend bun build).
 
 ## More
 

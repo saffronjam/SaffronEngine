@@ -36,7 +36,7 @@ The `justfile` at the repo root drives everything through `cargo`, the `xtask` h
 ```sh
 just engine    # cargo build --workspace + cargo run -p xtask -- shaders
 just test      # cargo test --workspace
-just lint      # cargo fmt --check + cargo clippy --workspace -- -D warnings + editor oxlint
+just lint      # cargo fmt --check + cargo clippy --workspace -- -D warnings + oxfmt/oxlint over all TypeScript
 just run       # build the host, compile shaders, start the CEF editor shell
 just e2e       # the tests/e2e bun suite against a headless host
 just check     # the full reproducible gate
@@ -129,11 +129,32 @@ full speed while engine crates stay at `opt-level = 0` for fast incremental rebu
 profile keeps `debug = true` and `panic = "unwind"`, because the FFI seams must unwind cleanly
 across the Rust/C++ boundary.
 
+## One TypeScript arrangement
+
+The repo's TypeScript is not one app. It is the editor frontend, the e2e driver, two contract and
+budget tools, and the packager — separate programs with different dependencies. They all answer to
+one formatter, one linter, and one install. A per-directory toolchain buys nothing and costs
+coverage: whichever directory owns its own config is the directory the gate forgets, and a suite
+outside the gate drifts silently.
+
+So the arrangement lives at the repo root. `package.json` declares a Bun workspace whose members are
+`editor`, `packager`, `tests/e2e`, and `tools`, so one `bun install` resolves the whole tree against
+one lockfile. `.oxfmtrc.json` and `.oxlintrc.json` govern every `.ts`/`.tsx` in the tree;
+`just format` writes and `just lint` checks, and oxlint runs with `--deny-warnings` so a warning
+fails the same way a `clippy` warning does. Types split along the only line that is real — the
+runtime a file executes in: `editor/tsconfig.json` is the browser program (DOM, React, JSX), and the
+root `tsconfig.json` is the Bun program covering the tools, the e2e suite, the packager, and the
+editor's own build scripts. `just typecheck` runs both.
+
+The generated `editor/src/protocol/sa-types.ts` is the one source file excluded from all three,
+because `xtask gen-protocol` owns its contents.
+
 ## In the code
 
 | What | File | Symbols |
 |---|---|---|
 | Recipe preludes + opt-out | `justfile` | `reenter`, `gpu_driver`, `SAFFRON_NO_TOOLBOX` |
+| TypeScript workspace + style + types | `package.json`, `.oxfmtrc.json`, `.oxlintrc.json`, `tsconfig.json`, `editor/tsconfig.json` | `workspaces`, `format`, `lint`, `typecheck`, `ignorePatterns` |
 | Toolchain pin | `rust-toolchain.toml` | `channel`, `components` |
 | MSRV + profile knobs | `engine/Cargo.toml` | `rust-version`, `[profile.dev]`, `[profile.dev.package."*"]`, `[profile.release]` |
 | `slangc` resolution + shader step | `engine/xtask/src/shaders.rs` | `Config::resolve`, `find_slangc`, `run` |
