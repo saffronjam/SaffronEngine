@@ -14,25 +14,33 @@ MoltenVK). The engine keeps the API *shape* that works — an `App`/`Layer` life
 
 ## Conventions (not optional)
 
-- **ALWAYS the modern, correct approach — cost is never the deciding factor.** When two
-  implementations differ in correctness or modernity, choose the modern, technically-right one
-  *regardless of how large the coding task is*. Never propose or pick a cheaper, simpler, or
-  partial alternative *because* it is less work, smaller, or faster to land — effort is not a
-  reason to compromise on the right design. Surface the correct option as the recommendation and
-  build it; mention a lesser fallback only if explicitly asked. (Scope/phasing may still be
-  discussed, but the destination is always the correct modern design.)
+- **GREENFIELD ALWAYS — design as if the tree did not exist yet.** This is not a production project.
+  Nothing ships, nothing is deployed, no user data is at stake, and no downstream consumer can be
+  broken. So the only question that ever matters is *what would this look like if it were built
+  correctly from scratch, today, knowing everything we now know* — and that is what gets built. The
+  current shape of the code is an artifact of the order things were written in, never an argument
+  for anything. Judge a design against the ideal, not against the diff from where you are.
+  - Never let an existing structure, signature, format, command, or test **suggest** the answer. If
+    the right design needs different types, a different wire shape, a different file layout, or a
+    different module boundary, that is the design — reshape the tree to it.
+  - Never carry a constraint forward because it is already there. "The existing X works this way" is
+    a fact about history, not a requirement. Ask what X *should* be and make it that.
+  - Never build the smaller thing and leave a seam for the bigger one. There is no later; build the
+    destination now.
+  - A refactor that touches a hundred files to reach the correct shape is a normal change here.
+    Blast radius is a cost, never a veto.
 - **DO NOT ASK PERMISSION TO DO THE RIGHT THING — BUILD IT.** Once the correct design is identified,
-  implement it. Size, protocol churn, a wire/format change, a broken caller, a rewritten test, or a
-  large blast radius are **not** grounds to stop and ask; they are the work. "Should I do X or the
-  smaller Y?" where X is correct is a question that must not be asked — do X. Report what you built
-  and what it broke, after it is built and green. Ask only when the *requirement* is genuinely
+  implement it. Size, protocol churn, a wire/format change, a broken caller, a rewritten test, a
+  hundred-file diff — these are **not** grounds to stop and ask; they are the work. "Should I do X or
+  the smaller Y?" where X is correct is a question that must not be asked — do X. Report what you
+  built and what it broke, after it is built and green. Ask only when the *requirement* is genuinely
   ambiguous (two designs are equally correct and the choice is a matter of product intent), never
   when the only open question is whether the correct change is too much work.
-- **NO LEGACY. NO COMPAT SHIMS. EVER.** This is a clean-slate codebase (`main` is an intentional orphan
-  fresh start — there is nothing on disk, in the field, or downstream to be backward-compatible with).
-  There is exactly **one** way to do each thing, and one code path for it. When a change would break an
-  existing flow, command, file format, component, or test: **break it, then rebuild that flow on the new
-  design — in the same change.** This is absolute and overrides any instinct toward caution:
+- **NO LEGACY. NO COMPAT SHIMS. EVER.** The operational half of greenfield: there is nothing on disk,
+  in the field, or downstream to be backward-compatible with (`main` is an intentional orphan fresh
+  start). There is exactly **one** way to do each thing, and one code path for it. When a change would
+  break an existing flow, command, file format, component, or test: **break it, then rebuild that flow
+  on the new design — in the same change.** This is absolute and overrides any instinct toward caution:
   - **Never** keep an old code path alive "for back-compat" or "so callers don't break".
   - **Never** add a second command / function / format / field that duplicates an existing one's purpose
     just to avoid disturbing its callers. Replace the old one and update every caller.
@@ -156,9 +164,10 @@ cargo run -p xtask -- shaders    # compile engine/assets/shaders/*.slang → SPI
   JSON, so the driver need not be Rust.
 - Convenience recipes (all auto-enter the toolbox; `just help` lists them): `just run` starts the
   editor, which spawns the host; `just run-engine` starts only the present-only host; `just run-docs`
-  serves the Hugo site. `just format` runs `cargo fmt` over the workspace and oxfmt over the editor
-  TypeScript; `just lint` runs `cargo fmt --check` + `cargo clippy --workspace -- -D warnings` + oxlint
-  (`editor/.oxlintrc.json`); `just prepare-for-commit` does format then lint.
+  serves the Hugo site. `just format` runs `cargo fmt` over the workspace and oxfmt over every
+  `.ts`/`.tsx` in the tree; `just lint` runs `cargo fmt --check` + `cargo clippy --workspace -- -D
+  warnings` + `oxfmt --check` + `oxlint --deny-warnings` over the same set; `just prepare-for-commit`
+  does format then lint. `just typecheck` is `tsc --noEmit` over both TypeScript programs.
 
 ### The editor (CEF/React shell)
 
@@ -166,13 +175,30 @@ With `bun` on PATH inside the toolbox, `just run` builds the host + the CEF shel
 starts Vite, and launches the shell. For frontend-only work:
 
 ```sh
-cd editor && bun install && bun run check
+bun install                     # once, at the repo root — one workspace covers all TypeScript
+cd editor && bun run check
 ```
 
 `bun run check` regenerates `@saffron/protocol` (via `xtask gen-protocol`) from the `saffron-protocol`
-DTOs and typechecks; `bun run format` (oxfmt) and `bun run lint` (oxlint) cover style. The shell spawns
+DTOs and typechecks the editor app; style is repo-level (`just format` / `just lint`). The shell spawns
 `engine/target/debug/saffron-host` (override with `SAFFRON_ANIMA_BIN`) and needs a Wayland session for
 the OSR compositing + subsurface presenter.
+
+### TypeScript across the tree
+
+Every `.ts`/`.tsx` in the repo — `editor/src`, `editor/scripts`, `editor/vite.config.ts`, `tools/`,
+`tests/e2e/`, `packager/` — is governed by one arrangement rooted at the repo root:
+
+| What | File |
+|---|---|
+| Bun workspace + the `format`/`lint`/`typecheck` scripts | `package.json` (members: `editor`, `packager`, `tests/e2e`, `tools`) |
+| Formatter | `.oxfmtrc.json` (oxfmt) |
+| Linter | `.oxlintrc.json` (oxlint; `--deny-warnings`, so every finding fails) |
+| The bun-side type program | `tsconfig.json` (tools, e2e, packager, editor scripts) |
+| The editor app's type program | `editor/tsconfig.json` (DOM + React) |
+
+One `bun install` at the root installs the whole tree. `editor/src/protocol/sa-types.ts` is generated
+and is the one source file excluded from all three.
 
 ## Architecture
 
@@ -259,11 +285,13 @@ engine/xtask/           the build-task runner: `cargo run -p xtask -- {shaders,g
 engine/assets/          shaders (*.slang → SPIR-V via xtask), models, fonts, icons (copied next to the exe)
 editor/                 CEF/React/TS editor — src/ (React + Zustand + typed control client), shell/ (the CEF/Rust shell)
 schemas/control/        DTO-first wire contract → @saffron/protocol: hand-authored envelope.schema.json + generated openrpc/command-manifest JSON (from the saffron-protocol DTOs via xtask gen-protocol)
-tools/ci/, tools/check-control-schema/, tools/check-projects/   the reproducible gate, the live-vs-schema contract test, the project-feature smoke
+tools/ci/, tools/check-control-schema/, tools/bench-foliage-phase1/, tools/check-projects/   the reproducible gate, the live-vs-schema contract test, the foliage budgets, the project-feature smoke
 tests/e2e/              end-to-end tests (bun) driving a headless host over the control plane
+packager/               the Bun packager that builds the editor into a per-OS distributable
 docs/                   Hugo (hugo-book) docs site — per-concept explanations + how-to/reference/tutorials
 plans/                  phased, dependency-ordered plans for future expansions
 justfile                the task runner (build/run/test/lint/format/check); auto-enters the toolbox
+package.json, tsconfig.json, .oxfmtrc.json, .oxlintrc.json   the repo-wide TypeScript arrangement: one Bun workspace, one formatter, one linter, one bun-side type program
 ```
 
 The `sa` control CLI is the `sa` crate (`engine/crates/sa`); the protocol codegen is `xtask
