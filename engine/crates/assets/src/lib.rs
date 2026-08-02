@@ -382,7 +382,7 @@ pub struct AssetServer {
     /// `on_update` (build the preview scene → render on the offscreen thumbnail view → write the disk
     /// cache). FIFO.
     pub preview_render_queue: std::collections::VecDeque<crate::thumbnail::PreviewRenderJob>,
-    /// The cache paths of preview-render jobs queued or rendering — dedups re-requests while the
+    /// The cache paths of preview render jobs queued or rendering — dedups re-requests while the
     /// editor repolls.
     pub preview_render_in_flight: std::collections::HashSet<String>,
 }

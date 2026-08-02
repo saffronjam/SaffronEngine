@@ -11,7 +11,7 @@ use saffron_protocol::{
     MaterialImportParams, MaterialImportResultDto, MaterialListResult, MaterialRefDto,
     MaterialSchemaParams, MaterialSchemaResult, MaterialSetGraphParams, MaterialSetGraphResult,
     MaterialSetOverrideParams, MaterialSetOverrideResult, MaterialUpdateParams,
-    MaterialUpdateResult, PreviewRenderParams, PreviewRenderResult, Uuid as WireUuid,
+    MaterialUpdateResult, Uuid as WireUuid,
 };
 use saffron_scene::{AssetType, MaterialSet, MaterialSlot};
 use serde_json::json;
@@ -21,7 +21,7 @@ use crate::error::Error;
 use crate::registry::CommandRegistry;
 use crate::selector::resolve_entity;
 
-/// Registers the `material-*` commands plus `preview-render`.
+/// Registers the `material-*` commands.
 pub(crate) fn register_material(reg: &mut CommandRegistry) {
     reg.register::<MaterialCreateParams, MaterialCreateResult>(
         "material-create",
@@ -230,26 +230,6 @@ pub(crate) fn register_material(reg: &mut CommandRegistry) {
             ctx.scene_edit.scene_version += 1;
             Ok(MaterialUpdateResult {
                 id: WireUuid(id.value()),
-            })
-        },
-    );
-
-    reg.register::<PreviewRenderParams, PreviewRenderResult>(
-        "preview-render",
-        "preview-render {material} [size]",
-        |ctx, params| {
-            let id = resolve_asset(ctx, &params.material)?;
-            let size = params.size.unwrap_or(256);
-            // Rendered through the main forward+ graph on the offscreen thumbnail view — the same
-            // path the Assets tiles take — so the live preview pane matches a tile exactly
-            // (displacement, procedural sky, floor, key light). A non-foldable graph shades through
-            // its compiled `_mesh.spv` variant, a foldable one through its folded params.
-            let bytes = ctx
-                .renderer
-                .render_material_preview_png(ctx.assets, PreviewSubject::Material(id), size)
-                .map_err(Error::command)?;
-            Ok(PreviewRenderResult {
-                png: base64_encode(&bytes),
             })
         },
     );

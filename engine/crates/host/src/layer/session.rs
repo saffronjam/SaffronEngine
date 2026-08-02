@@ -162,9 +162,9 @@ impl HostLayer {
         if self.any_animation_active() {
             reasons.push("animation");
         }
-        // Queued main-graph preview tiles (material / texture) drain a small budget per tick; hold
-        // full cadence until the queue empties so tiles fill in promptly instead of at idle latency.
-        if self.assets.preview_render_pending() {
+        // Main-graph preview tiles (material / texture) converge one frame per tick; hold full
+        // cadence until the queue empties so tiles fill in promptly instead of at idle latency.
+        if self.preview_render_active() {
             reasons.push("thumbnails");
         }
         reasons

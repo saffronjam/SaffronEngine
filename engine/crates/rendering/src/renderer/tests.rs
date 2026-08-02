@@ -1342,3 +1342,68 @@ fn a_frame_closes_its_slot_whether_or_not_it_reached_the_tail_submit() {
     );
     renderer.device().wait_idle().expect("idle before teardown");
 }
+
+/// A view resize idles the GPU and reallocates every target of the view, so it must never land
+/// between a slot's begin and its submit — a slot whose images were freed under it strands its
+/// fence. `set_viewport_desired_size` therefore only records the request, and
+/// `begin_offscreen_frame` is the one point that applies it. The request still reads back the
+/// instant it is made, so a `set-viewport-size` reply and a follow-up query agree within one
+/// control drain.
+#[test]
+fn a_view_resize_lands_at_a_frame_begin_never_inside_an_armed_slot() {
+    let mut renderer = match Renderer::new(&SurfaceSource::Offscreen, 64, 64) {
+        Ok(renderer) => renderer,
+        Err(err) => {
+            eprintln!("skipping: no Vulkan device obtainable ({err})");
+            return;
+        }
+    };
+    renderer.set_active_view(ViewId::Thumbnail);
+    assert_eq!(
+        (renderer.viewport_width(), renderer.viewport_height()),
+        (64, 64)
+    );
+
+    renderer
+        .begin_offscreen_frame()
+        .expect("begin_offscreen_frame");
+    assert!(renderer.slot_fence_armed, "the begin arms the slot");
+
+    renderer.set_viewport_desired_size(ViewId::Thumbnail, 128, 96);
+    assert_eq!(
+        (
+            renderer.view_desired_width(ViewId::Thumbnail),
+            renderer.view_desired_height(ViewId::Thumbnail)
+        ),
+        (128, 96),
+        "the request reads back the moment it is made, before it is applied"
+    );
+    assert_eq!(
+        (renderer.viewport_width(), renderer.viewport_height()),
+        (64, 64),
+        "the armed slot's targets are untouched by the request"
+    );
+
+    renderer
+        .finish_unsubmitted_frame()
+        .expect("closing the armed slot");
+    assert_eq!(
+        (renderer.viewport_width(), renderer.viewport_height()),
+        (64, 64),
+        "closing the slot is not the apply point either"
+    );
+
+    renderer
+        .begin_offscreen_frame()
+        .expect("begin_offscreen_frame");
+    assert_eq!(
+        (renderer.viewport_width(), renderer.viewport_height()),
+        (128, 96),
+        "the next frame begin is what applies the deferred resize"
+    );
+
+    renderer
+        .finish_unsubmitted_frame()
+        .expect("closing the slot");
+    renderer.device().wait_idle().expect("idle before teardown");
+}

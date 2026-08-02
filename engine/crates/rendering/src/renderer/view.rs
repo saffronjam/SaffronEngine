@@ -184,27 +184,15 @@ impl Renderer {
             * self.frame_deformation.view_proj
     }
 
-    /// Sets a view's desired render size and resizes its offscreen targets to match,
-    /// Sets a view's desired render size and resizes its offscreen targets to match, idling the
-    /// GPU first. The desired size is recorded even when the extent already matches, so
-    /// [`ViewTarget::desired_width`] tracks whether the view has been sized at all.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`Error`] if the device cannot idle or the targets cannot be recreated.
-    pub fn set_viewport_desired_size(
-        &mut self,
-        view: ViewId,
-        width: u32,
-        height: u32,
-    ) -> Result<()> {
+    /// Requests a view's desired render size. The resize idles the GPU and reallocates every target
+    /// of the view, so it is recorded here and applied at the next frame boundary
+    /// ([`Renderer::begin_offscreen_frame`]) — never between a slot's begin and its submit, where
+    /// the reallocation would strand that slot's fence.
+    pub fn set_viewport_desired_size(&mut self, view: ViewId, width: u32, height: u32) {
         if width == 0 || height == 0 {
-            return Ok(());
+            return;
         }
-        let i = view.index();
-        self.views[i].desired_width = width;
-        self.views[i].desired_height = height;
-        self.apply_render_extent(i)
+        self.pending_view_size[view.index()] = Some((width, height));
     }
 
     /// Sets the dynamic-resolution factor for a view and re-sizes its render targets to
@@ -254,7 +242,7 @@ impl Renderer {
     /// depth / motion / G-buffer / ReSTIR) and the DISPLAY class (`published_extent` — the resolve
     /// output + TAA history + overlay depth). A desired-size change moves both, a render-scale
     /// change only the input class. A no-op when neither moved.
-    fn apply_render_extent(&mut self, i: usize) -> Result<()> {
+    pub(super) fn apply_render_extent(&mut self, i: usize) -> Result<()> {
         let input = self.views[i].scaled_render_extent();
         let display = self.views[i].published_extent();
         let cur_input = self.views[i].scratch.as_ref().map(|s| s.extent);
@@ -340,14 +328,19 @@ impl Renderer {
         Ok(())
     }
 
-    /// A view's last-requested render width in device pixels (`0` until the view is sized).
+    /// A view's last-requested render width in device pixels (`0` until the view is sized). Reports
+    /// a size still awaiting the frame boundary, so a request reads back the moment it is made.
     pub fn view_desired_width(&self, view: ViewId) -> u32 {
-        self.views[view.index()].desired_width
+        self.pending_view_size[view.index()]
+            .map_or(self.views[view.index()].desired_width, |(width, _)| width)
     }
 
     /// A view's last-requested render height in device pixels.
     pub fn view_desired_height(&self, view: ViewId) -> u32 {
-        self.views[view.index()].desired_height
+        self.pending_view_size[view.index()]
+            .map_or(self.views[view.index()].desired_height, |(_, height)| {
+                height
+            })
     }
 
     /// The active view's INPUT (scene render) width in device pixels.
@@ -389,11 +382,11 @@ impl Renderer {
         }
     }
 
-    /// Restores the active view without resetting its temporal state, unlike
-    /// [`Renderer::set_active_view`]: a background thumbnail render makes a brief
-    /// `Scene → Thumbnail → Scene` excursion each drained frame and must not wipe the Scene
-    /// view's accumulated history.
-    pub fn restore_active_view_no_reset(&mut self, view: ViewId) {
+    /// Selects the active view without resetting its temporal state, unlike
+    /// [`Renderer::set_active_view`]. An amortized thumbnail render makes a `Scene → Thumbnail →
+    /// Scene` excursion every tick while it converges, so neither leg may wipe the history the
+    /// other side accumulated.
+    pub fn set_active_view_no_reset(&mut self, view: ViewId) {
         self.active_view = view;
     }
 

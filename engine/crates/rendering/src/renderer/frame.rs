@@ -30,8 +30,9 @@ impl Renderer {
         let raw = self.device.raw();
         let in_flight = self.frames.in_flight();
         // The wait is unbounded, so a frame whose GPU work never completes blocks here forever.
-        // Registering it names that frame from the watchdog thread instead of hanging silently.
-        let _watch = crate::watchdog::watch("frame", self.frame_serial());
+        // Registering the slot lets the watchdog thread read the record that slot's last submission
+        // published and name the batch the GPU is inside, instead of hanging silently.
+        let _watch = crate::watchdog::watch_frame(self.frames.index());
         // SAFETY: the ash seam. The fence belongs to this device; the wait blocks until this
         // slot's prior GPU work completes, so its per-frame buffers/sets are free to reuse.
         let waited = checked(
@@ -82,6 +83,27 @@ impl Renderer {
         // here until a submit signals it, only this flag makes the slot recoverable.
         self.slot_fence_armed = true;
         self.frames.reset_command_pools(&self.device)?;
+        // Nothing is recorded into this slot yet, so this is the one point where an idle-and-
+        // reallocate is free of an in-flight frame. It runs after the shm staging above, so this
+        // slot's read-back is drained at the size it was recorded at.
+        self.reconcile_pending_view_targets()?;
+        Ok(())
+    }
+
+    /// Applies the view-target changes deferred to this frame boundary: the requested desired sizes
+    /// and the budget controller's render scale. Both idle the GPU and reallocate a view's targets.
+    fn reconcile_pending_view_targets(&mut self) -> Result<()> {
+        for i in 0..crate::VIEW_COUNT {
+            let Some((width, height)) = self.pending_view_size[i].take() else {
+                continue;
+            };
+            self.views[i].desired_width = width;
+            self.views[i].desired_height = height;
+            self.apply_render_extent(i)?;
+        }
+        if let Some(scale) = self.pending_render_scale.take() {
+            self.set_render_scale(self.active_view, scale)?;
+        }
         Ok(())
     }
 
@@ -125,6 +147,14 @@ impl Renderer {
             fence,
             "queue_submit2 (empty frame)",
         )?;
+        // The closing submit reserves no timeline point, so the slot's next fence wait has nothing
+        // to name: replace the previous submission's record rather than let it read as current.
+        crate::watchdog::publish_frame(
+            self.frames.index(),
+            self.device.raw().handle(),
+            self.frame_serial,
+            &[],
+        );
         self.slot_fence_armed = false;
         self.pending_compute_signal = None;
         self.frames.advance();
@@ -143,12 +173,6 @@ impl Renderer {
     ///
     /// Returns [`Error::Vk`] for any failing Vulkan call.
     pub fn render_scene_offscreen(&mut self) -> Result<()> {
-        // Apply a budget-controller render-scale change here — a safe frame boundary (it idles the
-        // GPU + reallocates the render targets), unlike the post-submit hook that requested it.
-        if let Some(scale) = self.pending_render_scale.take() {
-            self.set_render_scale(self.active_view, scale)?;
-        }
-
         // Advance fence-owned IBL refreshes at the frame boundary. A completed back set is
         // descriptor-committed here; in-flight frames continue sampling the front set.
         match self.ibl.update_refresh(&self.device) {
@@ -767,13 +791,17 @@ impl Renderer {
             Some(present_sync) => present_sync.scene_finished_to_signal(frame)?,
             None => None,
         };
+        // The tail signals a point of its own alongside the slot fence, so every submission this
+        // frame makes is one the hang watchdog can name by comparing counters.
+        let tail_point = self.frames.reserve_timeline(RgQueueAssignment::Graphics)?;
+        self.publish_frame_submission(frame, prefix_point, &recorded, &batch_points, tail_point);
         submit_graph_command(
             &self.device,
             GraphCommandSubmission {
                 queue: RgQueueAssignment::Graphics,
                 command_buffer: recorded.tail,
                 waits: &tail_waits,
-                signals: &[],
+                signals: &[tail_point],
                 binary_signal: present_signal,
                 fence: self.frames.in_flight(),
                 context: "queue_submit2 (scene tail)",
@@ -793,5 +821,45 @@ impl Renderer {
         u32::try_from(recorded.batches.len().saturating_add(2)).map_err(|_| {
             Error::InvalidUploadData("render-graph submit count exceeds u32".to_owned())
         })
+    }
+
+    /// Publishes this frame's submissions — prefix, every render-graph batch, tail — in submission
+    /// order, so a wedged fence wait on this slot names the batch whose point never signalled.
+    fn publish_frame_submission(
+        &self,
+        frame: usize,
+        prefix: FrameTimelinePoint,
+        recorded: &RecordedSceneGraph,
+        batch_points: &[FrameTimelinePoint],
+        tail: FrameTimelinePoint,
+    ) {
+        let mut submitted = Vec::with_capacity(recorded.batches.len() + 2);
+        submitted.push(crate::watchdog::SubmittedBatch {
+            label: "scene-prefix",
+            semaphore: prefix.semaphore,
+            value: prefix.value,
+        });
+        submitted.extend(
+            recorded
+                .batches
+                .iter()
+                .zip(batch_points)
+                .map(|(batch, point)| crate::watchdog::SubmittedBatch {
+                    label: &batch.label,
+                    semaphore: point.semaphore,
+                    value: point.value,
+                }),
+        );
+        submitted.push(crate::watchdog::SubmittedBatch {
+            label: "scene-tail",
+            semaphore: tail.semaphore,
+            value: tail.value,
+        });
+        crate::watchdog::publish_frame(
+            frame,
+            self.device.raw().handle(),
+            self.frame_serial,
+            &submitted,
+        );
     }
 }

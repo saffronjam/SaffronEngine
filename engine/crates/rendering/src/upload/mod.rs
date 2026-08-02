@@ -395,7 +395,7 @@ impl Uploader {
                 "end_command_buffer (one-off)",
             )?;
             // Registered across the wait, so a submission that never completes is still named.
-            let _watch = crate::watchdog::watch(label, 0);
+            let _watch = crate::watchdog::watch(label);
             self.submit_and_wait(cmd)
         })();
 

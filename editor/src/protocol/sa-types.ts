@@ -3545,15 +3545,6 @@ export interface MaterialUpdateResult {
   id: WireUuid;
 }
 
-export interface PreviewRenderParams {
-  material: AssetSelector;
-  size?: number;
-}
-
-export interface PreviewRenderResult {
-  png: string;
-}
-
 export interface MaterialSetGraphParams {
   material: AssetSelector;
   graph: unknown;
@@ -4880,7 +4871,6 @@ export interface CommandParamsMap {
   "material-get": MaterialGetParams;
   "material-schema": MaterialSchemaParams;
   "material-update": MaterialUpdateParams;
-  "preview-render": PreviewRenderParams;
   "material-set-graph": MaterialSetGraphParams;
   "material-create-instance": MaterialCreateInstanceParams;
   "material-set-override": MaterialSetOverrideParams;
@@ -5141,7 +5131,6 @@ export interface CommandResultMap {
   "material-get": MaterialGetResult;
   "material-schema": MaterialSchemaResult;
   "material-update": MaterialUpdateResult;
-  "preview-render": PreviewRenderResult;
   "material-set-graph": MaterialSetGraphResult;
   "material-create-instance": MaterialCreateResult;
   "material-set-override": MaterialSetOverrideResult;

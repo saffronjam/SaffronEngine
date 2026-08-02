@@ -1397,12 +1397,6 @@ pub static COMMANDS: &[CommandSpec] = &[
         "MaterialUpdateResult",
     ),
     CommandSpec::new(
-        "preview-render",
-        "preview-render {material} [size]",
-        "PreviewRenderParams",
-        "PreviewRenderResult",
-    ),
-    CommandSpec::new(
         "material-set-graph",
         "material-set-graph {material, graph}",
         "MaterialSetGraphParams",

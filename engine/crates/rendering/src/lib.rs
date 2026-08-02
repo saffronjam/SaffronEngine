@@ -385,6 +385,15 @@ pub enum Error {
 
     #[error("render-graph timeline semaphore value overflowed")]
     TimelineValueOverflow,
+
+    /// A view's temporal accumulation and asynchronous environment refresh were still unsettled
+    /// after the caller's frame bound, so the read-back was abandoned rather than capturing a
+    /// half-converged image.
+    #[error("view did not converge within {frames} frames")]
+    NotConverged {
+        /// The converge-frame bound that was exhausted.
+        frames: u32,
+    },
 }
 
 impl Error {

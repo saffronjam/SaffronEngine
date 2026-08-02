@@ -42,9 +42,12 @@ test("the fault watch keeps device-loss and hang lines whole across chunk splits
       controller.enqueue(
         encoder.encode("frame 12 ok\nERROR vulkan: wait_for_fences (begin) -> ERR"),
       );
-      controller.enqueue(encoder.encode("OR_DEVICE_LOST\nGPU submission 'frame 167' has been in "));
+      controller.enqueue(encoder.encode("OR_DEVICE_LOST\nGPU frame ring slot 0 has been in "));
       controller.enqueue(
-        encoder.encode("flight 3s — a hang, not a slow frame\ntrailing without newline"),
+        encoder.encode(
+          "flight 3s — frame 167 is wedged in render-graph batch 6/14 'gbuffer…ssgi', whose " +
+            "timeline point 41 has not signalled (counter 40)\ntrailing without newline",
+        ),
       );
       controller.close();
     },
@@ -55,7 +58,8 @@ test("the fault watch keeps device-loss and hang lines whole across chunk splits
 
   expect(faults.report()).toEqual([
     "ERROR vulkan: wait_for_fences (begin) -> ERROR_DEVICE_LOST",
-    "GPU submission 'frame 167' has been in flight 3s — a hang, not a slow frame",
+    "GPU frame ring slot 0 has been in flight 3s — frame 167 is wedged in render-graph batch " +
+      "6/14 'gbuffer…ssgi', whose timeline point 41 has not signalled (counter 40)",
   ]);
 });
 

@@ -93,10 +93,6 @@ export const assetCommands = {
   materialImport(path: string, name?: string) {
     return call("material-import", { path, name: name ?? "" });
   },
-  /// Render a material on a studio-lit sphere; returns a base64 PNG.
-  previewRender(material: string, size?: number) {
-    return call("preview-render", { material, size });
-  },
   /// Replace a material's node graph; returns whether it folded entirely to params (no codegen node).
   materialSetGraph(material: string, graph: MaterialGraph) {
     return call("material-set-graph", { material, graph });

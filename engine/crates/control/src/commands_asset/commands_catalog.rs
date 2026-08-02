@@ -276,8 +276,7 @@ pub(crate) fn register_catalog(reg: &mut CommandRegistry) {
                     ctx.renderer.viewport_width(),
                     ctx.renderer.viewport_height(),
                 );
-                let _ = ctx
-                    .renderer
+                ctx.renderer
                     .set_view_desired_size(ViewId::AssetPreview, w, h);
             }
             ctx.renderer.set_active_view(view);

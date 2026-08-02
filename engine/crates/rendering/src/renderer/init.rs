@@ -548,6 +548,7 @@ impl Renderer {
             render_quality: RenderQuality::default(),
             budget_controller: BudgetController::new(),
             pending_render_scale: None,
+            pending_view_size: [None; crate::VIEW_COUNT],
             tonemap_mode: TonemapMode::default(),
             color_grade: ColorGrade::default(),
             default_lut,

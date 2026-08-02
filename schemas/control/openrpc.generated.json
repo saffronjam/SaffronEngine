@@ -4308,24 +4308,6 @@
       }
     },
     {
-      "name": "preview-render",
-      "summary": "preview-render {material} [size]",
-      "params": [
-        {
-          "name": "params",
-          "schema": {
-            "$ref": "#/components/schemas/PreviewRenderParams"
-          }
-        }
-      ],
-      "result": {
-        "name": "result",
-        "schema": {
-          "$ref": "#/components/schemas/PreviewRenderResult"
-        }
-      }
-    },
-    {
       "name": "material-set-graph",
       "summary": "material-set-graph {material, graph}",
       "params": [
@@ -13611,34 +13593,6 @@
           "range",
           "volumetricScattering",
           "castVolumetricShadow"
-        ]
-      },
-      "PreviewRenderParams": {
-        "type": "object",
-        "additionalProperties": false,
-        "properties": {
-          "material": {
-            "$ref": "#/components/schemas/AssetSelector"
-          },
-          "size": {
-            "type": "integer",
-            "minimum": 0
-          }
-        },
-        "required": [
-          "material"
-        ]
-      },
-      "PreviewRenderResult": {
-        "type": "object",
-        "additionalProperties": false,
-        "properties": {
-          "png": {
-            "type": "string"
-          }
-        },
-        "required": [
-          "png"
         ]
       },
       "ProbeRef": {

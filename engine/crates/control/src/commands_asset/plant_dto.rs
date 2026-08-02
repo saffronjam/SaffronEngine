@@ -21,8 +21,8 @@ use saffron_vegetation::{
 use super::*;
 use crate::error::{Error, Result};
 
-/// The `base64` standard encoder, used by `preview-render` and the thumbnail commands to
-/// ship PNG bytes inside a JSON string.
+/// The `base64` standard encoder, used by the thumbnail and plant-atlas commands to ship PNG
+/// bytes inside a JSON string.
 pub(crate) fn base64_encode(bytes: &[u8]) -> String {
     const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);

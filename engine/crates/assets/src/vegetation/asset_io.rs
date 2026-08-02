@@ -373,7 +373,8 @@ mod tests {
         // cache replies pending and enqueues one preview render for the host to drain.
         let pending = crate::request_thumbnail(&mut assets, plant, 128).unwrap();
         assert!(pending.pending);
-        assert_eq!(assets.take_preview_render_jobs(4).len(), 1);
+        assert!(assets.take_preview_render_job().is_some());
+        assert!(assets.take_preview_render_job().is_none());
         assert_eq!(assets.thumbnail_cache_stats().entries, 2);
     }
 

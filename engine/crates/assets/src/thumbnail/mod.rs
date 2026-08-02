@@ -139,7 +139,7 @@ pub struct ThumbnailJob {
     pub content: ThumbnailContent,
 }
 
-/// A preview-render subject — every asset kind maps to one. Rendered through the main forward+ graph
+/// A preview render subject — every asset kind maps to one. Rendered through the main forward+ graph
 /// on the offscreen thumbnail view. The host maps this to the control crate's `PreviewSubject` when
 /// draining [`AssetServer::preview_render_queue`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -201,11 +201,11 @@ impl AssetServer {
         !self.preview_render_queue.is_empty()
     }
 
-    /// Pops up to `max` queued preview-render jobs for the host to render this tick (a small budget
-    /// offsets the K-frame converge cost of each tile).
-    pub fn take_preview_render_jobs(&mut self, max: usize) -> Vec<PreviewRenderJob> {
-        let n = max.min(self.preview_render_queue.len());
-        self.preview_render_queue.drain(..n).collect()
+    /// Pops the next queued preview render job. Exactly one tile is in flight at a time: each
+    /// converges over many frames on the shared frame ring, so a second tile would interleave two
+    /// converging subjects through one set of temporal accumulators.
+    pub fn take_preview_render_job(&mut self) -> Option<PreviewRenderJob> {
+        self.preview_render_queue.pop_front()
     }
 
     /// Clears a job's in-flight marker after the host renders (or fails to render) it, so a later
@@ -435,7 +435,7 @@ mod tests {
         );
     }
 
-    /// The preview-render queue reports pending, drains up to the budget, and dedups on the cache
+    /// The preview render queue reports pending, drains up to the budget, and dedups on the cache
     /// path — the host-drain contract.
     #[test]
     fn preview_render_queue_drains_and_clears_in_flight() {
@@ -453,9 +453,8 @@ mod tests {
         });
         assert!(assets.preview_render_pending());
 
-        let jobs = assets.take_preview_render_jobs(8);
-        assert_eq!(jobs.len(), 1);
-        assert_eq!(jobs[0].kind, PreviewRenderKind::Material(Uuid(1)));
+        let job = assets.take_preview_render_job().expect("one job queued");
+        assert_eq!(job.kind, PreviewRenderKind::Material(Uuid(1)));
         assert!(!assets.preview_render_pending(), "the queue drained");
 
         assets.finish_preview_render("v7-1-64.png");

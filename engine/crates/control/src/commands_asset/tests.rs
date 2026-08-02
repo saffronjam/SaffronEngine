@@ -1261,7 +1261,6 @@ fn asset_commands_register_in_manifest_order() {
         "material-get",
         "material-schema",
         "material-update",
-        "preview-render",
         "material-set-graph",
         "material-create-instance",
         "material-set-override",

@@ -928,6 +928,16 @@ impl Device {
         result
     }
 
+    /// The current value of a timeline semaphore, or `None` if the query failed.
+    ///
+    /// Legal at any time, non-blocking, and free of external-synchronization requirements, so the
+    /// hang watchdog reads it from its own thread while every other thread is blocked on a fence.
+    #[must_use]
+    pub fn timeline_counter(&self, semaphore: vk::Semaphore) -> Option<u64> {
+        // SAFETY: the ash seam. The handle belongs to this device and the query only reads.
+        unsafe { self.raw().get_semaphore_counter_value(semaphore) }.ok()
+    }
+
     /// Logs what the GPU was doing while a submission is wedged, for the hang watchdog. Reports
     /// whether it logged anything.
     ///

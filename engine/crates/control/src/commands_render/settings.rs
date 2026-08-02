@@ -747,8 +747,7 @@ pub(crate) fn register_toggles(reg: &mut CommandRegistry) {
                 .unwrap_or(ctx.renderer.viewport_height() as i32)
                 .max(1);
             ctx.renderer
-                .set_view_desired_size(view, width as u32, height as u32)
-                .map_err(Error::Command)?;
+                .set_view_desired_size(view, width as u32, height as u32);
             Ok(SetViewportSizeResult { width, height })
         },
     );

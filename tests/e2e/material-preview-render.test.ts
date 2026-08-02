@@ -1,13 +1,14 @@
-// Preview-render suite for the material system: the offscreen studio-sphere preview (the editor's
-// material preview pane + cached thumbnails) plus the one scene-screenshot case that shares the same
-// codegen/override plumbing (normal-map perturbation). Consolidated onto a single booted host.
+// Preview suite for the material system: the offscreen studio-sphere thumbnail (the editor's
+// material preview pane + cached Assets tiles) plus the one scene-screenshot case that shares the
+// same codegen/override plumbing (normal-map perturbation). Consolidated onto a single booted host.
 //
 // Covers:
-//   - preview-render returns a PNG that reflects the material's base color (white vs red differ);
+//   - get-thumbnail returns a PNG that reflects the material's base color (white vs red differ);
 //   - a foldable constant graph folds to the same preview as a direct base-color material;
 //   - a non-foldable multiply graph codegen-renders in the preview;
 //   - a procedural uv/frac graph codegen-renders in the preview;
-//   - get-thumbnail renders a material preview PNG;
+//   - a mixed-size backlog drains one tile at a time;
+//   - view-asset renders the same material at its larger default;
 //   - a normal map assigned to an entity perturbs the shaded scene result.
 
 import { afterAll, afterEach, beforeAll, expect, test } from "bun:test";
@@ -44,17 +45,26 @@ async function screenshot(tag: string): Promise<Buffer> {
   return captureViewport(engine, caseCleaner, `matprev-${tag}`);
 }
 
-test("preview-render returns a PNG that reflects the material's color", async () => {
+/// The material preview the editor's pane and an Assets tile both take: one command, one
+/// content-addressed cache, one converge loop.
+function preview(material: string, size: number) {
+  return engine.getThumbnail("get-thumbnail", { asset: material, size });
+}
+
+test("get-thumbnail returns a PNG that reflects the material's color", async () => {
   const a = await engine.call("material-create", { name: "PrevA" });
   const b = await engine.call("material-create", { name: "PrevB" });
   await engine.call("material-update", { material: b.id, baseColor: { x: 1, y: 0, z: 0, w: 1 } });
 
-  const pa = await engine.call("preview-render", { material: a.id, size: 128 });
-  const pb = await engine.call("preview-render", { material: b.id, size: 128 });
+  const pa = await preview(a.id, 128);
+  const pb = await preview(b.id, 128);
 
-  expect(pa.png.length).toBeGreaterThan(100);
-  expect(pa.png.startsWith("iVBORw0KGgo")).toBe(true); // PNG magic, base64
-  expect(pa.png).not.toBe(pb.png); // white vs red sphere
+  expect(pa.format).toBe("png");
+  expect(pa.width).toBe(128);
+  expect(pa.height).toBe(128);
+  expect(pa.base64.length).toBeGreaterThan(100);
+  expect(pa.base64.startsWith("iVBORw0KGgo")).toBe(true); // PNG magic, base64
+  expect(pa.base64).not.toBe(pb.base64); // white vs red sphere
   expect(engine.validationErrors()).toEqual([]);
 });
 
@@ -77,10 +87,10 @@ test("a foldable node graph drives the material like direct factors", async () =
 
   await engine.call("material-update", { material: b.id, baseColor: { x: 1, y: 0, z: 0, w: 1 } });
 
-  const pa = await engine.call("preview-render", { material: a.id, size: 128 });
-  const pb = await engine.call("preview-render", { material: b.id, size: 128 });
+  const pa = await preview(a.id, 128);
+  const pb = await preview(b.id, 128);
 
-  expect(pa.png).toBe(pb.png); // the graph folds to the same red material
+  expect(pa.base64).toBe(pb.base64); // the graph folds to the same red material
   expect(engine.validationErrors()).toEqual([]);
 });
 
@@ -101,9 +111,9 @@ test("a procedural graph renders via codegen in the preview", async () => {
   };
   await engine.call("material-set-graph", { material: m.id, graph });
 
-  const prev = await engine.call("preview-render", { material: m.id, size: 128 });
-  expect(prev.png.startsWith("iVBORw0KGgo")).toBe(true); // valid PNG from the codegen'd pipeline
-  expect(prev.png.length).toBeGreaterThan(200);
+  const prev = await preview(m.id, 128);
+  expect(prev.base64.startsWith("iVBORw0KGgo")).toBe(true); // valid PNG from the codegen'd pipeline
+  expect(prev.base64.length).toBeGreaterThan(200);
   expect(engine.validationErrors()).toEqual([]);
 });
 
@@ -126,30 +136,54 @@ test("a procedural uv/frac graph codegen-renders in the preview", async () => {
   };
   await engine.call("material-set-graph", { material: m.id, graph });
 
-  const prev = await engine.call("preview-render", { material: m.id, size: 128 });
-  expect(prev.png.startsWith("iVBORw0KGgo")).toBe(true);
-  expect(prev.png.length).toBeGreaterThan(200);
+  const prev = await preview(m.id, 128);
+  expect(prev.base64.startsWith("iVBORw0KGgo")).toBe(true);
+  expect(prev.base64.length).toBeGreaterThan(200);
   expect(engine.validationErrors()).toEqual([]);
 });
 
-test("get-thumbnail renders a material preview PNG", async () => {
+test("a mixed-size preview backlog drains one tile at a time", async () => {
+  // One tile is in flight at a time and advances one frame per tick, so a backlog only clears if
+  // every tile is started, converged, cached and retired in turn — and the single thumbnail view
+  // is resized between tiles. A tile that never starts, never finishes, or leaves its in-flight
+  // marker behind leaves the reply `pending` until this times out.
+  const ids: string[] = [];
+  for (let i = 0; i < 4; i++) {
+    const m = await engine.call("material-create", { name: `Backlog${i}` });
+    await engine.call("material-update", {
+      material: m.id,
+      baseColor: { x: i / 4, y: 1 - i / 4, z: 0.5, w: 1 },
+    });
+    ids.push(m.id);
+  }
+  for (const id of ids) {
+    const big = await preview(id, 128);
+    expect(big.base64.startsWith("iVBORw0KGgo")).toBe(true);
+    const small = await preview(id, 64);
+    expect(small.base64.startsWith("iVBORw0KGgo")).toBe(true);
+    expect(small.width).toBe(64);
+  }
+  await engine.settle(300);
+
+  const faults = engine.log
+    .split("\n")
+    .filter((line) => /has been in flight|ERROR_DEVICE_LOST|preview thumbnail render:/.test(line));
+  expect(faults).toEqual([]);
+  expect(engine.validationErrors()).toEqual([]);
+});
+
+test("view-asset renders the same material at its larger default", async () => {
   const m = await engine.call("material-create", { name: "Thumb" });
-  const thumb = await engine.getThumbnail("get-thumbnail", {
-    asset: m.id,
-    size: 96,
-  });
-  expect(thumb.format).toBe("png");
-  expect(thumb.base64.startsWith("iVBORw0KGgo")).toBe(true);
+  const view = await engine.getThumbnail("view-asset", { asset: m.id });
+  expect(view.format).toBe("png");
+  expect(view.width).toBe(512);
+  expect(view.base64.startsWith("iVBORw0KGgo")).toBe(true);
   expect(engine.validationErrors()).toEqual([]);
 });
 
 test("an assigned normal map perturbs the shaded result", async () => {
   const asset = (await engine.call("import-model", { path: MAPPED })).id;
-  const e = trackEntity(
-    caseCleaner,
-    engine,
-    await engine.call("instantiate-model", { asset }),
-  );
+  const e = trackEntity(caseCleaner, engine, await engine.call("instantiate-model", { asset }));
   await engine.settle(300);
 
   // Reuse the fixture's own albedo texture (from the imported model's referenced `.smat`) as a
@@ -157,9 +191,7 @@ test("an assigned normal map perturbs the shaded result", async () => {
   const info = await engine.call("inspect", { entity: e.id });
   const slots = info.components.MaterialSet?.slots ?? [];
   expect(slots.length).toBeGreaterThan(0);
-  const albedo = (
-    await engine.call("material-get", { material: slots[0].material })
-  ).albedoTexture;
+  const albedo = (await engine.call("material-get", { material: slots[0].material })).albedoTexture;
   expect(albedo).toBeDefined();
   expect(albedo).not.toBe("0");
 

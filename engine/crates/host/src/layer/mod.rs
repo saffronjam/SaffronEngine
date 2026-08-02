@@ -7,7 +7,7 @@ mod overlays;
 mod present;
 mod session;
 
-pub(crate) use present::render_preview_scene_to_png;
+use present::PreviewRenderState;
 
 #[cfg(test)]
 mod tests;
@@ -54,6 +54,9 @@ pub struct HostLayer {
     shm_publish: bool,
     /// Tracks asset-preview transitions so the anim runtime is pruned once per edge.
     preview_active: bool,
+    /// The preview tile converging on the thumbnail view, one frame per tick. At most one, so a
+    /// tick renders one preview frame and the queue drains as an ordinary frame-loop job.
+    preview_job: Option<PreviewRenderState>,
 
     /// Whether the editor spawned this host; gates the parent-death watch.
     editor_spawned: bool,
@@ -143,6 +146,7 @@ impl HostLayer {
             shm: ViewportShmPublisher::new(),
             shm_publish,
             preview_active: false,
+            preview_job: None,
             editor_spawned,
             editor_pid: if editor_spawned {
                 rustix::process::getppid()
@@ -363,6 +367,14 @@ impl Layer for HostLayer {
         let mut mutated = false;
         if let Some(renderer) = app.frame_host.renderer_mut() {
             self.update_spatial_source(dt);
+            // Publish mode: the editor owns the render size (set-viewport-size); the hidden
+            // window's size is meaningless. Present mode tracks the window.
+            if !self.shm_publish
+                && let Some(window) = app.window.as_ref()
+            {
+                let view = renderer.active_view_id();
+                renderer.set_viewport_desired_size(view, window.width(), window.height());
+            }
             // Headless editor mode has no window, but the control plane still takes a `Window`
             // facade: the size is unused in publish mode and the signals are inert without an
             // event loop.
@@ -424,8 +436,7 @@ impl Layer for HostLayer {
     fn on_ui(&mut self, app: &mut App) {
         let mut vegetation_mutated = false;
         if let Some(renderer) = app.frame_host.renderer_mut() {
-            let window = app.window.as_ref();
-            vegetation_mutated = self.render_ui(window, renderer);
+            vegetation_mutated = self.render_ui(renderer);
         }
         // Streamed vegetation changes the visible scene without a control mutation, so the reactive
         // loop must keep painting until the temporal effects converge.

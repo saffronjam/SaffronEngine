@@ -64,6 +64,23 @@ export async function getThumbnailUrl(assetId: string, size: number): Promise<st
   }
 }
 
+/// Resolve a material's studio-lit preview as a base64 PNG, bypassing the blob-URL cache above: a
+/// material's look changes on every edit, so the pane needs the freshly keyed render rather than the
+/// URL a tile already holds. The engine converges the tile over several frames of its ordinary
+/// render loop and replies `pending` until it lands, so re-request with backoff. Rejects on an
+/// engine error.
+export async function getMaterialPreviewBase64(material: string, size: number): Promise<string> {
+  let delayMs = 60;
+  for (;;) {
+    const preview = await client.getThumbnail(material, size);
+    if (!preview.pending) {
+      return preview.base64;
+    }
+    await new Promise((resolve) => setTimeout(resolve, delayMs));
+    delayMs = Math.min(delayMs * 2, 1000);
+  }
+}
+
 /// Revoke every cached blob URL: the catalog changed, so cached images are stale.
 export function invalidateThumbnails(): void {
   for (const entry of thumbnailCache.values()) {

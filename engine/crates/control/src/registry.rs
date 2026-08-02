@@ -454,18 +454,9 @@ pub trait ControlRenderer {
     /// sized at least once. Read to tell whether a not-yet-shown preview pane needs
     /// seeding before a `set-active-view assetPreview`.
     fn view_desired_size(&self, view: ViewId) -> (u32, u32);
-    /// Sets a view's desired offscreen render size, recreating its targets.
-    ///
-    /// # Errors
-    ///
-    /// Returns the device error message if the GPU cannot idle or the targets cannot be
-    /// recreated.
-    fn set_view_desired_size(
-        &mut self,
-        view: ViewId,
-        width: u32,
-        height: u32,
-    ) -> std::result::Result<(), String>;
+    /// Requests a view's offscreen render size; its targets are recreated at the next frame
+    /// boundary.
+    fn set_view_desired_size(&mut self, view: ViewId, width: u32, height: u32);
 
     /// Captures the active view's offscreen scene color to a PNG file (the
     /// `screenshot {target:viewport}` path). Synchronous: idles, reads back, and
@@ -499,21 +490,6 @@ pub trait ControlRenderer {
     fn create_vegetation_compute_executor(
         &self,
     ) -> std::result::Result<Option<VegetationComputeExecutor>, String>;
-
-    /// Renders a material or texture-role preview subject through the **main forward+ graph** on the
-    /// offscreen thumbnail view (displacement + procedural sky + floor + key light) and returns the
-    /// PNG bytes — the sync `preview-render` seam. Live/uncached, so it reflects unsaved edits. The
-    /// async Assets tiles use the same render primitive off a queue in the host, not this seam.
-    ///
-    /// # Errors
-    ///
-    /// Returns the render/read-back/encode error message.
-    fn render_material_preview_png(
-        &mut self,
-        assets: &mut AssetServer,
-        subject: crate::commands_asset::PreviewSubject,
-        size: u32,
-    ) -> std::result::Result<Vec<u8>, String>;
 
     /// Serializes the renderer's settings as the project-file `renderSettings` block (the
     /// [`ProjectHost::render_settings_to_json`] seam the project lifecycle commands save).

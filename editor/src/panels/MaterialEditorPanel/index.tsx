@@ -3,6 +3,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { client } from "../../control/client";
 import { useEditorStore } from "../../state/store";
+import { getMaterialPreviewBase64 } from "../../state/store/thumbnails";
 import { renderField, type FieldRenderContext } from "../../components/fieldRenderer";
 import { AssetPicker } from "../../components/AssetPicker";
 import { NumberDrag } from "../../components/NumberDrag";
@@ -134,14 +135,13 @@ export function MaterialEditorPanel({
   const [preview, setPreview] = useState<string | null>(null);
   const coalescers = useRef<Map<string, Coalescer<unknown>>>(new Map());
   // One preview render per edit-burst (not one per field): edits push the material id here and the
-  // coalescer keeps at most one preview-render in flight, re-driving with the latest on completion.
+  // coalescer keeps at most one thumbnail request in flight, re-driving with the latest on completion.
   const previewCoalescer = useRef<Coalescer<string> | null>(null);
   if (previewCoalescer.current === null) {
     previewCoalescer.current = makeCoalescer<string>({
       throttleMs: 200,
       send: async (id) => {
-        const result = await client.previewRender(id, 256);
-        setPreview(result.png);
+        setPreview(await getMaterialPreviewBase64(id, 256));
       },
     });
   }

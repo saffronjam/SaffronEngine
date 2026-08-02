@@ -1206,3 +1206,22 @@ fn external_buffer_state_carries_ownership_without_a_pass_index() {
         }
     }
 }
+
+/// A batch retires as a unit, so a hang report can attribute the wedge no finer than the run of
+/// passes it covers. That run is what names it.
+#[test]
+fn a_batch_is_named_by_the_run_of_passes_it_covers() {
+    let passes = [
+        Some(RgPass::compute("gbuffer")),
+        Some(RgPass::compute("gtao")),
+        Some(RgPass::compute("ssgi")),
+    ];
+
+    assert_eq!(super::graph::batch_label(&passes, 0..3), "gbuffer…ssgi");
+    assert_eq!(super::graph::batch_label(&passes, 1..2), "gtao");
+    assert_eq!(
+        super::graph::batch_label(&passes, 1..1),
+        "queue-ownership-release",
+        "a synthetic prologue batch covers no passes at all"
+    );
+}

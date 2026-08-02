@@ -1,107 +1,208 @@
 //! The renderer-coupled half: the scene render, the shared-memory publish, and the preview
-//! thumbnail render.
+//! thumbnail job.
 
 use saffron_assets::{
-    AssetServer, GpuSceneMirror, PREVIEW_THUMBNAIL_MATERIAL_ID, PreviewRenderKind,
-    RenderSceneOptions, RendererScene, RendererUploader, render_scene, write_thumbnail_cache,
+    PREVIEW_THUMBNAIL_MATERIAL_ID, PreviewRenderJob, PreviewRenderKind, RenderSceneOptions,
+    RendererScene, RendererUploader, render_scene, write_thumbnail_cache,
 };
 use saffron_control::{PreviewSubject, build_preview_scene_for_thumbnail};
 
-use saffron_rendering::{Renderer, Uploader};
+use saffron_rendering::{Renderer, ThumbnailPng, ViewId};
 use saffron_scene::{CameraView, Scene};
 use saffron_sceneedit::PlayState;
-use saffron_window::Window;
 
 use crate::viewport_shm::ShmView;
 
 use super::*;
 
-impl HostLayer {
-    /// Renders a small budget of queued material / texture preview tiles through the main forward+
-    /// graph (the interactive previewer's path) on the offscreen thumbnail view, writing each to the
-    /// disk cache the editor repolls for. The worker cannot drive the main graph (it lives on the
-    /// render thread), so [`saffron_assets::request_thumbnail`] enqueues these and this drains them.
-    /// A small per-tick budget offsets the multi-frame converge cost of each tile.
-    pub(super) fn drive_preview_render_queue(&mut self, renderer: &mut Renderer) {
-        /// Tiles rendered per `on_update` tick — each converges several frames, so keep it small.
-        const MAX_PREVIEW_RENDERS_PER_TICK: usize = 2;
+/// Frames a preview tile renders before its read-back, so the temporal effects settle to the
+/// interactive previewer's look.
+const MIN_CONVERGE_FRAMES: u32 = 8;
+/// Safety bound for a preview environment whose asynchronous refresh never completes.
+const MAX_CONVERGE_FRAMES: u32 = 256;
 
+/// A preview tile converging on the offscreen [`ViewId::Thumbnail`] view, one frame per tick.
+///
+/// The subject scene is furnished once when the job starts and re-rendered each tick, so the
+/// thumbnail view accumulates its temporal history across ticks exactly as a viewport does.
+pub(super) struct PreviewRenderState {
+    /// What to render and where its PNG is cached.
+    job: PreviewRenderJob,
+    /// The furnished subject scene.
+    scene: Scene,
+    /// The framed preview camera.
+    camera: CameraView,
+    /// Converge frames rendered so far.
+    frames: u32,
+}
+
+/// The preview subject a queued job renders.
+fn preview_subject(kind: PreviewRenderKind) -> PreviewSubject {
+    match kind {
+        PreviewRenderKind::Material(id) => PreviewSubject::Material(id),
+        PreviewRenderKind::TextureRole { tid, role } => PreviewSubject::TextureRole { tid, role },
+        PreviewRenderKind::Mesh(id) => PreviewSubject::Mesh(id),
+        PreviewRenderKind::Model(id) => PreviewSubject::Model(id),
+        PreviewRenderKind::Hdri(tid) => PreviewSubject::Hdri(tid),
+        PreviewRenderKind::Plant(id) => PreviewSubject::Plant(id),
+    }
+}
+
+impl HostLayer {
+    /// Advances the queued material / texture / mesh preview tiles by **one** converge frame per
+    /// tick, through the main forward+ graph (the interactive previewer's path) on the offscreen
+    /// thumbnail view, writing each finished tile to the disk cache the editor repolls for. The
+    /// worker cannot drive the main graph (it lives on the render thread), so
+    /// [`saffron_assets::request_thumbnail`] enqueues these and this drains them.
+    ///
+    /// One tile is in flight and one frame is rendered per tick, so a tile costs the frame loop the
+    /// same as an ordinary viewport rather than a burst of frames inside a single update.
+    pub(super) fn drive_preview_render_queue(&mut self, renderer: &mut Renderer) {
+        // A project load swaps the scene and clears the asset caches across frames, so a tile
+        // converging against the outgoing catalog would render into a torn scene. Abandon it; the
+        // editor's next poll re-enqueues against the loaded project.
+        if self.editor.project_phase == ProjectPhase::Loading {
+            if let Some(state) = self.preview_job.take() {
+                self.assets.finish_preview_render(&state.job.cache_path);
+            }
+            return;
+        }
+        if self.preview_job.is_some() {
+            self.advance_preview_job(renderer);
+        } else {
+            self.start_preview_job(renderer);
+        }
+    }
+
+    /// Whether a preview tile is queued or converging — a render-activity reason, so the reactive
+    /// loop holds full cadence until every tile has landed.
+    pub(super) fn preview_render_active(&self) -> bool {
+        self.preview_job.is_some() || self.assets.preview_render_pending()
+    }
+
+    /// Takes the next queued tile, furnishes its subject scene, and requests the thumbnail view's
+    /// size. The size lands at the next frame boundary, so the first converge frame runs on the
+    /// tick after this one.
+    fn start_preview_job(&mut self, renderer: &mut Renderer) {
         if !self.assets.preview_render_pending() {
             return;
         }
         self.ensure_uploader(renderer);
-        if self.uploader.is_none() {
+        let Some(uploader) = self.uploader.as_ref() else {
             return;
-        }
+        };
+        let Some(job) = self.assets.take_preview_render_job() else {
+            return;
+        };
         let skinning = renderer.skinning_enabled();
-        let jobs = self
-            .assets
-            .take_preview_render_jobs(MAX_PREVIEW_RENDERS_PER_TICK);
-        let uploader = self.uploader.as_ref().expect("uploader present");
-        let assets = &mut self.assets;
-        let mirror = &mut self.gpu_scene_mirror;
-        for (index, job) in jobs.iter().enumerate() {
-            let subject = match job.kind {
-                PreviewRenderKind::Material(id) => PreviewSubject::Material(id),
-                PreviewRenderKind::TextureRole { tid, role } => {
-                    PreviewSubject::TextureRole { tid, role }
-                }
-                PreviewRenderKind::Mesh(id) => PreviewSubject::Mesh(id),
-                PreviewRenderKind::Model(id) => PreviewSubject::Model(id),
-                PreviewRenderKind::Hdri(tid) => PreviewSubject::Hdri(tid),
-                PreviewRenderKind::Plant(id) => PreviewSubject::Plant(id),
-            };
-            // Build the furnished scene (transient uploader over the renderer's descriptors), then
-            // render it (the uploader borrow ends with the block, freeing the renderer).
-            let (mut scene, _root, camera) = {
-                let gpu = RendererUploader::new(uploader, renderer.descriptors(), skinning);
-                build_preview_scene_for_thumbnail(
-                    assets,
-                    &gpu,
-                    subject,
-                    PREVIEW_THUMBNAIL_MATERIAL_ID,
-                )
-            };
-            let view = camera.view();
-            match render_preview_scene_to_png(
-                renderer, uploader, mirror, &mut scene, assets, &view, job.size,
-            ) {
-                Ok(png) => {
-                    if let Err(err) =
-                        write_thumbnail_cache(std::path::Path::new(&job.cache_path), &png.bytes)
-                    {
-                        tracing::warn!("preview thumbnail cache write: {err}");
-                    }
-                }
-                Err(err) => {
-                    tracing::error!("preview thumbnail render: {err}");
-                    // The failed render left the frame ring mid-flight; the rest of the budget
-                    // would drive it further before the loop closes the slot. Release every
-                    // remaining job's in-flight marker so a later request re-enqueues it, and
-                    // give the tick back.
-                    for abandoned in &jobs[index..] {
-                        assets.finish_preview_render(&abandoned.cache_path);
-                    }
-                    return;
-                }
-            }
-            assets.finish_preview_render(&job.cache_path);
-        }
+        // The transient uploader borrows the renderer's descriptors; the borrow ends with the
+        // block, freeing the renderer for the converge frames.
+        let (scene, _root, camera) = {
+            let gpu = RendererUploader::new(uploader, renderer.descriptors(), skinning);
+            build_preview_scene_for_thumbnail(
+                &mut self.assets,
+                &gpu,
+                preview_subject(job.kind),
+                PREVIEW_THUMBNAIL_MATERIAL_ID,
+            )
+        };
+        renderer.set_viewport_desired_size(ViewId::Thumbnail, job.size, job.size);
+        self.preview_job = Some(PreviewRenderState {
+            job,
+            scene,
+            camera: camera.view(),
+            frames: 0,
+        });
     }
 
-    /// Renders the scene through the active camera and submits the native gizmo overlay: track
-    /// the viewport size in present mode, sync the gizmo, render the scene, then build + submit
-    /// the edit overlay geometry.
-    pub(super) fn render_ui(&mut self, window: Option<&Window>, renderer: &mut Renderer) -> bool {
-        // Publish mode: the editor owns the render size (set-viewport-size); the hidden
-        // window's size is meaningless. Present mode tracks the window.
-        if !self.shm_publish
-            && let Some(window) = window
-        {
-            let view = renderer.active_view_id();
-            let _ = renderer.set_viewport_desired_size(view, window.width(), window.height());
-        }
+    /// Renders one converge frame of the active tile and, once the preview environment's
+    /// asynchronous IBL refresh and derived lighting capture have landed, reads it back to a PNG
+    /// and writes the disk cache.
+    fn advance_preview_job(&mut self, renderer: &mut Renderer) {
+        let outcome = {
+            let Some(state) = self.preview_job.as_mut() else {
+                return;
+            };
+            let Some(uploader) = self.uploader.as_ref() else {
+                return;
+            };
+            let assets = &mut self.assets;
+            let mirror = &mut self.gpu_scene_mirror;
+            let skinning = renderer.skinning_enabled();
+            let prev_view = renderer.active_view_id();
+            if state.frames == 0 {
+                // A fresh subject starts from a clean history rather than the last tile's.
+                renderer.set_active_view(ViewId::Thumbnail);
+            } else {
+                renderer.set_active_view_no_reset(ViewId::Thumbnail);
+            }
+            let result = (|| {
+                let world = ViewId::Thumbnail.gpu_scene_world();
+                if let Err(error) = mirror.sync_renderer_world(
+                    world,
+                    &mut state.scene,
+                    None,
+                    assets,
+                    renderer,
+                    uploader,
+                ) {
+                    tracing::error!("gpu scene mirror sync (thumbnail): {error}");
+                }
+                {
+                    let mut driver = RendererScene::new(renderer, uploader, skinning);
+                    render_scene(
+                        &mut driver,
+                        &mut state.scene,
+                        assets,
+                        &mut *mirror,
+                        &state.camera,
+                        RenderSceneOptions {
+                            show_editor_camera_models: false,
+                            show_grid: false,
+                        },
+                    );
+                }
+                renderer.render_scene_offscreen()?;
+                state.frames += 1;
+                if state.frames >= MIN_CONVERGE_FRAMES && renderer.active_environment_converged() {
+                    return renderer.encode_active_offscreen_png().map(Some);
+                }
+                if state.frames >= MAX_CONVERGE_FRAMES {
+                    return Err(saffron_rendering::Error::NotConverged {
+                        frames: MAX_CONVERGE_FRAMES,
+                    });
+                }
+                Ok(None)
+            })();
+            // Leave the excursion without resetting the viewport's accumulated history.
+            renderer.set_active_view_no_reset(prev_view);
+            result
+        };
 
+        let finished: Option<ThumbnailPng> = match outcome {
+            Ok(None) => return,
+            Ok(Some(png)) => Some(png),
+            Err(err) => {
+                tracing::error!("preview thumbnail render: {err}");
+                None
+            }
+        };
+        let Some(state) = self.preview_job.take() else {
+            return;
+        };
+        if let Some(png) = finished
+            && let Err(err) =
+                write_thumbnail_cache(std::path::Path::new(&state.job.cache_path), &png.bytes)
+        {
+            tracing::warn!("preview thumbnail cache write: {err}");
+        }
+        // Release the in-flight marker either way, so a later request re-enqueues the tile.
+        self.assets.finish_preview_render(&state.job.cache_path);
+    }
+
+    /// Renders the scene through the active camera and submits the native gizmo overlay: sync the
+    /// gizmo, render the scene, then build + submit the edit overlay geometry.
+    pub(super) fn render_ui(&mut self, renderer: &mut Renderer) -> bool {
         self.editor.sync_native_gizmo();
         let cam = self.editor.render_camera_view();
         let (view_width, view_height) = (renderer.viewport_width(), renderer.viewport_height());
@@ -229,63 +330,4 @@ impl HostLayer {
         }
         self.shm.publish(view, width, height, pixels);
     }
-}
-
-/// Renders a throwaway preview `scene` through the main forward+ graph on the offscreen
-/// [`saffron_rendering::ViewId::Thumbnail`] view and returns the encoded PNG — the one render
-/// primitive both the async Assets-tile queue and the sync `preview-render` seam drive. Converges
-/// temporal effects and waits for the preview environment's asynchronous IBL refresh and derived
-/// lighting capture before readback. Restores the prior active view *without* resetting its temporal
-/// state, so a `Scene → Thumbnail → Scene` excursion never wipes the live viewport's accumulated
-/// history.
-pub(crate) fn render_preview_scene_to_png(
-    renderer: &mut Renderer,
-    uploader: &Uploader,
-    mirror: &mut GpuSceneMirror,
-    scene: &mut Scene,
-    assets: &mut AssetServer,
-    camera: &CameraView,
-    size: u32,
-) -> saffron_rendering::Result<saffron_rendering::ThumbnailPng> {
-    /// Minimum frames rendered before readback so temporal effects converge to the previewer's look.
-    const MIN_CONVERGE_FRAMES: u32 = 8;
-    /// Safety bound for a failed asynchronous environment refresh.
-    const MAX_CONVERGE_FRAMES: u32 = 256;
-
-    let skinning = renderer.skinning_enabled();
-    let prev_view = renderer.active_view_id();
-    renderer.set_active_view(saffron_rendering::ViewId::Thumbnail);
-    let result = (|| {
-        renderer.set_viewport_desired_size(saffron_rendering::ViewId::Thumbnail, size, size)?;
-        let options = RenderSceneOptions {
-            show_editor_camera_models: false,
-            show_grid: false,
-        };
-        let mut converged = false;
-        for frame in 0..MAX_CONVERGE_FRAMES {
-            let world = saffron_rendering::ViewId::Thumbnail.gpu_scene_world();
-            if let Err(error) =
-                mirror.sync_renderer_world(world, scene, None, assets, renderer, uploader)
-            {
-                tracing::error!("gpu scene mirror sync (thumbnail): {error}");
-            }
-            {
-                let mut driver = RendererScene::new(renderer, uploader, skinning);
-                render_scene(&mut driver, scene, assets, mirror, camera, options);
-            }
-            renderer.render_scene_offscreen()?;
-            if frame + 1 >= MIN_CONVERGE_FRAMES && renderer.active_environment_converged() {
-                converged = true;
-                break;
-            }
-        }
-        if !converged {
-            return Err(saffron_rendering::Error::ShaderLoad(
-                "thumbnail environment did not converge".to_owned(),
-            ));
-        }
-        renderer.encode_active_offscreen_png()
-    })();
-    renderer.restore_active_view_no_reset(prev_view);
-    result
 }

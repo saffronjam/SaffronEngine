@@ -298,7 +298,6 @@ fn asset_domain() -> &'static [&'static str] {
         "material-get",
         "material-schema",
         "material-update",
-        "preview-render",
         "material-set-graph",
         "material-create-instance",
         "material-set-override",

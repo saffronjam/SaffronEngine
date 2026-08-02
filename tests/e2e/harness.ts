@@ -179,7 +179,9 @@ export class Engine {
         await engine.awaitProjectReady();
       } catch (err) {
         engine.cleanupAppdata();
-        throw new Error(`project did not load on boot: ${String(err)}\n${engine.buf}`);
+        throw new Error(`project did not load on boot: ${String(err)}\n${engine.buf}`, {
+          cause: err,
+        });
       }
     }
     return engine;
@@ -245,12 +247,12 @@ export class Engine {
   }
 
   // Fetch a thumbnail, transparently retrying the `pending` reply the engine sends while its
-  // worker thread generates a cold-cache entry (mirrors the editor's backoff). Resolves the final
-  // PNG reply; rejects on an engine error or after `timeoutMs`.
+  // preview job converges the tile on the frame loop (mirrors the editor's backoff). Resolves the
+  // final PNG reply; rejects on an engine error or after `timeoutMs`.
   async getThumbnail(
     cmd: "get-thumbnail" | "view-asset",
     params: ThumbnailParams,
-    timeoutMs = 10_000,
+    timeoutMs = 30_000,
   ): Promise<ThumbnailResult> {
     const start = Date.now();
     let delayMs = 30;

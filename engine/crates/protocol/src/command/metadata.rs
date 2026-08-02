@@ -499,7 +499,6 @@ pub static COMMAND_SKIPS: &[(&str, &str)] = &[
     ("material-get", "needs a created material asset"),
     ("material-schema", "needs a created material asset"),
     ("material-update", "needs a created material asset"),
-    ("preview-render", "renders a material to a PNG blob"),
     ("material-set-graph", "needs a created material asset"),
     (
         "material-create-instance",

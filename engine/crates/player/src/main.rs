@@ -409,7 +409,7 @@ impl Layer for PlayerLayer {
         // Track the window size so the offscreen the present blits from stays native-resolution.
         if let Some(window) = app.window.as_ref() {
             let view = renderer.active_view_id();
-            let _ = renderer.set_viewport_desired_size(view, window.width(), window.height());
+            renderer.set_viewport_desired_size(view, window.width(), window.height());
         }
         self.ensure_uploader(renderer);
         let Some(uploader) = self.uploader.as_ref() else {

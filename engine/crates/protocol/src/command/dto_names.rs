@@ -478,8 +478,6 @@ pub static DTO_TYPE_NAMES: &[&str] = &[
     "ExposedParamDto",
     "MaterialUpdateParams",
     "MaterialUpdateResult",
-    "PreviewRenderParams",
-    "PreviewRenderResult",
     "MaterialSetGraphParams",
     "MaterialSetGraphResult",
     "MaterialCreateInstanceParams",

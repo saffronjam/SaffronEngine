@@ -9,7 +9,7 @@
 use std::path::Path;
 use std::sync::Arc;
 
-use saffron_assets::{AssetServer, GpuUploader, PREVIEW_THUMBNAIL_MATERIAL_ID, RendererUploader};
+use saffron_assets::{GpuUploader, RendererUploader};
 use saffron_control::{ControlRenderer, VegetationComputeExecutor};
 use saffron_rendering::{
     ActiveAlarm, AlarmDrain, CaptureMode, CaptureState, FrameHistoryStats, FrameSample, PassTiming,
@@ -772,15 +772,8 @@ impl ControlRenderer for HostControlRenderer<'_> {
             self.renderer.view_desired_height(view),
         )
     }
-    fn set_view_desired_size(
-        &mut self,
-        view: ViewId,
-        width: u32,
-        height: u32,
-    ) -> Result<(), String> {
-        self.renderer
-            .set_viewport_desired_size(view, width, height)
-            .map_err(|e| e.to_string())
+    fn set_view_desired_size(&mut self, view: ViewId, width: u32, height: u32) {
+        self.renderer.set_viewport_desired_size(view, width, height);
     }
 
     fn capture_viewport(&mut self, path: &Path) -> Result<(), String> {
@@ -812,42 +805,6 @@ impl ControlRenderer for HostControlRenderer<'_> {
         let executor = VulkanGraphComputeExecutor::new(self.renderer.device_arc())
             .map_err(|error| error.to_string())?;
         Ok(Some(Arc::new(executor)))
-    }
-
-    fn render_material_preview_png(
-        &mut self,
-        assets: &mut AssetServer,
-        subject: saffron_control::PreviewSubject,
-        size: u32,
-    ) -> Result<Vec<u8>, String> {
-        // Build the furnished preview scene through a transient uploader over the renderer's
-        // descriptors, then render it through the main graph on the offscreen thumbnail view. The
-        // uploader borrow of the renderer ends with the block, freeing it for the render pass.
-        let (mut scene, _root, camera) = {
-            let gpu = RendererUploader::new(
-                self.uploader,
-                self.renderer.descriptors(),
-                self.skinning_enabled,
-            );
-            saffron_control::build_preview_scene_for_thumbnail(
-                assets,
-                &gpu,
-                subject,
-                PREVIEW_THUMBNAIL_MATERIAL_ID,
-            )
-        };
-        let view = camera.view();
-        crate::layer::render_preview_scene_to_png(
-            self.renderer,
-            self.uploader,
-            self.mirror,
-            &mut scene,
-            assets,
-            &view,
-            size,
-        )
-        .map(|png| png.bytes)
-        .map_err(|e| e.to_string())
     }
 
     fn render_settings_to_json(&self) -> Value {

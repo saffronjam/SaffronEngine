@@ -192,6 +192,9 @@ impl FrameRing {
     /// Destroys every slot's handles. Must be called after `wait_idle`, before the
     /// device is torn down (the handles borrow the device).
     pub fn destroy(&mut self, device: &Device) {
+        // The published hang records hold these timeline handles; drop them before the semaphores
+        // go, so a stale handle can never reach `vkGetSemaphoreCounterValue`.
+        crate::watchdog::clear_frames();
         let raw = device.raw();
         for frame in &self.frames {
             // SAFETY: the ash seam. `wait_idle` ran first, so no handle is in use;

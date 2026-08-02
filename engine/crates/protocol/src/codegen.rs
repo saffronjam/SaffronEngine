@@ -555,8 +555,6 @@ macro_rules! dto_universe {
             MaterialSchemaResult,
             MaterialUpdateParams,
             MaterialUpdateResult,
-            PreviewRenderParams,
-            PreviewRenderResult,
             MaterialSetGraphParams,
             MaterialSetGraphResult,
             MaterialCreateInstanceParams,

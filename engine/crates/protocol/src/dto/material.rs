@@ -177,22 +177,6 @@ pub struct MaterialUpdateResult {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema, TS)]
 #[serde(rename_all = "camelCase")]
 #[ts(export)]
-pub struct PreviewRenderParams {
-    pub material: AssetSelector,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub size: Option<u32>,
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema, TS)]
-#[serde(rename_all = "camelCase")]
-#[ts(export)]
-pub struct PreviewRenderResult {
-    pub png: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema, TS)]
-#[serde(rename_all = "camelCase")]
-#[ts(export)]
 pub struct MaterialSetGraphParams {
     pub material: AssetSelector,
     pub graph: Value,

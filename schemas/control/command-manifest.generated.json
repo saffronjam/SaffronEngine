@@ -1675,13 +1675,6 @@
       "skip": "needs a created material asset"
     },
     {
-      "name": "preview-render",
-      "params": "PreviewRenderParams",
-      "result": "PreviewRenderResult",
-      "status": "typed",
-      "skip": "renders a material to a PNG blob"
-    },
-    {
       "name": "material-set-graph",
       "params": "MaterialSetGraphParams",
       "result": "MaterialSetGraphResult",

@@ -139,8 +139,7 @@ pub fn convert_to_rgb(
 ///
 /// # Errors
 ///
-/// Returns [`crate::Error::ShaderLoad`] is never produced here; a PNG encode failure is
-/// surfaced as [`std::io::Error`].
+/// Returns [`std::io::Error`] when the PNG encoder rejects the image.
 pub fn encode_to_png(
     pixels: &[u8],
     width: u32,

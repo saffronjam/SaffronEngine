@@ -331,6 +331,8 @@ pub struct RgBatchCommandBuffers<'a> {
 pub struct RgRecordedBatch {
     /// Selected queue.
     pub queue: RgQueueAssignment,
+    /// The passes the batch covers, as `first…last` — what a hang report names it by.
+    pub label: String,
     /// Recorded primary command buffer.
     pub command_buffer: vk::CommandBuffer,
     /// Earlier batch indices whose timeline points this batch waits for.

@@ -622,6 +622,7 @@ impl RenderGraph {
             .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
 
         for batch in &plan.batches {
+            let label = batch_label(&passes, batch.passes.clone());
             let command_buffer = match batch.queue {
                 RgQueueAssignment::Graphics => {
                     let command = commands.graphics[graphics_index];
@@ -726,6 +727,7 @@ impl RenderGraph {
             }
             recorded.push(RgRecordedBatch {
                 queue: batch.queue,
+                label,
                 command_buffer,
                 wait_for_batches: batch.wait_for_batches.clone(),
                 passes: batch.passes.clone(),
@@ -909,4 +911,25 @@ pub(super) fn emit_barriers(
 
 pub(super) fn records_pipeline_statistics(queue: RgQueueAssignment) -> bool {
     queue == RgQueueAssignment::Graphics
+}
+
+/// Names a batch by the run of passes it covers: `first…last`, or the one pass's own name. A
+/// batch's timeline point retires all of them at once, so that range is the finest granularity a
+/// hang report can attribute the wedge to.
+pub(super) fn batch_label(passes: &[Option<RgPass>], range: std::ops::Range<usize>) -> String {
+    let name = |index: usize| {
+        passes
+            .get(index)
+            .and_then(Option::as_ref)
+            .map(|pass| pass.name.as_str())
+    };
+    // A synthetic prologue batch records queue-ownership releases over no passes at all.
+    if range.is_empty() {
+        return "queue-ownership-release".to_owned();
+    }
+    match (name(range.start), name(range.end - 1)) {
+        (Some(first), Some(last)) if first == last => first.to_owned(),
+        (Some(first), Some(last)) => format!("{first}…{last}"),
+        _ => "queue-ownership-release".to_owned(),
+    }
 }

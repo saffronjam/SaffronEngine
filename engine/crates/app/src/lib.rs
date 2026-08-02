@@ -143,9 +143,7 @@ impl FrameHost for Renderer {
         // The present blit's source is the active offscreen view; track the window so the
         // presented image is rendered at native resolution, not scaled.
         let view = self.active_view_id();
-        if let Err(err) = self.set_viewport_desired_size(view, width, height) {
-            tracing::error!("viewport resize failed: {err}");
-        }
+        self.set_viewport_desired_size(view, width, height);
     }
 
     fn renderer_mut(&mut self) -> Option<&mut Renderer> {

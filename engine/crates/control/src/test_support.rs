@@ -855,21 +855,15 @@ impl ControlRenderer for StubRenderer {
     fn view_desired_size(&self, view: ViewId) -> (u32, u32) {
         self.view_sizes[view.index()]
     }
-    fn set_view_desired_size(
-        &mut self,
-        view: ViewId,
-        width: u32,
-        height: u32,
-    ) -> Result<(), String> {
+    fn set_view_desired_size(&mut self, view: ViewId, width: u32, height: u32) {
         if width == 0 || height == 0 {
-            return Ok(());
+            return;
         }
         self.view_sizes[view.index()] = (width, height);
         if view == self.active_view {
             self.width = width;
             self.height = height;
         }
-        Ok(())
     }
 
     fn capture_viewport(&mut self, _path: &Path) -> Result<(), String> {
@@ -888,16 +882,6 @@ impl ControlRenderer for StubRenderer {
         &self,
     ) -> Result<Option<crate::VegetationComputeExecutor>, String> {
         Ok(None)
-    }
-
-    fn render_material_preview_png(
-        &mut self,
-        _assets: &mut AssetServer,
-        _subject: crate::commands_asset::PreviewSubject,
-        _size: u32,
-    ) -> std::result::Result<Vec<u8>, String> {
-        // The stub renders no scene; a fixed non-empty byte string proves the seam is wired.
-        Ok(b"stub-preview-png".to_vec())
     }
 
     fn render_settings_to_json(&self) -> Value {

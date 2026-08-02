@@ -576,6 +576,10 @@ pub struct Renderer {
     budget_controller: BudgetController,
     /// A render-scale change the budget controller requested, applied at the next safe resize point.
     pending_render_scale: Option<f32>,
+    /// Per-view desired render sizes awaiting the next frame boundary. A resize idles the GPU and
+    /// reallocates every target of the view, so it must never land between a slot's begin and its
+    /// submit; [`Renderer::begin_offscreen_frame`] is the one point that applies these.
+    pending_view_size: [Option<(u32, u32)>; VIEW_COUNT],
 
     /// The active tonemap operator (default ACES), applied in the tonemap pass + reported in stats.
     tonemap_mode: TonemapMode,
