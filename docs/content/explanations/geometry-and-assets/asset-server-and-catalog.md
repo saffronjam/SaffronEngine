@@ -26,7 +26,7 @@ pub struct AssetServer {
     model_by_uuid: AssetCache<ModelAsset>,           // opened .smodel containers
     material_by_uuid: AssetCache<MaterialAsset>,     // parent-resolved .smat state
     asset_journal: VecDeque<AssetMutation>,          // ordered derived-state invalidations
-    // + the codegen-shader memo, the preview-render queue, the thumbnail cache root
+    // + the codegen-shader memo, the preview render queue, the thumbnail cache root
 }
 ```
 
