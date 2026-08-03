@@ -1,6 +1,11 @@
-# Saffron Anima
+# Anima
 
-A from-scratch **Vulkan** renderer / **Rust** game engine. The workspace (`engine/`, a Cargo
+A from-scratch **Vulkan** renderer / **Rust** game engine in the Saffron family. Refer to the
+project, engine, editor, and renderer as **Anima** in prose; use **Saffron** for the family name and
+for concrete technical identifiers that already carry it, such as `saffron-*` crates, binaries,
+protocol packages, environment variables, paths, and URLs.
+
+The workspace (`engine/`, a Cargo
 workspace) builds **`saffron-host`**, a *present-only viewport host*: it renders the scene plus a
 native gizmo overlay offscreen, publishes frames into shared memory, and serves the control plane —
 **no UI panels of its own**. The **editor is the CEF/React/TypeScript app in `editor/`** — a Rust shell
@@ -158,6 +163,11 @@ cargo run -p xtask -- shaders    # compile engine/assets/shaders/*.slang → SPI
   control-schema contract test → frontend bun build. `just check` wraps it once the toolbox/bun/display
   are set up (also `just engine|editor|schema|test|e2e`). There is intentionally no GitHub-hosted CI (a
   stock runner can't reproduce the toolbox); `.github/workflows/ci.yml` targets a self-hosted runner.
+- Renderer, shadow, scene-upload, and editor-interaction changes include a loaded-scene performance
+  check before "done": boot the saved `Test` project from `appdata/userdata`, move the relevant
+  object or light the way the issue describes, capture profiler/render-stats data on the real GPU,
+  and inspect the loaded viewport. For this simple scene, sustained frame or pass cost above 3-4 ms is
+  a bug to fix before claiming the change is complete.
 - `just e2e` runs the `tests/e2e` suite — TypeScript on `bun test` that boots a headless host and
   drives it over the control plane (typed via `@saffron/protocol`), asserting responses and a
   validation-clean log. It is the language-appropriate place for engine behaviour tests: the wire is
