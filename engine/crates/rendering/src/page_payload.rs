@@ -38,8 +38,8 @@ pub struct GpuPageNodeRecord {
     pub appearance_total: u32,
     /// Static payload maximum, local metres.
     pub bounds_max: [f32; 3],
-    /// Representation-transition threshold total.
-    pub transition_total: u32,
+    /// Padding: std430 starts a three-component vector on a 16-byte boundary.
+    pub pad0: u32,
     /// Conservative deformed minimum, local metres.
     pub deformed_min: [f32; 3],
     /// Voxel surface vertices stored by this page (zero for a triangle page).
@@ -237,7 +237,6 @@ pub fn build_page_payload(
         bounds_min: bounds_min(&node.bounds),
         appearance_total: node.appearance_error.total,
         bounds_max: bounds_max(&node.bounds),
-        transition_total: page.transition_error.total,
         deformed_min: bounds_min(&node.deformed_bounds),
         vertex_count: 0,
         deformed_max: bounds_max(&node.deformed_bounds),
@@ -394,7 +393,6 @@ mod tests {
                 bytemuck::from_bytes(&payload.bytes[..size_of::<GpuPageNodeRecord>()]);
             let node = &hierarchy.nodes[page.node as usize];
             assert_eq!(header.child_count as usize, node.children.len());
-            assert_eq!(header.transition_total, page.transition_error.total);
             assert_eq!(header.appearance_total, node.appearance_error.total);
             assert_eq!(
                 header.flags & GPU_PAGE_PAYLOAD_FLAG_GUARANTEED_ROOT != 0,

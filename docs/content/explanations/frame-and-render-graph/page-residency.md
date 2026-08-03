@@ -13,10 +13,9 @@ arena when its parent is resident, and evicted leaf-first under a byte budget.
 ## The payload
 
 Every mesh cook produces a parent-before-child page directory; each page's device payload
-is byte-locked: a `GpuPageNodeRecord` header (representation, bounds, appearance and
-transition error totals), the node's child pages as resident page-table handles, one
-`GpuPageClusterRecord` per triangle cluster, an optional voxel-surface vertex block, and a
-u32 index blob.
+is byte-locked: a `GpuPageNodeRecord` header (representation, bounds, appearance error
+total), the node's child pages as resident page-table handles, one `GpuPageClusterRecord`
+per triangle cluster, an optional voxel-surface vertex block, and a u32 index blob.
 
 Triangle indices are geometry-relative — the cook's cluster vertices resolved back to
 source vertex indices — so a cluster draws over the geometry's resident vertex range with
@@ -55,7 +54,8 @@ Demand is priority-scored, never distance alone. The CPU prioritizer scores the
 refinement frontier (unloaded pages whose parent is resident) by projected transition
 error: the page's cooked error total (Q15.16) scaled to pixels through the view's
 projection and the nearest instance distance, reduced for instances outside the frustum
-and outside the reach of any gather. It walks placed vegetation alongside scene instances:
+and outside the reach of any gather. That total is the error of the representation the
+page displaces — its parent node's — which is exactly what resolving the page buys back. It walks placed vegetation alongside scene instances:
 plants never enter the ECS, and they are where most of the paged geometry actually is, so a
 prioritizer that skipped them would be scoring the smaller half of the scene.
 

@@ -1,10 +1,61 @@
 //! Shared cook fixtures for the hierarchy unit tests.
 
+use glam::{Vec2, Vec3};
+
+use crate::{Mesh, Submesh, Vertex};
+
 use super::types::{
     MicroInstance, PortableAggregationMode, PortableBounds, PortableHierarchyInput,
     PortableSourceMesh, PortableSourceSubmesh, PortableSourceVertex, VirtualHierarchyMaterial,
     identity_transform_bits,
 };
+
+/// A UV sphere of `radius` metres, dense enough to clusterize into far more leaves than one
+/// node may carry.
+pub(super) fn uv_sphere_input(radius: f32) -> PortableHierarchyInput {
+    const RINGS: u32 = 48;
+    const SEGMENTS: u32 = 64;
+    let mut vertices = Vec::new();
+    for ring in 0..=RINGS {
+        let v = f64::from(ring) / f64::from(RINGS);
+        let theta = v * std::f64::consts::PI;
+        for segment in 0..=SEGMENTS {
+            let u = f64::from(segment) / f64::from(SEGMENTS);
+            let phi = u * std::f64::consts::TAU;
+            let normal = Vec3::new(
+                (theta.sin() * phi.cos()) as f32,
+                theta.cos() as f32,
+                (theta.sin() * phi.sin()) as f32,
+            );
+            vertices.push(Vertex {
+                position: normal * radius,
+                normal,
+                uv0: Vec2::new(u as f32, v as f32),
+                ..Vertex::default()
+            });
+        }
+    }
+    let mut indices = Vec::new();
+    for ring in 0..RINGS {
+        for segment in 0..SEGMENTS {
+            let top = ring * (SEGMENTS + 1) + segment;
+            let bottom = top + SEGMENTS + 1;
+            indices.extend([top, bottom, top + 1, top + 1, bottom, bottom + 1]);
+        }
+    }
+    let index_count = indices.len() as u32;
+    let mesh = Mesh {
+        vertices,
+        indices,
+        submeshes: vec![Submesh {
+            first_index: 0,
+            index_count,
+            vertex_offset: 0,
+            material_slot: 0,
+        }],
+    };
+    PortableHierarchyInput::from_mesh(&mesh, &[]).expect("uv sphere input")
+}
 
 pub(super) fn source_vertex(position_bits: [i32; 3], uv_bits: [i32; 2]) -> PortableSourceVertex {
     PortableSourceVertex {

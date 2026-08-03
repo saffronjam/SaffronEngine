@@ -15,8 +15,15 @@ pub const PORTABLE_CLUSTER_MAX_VERTICES: usize = 64;
 pub const PORTABLE_CLUSTER_MAX_TRIANGLES: usize = 124;
 /// Canonical aggregate brick edge in voxels.
 pub const PORTABLE_VOXEL_BRICK_EDGE: u8 = 8;
+/// Largest child set one hierarchy node may carry.
+///
+/// The GPU cut walk keeps a fixed-size per-thread page stack, so a node's whole child set
+/// has to fit beside the path already pushed. Four keeps a million-cluster prototype inside
+/// that stack and gives the cut real intermediate levels to stop at, instead of one coarse
+/// stand-in for the entire prototype.
+pub const PORTABLE_HIERARCHY_MAX_CHILDREN: usize = 4;
 /// Canonical envelope version for the five portable hierarchy sections.
-pub const PORTABLE_HIERARCHY_FORMAT_VERSION: u32 = 4;
+pub const PORTABLE_HIERARCHY_FORMAT_VERSION: u32 = 5;
 
 /// Format-neutral aggregate material moments stored as canonical integer bits.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -548,7 +555,8 @@ pub struct PortableHierarchyPage {
     pub bounds: PortableBounds,
     /// Swept payload bounds.
     pub deformed_bounds: PortableBounds,
-    /// Representation transition threshold.
+    /// Appearance error this page removes: the error of the representation drawn in its
+    /// place, which is its parent node's. Streaming demand is worth exactly that.
     pub transition_error: AppearanceError,
     /// Root pages remain drawable under every pressure condition.
     pub guaranteed_root: bool,

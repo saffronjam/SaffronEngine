@@ -23,10 +23,16 @@ the cooker. Format adapters turn an ordinary `Mesh` or a normalized plant family
 `PortableHierarchyInput`; clustering, simplification, paging, codecs, and validation remain in
 `saffron-geometry`.
 
-Contiguous solid geometry simplifies through border-locked hierarchy groups. Repeated plant parts
-remain one prototype plus assembly transforms instead of expanding every leaf or branch into the
-cooked geometry. Disconnected fine foliage also receives aggregate voxel-brick nodes containing
-occupancy, coverage density, albedo, roughness, transmission, thickness, and normal moments.
+The hierarchy branches narrowly. Leaf clusters group into sibling sets of at most
+`PORTABLE_HIERARCHY_MAX_CHILDREN`, each set collapses into one parent, and the collapse repeats
+until a submesh has a single root; submeshes and prototypes group the same way beneath the family
+root. Contiguous solid geometry collapses a group through a border-locked simplification to a
+quarter of its triangles, so each level is a real intermediate detail step the cut can stop at, and
+a node's whole child set fits on the traversal's fixed page stack no matter how large the model is.
+Repeated plant parts remain one prototype plus assembly transforms instead of expanding every leaf
+or branch into the cooked geometry. Disconnected fine foliage collapses a group into an aggregate
+voxel-brick node instead, containing occupancy, coverage density, albedo, roughness, transmission,
+thickness, and normal moments.
 
 Appearance error is a tuple rather than geometric distance alone:
 
@@ -34,10 +40,15 @@ Appearance error is a tuple rather than geometric distance alone:
 (silhouette, coverage, transmission, material variation, normal distribution)
 ```
 
-Parent error bounds its descendants. A cut can therefore mix triangle and aggregate nodes while
-retaining a drawable coarse root. Page dependencies are parent-first, and a parent remains usable
-until all selected children and their dependencies are resident. The portable aggregate output is
-indexed geometry, so it does not require Vulkan sparse residency.
+Silhouette is a Q15.16 distance in the prototype's own local metres, measured against the group
+being collapsed rather than against the whole model, and the levels' errors add downward from the
+root — so a large model declares a large error and a small part of it declares its own. Parent error
+bounds its descendants. A cut can therefore mix triangle and aggregate nodes while retaining a
+drawable coarse root. Page dependencies are parent-first, and a parent remains usable until all
+selected children and their dependencies are resident. A page's transition error is the error of the
+representation drawn in its place — its parent node's — because that is what resolving the page
+removes, and it is what streaming demand is priced from. The portable aggregate output is indexed
+geometry, so it does not require Vulkan sparse residency.
 
 An ordinary `.smesh` stores the five-section hierarchy in a required envelope after its conditioning
 data. Mesh upload validates this envelope and carries its pages on `GpuMesh`; the GPU-scene mirror

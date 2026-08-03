@@ -7,7 +7,8 @@ use optimesh::clusterizer::{
 };
 use optimesh::meshletutils::compute_meshlet_bounds;
 use optimesh::simplifier::{
-    SIMPLIFY_LOCK_BORDER, SIMPLIFY_REGULARIZE, SimplifyTarget, VertexData, simplify,
+    SIMPLIFY_ERROR_ABSOLUTE, SIMPLIFY_LOCK_BORDER, SIMPLIFY_REGULARIZE, SIMPLIFY_SPARSE,
+    SimplifyTarget, VertexData, simplify,
 };
 use optimesh::vcacheoptimizer::optimize_vertex_cache;
 
@@ -19,10 +20,11 @@ use super::support::{
 };
 use super::types::{
     AppearanceError, GeometryPrototype, HierarchyRepresentation, PORTABLE_CLUSTER_MAX_TRIANGLES,
-    PORTABLE_CLUSTER_MAX_VERTICES, PortableAggregationMode, PortableBounds, PortableClusterVertex,
-    PortableHierarchyInput, PortableHierarchyNode, PortableHierarchyPage, PortableRayTracingRecord,
-    PortableSourceMesh, PortableSourceSkin, PortableTriangleCluster, PortableVirtualHierarchy,
-    VirtualHierarchyMaterial, VirtualMaterialClass,
+    PORTABLE_CLUSTER_MAX_VERTICES, PORTABLE_HIERARCHY_MAX_CHILDREN, PortableAggregationMode,
+    PortableBounds, PortableClusterVertex, PortableHierarchyInput, PortableHierarchyNode,
+    PortableHierarchyPage, PortableRayTracingRecord, PortableSourceMesh, PortableSourceSkin,
+    PortableTriangleCluster, PortableVirtualHierarchy, VirtualHierarchyMaterial,
+    VirtualMaterialClass,
 };
 use super::validate::validate_portable_virtual_hierarchy;
 use super::voxel::{build_coarse_root_brick, build_voxel_brick};
@@ -102,6 +104,7 @@ pub fn cook_portable_virtual_hierarchy(
         let prototype_id = u32::try_from(prototype_index).map_err(|_| Error::NumericOverflow)?;
         let first_fine_cluster = u32_len(cooked.triangle_clusters.len())?;
         let mesh_bounds = bounds_for_positions(&mesh.vertices)?;
+        let positions = mesh_positions(mesh);
         let mut submesh_roots = Vec::new();
         for (submesh_index, submesh) in mesh.submeshes.iter().enumerate() {
             let source_submesh =
@@ -113,103 +116,17 @@ pub fn cook_portable_virtual_hierarchy(
                 .indices
                 .get(begin..end)
                 .ok_or_else(|| format_error("portable hierarchy", "submesh.indices"))?;
-            let material = submesh.material;
-            let leaf_start = u32_len(cooked.triangle_clusters.len())?;
-            let mut leaf_clusters = build_clusters(
+            let source = SubmeshSource {
                 mesh,
-                source_indices,
-                prototype_id,
-                source_submesh,
-                material,
+                positions: &positions,
+                prototype: prototype_id,
+                submesh: source_submesh,
+                material: submesh.material,
                 padding,
-                AppearanceError::default(),
-            )?;
-            if leaf_clusters.is_empty() {
-                continue;
-            }
-            assign_cluster_ids(&mut leaf_clusters, leaf_start)?;
-            cooked.triangle_clusters.extend(leaf_clusters);
-            let leaf_end = u32_len(cooked.triangle_clusters.len())?;
-            let mut leaves = Vec::new();
-            for cluster in leaf_start..leaf_end {
-                let id = u32_len(cooked.nodes.len())?;
-                let payload = &cooked.triangle_clusters[cluster as usize];
-                cooked.nodes.push(PortableHierarchyNode {
-                    id,
-                    representation: HierarchyRepresentation::Triangles {
-                        first: cluster,
-                        count: 1,
-                    },
-                    parent: None,
-                    children: Vec::new(),
-                    page: u32::MAX,
-                    bounds: payload.bounds,
-                    deformed_bounds: payload.deformed_bounds,
-                    appearance_error: AppearanceError::default(),
-                });
-                leaves.push(id);
-            }
-
-            let root = if leaves.len() == 1 {
-                leaves[0]
-            } else if mesh.aggregation == PortableAggregationMode::Disconnected {
-                let bounds = bounds_for_indexed(mesh, source_indices)?;
-                let brick_id = u32_len(cooked.voxel_bricks.len())?;
-                let brick =
-                    build_voxel_brick(brick_id, bounds, mesh, source_indices, material, padding)?;
-                let error = brick.appearance_error;
-                cooked.voxel_bricks.push(brick);
-                let node_id = u32_len(cooked.nodes.len())?;
-                cooked.nodes.push(PortableHierarchyNode {
-                    id: node_id,
-                    representation: HierarchyRepresentation::Voxel { brick: brick_id },
-                    parent: None,
-                    children: leaves.clone(),
-                    page: u32::MAX,
-                    bounds,
-                    deformed_bounds: bounds.expanded(padding),
-                    appearance_error: error,
-                });
-                set_parent(&mut cooked.nodes, &leaves, node_id)?;
-                node_id
-            } else {
-                let (simplified, simplification_error) = simplify_contiguous(mesh, source_indices)?;
-                let parent_error =
-                    AppearanceError::new(error_bits(simplification_error), 0, 0, 0, 0);
-                let coarse_start = u32_len(cooked.triangle_clusters.len())?;
-                let mut coarse = build_clusters(
-                    mesh,
-                    &simplified,
-                    prototype_id,
-                    source_submesh,
-                    material,
-                    padding,
-                    parent_error,
-                )?;
-                assign_cluster_ids(&mut coarse, coarse_start)?;
-                cooked.triangle_clusters.extend(coarse);
-                let coarse_count = u32_len(cooked.triangle_clusters.len())?
-                    .checked_sub(coarse_start)
-                    .ok_or(Error::NumericOverflow)?;
-                let node_id = u32_len(cooked.nodes.len())?;
-                let bounds = bounds_for_indexed(mesh, &simplified)?;
-                cooked.nodes.push(PortableHierarchyNode {
-                    id: node_id,
-                    representation: HierarchyRepresentation::Triangles {
-                        first: coarse_start,
-                        count: coarse_count,
-                    },
-                    parent: None,
-                    children: leaves.clone(),
-                    page: u32::MAX,
-                    bounds,
-                    deformed_bounds: bounds.expanded(padding),
-                    appearance_error: parent_error,
-                });
-                set_parent(&mut cooked.nodes, &leaves, node_id)?;
-                node_id
             };
-            submesh_roots.push(root);
+            if let Some(root) = build_submesh_subtree(&mut cooked, &source, source_indices)? {
+                submesh_roots.push(root);
+            }
         }
 
         let prototype_end = u32_len(cooked.triangle_clusters.len())?;
@@ -226,13 +143,15 @@ pub fn cook_portable_virtual_hierarchy(
         if submesh_roots.is_empty() {
             continue;
         }
-        mesh_roots.push(if submesh_roots.len() == 1 {
-            submesh_roots[0]
+        let bounded = bound_sibling_count(&mut cooked, submesh_roots, padding)?;
+        mesh_roots.push(if let [only] = bounded[..] {
+            only
         } else {
-            aggregate_node(&mut cooked, &submesh_roots, padding)?
+            aggregate_node(&mut cooked, &bounded, padding)?
         });
     }
 
+    let root_children = bound_sibling_count(&mut cooked, mesh_roots, padding)?;
     let family_bounds = input.bounds;
     let root_brick = build_coarse_root_brick(
         u32_len(cooked.voxel_bricks.len())?,
@@ -240,19 +159,8 @@ pub fn cook_portable_virtual_hierarchy(
         input.root_material,
         padding,
     )?;
-    let root_error = mesh_roots
-        .iter()
-        .try_fold(root_brick.appearance_error, |error, node| {
-            Ok::<_, Error>(
-                error.max(
-                    cooked
-                        .nodes
-                        .get(*node as usize)
-                        .ok_or_else(|| format_error("portable hierarchy", "root.children"))?
-                        .appearance_error,
-                ),
-            )
-        })?;
+    let root_error =
+        child_appearance_error(&cooked, &root_children)?.max(root_brick.appearance_error);
     let root_brick_id = root_brick.id;
     cooked.voxel_bricks.push(root_brick);
     let root_node = u32_len(cooked.nodes.len())?;
@@ -262,13 +170,13 @@ pub fn cook_portable_virtual_hierarchy(
             brick: root_brick_id,
         },
         parent: None,
-        children: mesh_roots.clone(),
+        children: root_children.clone(),
         page: u32::MAX,
         bounds: family_bounds,
         deformed_bounds: family_bounds.expanded(padding),
         appearance_error: root_error,
     });
-    set_parent(&mut cooked.nodes, &mesh_roots, root_node)?;
+    set_parent(&mut cooked.nodes, &root_children, root_node)?;
     cooked.roots.push(root_node);
     close_subtree_bounds(&mut cooked)?;
     assign_pages(&mut cooked)?;
@@ -277,15 +185,269 @@ pub fn cook_portable_virtual_hierarchy(
     Ok(cooked)
 }
 
-fn build_clusters(
-    mesh: &PortableSourceMesh,
-    source_indices: &[u32],
+/// Everything one submesh's subtree is cooked from, carried together because every level of
+/// the grouping shares it.
+#[derive(Clone, Copy)]
+struct SubmeshSource<'a> {
+    mesh: &'a PortableSourceMesh,
+    /// The whole prototype's positions, unpacked once per mesh rather than per level.
+    positions: &'a [f32],
     prototype: u32,
-    source_submesh: u32,
+    submesh: u32,
     material: VirtualHierarchyMaterial,
-    deformation_padding: i32,
+    padding: i32,
+}
+
+/// One node of the level currently being grouped, with the triangles its parent simplifies
+/// or voxelizes.
+struct LevelNode {
+    node: u32,
+    /// Prototype-relative triangle indices: the node's own drawable geometry for a
+    /// simplified chain, the geometry it stands in for once the chain aggregates to voxels.
+    indices: Vec<u32>,
+}
+
+/// Cooks one submesh into a bounded-branching subtree and returns its root node, or `None`
+/// when the submesh clusterizes to nothing.
+///
+/// Leaf clusters group into fixed-size sibling sets, each set collapses to one parent, and
+/// the collapse repeats until a single node remains — so every node's child count stays
+/// within [`PORTABLE_HIERARCHY_MAX_CHILDREN`] and the cut has a level to stop at for every
+/// factor-of-four step in detail.
+fn build_submesh_subtree(
+    cooked: &mut PortableVirtualHierarchy,
+    source: &SubmeshSource<'_>,
+    source_indices: &[u32],
+) -> Result<Option<u32>> {
+    let leaf_start = u32_len(cooked.triangle_clusters.len())?;
+    let mut leaf_clusters = build_clusters(source, source_indices, AppearanceError::default())?;
+    if leaf_clusters.is_empty() {
+        return Ok(None);
+    }
+    assign_cluster_ids(&mut leaf_clusters, leaf_start)?;
+    cooked.triangle_clusters.extend(leaf_clusters);
+    let leaf_end = u32_len(cooked.triangle_clusters.len())?;
+
+    let mut level = Vec::new();
+    for cluster in leaf_start..leaf_end {
+        let id = u32_len(cooked.nodes.len())?;
+        let payload = &cooked.triangle_clusters[cluster as usize];
+        let indices = cluster_source_indices(payload)?;
+        cooked.nodes.push(PortableHierarchyNode {
+            id,
+            representation: HierarchyRepresentation::Triangles {
+                first: cluster,
+                count: 1,
+            },
+            parent: None,
+            children: Vec::new(),
+            page: u32::MAX,
+            bounds: payload.bounds,
+            deformed_bounds: payload.deformed_bounds,
+            appearance_error: AppearanceError::default(),
+        });
+        level.push(LevelNode { node: id, indices });
+    }
+
+    while level.len() > 1 {
+        level = collapse_level(cooked, source, level)?;
+    }
+    level
+        .first()
+        .map(|root| root.node)
+        .ok_or_else(|| format_error("portable hierarchy", "submesh.root"))
+        .map(Some)
+}
+
+/// Collapses one level of siblings into the next coarser level.
+fn collapse_level(
+    cooked: &mut PortableVirtualHierarchy,
+    source: &SubmeshSource<'_>,
+    level: Vec<LevelNode>,
+) -> Result<Vec<LevelNode>> {
+    let sizes = group_sizes(level.len(), PORTABLE_HIERARCHY_MAX_CHILDREN);
+    let mut members = level.into_iter();
+    let mut parents = Vec::with_capacity(sizes.len());
+    for size in sizes {
+        let group = members.by_ref().take(size).collect::<Vec<_>>();
+        let children = group.iter().map(|member| member.node).collect::<Vec<_>>();
+        let indices = group
+            .into_iter()
+            .flat_map(|member| member.indices)
+            .collect::<Vec<_>>();
+        let child_error = child_appearance_error(cooked, &children)?;
+        let parent = if source.mesh.aggregation == PortableAggregationMode::Disconnected {
+            aggregate_group(cooked, source, &children, child_error, indices)?
+        } else {
+            simplify_group(cooked, source, &children, child_error, &indices)?
+        };
+        set_parent(&mut cooked.nodes, &children, parent.node)?;
+        parents.push(parent);
+    }
+    Ok(parents)
+}
+
+/// Voxelizes one sibling group into an aggregate parent, for geometry too disconnected for
+/// edge collapses to coarsen without dissolving it.
+fn aggregate_group(
+    cooked: &mut PortableVirtualHierarchy,
+    source: &SubmeshSource<'_>,
+    children: &[u32],
+    child_error: AppearanceError,
+    indices: Vec<u32>,
+) -> Result<LevelNode> {
+    let bounds = bounds_for_indexed(source.mesh, &indices)?;
+    let brick_id = u32_len(cooked.voxel_bricks.len())?;
+    let brick = build_voxel_brick(
+        brick_id,
+        bounds,
+        source.mesh,
+        &indices,
+        source.material,
+        source.padding,
+    )?;
+    let appearance_error = child_error.max(brick.appearance_error);
+    cooked.voxel_bricks.push(brick);
+    let node = u32_len(cooked.nodes.len())?;
+    cooked.nodes.push(PortableHierarchyNode {
+        id: node,
+        representation: HierarchyRepresentation::Voxel { brick: brick_id },
+        parent: None,
+        children: children.to_vec(),
+        page: u32::MAX,
+        bounds,
+        deformed_bounds: bounds.expanded(source.padding),
+        appearance_error,
+    });
+    Ok(LevelNode { node, indices })
+}
+
+/// Simplifies one sibling group into a coarser triangle parent.
+fn simplify_group(
+    cooked: &mut PortableVirtualHierarchy,
+    source: &SubmeshSource<'_>,
+    children: &[u32],
+    child_error: AppearanceError,
+    indices: &[u32],
+) -> Result<LevelNode> {
+    let (simplified, silhouette_metres) =
+        simplify_contiguous(source.mesh, source.positions, indices)?;
+    // The collapse error is measured against this group's own geometry, which is already a
+    // stand-in for everything below it, so the levels' errors add rather than replace.
+    let appearance_error = AppearanceError::new(
+        child_error
+            .silhouette
+            .saturating_add(error_bits(silhouette_metres)),
+        child_error.coverage,
+        child_error.transmission,
+        child_error.material,
+        child_error.normal_distribution,
+    );
+    let first = u32_len(cooked.triangle_clusters.len())?;
+    let mut coarse = build_clusters(source, &simplified, appearance_error)?;
+    if coarse.is_empty() {
+        return Err(format_error("portable hierarchy", "coarse.clusters"));
+    }
+    assign_cluster_ids(&mut coarse, first)?;
+    cooked.triangle_clusters.extend(coarse);
+    let count = u32_len(cooked.triangle_clusters.len())?
+        .checked_sub(first)
+        .ok_or(Error::NumericOverflow)?;
+    let bounds = bounds_for_indexed(source.mesh, &simplified)?;
+    let node = u32_len(cooked.nodes.len())?;
+    cooked.nodes.push(PortableHierarchyNode {
+        id: node,
+        representation: HierarchyRepresentation::Triangles { first, count },
+        parent: None,
+        children: children.to_vec(),
+        page: u32::MAX,
+        bounds,
+        deformed_bounds: bounds.expanded(source.padding),
+        appearance_error,
+    });
+    Ok(LevelNode {
+        node,
+        indices: simplified,
+    })
+}
+
+/// Splits `count` siblings into as few groups as the branching bound allows, sized within
+/// one of each other so no sibling is ever left in a group of its own.
+fn group_sizes(count: usize, bound: usize) -> Vec<usize> {
+    let groups = count.div_ceil(bound).max(1);
+    let base = count / groups;
+    let remainder = count % groups;
+    (0..groups)
+        .map(|index| base + usize::from(index < remainder))
+        .collect()
+}
+
+/// The widest error any of `children` declares.
+fn child_appearance_error(
+    hierarchy: &PortableVirtualHierarchy,
+    children: &[u32],
+) -> Result<AppearanceError> {
+    children
+        .iter()
+        .try_fold(AppearanceError::default(), |error, child| {
+            Ok(error.max(
+                hierarchy
+                    .nodes
+                    .get(*child as usize)
+                    .ok_or_else(|| format_error("portable hierarchy", "node.child"))?
+                    .appearance_error,
+            ))
+        })
+}
+
+/// Reduces `nodes` to at most [`PORTABLE_HIERARCHY_MAX_CHILDREN`] siblings by repeatedly
+/// grouping them under aggregate parents, so a prototype with many submeshes — or a family
+/// with many prototypes — still refines past its root.
+fn bound_sibling_count(
+    cooked: &mut PortableVirtualHierarchy,
+    mut nodes: Vec<u32>,
+    padding: i32,
+) -> Result<Vec<u32>> {
+    while nodes.len() > PORTABLE_HIERARCHY_MAX_CHILDREN {
+        let sizes = group_sizes(nodes.len(), PORTABLE_HIERARCHY_MAX_CHILDREN);
+        let mut members = nodes.into_iter();
+        let mut parents = Vec::with_capacity(sizes.len());
+        for size in sizes {
+            let group = members.by_ref().take(size).collect::<Vec<_>>();
+            parents.push(aggregate_node(cooked, &group, padding)?);
+        }
+        nodes = parents;
+    }
+    Ok(nodes)
+}
+
+fn cluster_source_indices(cluster: &PortableTriangleCluster) -> Result<Vec<u32>> {
+    cluster
+        .local_indices
+        .iter()
+        .map(|local| {
+            cluster
+                .source_vertices
+                .get(*local as usize)
+                .copied()
+                .ok_or_else(|| format_error("portable hierarchy", "cluster.localIndex"))
+        })
+        .collect()
+}
+
+fn build_clusters(
+    source: &SubmeshSource<'_>,
+    source_indices: &[u32],
     appearance_error: AppearanceError,
 ) -> Result<Vec<PortableTriangleCluster>> {
+    let SubmeshSource {
+        mesh,
+        positions,
+        prototype,
+        submesh: source_submesh,
+        material,
+        padding: deformation_padding,
+    } = *source;
     if source_indices.is_empty() {
         return Ok(Vec::new());
     }
@@ -296,7 +458,6 @@ fn build_clusters(
     {
         return Err(format_error("portable hierarchy", "cluster.indices"));
     }
-    let positions = mesh_positions(mesh);
     let mut optimized = vec![0_u32; source_indices.len()];
     optimize_vertex_cache(&mut optimized, source_indices, mesh.vertices.len());
     let bound = build_meshlets_bound(
@@ -315,7 +476,7 @@ fn build_clusters(
         },
         &optimized,
         &Positions {
-            data: &positions,
+            data: positions,
             count: mesh.vertices.len(),
             stride: 12,
         },
@@ -349,7 +510,7 @@ fn build_clusters(
             global_vertices,
             &local_indices,
             meshlet.triangle_count as usize,
-            &positions,
+            positions,
             mesh.vertices.len(),
             12,
         );
@@ -403,11 +564,19 @@ fn assign_cluster_ids(clusters: &mut [PortableTriangleCluster], first: u32) -> R
     Ok(())
 }
 
+/// Collapses `source_indices` to a quarter of its triangles and reports the silhouette
+/// deviation that cost, in local metres.
+///
+/// The triangle ratio is the sole stopping condition: an error budget tight enough to bind
+/// returns a parent nearly as heavy as the children it stands in for, which buys the cut
+/// nothing. Sparse addressing scales the reported error by the submesh's own extent rather
+/// than the whole prototype's, so a small part of a large model declares the error it
+/// actually has.
 fn simplify_contiguous(
     mesh: &PortableSourceMesh,
+    positions: &[f32],
     source_indices: &[u32],
 ) -> Result<(Vec<u32>, f32)> {
-    let positions = mesh_positions(mesh);
     let target_triangles = (source_indices.len() / 3).div_ceil(4).max(1);
     let target_index_count = target_triangles
         .checked_mul(3)
@@ -417,14 +586,17 @@ fn simplify_contiguous(
         &mut simplified,
         source_indices,
         &VertexData {
-            positions: &positions,
+            positions,
             count: mesh.vertices.len(),
             stride: 12,
         },
         &SimplifyTarget {
             target_index_count,
-            target_error: 1.0,
-            options: SIMPLIFY_LOCK_BORDER | SIMPLIFY_REGULARIZE,
+            target_error: NON_BINDING_SIMPLIFY_ERROR,
+            options: SIMPLIFY_LOCK_BORDER
+                | SIMPLIFY_REGULARIZE
+                | SIMPLIFY_SPARSE
+                | SIMPLIFY_ERROR_ABSOLUTE,
         },
     );
     if count == 0 || !count.is_multiple_of(3) {
@@ -433,6 +605,10 @@ fn simplify_contiguous(
     simplified.truncate(count);
     Ok((simplified, error))
 }
+
+/// An absolute error budget wider than any local-space model, so only the triangle ratio
+/// stops a collapse.
+const NON_BINDING_SIMPLIFY_ERROR: f32 = 1.0e9;
 
 fn mesh_positions(mesh: &PortableSourceMesh) -> Vec<f32> {
     mesh.vertices
@@ -512,7 +688,7 @@ fn aggregate_node(
     let brick_id = u32_len(hierarchy.voxel_bricks.len())?;
     material.moments.occupancy = u16::MAX;
     let brick = build_coarse_root_brick(brick_id, bounds, material, padding)?;
-    let error = brick.appearance_error;
+    let error = child_appearance_error(hierarchy, children)?.max(brick.appearance_error);
     hierarchy.voxel_bricks.push(brick);
     let node_id = u32_len(hierarchy.nodes.len())?;
     hierarchy.nodes.push(PortableHierarchyNode {
@@ -570,6 +746,30 @@ fn close_subtree_bounds(hierarchy: &mut PortableVirtualHierarchy) -> Result<()> 
     Ok(())
 }
 
+/// The error the representation drawn in `node`'s place declares — its parent's, or its own at a
+/// root.
+///
+/// This is what resolving `node` removes, so it is what both the page directory and the cluster
+/// records price a refinement by. A node's own error answers the different question of whether to
+/// refine past it, and a leaf's is legitimately zero because leaf geometry is exact.
+fn parent_appearance_error(
+    hierarchy: &PortableVirtualHierarchy,
+    node_id: u32,
+) -> Result<AppearanceError> {
+    let node = hierarchy
+        .nodes
+        .get(node_id as usize)
+        .ok_or_else(|| format_error("portable hierarchy", "node"))?;
+    match node.parent {
+        Some(parent) => Ok(hierarchy
+            .nodes
+            .get(parent as usize)
+            .ok_or_else(|| format_error("portable hierarchy", "node.parent"))?
+            .appearance_error),
+        None => Ok(node.appearance_error),
+    }
+}
+
 fn assign_pages(hierarchy: &mut PortableVirtualHierarchy) -> Result<()> {
     let mut queue = VecDeque::new();
     for root in &hierarchy.roots {
@@ -581,6 +781,7 @@ fn assign_pages(hierarchy: &mut PortableVirtualHierarchy) -> Result<()> {
             return Err(format_error("portable hierarchy", "page.nodeCycle"));
         }
         let page_id = u32_len(hierarchy.pages.len())?;
+        let transition_error = parent_appearance_error(hierarchy, node_id)?;
         let node = hierarchy
             .nodes
             .get_mut(node_id as usize)
@@ -593,7 +794,7 @@ fn assign_pages(hierarchy: &mut PortableVirtualHierarchy) -> Result<()> {
             node: node_id,
             bounds: node.bounds,
             deformed_bounds: node.deformed_bounds,
-            transition_error: node.appearance_error,
+            transition_error,
             guaranteed_root: dependency.is_none(),
         });
         match node.representation {
@@ -623,9 +824,7 @@ fn assign_pages(hierarchy: &mut PortableVirtualHierarchy) -> Result<()> {
         return Err(format_error("portable hierarchy", "page.unreachableNode"));
     }
     for node in &hierarchy.nodes {
-        let parent_error = node.parent.map_or(node.appearance_error, |parent| {
-            hierarchy.nodes[parent as usize].appearance_error
-        });
+        let parent_error = parent_appearance_error(hierarchy, node.id)?;
         if let HierarchyRepresentation::Triangles { first, count } = node.representation {
             for cluster in &mut hierarchy.triangle_clusters
                 [first as usize..first.saturating_add(count) as usize]
@@ -676,7 +875,82 @@ fn build_ray_tracing(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::virtual_hierarchy::fixtures::multi_page_input;
+    use crate::virtual_hierarchy::fixtures::{multi_page_input, uv_sphere_input};
+
+    /// The coarsest triangle level's declared error, in Q15.16 local metres.
+    fn coarsest_triangle_error(hierarchy: &PortableVirtualHierarchy) -> u32 {
+        hierarchy
+            .nodes
+            .iter()
+            .filter(|node| {
+                matches!(
+                    node.representation,
+                    HierarchyRepresentation::Triangles { .. }
+                )
+            })
+            .map(|node| node.appearance_error.total)
+            .max()
+            .expect("the sphere cooks triangle nodes")
+    }
+
+    #[test]
+    fn the_declared_silhouette_error_is_metres_not_a_fraction_of_the_model() {
+        // The same sphere at two sizes: eight times the model is eight times the deviation a
+        // collapse costs, and the cut selector divides that by distance to get pixels. A
+        // fraction of the bounding box would read identically at both sizes, so the larger
+        // model would under-declare its only real LOD error eightfold.
+        let small = cook_portable_virtual_hierarchy(&uv_sphere_input(0.5)).unwrap();
+        let large = cook_portable_virtual_hierarchy(&uv_sphere_input(4.0)).unwrap();
+        let ratio =
+            f64::from(coarsest_triangle_error(&large)) / f64::from(coarsest_triangle_error(&small));
+        assert!(
+            (7.0..9.0).contains(&ratio),
+            "an eight-times model must declare an eight-times error, got {ratio}"
+        );
+    }
+
+    #[test]
+    fn every_page_below_the_root_is_worth_the_error_it_removes() {
+        let hierarchy = cook_portable_virtual_hierarchy(&uv_sphere_input(1.0)).unwrap();
+        assert!(
+            hierarchy.pages.len() > 32,
+            "the fixture has to be past what one flat node could ever hold, got {}",
+            hierarchy.pages.len()
+        );
+        for page in &hierarchy.pages {
+            if page.dependency.is_none() {
+                continue;
+            }
+            assert!(
+                page.transition_error.total > 0,
+                "page {} removes no error, so streaming would never ask for it",
+                page.id
+            );
+        }
+        for node in &hierarchy.nodes {
+            assert!(
+                node.children.len() <= PORTABLE_HIERARCHY_MAX_CHILDREN,
+                "node {} fans out to {} children",
+                node.id,
+                node.children.len()
+            );
+        }
+
+        let mut depth = vec![0_u32; hierarchy.nodes.len()];
+        let mut stack = hierarchy.roots.clone();
+        let mut deepest = 0;
+        while let Some(node) = stack.pop() {
+            deepest = deepest.max(depth[node as usize]);
+            for child in &hierarchy.nodes[node as usize].children {
+                depth[*child as usize] = depth[node as usize] + 1;
+                stack.push(*child);
+            }
+        }
+        assert!(
+            deepest > 2,
+            "bounded branching has to buy real intermediate levels, got depth {deepest}"
+        );
+    }
 
     #[test]
     fn every_cooked_node_encloses_its_subtree() {

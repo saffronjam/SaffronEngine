@@ -1,6 +1,6 @@
 fixture: cube.smodel
-bytes: 1216
-sha256: fb96ddd70d1979b0d7ae4f55ef3c4941f698388ef09deeca281982b6e2fca6cc
+bytes: 38576
+sha256: 0bf7decb2d2a5d0ab62c5624074e694baa40b85608e4904f4f591bc3f1f23ebf
 source: C++ engine-old geometry.cppm writeContainer / SModelHeader / TocEntry (:296)
 generator: fixtures/golden/gen/gen_golden.cpp
 commit: d8b4cea

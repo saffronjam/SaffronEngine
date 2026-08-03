@@ -944,7 +944,8 @@ public struct GpuPageNodeRecord
     public float3 boundsMin;
     public uint appearanceTotal;
     public float3 boundsMax;
-    public uint transitionTotal;
+    // Padding: std430 starts a three-component vector on a 16-byte boundary.
+    public uint pad0;
     public float3 deformedMin;
     public uint vertexCount;
     public float3 deformedMax;

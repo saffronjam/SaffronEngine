@@ -79,6 +79,12 @@ threshold and every child page payload is resident. A missing child appends a
 [missing-page request](../page-residency/) and the resident parent stays drawable — the
 cut cannot hole.
 
+The walk keeps a fixed per-thread page stack, so a refinement also has to fit its whole
+child set beside the path already pushed. The cook bounds every node's fan-out to a handful
+of children for exactly this reason: a hierarchy that parented a prototype's clusters flat
+would exhaust the stack at the first refinement and draw the whole model as its coarse
+stand-in.
+
 Nodes on the cut emit one semantic `GpuDrawRecord` per triangle cluster (or one for a
 voxel brick), with the material resolved through the instance's sparse overrides and the
 prototype defaults.

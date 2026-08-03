@@ -21,11 +21,12 @@ pub use cook::cook_portable_virtual_hierarchy;
 pub use types::{
     AppearanceError, GeometryPrototype, HierarchyRepresentation, MicroInstance,
     PORTABLE_CLUSTER_MAX_TRIANGLES, PORTABLE_CLUSTER_MAX_VERTICES,
-    PORTABLE_HIERARCHY_FORMAT_VERSION, PORTABLE_VOXEL_BRICK_EDGE, PortableAggregationMode,
-    PortableBounds, PortableClusterVertex, PortableDeformationKind, PortableDeformationRegion,
-    PortableHierarchyInput, PortableHierarchyNode, PortableHierarchyPage, PortableMaterialMoments,
-    PortableOpacityMicromap, PortableRayTracingRecord, PortableSourceMesh, PortableSourceSkin,
-    PortableSourceSubmesh, PortableSourceVertex, PortableTriangleCluster, PortableUseCombination,
+    PORTABLE_HIERARCHY_FORMAT_VERSION, PORTABLE_HIERARCHY_MAX_CHILDREN, PORTABLE_VOXEL_BRICK_EDGE,
+    PortableAggregationMode, PortableBounds, PortableClusterVertex, PortableDeformationKind,
+    PortableDeformationRegion, PortableHierarchyInput, PortableHierarchyNode,
+    PortableHierarchyPage, PortableMaterialMoments, PortableOpacityMicromap,
+    PortableRayTracingRecord, PortableSourceMesh, PortableSourceSkin, PortableSourceSubmesh,
+    PortableSourceVertex, PortableTriangleCluster, PortableUseCombination,
     PortableVirtualHierarchy, PortableVoxelBrick, PortableVoxelVertex, VirtualHierarchyMaterial,
     VirtualMaterialClass, aggregate_virtual_hierarchy_materials,
 };
