@@ -333,9 +333,8 @@ pub(super) fn add_fog_icon(
 /// Clips a clip-space line segment to the six clip planes, mutating the endpoints in place.
 /// Returns `false` when the segment is fully outside.
 ///
-/// The near plane is `z + w >= 0` (the GL `[-1, 1]` clip convention `camera_projection`
-/// produces): the projection is `perspective_rh_gl`, so the line clips against the same frustum
-/// the scene's depth buffer was rasterized with.
+/// The near plane is `z >= 0`: `camera_projection` uses the Vulkan `[0, 1]` clip-depth convention,
+/// so the line clips against the same frustum the scene's depth buffer was rasterized with.
 pub(super) fn clip_overlay_line(a: &mut Vec4, b: &mut Vec4) -> bool {
     let clip_plane = |a: &mut Vec4, b: &mut Vec4, distance: fn(Vec4) -> f32| -> bool {
         let da = distance(*a);
@@ -359,7 +358,7 @@ pub(super) fn clip_overlay_line(a: &mut Vec4, b: &mut Vec4) -> bool {
         && clip_plane(a, b, |p| p.w - p.x)
         && clip_plane(a, b, |p| p.y + p.w)
         && clip_plane(a, b, |p| p.w - p.y)
-        && clip_plane(a, b, |p| p.z + p.w)
+        && clip_plane(a, b, |p| p.z)
         && clip_plane(a, b, |p| p.w - p.z)
 }
 

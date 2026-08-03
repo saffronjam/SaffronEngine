@@ -682,10 +682,10 @@ impl Scene {
     }
 }
 
-/// An un-flipped perspective projection for the resolved camera (GL clip convention).
+/// An un-flipped perspective projection for the resolved camera with Vulkan `[0, 1]` clip depth.
 #[must_use]
 pub fn camera_projection(camera: &CameraView, aspect: f32) -> Mat4 {
-    Mat4::perspective_rh_gl(
+    Mat4::perspective_rh(
         camera.fov.to_radians(),
         aspect,
         camera.near_plane,

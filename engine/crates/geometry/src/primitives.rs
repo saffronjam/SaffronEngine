@@ -3,9 +3,9 @@
 //! Each returns a [`Mesh`] with the layout every importer produces: interleaved
 //! position/normal/uv0, 32-bit indices, one [`Submesh`].
 //!
-//! Winding is counter-clockwise as seen from outside, matching the renderer's
-//! `FrontFace::COUNTER_CLOCKWISE` back-face cull and glTF's mandated CCW front face. All
-//! primitives are origin-centred and unit-scaled; an entity's `Transform` sizes them.
+//! Winding is counter-clockwise as seen from outside, matching glTF's mandated CCW source
+//! convention. All primitives are origin-centred and unit-scaled; an entity's `Transform` sizes
+//! them.
 
 use glam::{Vec2, Vec3};
 
@@ -151,8 +151,7 @@ mod tests {
     }
 
     /// Every non-degenerate triangle (the poles collapse to a point) winds CCW as seen
-    /// from outside — its geometric normal agrees with the outward radial — matching the
-    /// renderer's `FrontFace::COUNTER_CLOCKWISE` + back-face cull for solid materials.
+    /// from outside, so its geometric normal agrees with the outward radial.
     #[test]
     fn sphere_winding_is_ccw_outward() {
         let m = uv_sphere();
