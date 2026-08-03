@@ -18,8 +18,23 @@ use super::*;
 /// Frames a preview tile renders before its read-back, so the temporal effects settle to the
 /// interactive previewer's look.
 const MIN_CONVERGE_FRAMES: u32 = 8;
-/// Safety bound for a preview environment whose asynchronous refresh never completes.
-const MAX_CONVERGE_FRAMES: u32 = 256;
+/// Consecutive idle page-streaming frames that mark the end of the last streaming round rather
+/// than the gap between two.
+///
+/// Streaming runs in rounds: a frame's missing-page requests are only readable once its slot's
+/// fence completes ([`saffron_rendering::MAX_FRAMES_IN_FLIGHT`] frames later), the mirror hands
+/// them to the worker on the following sync, and the payload publishes a frame or more after
+/// that. So the counters read idle for the two or three frames between a page landing and the
+/// deeper pages it uncovers being requested, and a single idle frame says nothing. Twice that
+/// worst-case gap is the streak that only the true end of streaming can produce.
+const STREAMING_SETTLED_FRAMES: u32 = 6;
+/// Frame bound after which the tile reads back whatever it has.
+///
+/// Generous enough for a cold asset to stream its page hierarchy in level by level, and a bound
+/// that degrades to a logged read-back rather than to no thumbnail at all: a tile that never
+/// settles is worth capturing imperfectly, since the alternative is an asset the editor can never
+/// show.
+const MAX_CONVERGE_FRAMES: u32 = 512;
 
 /// A preview tile converging on the offscreen [`ViewId::Thumbnail`] view, one frame per tick.
 ///
@@ -34,6 +49,8 @@ pub(super) struct PreviewRenderState {
     camera: CameraView,
     /// Converge frames rendered so far.
     frames: u32,
+    /// Consecutive trailing frames whose page streaming read idle.
+    settled_frames: u32,
 }
 
 /// The preview subject a queued job renders.
@@ -112,12 +129,17 @@ impl HostLayer {
             scene,
             camera: camera.view(),
             frames: 0,
+            settled_frames: 0,
         });
     }
 
     /// Renders one converge frame of the active tile and, once the preview environment's
-    /// asynchronous IBL refresh and derived lighting capture have landed, reads it back to a PNG
-    /// and writes the disk cache.
+    /// asynchronous IBL refresh and derived lighting capture have landed and page streaming has
+    /// settled, reads it back to a PNG and writes the disk cache.
+    ///
+    /// Streaming is part of the gate because the geometry a tile shows is paged in on demand: a
+    /// read-back taken mid-round captures whichever pages happen to be resident, which renders as
+    /// a mesh with chunks missing.
     fn advance_preview_job(&mut self, renderer: &mut Renderer) {
         let outcome = {
             let Some(state) = self.preview_job.as_mut() else {
@@ -164,13 +186,27 @@ impl HostLayer {
                 }
                 renderer.render_scene_offscreen()?;
                 state.frames += 1;
-                if state.frames >= MIN_CONVERGE_FRAMES && renderer.active_environment_converged() {
+                let streaming_idle = renderer.page_streaming_idle();
+                state.settled_frames = if streaming_idle {
+                    state.settled_frames + 1
+                } else {
+                    0
+                };
+                let environment_converged = renderer.active_environment_converged();
+                if state.frames >= MIN_CONVERGE_FRAMES
+                    && state.settled_frames >= STREAMING_SETTLED_FRAMES
+                    && environment_converged
+                {
                     return renderer.encode_active_offscreen_png().map(Some);
                 }
                 if state.frames >= MAX_CONVERGE_FRAMES {
-                    return Err(saffron_rendering::Error::NotConverged {
-                        frames: MAX_CONVERGE_FRAMES,
-                    });
+                    tracing::warn!(
+                        cache = state.job.cache_path,
+                        streaming_idle,
+                        environment_converged,
+                        "preview thumbnail read back unsettled after {MAX_CONVERGE_FRAMES} frames"
+                    );
+                    return renderer.encode_active_offscreen_png().map(Some);
                 }
                 Ok(None)
             })();

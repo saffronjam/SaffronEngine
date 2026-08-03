@@ -68,6 +68,17 @@ impl Renderer {
     }
 
     /// The page-payload residency counters (registered/resident/bytes/evictions).
+    /// Whether virtual-geometry page streaming has settled: nothing requested, loading, or waiting
+    /// to publish.
+    ///
+    /// A synchronous readback (a thumbnail) must wait for this or it captures whichever pages
+    /// happened to be resident, which renders as a mesh with chunks missing rather than as an
+    /// obviously unfinished image.
+    pub fn page_streaming_idle(&self) -> bool {
+        let stats = self.page_residency_stats();
+        stats.requested == 0 && stats.loading == 0 && stats.ready == 0
+    }
+
     pub fn page_residency_stats(&self) -> crate::PageResidencyStats {
         self.page_residency.stats()
     }
@@ -90,8 +101,10 @@ impl Renderer {
     /// projection scale (pixels per metre at unit distance), and the view-projection
     /// for frustum visibility probability.
     pub fn page_demand_view(&self) -> crate::PageDemandView {
-        let view = self.ssao.view();
-        let inv_projection = self.ssao.inv_projection();
+        // This view's own camera when it has drawn once; the shared one only until then.
+        let (view, inv_projection) = self.views[self.active_view.index()]
+            .page_demand_camera
+            .unwrap_or_else(|| (self.ssao.view(), self.ssao.inv_projection()));
         let extent = self.views[self.active_view.index()].scaled_render_extent();
         let inv_scale = inv_projection.col(1).y;
         let proj_scale = if inv_scale.abs() > f32::EPSILON {

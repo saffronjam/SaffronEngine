@@ -173,6 +173,14 @@ pub struct ViewTarget {
     pub prev_view_proj: saffron_geometry::glam::Mat4,
     /// False until the first frame stores `prev_view_proj`.
     pub prev_view_proj_valid: bool,
+    /// This view's own camera for page demand: `(view, inverse projection)`, stored when the scene
+    /// drive sets the frame camera.
+    ///
+    /// Per-view because the mirror syncs one world per view and demand is scored before the frame
+    /// camera is set. A renderer-global camera means a preview's subject is scored against the
+    /// viewport's camera, lands out of frustum and far away, and so never demands a page — the
+    /// preview then renders whatever handful of pages happened to be resident.
+    pub page_demand_camera: Option<(saffron_geometry::glam::Mat4, saffron_geometry::glam::Mat4)>,
     /// The Halton jitter phase index, advanced once per rendered frame while TAA is active.
     /// Per-view for the same reason as `prev_view_proj`: a re-activated view restarts cleanly.
     pub jitter_index: u32,
@@ -414,6 +422,7 @@ impl ViewTarget {
             history_valid: false,
             prev_view_proj: saffron_geometry::glam::Mat4::IDENTITY,
             prev_view_proj_valid: false,
+            page_demand_camera: None,
             jitter_index: 0,
             jitter: saffron_geometry::glam::Vec2::ZERO,
             prev_jitter: saffron_geometry::glam::Vec2::ZERO,

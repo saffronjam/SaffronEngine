@@ -11,13 +11,23 @@ use async_trait::async_trait;
 use serde_json::Value;
 
 use super::{
-    AssetPart, AuthKind, ConnectorError, ResourceCache, SearchPage, SearchQuery, StoreConnector,
-    StoreCursor, StoreImportDescriptor, StoreKind, StoreLicense, StoreRef, StoreResult,
-    extract_zip,
+    AssetPart, AuthKind, ConnectorError, GalleryImage, ResourceCache, SearchPage, SearchQuery,
+    StoreConnector, StoreCursor, StoreImportDescriptor, StoreKind, StoreLicense, StoreRef,
+    StoreResult, extract_zip,
 };
 
 const API_BASE: &str = "https://ambientcg.com/api/v2/full_json";
 const PAGE: usize = 24;
+
+/// ambientCG renders every asset's preview sphere at a fixed ladder of sizes under one path.
+/// WebP is the variant taken: it keeps the sphere's alpha (so the card reads on any surface) at
+/// roughly a sixth of the PNG's bytes.
+const THUMBNAIL_BASE: &str =
+    "https://acg-media.struffelproductions.com/file/ambientCG-Web/media/thumbnail";
+/// Grid cards: big enough to stay sharp on a hidpi tile, small enough that a screenful is cheap.
+const CARD_PX: u32 = 256;
+/// The detail view's hero, which renders the same framing at ~520 px.
+const HERO_PX: u32 = 1024;
 
 /// Maps an ambientCG `maps` role → (colorspace role, label, filename token to match in the zip).
 fn role_of(map: &str) -> Option<(&'static str, &'static str, &'static str)> {
@@ -116,7 +126,7 @@ impl AmbientCg {
                 .unwrap_or(asset_id)
                 .to_owned(),
             author: "ambientCG".to_owned(),
-            thumbnail_url: preview_url(item, asset_id),
+            thumbnail_url: thumbnail_url(asset_id, CARD_PX),
             source_url: format!("https://ambientcg.com/view?id={asset_id}"),
             license: Self::cc0(),
             import_descriptor: StoreImportDescriptor {
@@ -288,6 +298,17 @@ impl StoreConnector for AmbientCg {
         }
     }
 
+    async fn gallery(&self, result: &StoreResult) -> Result<Vec<GalleryImage>, ConnectorError> {
+        // One rendered sphere per asset — the card keeps the 256 px thumb it already loaded (no
+        // reload blink) and the detail view upgrades to the 1024 px render of the same framing.
+        // The PBR maps are the *parts*, resolved separately by the import dropdown.
+        Ok(vec![GalleryImage {
+            url: result.thumbnail_url.clone(),
+            label: Some("Preview".to_owned()),
+            full_url: Some(thumbnail_url(&result.id, HERO_PX)),
+        }])
+    }
+
     async fn parts(&self, result: &StoreResult) -> Result<Vec<AssetPart>, ConnectorError> {
         // The whole-asset import already picked a resolution zip; reuse it as the bundle so
         // every chosen map is served from a single cached download.
@@ -419,16 +440,11 @@ fn url_with_resolution(url: &str, res: &str) -> String {
     url.to_owned()
 }
 
-fn preview_url(item: &Value, asset_id: &str) -> String {
-    item.get("previewImage")
-        .and_then(Value::as_object)
-        .and_then(|m| m.values().find_map(Value::as_str))
-        .map(str::to_owned)
-        .unwrap_or_else(|| {
-            format!(
-                "https://acg-media.struffelproduction.com/file/ambientCG-Web/media/thumbnail/256-PNG/{asset_id}.png"
-            )
-        })
+/// The preview sphere for `asset_id` at `px`. The size is named, never read off the API's
+/// `previewImage` map — that map lists every size in every format (64…2048, PNG/JPG/WebP) and
+/// picking "the first entry" hands back whichever variant the response happens to list first.
+fn thumbnail_url(asset_id: &str, px: u32) -> String {
+    format!("{THUMBNAIL_BASE}/{px}-WEBP/{asset_id}.webp")
 }
 
 /// A short, filesystem-safe id derived from a url (for the cache dir / file name).

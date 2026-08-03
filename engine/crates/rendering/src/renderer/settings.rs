@@ -360,6 +360,9 @@ impl Renderer {
         sun_direction_world: saffron_geometry::glam::Vec3,
     ) {
         self.ssao.set_camera(view, proj, sun_direction_world);
+        // Page demand is scored per view, before this frame's camera is set, so record it against
+        // the view it belongs to rather than leaving the mirror to read whichever view set it last.
+        self.views[self.active_view.index()].page_demand_camera = Some((view, proj.inverse()));
         // Recenter the Global-SDF cascade clipmap on the camera eye (the inverse-view translation),
         // snapping each cascade to its own voxel grid for the toroidal incremental update.
         let eye = view.inverse().col(3).truncate();
