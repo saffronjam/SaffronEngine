@@ -659,8 +659,8 @@ pub struct Renderer {
     vsm_demanded: Vec<u32>,
     /// The spot matrix the resident spot pages were rendered under.
     vsm_spot_matrix: [f32; 16],
-    /// The point light's position + far of the pages on the atlas; a change invalidates every face.
-    vsm_point_key: [f32; 4],
+    /// The point light's exact position + far key for pages on the atlas.
+    vsm_point_key: [u32; 4],
     /// Per-world interaction field buffers (header + damped-oscillator texel cascades).
     interaction_fields: std::collections::HashMap<u64, crate::Buffer>,
     /// Impulses staged for this frame's interaction-field step.

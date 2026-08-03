@@ -1,9 +1,13 @@
 use super::*;
 
 impl Renderer {
-    /// Marks every resident virtual-shadow page a swept world AABB overlaps as dirty, across the
-    /// directional levels and the armed spot/point spaces. Marking an absent page is a no-op.
-    fn dirty_vsm_swept_bounds(&mut self, min: [f32; 3], max: [f32; 3]) {
+    /// Adds every directional page a swept world AABB overlaps to `pages`.
+    fn collect_vsm_directional_swept_bounds(
+        &self,
+        pages: &mut [bool],
+        min: [f32; 3],
+        max: [f32; 3],
+    ) {
         for level in 0..crate::VSM_DIRECTIONAL_LEVELS {
             let Some((x0, y0, x1, y1)) = self.vsm_space.directional_page_span(level, min, max)
             else {
@@ -11,87 +15,12 @@ impl Renderer {
             };
             for y in y0..=y1 {
                 for x in x0..=x1 {
-                    self.vsm_residency
-                        .mark_dirty(crate::VsmPageKey::Directional { level, x, y });
+                    let index = ((level * crate::VSM_LEVEL_PAGES + y) * crate::VSM_LEVEL_PAGES + x)
+                        as usize;
+                    if let Some(slot) = pages.get_mut(index) {
+                        *slot = true;
+                    }
                 }
-            }
-        }
-        let corners: [saffron_geometry::glam::Vec3; 8] = std::array::from_fn(|corner| {
-            saffron_geometry::glam::Vec3::new(
-                if corner & 1 == 0 { min[0] } else { max[0] },
-                if corner & 2 == 0 { min[1] } else { max[1] },
-                if corner & 4 == 0 { min[2] } else { max[2] },
-            )
-        });
-        let projective = |matrix: saffron_geometry::glam::Mat4,
-                          pages: u32,
-                          residency: &mut crate::VsmResidency,
-                          key: &dyn Fn(u32, u32) -> crate::VsmPageKey| {
-            // A box straddling the light's plane of projection has no finite footprint, so its
-            // whole space dirties. Skipping it instead — which a single-point projection is forced
-            // to do, having only one w to test — leaves the caster's old shadow on every page it
-            // still covers.
-            let mut ndc_min = [f32::INFINITY; 2];
-            let mut ndc_max = [f32::NEG_INFINITY; 2];
-            let mut straddles = false;
-            for corner in corners {
-                let clip = matrix * corner.extend(1.0);
-                if clip.w <= 1e-6 {
-                    straddles = true;
-                    break;
-                }
-                let ndc = clip.truncate() / clip.w;
-                ndc_min[0] = ndc_min[0].min(ndc.x);
-                ndc_min[1] = ndc_min[1].min(ndc.y);
-                ndc_max[0] = ndc_max[0].max(ndc.x);
-                ndc_max[1] = ndc_max[1].max(ndc.y);
-            }
-            if straddles {
-                ndc_min = [-1.0; 2];
-                ndc_max = [1.0; 2];
-            }
-            let lo = [
-                (ndc_min[0] * 0.5 + 0.5) * pages as f32,
-                (ndc_min[1] * 0.5 + 0.5) * pages as f32,
-            ];
-            let hi = [
-                (ndc_max[0] * 0.5 + 0.5) * pages as f32,
-                (ndc_max[1] * 0.5 + 0.5) * pages as f32,
-            ];
-            if hi[0] < 0.0 || hi[1] < 0.0 || lo[0] >= pages as f32 || lo[1] >= pages as f32 {
-                return;
-            }
-            let x0 = lo[0].max(0.0) as u32;
-            let y0 = lo[1].max(0.0) as u32;
-            let x1 = (hi[0].min(pages as f32 - 1.0)) as u32;
-            let y1 = (hi[1].min(pages as f32 - 1.0)) as u32;
-            for y in y0..=y1 {
-                for x in x0..=x1 {
-                    residency.mark_dirty(key(x, y));
-                }
-            }
-        };
-        if self.lighting.spot_shadow_pending() {
-            projective(
-                self.lighting.spot_shadow_view_proj(),
-                crate::vsm::VSM_SPOT_PAGES,
-                &mut self.vsm_residency,
-                &|x, y| crate::VsmPageKey::Spot { x, y },
-            );
-        }
-        if self.lighting.point_shadow_pending() {
-            let faces = crate::point_shadow_face_matrices(
-                self.lighting.point_shadow_pos(),
-                self.lighting.point_shadow_far(),
-            );
-            for (face, matrix) in faces.iter().enumerate() {
-                let face = face as u32;
-                projective(
-                    *matrix,
-                    crate::vsm::VSM_POINT_FACE_PAGES,
-                    &mut self.vsm_residency,
-                    &|x, y| crate::VsmPageKey::PointFace { face, x, y },
-                );
             }
         }
     }
@@ -124,7 +53,8 @@ impl Renderer {
         }
         // Pages staged last frame that the graph never rasterized stay dirty.
         for page in std::mem::take(&mut self.vsm_render_pages) {
-            self.vsm_residency.mark_dirty(page.key);
+            self.vsm_residency
+                .mark_dirty(page.key, crate::VsmDirtyReason::Restaged);
         }
         let space = crate::VsmDirectionalSpace::build(sun_direction, self.page_demand_view().eye);
         let serial = self.frame_serial;
@@ -150,6 +80,7 @@ impl Renderer {
                             y,
                         },
                         serial,
+                        crate::VsmDemandReason::Bootstrap,
                     );
                 }
             }
@@ -162,37 +93,129 @@ impl Renderer {
             self.vsm_residency.invalidate_spot(serial);
         }
         // A moved or re-ranged point light stales all six face spaces.
-        let point_key = self
-            .lighting
-            .point_shadow_pos()
-            .extend(self.lighting.point_shadow_far())
-            .to_array();
-        if self.vsm_point_key != point_key {
+        let point_key = crate::vsm::vsm_point_light_key(
+            self.lighting.point_shadow_pos(),
+            self.lighting.point_shadow_far(),
+        );
+        let point_light_moved = self.vsm_point_key != point_key;
+        let previous_point = saffron_geometry::glam::Vec3::new(
+            f32::from_bits(self.vsm_point_key[0]),
+            f32::from_bits(self.vsm_point_key[1]),
+            f32::from_bits(self.vsm_point_key[2]),
+        );
+        let previous_far = f32::from_bits(self.vsm_point_key[3]);
+        let point_texel_m = self.lighting.point_shadow_far().max(0.1)
+            / (crate::vsm::VSM_POINT_FACE_PAGES * crate::VSM_PAGE_SIZE) as f32;
+        let coherent_point_move = point_light_moved
+            && previous_far.is_finite()
+            && previous_far > 0.0
+            && previous_point.is_finite()
+            && previous_point.distance(self.lighting.point_shadow_pos()) <= point_texel_m * 2.0
+            && (previous_far - self.lighting.point_shadow_far()).abs() <= point_texel_m * 2.0;
+        if point_light_moved {
             self.vsm_point_key = point_key;
-            self.vsm_residency.invalidate_point(serial);
+            let reason = if coherent_point_move {
+                crate::VsmDirtyReason::CoherentLightTransform
+            } else {
+                crate::VsmDirtyReason::LightTransform
+            };
+            self.vsm_residency.mark_point_dirty(reason);
         }
         // Dynamic content re-dirties the pages it overlaps; static pages stay
         // cached. Discrete movers arrive as swept bounds from the persistent
         // scene's instance deltas; continuous wind sway re-dirties the levels
         // fine enough to resolve it (the render budget paces the churn).
         let (moved, moved_overflow) = self.persistent_gpu_scene.take_moved_bounds();
-        let wind_dynamic = self.scene_wind.speed > 0.0
-            && self
-                .wind_deform_records
-                .contains_key(&self.active_view.gpu_scene_world().0);
+        let wind_dynamic = self.scene_wind.speed > 0.0 && self.active_world_has_wind_instances();
         if wind_dynamic || moved_overflow {
             self.vsm_residency
                 .mark_dynamic_dirty(crate::vsm::VSM_DYNAMIC_MAX_LEVEL);
         }
-        for (min, max) in moved {
-            self.dirty_vsm_swept_bounds(min, max);
-        }
-        for &index in &self.vsm_demanded {
-            if let Some(key) = crate::vsm::vsm_demand_key(index) {
-                let _ = self.vsm_residency.demand(key, serial);
+        let moved_projective = !moved.is_empty();
+        if moved_projective {
+            let mut directional_pages = vec![
+                false;
+                (crate::VSM_DIRECTIONAL_LEVELS * crate::VSM_LEVEL_PAGES * crate::VSM_LEVEL_PAGES)
+                    as usize
+            ];
+            for (min, max) in moved {
+                self.collect_vsm_directional_swept_bounds(&mut directional_pages, min, max);
+            }
+            for (index, dirty) in directional_pages.into_iter().enumerate() {
+                if !dirty {
+                    continue;
+                }
+                let index = index as u32;
+                let level_area = crate::VSM_LEVEL_PAGES * crate::VSM_LEVEL_PAGES;
+                let level = index / level_area;
+                let page = index % level_area;
+                self.vsm_residency.mark_dirty(
+                    crate::VsmPageKey::Directional {
+                        level,
+                        x: page % crate::VSM_LEVEL_PAGES,
+                        y: page / crate::VSM_LEVEL_PAGES,
+                    },
+                    crate::VsmDirtyReason::MovedCaster,
+                );
             }
         }
-        self.vsm_render_pages = self.vsm_residency.take_render_pages(self.vsm_page_budget);
+        if moved_projective {
+            if self.lighting.spot_shadow_pending() {
+                self.vsm_residency
+                    .mark_spot_dirty(crate::VsmDirtyReason::MovedCaster);
+            }
+            if self.lighting.point_shadow_pending() {
+                self.vsm_residency
+                    .mark_point_dirty(crate::VsmDirtyReason::MovedCaster);
+            }
+        }
+        let mut demand_spot = false;
+        let mut demand_point_faces = [false; crate::vsm::VSM_POINT_FACES as usize];
+        for &index in &self.vsm_demanded {
+            if let Some(key) = crate::vsm::vsm_demand_key(index) {
+                match key {
+                    crate::VsmPageKey::Spot { .. } => demand_spot = true,
+                    crate::VsmPageKey::PointFace { face, .. } => {
+                        if let Some(slot) = demand_point_faces.get_mut(face as usize) {
+                            *slot = true;
+                        }
+                    }
+                    crate::VsmPageKey::Directional { .. } => {
+                        let _ = self.vsm_residency.demand(
+                            key,
+                            serial,
+                            crate::VsmDemandReason::Receiver,
+                        );
+                    }
+                }
+            }
+        }
+        if demand_spot && self.lighting.spot_shadow_pending() {
+            self.vsm_residency
+                .demand_spot_space(serial, crate::VsmDemandReason::Receiver);
+        }
+        if self.lighting.point_shadow_pending() {
+            for (face, demanded) in demand_point_faces.into_iter().enumerate() {
+                if demanded {
+                    self.vsm_residency.demand_point_face(
+                        face as u32,
+                        serial,
+                        crate::VsmDemandReason::Receiver,
+                    );
+                }
+            }
+        }
+        let demanded_point_faces = demand_point_faces.iter().filter(|demanded| **demanded).count();
+        let point_move_budget = demanded_point_faces
+            * (crate::vsm::VSM_POINT_FACE_PAGES * crate::vsm::VSM_POINT_FACE_PAGES) as usize;
+        let page_budget = if point_light_moved && !coherent_point_move && point_move_budget > 0 {
+            self.vsm_page_budget.max(point_move_budget)
+        } else {
+            self.vsm_page_budget
+        };
+        self.vsm_render_pages = self
+            .vsm_residency
+            .take_render_pages_prioritizing_point_faces(page_budget, demand_point_faces);
         let table = self
             .vsm_gpu
             .publish_table(&self.device, frame, &self.vsm_residency);
@@ -559,6 +582,14 @@ impl Renderer {
     /// atlas permanently rather than throttle it.
     pub fn set_vsm_page_budget(&mut self, budget: usize) {
         self.vsm_page_budget = budget.max(1);
+    }
+
+    fn active_world_has_wind_instances(&self) -> bool {
+        self.persistent_gpu_scene
+            .instances(self.active_view.gpu_scene_world())
+            .is_ok_and(|mut instances| {
+                instances.any(|(_, record)| record.flags & crate::GPU_SCENE_INSTANCE_FLAG_WIND != 0)
+            })
     }
 
     /// Marks the virtual-shadow pages the freshly seeded HZB depth demands, then compacts the

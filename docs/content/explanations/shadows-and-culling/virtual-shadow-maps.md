@@ -36,8 +36,12 @@ atlas is full. An evicted tile cools for two frames before reuse, so an in-fligh
 samples a tile that changed owners. Fresh allocations are dirty; dirty pages drain into the frame's
 render list under a per-frame budget, and pages the graph could not rasterize re-mark themselves.
 
-Whole spaces invalidate when their mapping moves: a directional level whose snapped window shifted,
-the spot when its transform changes, all six point faces when the light moves or its range changes.
+Whole spaces react when their mapping moves: a directional level whose snapped window shifted and
+the spot transform invalidate their pages, while a point-light transform dirties the resident cube
+faces. The point-light key tracks exact position and range changes. A small point-light move keeps
+the last coherent face visible during refresh; a larger move withholds dirty faces until the
+frame's refresh pass schedules them, so old face contents are not sampled with a visibly different
+light transform.
 
 ## What a mover dirties
 
@@ -46,19 +50,32 @@ invalidation is tight. A caster that moved, arrived, or left dirties the pages i
 covered — not its whole footprint.
 
 The persistent scene reports one swept world box per **cooked leaf page** of the moved instance's
-prototype: one triangle cluster or one aggregate brick each, taken over the deformed extent the
-cook proved the payload can reach, and over both the current and the previous transform so the box
-covers where the content was as well as where it is. Interior pages are left out, because their
-cooked bounds enclose their whole subtree — including them would hand the consumer the prototype's
-own root box beside every tight cluster box, and the union would be the root box. Dropping them
-stays conservative: a coarse representation's vertices are convex combinations of the fine ones it
-simplifies, so it lies inside the union of its children's boxes.
+prototype: one triangle cluster or one aggregate brick each. The box spans the deformed extent the
+cook proved the payload can reach, over both the current and previous transform, so it covers where
+the content was as well as where it is.
 
-Each box is then projected into every armed space by its eight **corners**, and only the page
+Interior pages are left out because their cooked bounds enclose their whole subtree. Including them
+would hand the consumer the prototype's own root box beside every tight cluster box, and the union
+would be the root box. Dropping them stays conservative: a coarse representation's vertices are
+convex combinations of the fine ones it simplifies, so it lies inside the union of its children's
+boxes.
+
+Each box is projected into the directional clip levels by its eight **corners**, and only the page
 rectangle that extent covers is marked. A bounding sphere through the box would be up to √3 wider
 on every axis, and each extra page in that margin is re-rasterized for geometry that never enters
-it — a caster's aspect is what decides the cost, so an edge-on plank dirties a strip rather than a
-disc (`VsmDirectionalSpace::directional_page_span`).
+it. A caster's aspect decides the cost, so an edge-on plank dirties a strip rather than a disc
+(`VsmDirectionalSpace::directional_page_span`).
+
+Spot and point pages publish as coherent projective grids. The spot plane and each point cube face
+are completed as page grids, and the sampler sees a grid only when every page in that grid is
+resident, rendered, and clean. A moved caster therefore dirties each armed projective grid once per
+frame; the directional levels keep the per-leaf page precision.
+
+Point faces also drain as coherent render units. One cube face is 64 pages, matching the default
+page budget, so a moving point light refreshes one complete face instead of scattering work across
+several partial, non-publishable faces. Receiver-demanded faces drain first, so visible shadow
+receivers steer the next refreshed face. A point-light transform change expands the frame's page
+budget to cover every receiver-demanded face.
 
 Continuous wind is the one dirty source that is not per-caster: it re-marks the directional levels
 fine enough to resolve sway, capped at `VSM_DYNAMIC_MAX_LEVEL`, since levels whose texels span half
@@ -80,7 +97,9 @@ drain:   dedup, decode via vsm_demand_key, demand into the residency
 ```
 
 A coarse bootstrap ring on the outermost directional level covers the first frames and un-marked
-regions; everything else is demand-driven.
+regions. A receiver demand inside the spot plane completes the spot grid, and a receiver demand
+inside a point face completes that one face. Other point faces stay absent until receivers ask for
+them.
 
 ## Page rendering
 
@@ -101,10 +120,27 @@ amplified detail is a camera-pass refinement.
 
 ## Observability
 
-`render-stats` reports the previous frame's residency activity as the `vsm` block: `requested`,
-`hits`, `allocated`, `rendered`, `dirtied`, `evicted`, and `overflow` (demands the full atlas could
-not satisfy). The `set-shadows` master toggle gates the whole system; off publishes a disabled
-table, and every sampler reads unshadowed.
+`render-stats` reports the previous frame's residency activity as the `vsm` block. The top-level
+counts summarize the atlas: `requested`, `hits`, `allocated`, `rendered`, `dirtied`, `evicted`, and
+`overflow` (demands the full atlas could not satisfy). The `directional`, `spot`, and `point`
+objects split those counts by page family and add `invalidated`, which separates address-space
+drops from LRU eviction.
+
+The same block splits causes: `requestedBootstrap`, `requestedProjective`, and
+`requestedReceiver` identify who asked for pages; `dirtiedRestaged`, `dirtiedDynamic`, and
+`dirtiedMoved` identify why clean resident pages became dirty; `invalidatedDirectionalWindow` and
+`invalidatedLightTransform` identify mapping changes. The `set-shadows` master toggle gates the
+whole system; off publishes a disabled table, and every sampler reads unshadowed.
+
+```json
+{
+  "vsm": {
+    "requestedReceiver": 82,
+    "dirtiedMoved": 64,
+    "point": { "requested": 64, "rendered": 64, "dirtied": 64, "invalidated": 0 }
+  }
+}
+```
 
 ## In the code
 
@@ -115,7 +151,7 @@ table, and every sampler reads unshadowed.
 | Atlas + page table | `crates/rendering/src/vsm.rs` | `VsmGpu`, `publish_table`, `vsm_table_entry` |
 | GPU demand | `crates/rendering/src/vsm.rs`, `vsm_demand.slang`, `vsm_demand_compact.slang` | `VsmDemand`, `vsm_demand_key` |
 | Frame preparation | `crates/rendering/src/renderer.rs` | `prepare_vsm_frame` |
-| Mover invalidation | `crates/rendering/src/renderer/vsm_passes.rs`, `vsm.rs`, `persistent_gpu_scene/apply.rs`, `assets/src/gpu_scene_mirror/shared.rs` | `dirty_vsm_swept_bounds`, `VsmDirectionalSpace::directional_page_span`, `instance_moved_bounds`, `note_instances_moved`, `leaf_page_bounds` |
+| Mover invalidation | `crates/rendering/src/renderer/vsm_passes.rs`, `vsm.rs`, `persistent_gpu_scene/apply.rs`, `assets/src/gpu_scene_mirror/shared.rs` | `collect_vsm_directional_swept_bounds`, `mark_spot_dirty`, `mark_point_dirty`, `VsmDirectionalSpace::directional_page_span`, `instance_moved_bounds`, `note_instances_moved`, `leaf_page_bounds` |
 | Page raster passes | `crates/rendering/src/renderer.rs` | `add_vsm_page_passes`, `vsm_page_crop` |
 | Samplers | `assets/shaders/lighting_common.slang` | `vsmSampleDirectional`, `vsmSampleSpot`, `vsmSamplePoint`, `vsmTilePcf` |
 

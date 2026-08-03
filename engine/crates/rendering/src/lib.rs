@@ -311,7 +311,8 @@ pub use vsm::{
     VSM_ATLAS_SIZE, VSM_ATLAS_TILES, VSM_COMPACT_PUSH_SIZE, VSM_DEFAULT_PAGE_BUDGET,
     VSM_DEMAND_CAPACITY, VSM_DEMAND_PUSH_SIZE, VSM_DIRECTIONAL_LEVELS, VSM_LEVEL_PAGES,
     VSM_LEVEL0_EXTENT_M, VSM_PAGE_SIZE, VSM_TABLE_RESIDENT, VsmCompactPush, VsmCounters, VsmDemand,
-    VsmDemandPush, VsmDirectionalSpace, VsmPageKey, VsmRenderPage, VsmResidency, vsm_table_entry,
+    VsmDemandPush, VsmDemandReason, VsmDirectionalSpace, VsmDirtyReason, VsmPageFamily,
+    VsmPageFamilyCounters, VsmPageKey, VsmRenderPage, VsmResidency, vsm_table_entry,
 };
 
 use ash::vk;

@@ -258,6 +258,9 @@ public float vsmSamplePoint(float3 worldPos, LightGlobals lg, Sampler2DShadow at
         return 1.0;
     }
     float depth = far * (axis - near) / (axis * (far - near));
+    float receiverBiasM = 0.03;
+    float depthBias = (far * near / (far - near)) * receiverBiasM / max(axis * axis, 1e-4);
+    depth = max(depth - depthBias, 0.0);
     float2 scaled = clamp(st / axis * 0.5 + 0.5, 0.0, 0.999) * 8.0;
     uint2 page = uint2(scaled);
     uint entry = *(uint*)(

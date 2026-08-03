@@ -595,7 +595,7 @@ impl Renderer {
             vsm_demand,
             vsm_demanded: Vec::new(),
             vsm_spot_matrix: [0.0; 16],
-            vsm_point_key: [0.0; 4],
+            vsm_point_key: [0; 4],
             interaction_fields: std::collections::HashMap::new(),
             interaction_impulses: Vec::new(),
             interaction_impulse_ring: Vec::new(),
