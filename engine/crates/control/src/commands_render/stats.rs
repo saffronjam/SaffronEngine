@@ -1,6 +1,6 @@
 use saffron_protocol::{
     AnamorphicParams, EmptyParams, GpuSceneMirrorStatsDto, RenderPassTimingDto,
-    RenderPassTimingsDto, RenderStatsDto, Uuid, VsmStatsDto,
+    RenderPassTimingsDto, RenderStatsDto, Uuid, VsmPageFamilyStatsDto, VsmStatsDto,
 };
 use saffron_rendering::{PassTiming, RenderStatsFull};
 
@@ -28,6 +28,17 @@ pub(crate) fn render_stats_dto(renderer: &dyn ControlRenderer) -> RenderStatsDto
             dirtied: stats.vsm.dirtied as i32,
             evicted: stats.vsm.evicted as i32,
             overflow: stats.vsm.overflow as i32,
+            directional: vsm_family_stats_dto(stats.vsm.directional),
+            spot: vsm_family_stats_dto(stats.vsm.spot),
+            point: vsm_family_stats_dto(stats.vsm.point),
+            requested_bootstrap: stats.vsm.requested_bootstrap as i32,
+            requested_projective: stats.vsm.requested_projective as i32,
+            requested_receiver: stats.vsm.requested_receiver as i32,
+            dirtied_restaged: stats.vsm.dirtied_restaged as i32,
+            dirtied_dynamic: stats.vsm.dirtied_dynamic as i32,
+            dirtied_moved: stats.vsm.dirtied_moved as i32,
+            invalidated_directional_window: stats.vsm.invalidated_directional_window as i32,
+            invalidated_light_transform: stats.vsm.invalidated_light_transform as i32,
         },
         rt_instances: stats.rt_instances as i32,
         rt_aggregate_instances: stats.rt_aggregate_instances as i32,
@@ -129,6 +140,19 @@ pub(crate) fn render_stats_dto(renderer: &dyn ControlRenderer) -> RenderStatsDto
         bloom_per_mip_tint: renderer.bloom_mip_tint(),
         aa: aa_mode_from_name(&renderer.aa_mode()),
         view_mode: view_mode_to_dto(stats.view_mode),
+    }
+}
+
+fn vsm_family_stats_dto(stats: saffron_rendering::VsmPageFamilyCounters) -> VsmPageFamilyStatsDto {
+    VsmPageFamilyStatsDto {
+        requested: stats.requested as i32,
+        hits: stats.hits as i32,
+        allocated: stats.allocated as i32,
+        rendered: stats.rendered as i32,
+        dirtied: stats.dirtied as i32,
+        invalidated: stats.invalidated as i32,
+        evicted: stats.evicted as i32,
+        overflow: stats.overflow as i32,
     }
 }
 

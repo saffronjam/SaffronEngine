@@ -26089,6 +26089,46 @@
           "pages"
         ]
       },
+      "VsmPageFamilyStatsDto": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "requested": {
+            "type": "integer"
+          },
+          "hits": {
+            "type": "integer"
+          },
+          "allocated": {
+            "type": "integer"
+          },
+          "rendered": {
+            "type": "integer"
+          },
+          "dirtied": {
+            "type": "integer"
+          },
+          "invalidated": {
+            "type": "integer"
+          },
+          "evicted": {
+            "type": "integer"
+          },
+          "overflow": {
+            "type": "integer"
+          }
+        },
+        "required": [
+          "requested",
+          "hits",
+          "allocated",
+          "rendered",
+          "dirtied",
+          "invalidated",
+          "evicted",
+          "overflow"
+        ]
+      },
       "VsmStatsDto": {
         "type": "object",
         "additionalProperties": false,
@@ -26113,6 +26153,39 @@
           },
           "overflow": {
             "type": "integer"
+          },
+          "directional": {
+            "$ref": "#/components/schemas/VsmPageFamilyStatsDto"
+          },
+          "spot": {
+            "$ref": "#/components/schemas/VsmPageFamilyStatsDto"
+          },
+          "point": {
+            "$ref": "#/components/schemas/VsmPageFamilyStatsDto"
+          },
+          "requestedBootstrap": {
+            "type": "integer"
+          },
+          "requestedProjective": {
+            "type": "integer"
+          },
+          "requestedReceiver": {
+            "type": "integer"
+          },
+          "dirtiedRestaged": {
+            "type": "integer"
+          },
+          "dirtiedDynamic": {
+            "type": "integer"
+          },
+          "dirtiedMoved": {
+            "type": "integer"
+          },
+          "invalidatedDirectionalWindow": {
+            "type": "integer"
+          },
+          "invalidatedLightTransform": {
+            "type": "integer"
           }
         },
         "required": [
@@ -26122,7 +26195,18 @@
           "rendered",
           "dirtied",
           "evicted",
-          "overflow"
+          "overflow",
+          "directional",
+          "spot",
+          "point",
+          "requestedBootstrap",
+          "requestedProjective",
+          "requestedReceiver",
+          "dirtiedRestaged",
+          "dirtiedDynamic",
+          "dirtiedMoved",
+          "invalidatedDirectionalWindow",
+          "invalidatedLightTransform"
         ]
       },
       "WindInteractionFieldParams": {

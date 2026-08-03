@@ -307,6 +307,8 @@ pub static DTO_TYPE_NAMES: &[&str] = &[
     "PingParams",
     "EmptyParams",
     "PingResult",
+    "VsmPageFamilyStatsDto",
+    "VsmStatsDto",
     "RenderStatsDto",
     "GpuSceneMirrorStatsDto",
     "VegetationRenderStatsDto",

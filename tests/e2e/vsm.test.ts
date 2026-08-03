@@ -150,6 +150,9 @@ test("a moving caster dirties pages without invalidating the whole atlas", async
   const moving = caster.entities.find((entity) => entity.name === "VSM caster");
   expect(moving).toBeDefined();
 
+  let peakMovedDirtied = 0;
+  let peakPointDirtied = 0;
+  let peakPointRequested = 0;
   for (let step = 1; step <= 6; step += 1) {
     await engine.call("set-component", {
       entity: moving!.id,
@@ -161,15 +164,23 @@ test("a moving caster dirties pages without invalidating the whole atlas", async
       },
     });
     await engine.settle(50);
+    const during = await vsm();
+    peakMovedDirtied = Math.max(peakMovedDirtied, during.dirtiedMoved);
+    peakPointDirtied = Math.max(peakPointDirtied, during.point.dirtied);
+    peakPointRequested = Math.max(peakPointRequested, during.point.requested);
   }
   // A one-cube move is not a whole-atlas storm: whatever the frame dirties, it stays inside the
   // pages the frame actually demanded and never overflows residency. How TIGHT the dirty set is
-  // around the caster's own footprint is a property of the page-span derivation, which
-  // `a_thin_caster_dirties_a_strip_where_a_cube_dirties_a_square` pins exactly; what this asserts
-  // is that the whole live path stays bounded by the working set.
+  // around the caster's own directional footprint is a property of the page-span derivation, which
+  // `a_thin_caster_dirties_a_strip_where_a_cube_dirties_a_square` pins exactly. Point shadows publish
+  // by coherent cube face, so a moved caster dirties already-armed faces without projecting every
+  // cooked leaf box through every face on the CPU.
   const after = await vsm();
   expect(after.dirtied).toBeLessThanOrEqual(after.requested);
   expect(after.overflow).toBe(0);
+  expect(peakMovedDirtied).toBeGreaterThan(0);
+  expect(peakPointDirtied).toBeGreaterThan(0);
+  expect(peakPointRequested).toBeGreaterThan(0);
   expect(engine.validationErrors()).toEqual([]);
 });
 

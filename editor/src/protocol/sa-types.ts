@@ -2253,6 +2253,17 @@ export interface PingResult {
   pid: number;
 }
 
+export interface VsmPageFamilyStatsDto {
+  requested: number;
+  hits: number;
+  allocated: number;
+  rendered: number;
+  dirtied: number;
+  invalidated: number;
+  evicted: number;
+  overflow: number;
+}
+
 export interface VsmStatsDto {
   requested: number;
   hits: number;
@@ -2261,6 +2272,17 @@ export interface VsmStatsDto {
   dirtied: number;
   evicted: number;
   overflow: number;
+  directional: VsmPageFamilyStatsDto;
+  spot: VsmPageFamilyStatsDto;
+  point: VsmPageFamilyStatsDto;
+  requestedBootstrap: number;
+  requestedProjective: number;
+  requestedReceiver: number;
+  dirtiedRestaged: number;
+  dirtiedDynamic: number;
+  dirtiedMoved: number;
+  invalidatedDirectionalWindow: number;
+  invalidatedLightTransform: number;
 }
 
 export interface RenderStatsDto {

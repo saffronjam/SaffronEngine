@@ -361,6 +361,7 @@ macro_rules! dto_universe {
             PingParams,
             EmptyParams,
             PingResult,
+            VsmPageFamilyStatsDto,
             VsmStatsDto,
             RenderStatsDto,
             GpuSceneMirrorStatsDto,

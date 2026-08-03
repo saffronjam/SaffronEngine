@@ -10,6 +10,29 @@ use ts_rs::TS;
 #[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize, JsonSchema, TS)]
 #[serde(rename_all = "camelCase")]
 #[ts(export)]
+pub struct VsmPageFamilyStatsDto {
+    /// Pages demanded (receiver requests + bootstrap).
+    pub requested: i32,
+    /// Demands answered by an already-resident page.
+    pub hits: i32,
+    /// Fresh page-to-tile allocations.
+    pub allocated: i32,
+    /// Pages the frame rasterized.
+    pub rendered: i32,
+    /// Resident pages re-marked dirty.
+    pub dirtied: i32,
+    /// Pages removed because their address space changed.
+    pub invalidated: i32,
+    /// LRU evictions.
+    pub evicted: i32,
+    /// Demands the full atlas could not satisfy.
+    pub overflow: i32,
+}
+
+/// One frame's virtual-shadow residency activity (page counts).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
 pub struct VsmStatsDto {
     /// Pages demanded (receiver requests + bootstrap).
     pub requested: i32,
@@ -25,6 +48,28 @@ pub struct VsmStatsDto {
     pub evicted: i32,
     /// Demands the full atlas could not satisfy.
     pub overflow: i32,
+    /// Directional page-family activity.
+    pub directional: VsmPageFamilyStatsDto,
+    /// Spot page-family activity.
+    pub spot: VsmPageFamilyStatsDto,
+    /// Point page-family activity.
+    pub point: VsmPageFamilyStatsDto,
+    /// Bootstrap page demands.
+    pub requested_bootstrap: i32,
+    /// Whole-projective-space page demands.
+    pub requested_projective: i32,
+    /// Receiver-generated page demands.
+    pub requested_receiver: i32,
+    /// Dirty marks from graph-staged pages that did not rasterize.
+    pub dirtied_restaged: i32,
+    /// Dirty marks from dynamic deformation.
+    pub dirtied_dynamic: i32,
+    /// Dirty marks from moved caster bounds.
+    pub dirtied_moved: i32,
+    /// Directional-window invalidations.
+    pub invalidated_directional_window: i32,
+    /// Light transform/range invalidations.
+    pub invalidated_light_transform: i32,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema, TS)]
