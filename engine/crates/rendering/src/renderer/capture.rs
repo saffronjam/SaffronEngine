@@ -114,9 +114,9 @@ impl Renderer {
 
     /// Records the active view's BGRA8 shm-publish readback into the frame command buffer `cmd`
     /// for frame slot `slot`: a 1:1 `vkCmdBlitImage` converts `RGBA16F`→BGRA8 into this slot's
-    /// persistent image, a `vkCmdCopyImageToBuffer` lands it in host-visible staging, and a
-    /// buffer→host barrier makes the bytes visible once the frame fence signals. Folded into the
-    /// frame's single submit; the offscreen is left in `TransferSrcOptimal`.
+    /// persistent image, a device-local transfer buffer receives the linear pixels, and a final
+    /// buffer copy lands them in host-visible staging. Folded into the frame's single submit; the
+    /// offscreen is left in `TransferSrcOptimal`.
     ///
     /// # Errors
     ///
@@ -143,7 +143,9 @@ impl Renderer {
             return Ok(());
         };
         let dst_image = capture.image.handle();
+        let readback = capture.readback.handle();
         let staging = capture.staging.handle();
+        let byte_size = capture.staging.size();
 
         let color_range = vk::ImageSubresourceRange {
             aspect_mask: vk::ImageAspectFlags::COLOR,
@@ -264,9 +266,24 @@ impl Renderer {
                 cmd,
                 dst_image,
                 vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
-                staging,
+                readback,
                 &[copy],
             );
+            let readback_ready = vk::BufferMemoryBarrier2::default()
+                .src_stage_mask(vk::PipelineStageFlags2::COPY)
+                .src_access_mask(vk::AccessFlags2::TRANSFER_WRITE)
+                .dst_stage_mask(vk::PipelineStageFlags2::COPY)
+                .dst_access_mask(vk::AccessFlags2::TRANSFER_READ)
+                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .buffer(readback)
+                .offset(0)
+                .size(vk::WHOLE_SIZE);
+            let readback_barriers = [readback_ready];
+            let dep = vk::DependencyInfo::default().buffer_memory_barriers(&readback_barriers);
+            raw.cmd_pipeline_barrier2(cmd, &dep);
+            let region = vk::BufferCopy::default().size(byte_size);
+            raw.cmd_copy_buffer(cmd, readback, staging, &[region]);
             // Make the staging write visible to host reads once the frame fence signals.
             let host = vk::BufferMemoryBarrier2::default()
                 .src_stage_mask(vk::PipelineStageFlags2::COPY)

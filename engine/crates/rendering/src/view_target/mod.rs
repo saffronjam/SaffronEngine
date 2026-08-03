@@ -24,15 +24,16 @@ use crate::{Device, Result};
 use screen_space::*;
 
 /// One frame-in-flight's viewport shm-publish capture target: a BGRA8 image the
-/// post-processed offscreen blits into (the GPU does the `RGBA16F`→BGRA8 conversion) and
-/// a host-visible mapped staging buffer the BGRA8 is copied into. The blit + copy are
-/// recorded into the *frame's* command buffer, so the frame's in-flight fence covers the
-/// readback — no per-slot fence, no separate submit, no synchronous stall. `valid` marks
-/// that a readback was recorded into this slot, so a slot whose fence has signalled holds
-/// a completed frame's bytes.
+/// post-processed offscreen blits into, a device-local linear readback buffer, and a
+/// host-visible mapped staging buffer. The blit + copies are recorded into the frame's
+/// command buffer, so the frame's in-flight fence covers the readback. `valid` marks that
+/// a readback was recorded into this slot, so a slot whose fence has signalled holds a
+/// completed frame's bytes.
 pub struct ShmCaptureSlot {
     /// The `B8G8R8A8_UNORM` blit destination (TRANSFER_DST + TRANSFER_SRC, optimal).
     pub image: Image,
+    /// Device-local tightly-packed BGRA8 transfer buffer.
+    pub readback: Buffer,
     /// The host-visible + mapped staging buffer holding the tightly-packed BGRA8 result.
     pub staging: Buffer,
     /// The extent the image + staging were sized for; a mismatch triggers a recreate.
@@ -496,6 +497,15 @@ impl ViewTarget {
             )?;
             let bytes =
                 vk::DeviceSize::from(extent.width) * vk::DeviceSize::from(extent.height) * 4;
+            let readback = Buffer::new(
+                resources,
+                bytes,
+                vk::BufferUsageFlags::TRANSFER_DST | vk::BufferUsageFlags::TRANSFER_SRC,
+                &vk_mem::AllocationCreateInfo {
+                    usage: vk_mem::MemoryUsage::AutoPreferDevice,
+                    ..Default::default()
+                },
+            )?;
             let staging = Buffer::new(
                 resources,
                 bytes,
@@ -509,6 +519,7 @@ impl ViewTarget {
             )?;
             self.shm_capture.slots[slot] = Some(ShmCaptureSlot {
                 image,
+                readback,
                 staging,
                 extent,
                 valid: false,
