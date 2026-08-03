@@ -216,6 +216,8 @@ impl Renderer {
             .then(|| self.device.mesh_shader_dispatch().cloned())
             .flatten();
         let survivor_mesh_dispatch = scene_mesh_dispatch.clone();
+        let scene_uses_mesh_executor = scene_mesh_dispatch.is_some();
+        let survivor_uses_mesh_executor = survivor_mesh_dispatch.is_some();
         let executor_draws: Vec<(crate::ExecutorBucket, bool, Arc<crate::Pipeline>)> =
             executor_buckets
                 .iter()
@@ -937,9 +939,14 @@ impl Renderer {
             let counters_res = graph.import_buffer(inputs.counters, None);
             let bucket_counts_res = graph.import_buffer(inputs.bucket_counts, None);
             let mesh_args_res = graph.import_buffer(inputs.mesh_args, None);
+            let command_usage = if scene_uses_mesh_executor {
+                RgUsage::MeshExecutorCommandRead
+            } else {
+                RgUsage::IndirectCommandRead
+            };
             scene = scene
                 .access(pages_res, RgUsage::IndexInputRead)
-                .access(commands_res, RgUsage::IndirectCommandRead)
+                .access(commands_res, command_usage)
                 .access(mesh_args_res, RgUsage::IndirectCommandRead)
                 .access(counters_res, RgUsage::IndirectCountRead)
                 .access(bucket_counts_res, RgUsage::IndirectCountRead);
@@ -1152,9 +1159,14 @@ impl Renderer {
                         let mesh_args_res = graph.import_buffer(inputs.mesh_args, None);
                         let counters_res = graph.import_buffer(inputs.counters, None);
                         let bucket_counts_res = graph.import_buffer(inputs.bucket_counts, None);
+                        let command_usage = if survivor_uses_mesh_executor {
+                            RgUsage::MeshExecutorCommandRead
+                        } else {
+                            RgUsage::IndirectCommandRead
+                        };
                         survivor_pass = survivor_pass
                             .access(pages_res, RgUsage::IndexInputRead)
-                            .access(commands_res, RgUsage::IndirectCommandRead)
+                            .access(commands_res, command_usage)
                             .access(mesh_args_res, RgUsage::IndirectCommandRead)
                             .access(counters_res, RgUsage::IndirectCountRead)
                             .access(bucket_counts_res, RgUsage::IndirectCountRead);

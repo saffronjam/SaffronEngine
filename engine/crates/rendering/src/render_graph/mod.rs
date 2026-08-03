@@ -66,6 +66,8 @@ pub enum RgUsage {
     ShaderDeviceAddressRead,
     /// Buffer read as indirect dispatch/draw arguments (or a draw-count).
     IndirectCommandRead,
+    /// Buffer read both as indirect draw arguments and as mesh-shader storage data.
+    MeshExecutorCommandRead,
     /// Buffer read as the count consumed by an indirect-count draw.
     IndirectCountRead,
 }

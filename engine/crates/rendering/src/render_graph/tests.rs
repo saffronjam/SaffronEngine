@@ -414,6 +414,44 @@ fn indirect_command_read_after_compute_write_is_one_memory_barrier() {
 }
 
 #[test]
+fn mesh_executor_command_read_after_compute_write_is_one_memory_barrier() {
+    let mut r = buffer_state();
+    let mut barriers = DerivedBarriers::default();
+    apply_access(
+        &mut r,
+        usage_info(RgUsage::StorageWriteCompute),
+        &mut barriers,
+    );
+    assert!(barriers.is_empty(), "first buffer write is no hazard");
+
+    apply_access(
+        &mut r,
+        usage_info(RgUsage::MeshExecutorCommandRead),
+        &mut barriers,
+    );
+    assert_eq!(
+        barriers.buffer.len(),
+        1,
+        "mesh executor command read after write is a hazard"
+    );
+    assert!(
+        barriers.image.is_empty(),
+        "buffers never emit image barriers"
+    );
+    let b = barriers.buffer[0];
+    assert_eq!(b.src_stage_mask, vk::PipelineStageFlags2::COMPUTE_SHADER);
+    assert_eq!(b.src_access_mask, vk::AccessFlags2::SHADER_STORAGE_WRITE);
+    assert_eq!(
+        b.dst_stage_mask,
+        vk::PipelineStageFlags2::DRAW_INDIRECT | vk::PipelineStageFlags2::MESH_SHADER_EXT
+    );
+    assert_eq!(
+        b.dst_access_mask,
+        vk::AccessFlags2::INDIRECT_COMMAND_READ | vk::AccessFlags2::SHADER_STORAGE_READ
+    );
+}
+
+#[test]
 fn indexed_indirect_abi_and_argument_barrier_ranges_are_byte_locked() {
     assert_eq!(size_of::<vk::DrawIndexedIndirectCommand>(), 20);
     assert_eq!(offset_of!(vk::DrawIndexedIndirectCommand, index_count), 0);

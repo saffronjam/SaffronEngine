@@ -68,14 +68,8 @@ pub struct ExecutorDrawInputs {
     pub displaced_indices: vk::Buffer,
     /// Element capacity of the command stream.
     pub record_capacity: u32,
-    /// Upper bound on the draws any one bucket slice can hold: the mirror's live draw-record
-    /// count, clamped to the slice capacity.
-    ///
-    /// A device with `drawIndirectCount` reads the exact count on the GPU and treats this as a
-    /// ceiling. A device without it must name a count host-side, and the slice capacity is the
-    /// wrong one: it issues one command per *slot*, tens of thousands of no-op draws per frame
-    /// whatever is on screen. Bounding by the records that actually exist keeps the pass
-    /// proportional to the scene while never asking for fewer draws than the GPU wrote.
+    /// Upper bound for command streams that are not fixed per-bucket slices, such as the sorted
+    /// transparent stream.
     pub draw_bound: u32,
 }
 
@@ -87,6 +81,8 @@ pub struct ExecutorBucketDraw {
     pub bucket: ExecutorBucket,
     /// Its index into the per-bucket count buffer.
     pub index: u32,
+    /// Dynamic culling state to set after binding the bucket PSO.
+    pub cull_mode: vk::CullModeFlags,
     /// Whether `drawIndirectCount` is available; without it the draw count is named host-side.
     pub draw_indirect_count: bool,
 }
@@ -107,13 +103,15 @@ pub fn record_executor_bucket_draw(
     let ExecutorBucketDraw {
         bucket,
         index: bucket_index,
+        cull_mode,
         draw_indirect_count,
     } = draw;
     // SAFETY: the ash seam. The PSO/buffers are valid this frame; the indirect stream,
     // counts, and slice bases were built by the bucket passes this frame.
     unsafe {
         raw.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, pipeline.0);
-        let draws = bucket.capacity.min(inputs.draw_bound);
+        raw.cmd_set_cull_mode(cmd, cull_mode);
+        let max_draw_count = executor_bucket_max_draw_count(bucket);
         if draw_indirect_count {
             raw.cmd_draw_indexed_indirect_count(
                 cmd,
@@ -121,7 +119,7 @@ pub fn record_executor_bucket_draw(
                 u64::from(bucket.base) * 20,
                 inputs.bucket_counts,
                 u64::from(bucket_index) * 4,
-                draws,
+                max_draw_count,
                 20,
             );
         } else {
@@ -129,7 +127,7 @@ pub fn record_executor_bucket_draw(
                 cmd,
                 inputs.commands,
                 u64::from(bucket.base) * 20,
-                draws,
+                max_draw_count,
                 20,
             );
         }
@@ -152,13 +150,15 @@ pub fn record_executor_bucket_draw_mesh(
     let ExecutorBucketDraw {
         bucket,
         index: bucket_index,
+        cull_mode,
         draw_indirect_count,
     } = draw;
     // SAFETY: the ash seam. The PSO/buffers are valid this frame; the mesh-args stream, counts,
     // and slice bases were written by the bucket passes this frame.
     unsafe {
         raw.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, pipeline.0);
-        let draws = bucket.capacity.min(inputs.draw_bound);
+        raw.cmd_set_cull_mode(cmd, cull_mode);
+        let max_draw_count = executor_bucket_max_draw_count(bucket);
         if draw_indirect_count {
             dispatch.cmd_draw_mesh_tasks_indirect_count(
                 cmd,
@@ -166,7 +166,7 @@ pub fn record_executor_bucket_draw_mesh(
                 u64::from(bucket.base) * MESH_TASK_COMMAND_STRIDE,
                 inputs.bucket_counts,
                 u64::from(bucket_index) * 4,
-                draws,
+                max_draw_count,
                 MESH_TASK_COMMAND_STRIDE as u32,
             );
         } else {
@@ -174,11 +174,15 @@ pub fn record_executor_bucket_draw_mesh(
                 cmd,
                 inputs.mesh_args,
                 u64::from(bucket.base) * MESH_TASK_COMMAND_STRIDE,
-                draws,
+                max_draw_count,
                 MESH_TASK_COMMAND_STRIDE as u32,
             );
         }
     }
+}
+
+fn executor_bucket_max_draw_count(bucket: ExecutorBucket) -> u32 {
+    bucket.capacity
 }
 
 #[cfg(test)]
@@ -237,5 +241,16 @@ mod tests {
             ..qualifying()
         };
         assert!(!mesh_executor_supported(&caps));
+    }
+
+    #[test]
+    fn bucket_draw_count_ceiling_is_the_bucket_slice_capacity() {
+        let bucket = ExecutorBucket {
+            shader_index: 0,
+            pso_bin: 0,
+            base: 4096,
+            capacity: 2048,
+        };
+        assert_eq!(executor_bucket_max_draw_count(bucket), 2048);
     }
 }

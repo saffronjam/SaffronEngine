@@ -60,7 +60,6 @@ pub fn record_executor_buckets(
         // backface culling, everything else culls BACK.
         // SAFETY: the ash seam; `cmd` is recording.
         unsafe {
-            raw.cmd_set_cull_mode(cmd, bucket_cull_mode(*bucket));
             raw.cmd_bind_index_buffer(
                 cmd,
                 bucket_index_buffer(*bucket, page_index_buffer, inputs.displaced_indices),
@@ -71,6 +70,7 @@ pub fn record_executor_buckets(
         let draw = crate::ExecutorBucketDraw {
             bucket: *bucket,
             index: bucket_index as u32,
+            cull_mode: bucket_cull_mode(*bucket),
             draw_indirect_count,
         };
         if let Some(dispatch) = mesh_dispatch {

@@ -107,6 +107,13 @@ pub(super) fn usage_info(usage: RgUsage) -> RgUsageInfo {
             layout: vk::ImageLayout::UNDEFINED,
             is_write: false,
         },
+        RgUsage::MeshExecutorCommandRead => RgUsageInfo {
+            stage: vk::PipelineStageFlags2::DRAW_INDIRECT
+                | vk::PipelineStageFlags2::MESH_SHADER_EXT,
+            access: vk::AccessFlags2::INDIRECT_COMMAND_READ | vk::AccessFlags2::SHADER_STORAGE_READ,
+            layout: vk::ImageLayout::UNDEFINED,
+            is_write: false,
+        },
         RgUsage::IndirectCountRead => RgUsageInfo {
             stage: vk::PipelineStageFlags2::DRAW_INDIRECT,
             access: vk::AccessFlags2::INDIRECT_COMMAND_READ,
@@ -129,6 +136,9 @@ pub(super) fn required_buffer_usage(usage: RgUsage) -> Option<vk::BufferUsageFla
         RgUsage::ShaderDeviceAddressRead => Some(vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS),
         RgUsage::IndirectCommandRead | RgUsage::IndirectCountRead => {
             Some(vk::BufferUsageFlags::INDIRECT_BUFFER)
+        }
+        RgUsage::MeshExecutorCommandRead => {
+            Some(vk::BufferUsageFlags::INDIRECT_BUFFER | vk::BufferUsageFlags::STORAGE_BUFFER)
         }
         RgUsage::AccelStructBuildRead => {
             Some(vk::BufferUsageFlags::ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_KHR)
@@ -191,7 +201,8 @@ pub(super) const GRAPHICS_ONLY_STAGES: vk::PipelineStageFlags2 = vk::PipelineSta
         | vk::PipelineStageFlags2::ALL_GRAPHICS.as_raw()
         | vk::PipelineStageFlags2::INDEX_INPUT.as_raw()
         | vk::PipelineStageFlags2::VERTEX_ATTRIBUTE_INPUT.as_raw()
-        | vk::PipelineStageFlags2::PRE_RASTERIZATION_SHADERS.as_raw(),
+        | vk::PipelineStageFlags2::PRE_RASTERIZATION_SHADERS.as_raw()
+        | vk::PipelineStageFlags2::MESH_SHADER_EXT.as_raw(),
 );
 
 /// The source scope of a same-queue barrier, expressed in terms `queue` can name.
