@@ -205,7 +205,10 @@ impl Renderer {
                 }
             }
         }
-        let demanded_point_faces = demand_point_faces.iter().filter(|demanded| **demanded).count();
+        let demanded_point_faces = demand_point_faces
+            .iter()
+            .filter(|demanded| **demanded)
+            .count();
         let point_move_budget = demanded_point_faces
             * (crate::vsm::VSM_POINT_FACE_PAGES * crate::vsm::VSM_POINT_FACE_PAGES) as usize;
         let page_budget = if point_light_moved && !coherent_point_move && point_move_budget > 0 {

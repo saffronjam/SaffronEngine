@@ -625,9 +625,9 @@ impl VsmResidency {
     pub fn publishable_pages(&self) -> impl Iterator<Item = (VsmPageKey, u32)> + '_ {
         let spot_coherent = (0..VSM_SPOT_PAGES).all(|y| {
             (0..VSM_SPOT_PAGES).all(|x| {
-                    self.pages
-                        .get(&VsmPageKey::Spot { x, y })
-                        .is_some_and(|state| state.rendered && state.table_publishable())
+                self.pages
+                    .get(&VsmPageKey::Spot { x, y })
+                    .is_some_and(|state| state.rendered && state.table_publishable())
             })
         });
         let point_face_coherent: [bool; VSM_POINT_FACES as usize] = std::array::from_fn(|face| {
