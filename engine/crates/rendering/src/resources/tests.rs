@@ -342,6 +342,17 @@ fn vram_folds_only_the_device_local_heaps() {
 }
 
 #[test]
+fn vram_uses_heap_size_when_reported_budget_is_implausible() {
+    let heaps = [
+        heap(8 * 1024 * 1024 * 1024, true),
+        heap(16 * 1024 * 1024 * 1024, false),
+    ];
+    let vram = device_local_vram(&heaps, [(107 * 1024 * 1024, 108 * 1024 * 1024), (0, 0)]);
+    assert_eq!(vram.usage_bytes, 107 * 1024 * 1024);
+    assert_eq!(vram.budget_bytes, 8 * 1024 * 1024 * 1024);
+}
+
+#[test]
 fn vram_is_zero_when_no_heap_is_device_local() {
     let heaps = [heap(4 * 1024 * 1024 * 1024, false)];
     let vram = device_local_vram(&heaps, [(123_456, 789_012)]);

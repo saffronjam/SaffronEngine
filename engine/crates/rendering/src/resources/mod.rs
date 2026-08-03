@@ -81,6 +81,15 @@ pub struct VramUsage {
     pub budget_bytes: u64,
 }
 
+fn device_local_heap_budget(heap: &vk::MemoryHeap, budget: u64) -> u64 {
+    let size = heap.size;
+    if budget == 0 || budget < size / 8 {
+        size
+    } else {
+        budget
+    }
+}
+
 /// Folds the per-heap `(usage, budget)` pairs `vmaGetHeapBudgets` reports, keeping only the heaps
 /// flagged `DEVICE_LOCAL`.
 ///
@@ -95,10 +104,12 @@ fn device_local_vram(
         .iter()
         .zip(budgets)
         .filter(|(heap, _)| heap.flags.contains(vk::MemoryHeapFlags::DEVICE_LOCAL))
-        .fold(VramUsage::default(), |total, (_, (usage, budget))| {
+        .fold(VramUsage::default(), |total, (heap, (usage, budget))| {
             VramUsage {
                 usage_bytes: total.usage_bytes.saturating_add(usage),
-                budget_bytes: total.budget_bytes.saturating_add(budget),
+                budget_bytes: total
+                    .budget_bytes
+                    .saturating_add(device_local_heap_budget(heap, budget)),
             }
         })
 }
