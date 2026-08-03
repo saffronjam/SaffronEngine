@@ -7,9 +7,13 @@ impl Renderer {
         self.submissions.push(Box::new(body));
     }
 
-    /// Replaces this frame's editor-overlay geometry: the `depth_tested` range (occluded by scene
-    /// geometry) then the `on_top` range. Composited into the post-tonemap color, so the
-    /// present-only path blits it too.
+    /// Submits the editor-overlay geometry for the next render: the `depth_tested` range
+    /// (occluded by scene geometry) then the `on_top` range. Composited into the post-tonemap
+    /// color, so the present-only path blits it too.
+    ///
+    /// Like the [`Renderer::submit`] closures, the geometry is consumed by the render that draws
+    /// it: a render nothing submits an overlay for — a thumbnail excursion onto another view —
+    /// draws none.
     pub fn submit_overlay(&mut self, depth_tested: Vec<OverlayVertex>, on_top: Vec<OverlayVertex>) {
         self.overlay.submit(depth_tested, on_top);
     }
@@ -505,8 +509,9 @@ impl Renderer {
         };
 
         // The final post chain: the tonemap is mandatory; the grid arms only when shown; the
-        // overlay PSOs arm only when geometry is queued. The overlay's per-frame vertex buffer is
-        // grown + uploaded here, before the graph build, so the pass captures the resolved handle.
+        // overlay PSOs arm only when this render has submitted geometry. The overlay's per-frame
+        // vertex buffer is grown + uploaded here, before the graph build, so the pass captures the
+        // resolved handle.
         let tonemap = self.pipelines.request_tonemap();
         // Aerial perspective fills + composites only when authored AND the atmosphere baked LUTs.
         let ap_active = self.fog.aerial_perspective && self.scene_ibl().atmosphere_live();
@@ -573,21 +578,22 @@ impl Renderer {
         } else {
             None
         };
-        let (overlay, overlay_depth, overlay_draw) = if self.overlay.has_geometry() {
-            let draw = match self.overlay.prepare(frame) {
-                Ok(draw) => draw,
-                Err(err) => {
-                    tracing::error!("overlay upload failed: {err}");
-                    None
-                }
-            };
+        // Draining here is what keeps the overlay to the render it was submitted for: this frame
+        // draws the gizmo, the next one draws it only if the host submits it again.
+        let overlay_draw = match self.overlay.take_draw(frame) {
+            Ok(draw) => draw,
+            Err(err) => {
+                tracing::error!("overlay upload failed: {err}");
+                None
+            }
+        };
+        let (overlay, overlay_depth) = if overlay_draw.is_some() {
             (
                 self.pipelines.request_overlay(),
                 self.pipelines.request_overlay_depth(),
-                draw,
             )
         } else {
-            (None, None, None)
+            (None, None)
         };
 
         // View-mode-specific post passes: the Lit Wireframe overlay and the motion-vector

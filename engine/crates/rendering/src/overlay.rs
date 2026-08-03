@@ -501,12 +501,15 @@ impl GridPush {
     }
 }
 
-/// Per-frame editor-overlay geometry: the vertex list (depth-tested range first, then
-/// the always-on-top range) and a grow-only mapped vertex buffer per frame-in-flight.
+/// The editor-overlay geometry submitted for the next render: the vertex list
+/// (depth-tested range first, then the always-on-top range) and a grow-only mapped vertex
+/// buffer per frame-in-flight.
 ///
-/// The pass body cannot hold `&mut Renderer`, so the buffer is prepared (grown +
-/// uploaded) *before* the graph build via [`OverlayState::prepare`]; the pass then
-/// captures only the resolved [`vk::Buffer`] handle + the counts.
+/// The geometry belongs to exactly one render — [`OverlayState::take_draw`] drains it — so a
+/// render nothing submitted an overlay for draws none, whichever view it targets.
+///
+/// The pass body cannot hold `&mut Renderer`, so the buffer is grown + uploaded *before* the
+/// graph build; the pass then captures only the resolved [`vk::Buffer`] handle + the counts.
 /// Single-thread state — only the render thread touches it.
 pub struct OverlayState {
     resources: Arc<DeviceResources>,
@@ -546,8 +549,8 @@ impl OverlayState {
         }
     }
 
-    /// Replaces this frame's overlay geometry: the `depth_tested` range (occluded by
-    /// scene geometry) followed by the `on_top` range (always drawn). The
+    /// Submits the overlay geometry for the next render: the `depth_tested` range (occluded
+    /// by scene geometry) followed by the `on_top` range (always drawn). The
     /// `depth_tested_count` is recorded so the pass draws each range with its own PSO.
     pub fn submit(&mut self, mut depth_tested: Vec<OverlayVertex>, on_top: Vec<OverlayVertex>) {
         self.depth_tested_count = depth_tested.len() as u32;
@@ -555,23 +558,22 @@ impl OverlayState {
         self.vertices = depth_tested;
     }
 
-    /// Whether any overlay geometry is queued this frame (the gate for arming the
-    /// overlay pass).
-    pub fn has_geometry(&self) -> bool {
-        !self.vertices.is_empty()
-    }
-
-    /// Grows the `frame` slot's vertex buffer to fit the queued geometry and uploads
-    /// it, returning the resolved draw info the graph captures — or `None` when no
-    /// geometry is queued (the pass is skipped). Done before the graph build so the
-    /// pass body captures only the handle.
+    /// Takes the submitted geometry, grows the `frame` slot's vertex buffer to fit it and
+    /// uploads it, returning the resolved draw info the graph captures — or `None` when
+    /// nothing was submitted (the pass is skipped). Done before the graph build so the pass
+    /// body captures only the handle.
+    ///
+    /// The geometry is drained whatever the outcome: it described one render, and the next
+    /// render draws only what is submitted for it.
     ///
     /// # Errors
     ///
     /// Returns [`crate::Error::Vk`] if the (re)allocation of the per-frame buffer
     /// fails; the prior buffer is left in place on failure.
-    pub fn prepare(&mut self, frame: usize) -> Result<Option<OverlayDraw>> {
-        let vertex_count = self.vertices.len() as u32;
+    pub fn take_draw(&mut self, frame: usize) -> Result<Option<OverlayDraw>> {
+        let vertices = std::mem::take(&mut self.vertices);
+        let depth_tested_count = std::mem::take(&mut self.depth_tested_count);
+        let vertex_count = vertices.len() as u32;
         if vertex_count == 0 {
             return Ok(None);
         }
@@ -597,13 +599,13 @@ impl OverlayState {
         let buffer = self.buffers[frame]
             .as_mut()
             .expect("the buffer was just ensured");
-        let src = bytemuck::cast_slice::<OverlayVertex, u8>(&self.vertices);
+        let src = bytemuck::cast_slice::<OverlayVertex, u8>(&vertices);
         let dst = buffer.mapped_bytes().expect("overlay buffer is MAPPED");
         dst[..src.len()].copy_from_slice(src);
         Ok(Some(OverlayDraw {
             buffer: buffer.handle(),
             vertex_count,
-            depth_tested_count: self.depth_tested_count.min(vertex_count),
+            depth_tested_count: depth_tested_count.min(vertex_count),
         }))
     }
 }
@@ -795,11 +797,12 @@ mod tests {
     }
 
     /// `submit` lays the depth-tested range first then the on-top range and records the
-    /// split count, so one buffer drives both draws, and [`OverlayState::prepare`] grows +
-    /// uploads the per-frame buffer. Needs a device (the per-frame buffer is
+    /// split count, so one buffer drives both draws; [`OverlayState::take_draw`] grows +
+    /// uploads the per-frame buffer and drains the geometry, so the next render draws
+    /// nothing unless something submits for it. Needs a device (the per-frame buffer is
     /// VMA-allocated); skips when none is present.
     #[test]
-    fn submit_lays_depth_tested_first_then_uploads() {
+    fn submit_lays_depth_tested_first_then_take_draw_uploads_and_drains() {
         let device = match crate::device::Device::new(&crate::device::SurfaceSource::Offscreen) {
             Ok(device) => device,
             Err(err) => {
@@ -809,27 +812,29 @@ mod tests {
         };
         let before = crate::validation_issue_count();
         let mut state = OverlayState::new(device.resources());
-        assert!(!state.has_geometry());
         assert!(
-            state.prepare(0).expect("empty prepare").is_none(),
-            "no geometry → no draw"
+            state.take_draw(0).expect("empty take").is_none(),
+            "nothing submitted → no draw"
         );
 
         let depth = vec![OverlayVertex::default(); 3];
         let on_top = vec![OverlayVertex::default(); 6];
         state.submit(depth, on_top);
-        assert!(state.has_geometry());
         assert_eq!(state.depth_tested_count, 3);
         assert_eq!(state.vertices.len(), 9);
 
-        // Prepare grows + uploads the per-frame buffer and reports the two draw ranges.
-        let draw = state.prepare(0).expect("prepare").expect("draw");
+        // The take grows + uploads the per-frame buffer and reports the two draw ranges.
+        let draw = state.take_draw(0).expect("take_draw").expect("draw");
         assert_eq!(draw.vertex_count, 9);
         assert_eq!(draw.depth_tested_count, 3);
 
-        // An empty submit clears the geometry (the gate disarms the pass).
-        state.submit(Vec::new(), Vec::new());
-        assert!(!state.has_geometry());
+        // The geometry belonged to that one render: a second take draws nothing.
+        assert!(
+            state.take_draw(0).expect("second take").is_none(),
+            "the geometry is drained by the render that drew it"
+        );
+        assert!(state.vertices.is_empty());
+        assert_eq!(state.depth_tested_count, 0);
 
         // Drop the state (freeing its buffer) before the device, then idle + teardown.
         drop(state);

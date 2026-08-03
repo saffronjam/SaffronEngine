@@ -343,7 +343,10 @@ fn final_post_chain_tonemaps_composites_grid_and_overlay_validation_clean() {
     for _present_only in [false, true] {
         let mut overlay_state = OverlayState::new(device.resources());
         overlay_state.submit(Vec::new(), on_top.clone());
-        let draw = overlay_state.prepare(0).expect("prepare").expect("draw");
+        let draw = overlay_state
+            .take_draw(0)
+            .expect("take_draw")
+            .expect("draw");
 
         let pixels = render_post_chain_readback(
             &device,
@@ -1099,6 +1102,93 @@ fn present_blit_carries_a_non_blank_scene() {
         before,
         after,
         "the present blit must be validation-clean (saw {} new issue(s))",
+        after.saturating_sub(before)
+    );
+}
+
+/// The editor overlay belongs to the render it was submitted for. The host renders asset
+/// thumbnails through the same [`Renderer`] as the viewport — a `ViewId::Thumbnail` excursion that
+/// submits no overlay — so overlay geometry outliving its render would composite the viewport's
+/// gizmo into every thumbnail. A fully-covering red overlay is submitted for one render; the next
+/// render, on another view and with nothing submitted, must come back without it. Skips when no
+/// Vulkan device is obtainable.
+#[test]
+fn a_render_that_submits_no_overlay_draws_none() {
+    use crate::overlay::OverlayVertex;
+    use saffron_geometry::glam::{Mat4, Vec2, Vec3, Vec4};
+
+    let mut renderer = match Renderer::new(&SurfaceSource::Offscreen, 64, 64) {
+        Ok(renderer) => renderer,
+        Err(err) => {
+            eprintln!("skipping: no Vulkan device obtainable ({err})");
+            return;
+        }
+    };
+    let before = validation_issue_count();
+    renderer.set_viewport_desired_size(ViewId::Thumbnail, 64, 64);
+
+    // A full-viewport on-top quad in opaque red: wherever the overlay draws, it covers.
+    let red = Vec4::new(1.0, 0.0, 0.0, 1.0);
+    let quad = |x: f32, y: f32| OverlayVertex::new(Vec2::new(x, y), red, Vec4::ZERO, 0.0);
+    let gizmo = vec![
+        quad(-1.0, -1.0),
+        quad(1.0, -1.0),
+        quad(1.0, 1.0),
+        quad(-1.0, -1.0),
+        quad(1.0, 1.0),
+        quad(-1.0, 1.0),
+    ];
+
+    let proj = Mat4::perspective_rh(60.0_f32.to_radians(), 1.0, 0.1, 100.0);
+    let view = Mat4::look_at_rh(Vec3::new(0.0, 1.0, 4.0), Vec3::ZERO, Vec3::Y);
+    let render = |renderer: &mut Renderer| {
+        renderer.submit_sky(&SkyRenderSettings::default());
+        renderer
+            .set_scene_lighting(&SceneLighting::default())
+            .expect("set_scene_lighting");
+        renderer
+            .submit_gpu_scene_deformations(proj * view, &[], &[])
+            .expect("submit_gpu_scene_deformations");
+        renderer
+            .render_scene_offscreen()
+            .expect("render_scene_offscreen");
+    };
+    // Whether the active view's centre texel is the overlay's opaque red (the overlay blends at
+    // alpha 1, so a covered texel is exactly it and a sky texel never is).
+    let centre_is_overlay = |renderer: &mut Renderer| -> bool {
+        let (extent, format, pixels) = renderer
+            .read_active_offscreen()
+            .expect("offscreen read-back");
+        assert_eq!(format, crate::OFFSCREEN_COLOR_FORMAT, "RGBA16F halves");
+        let halves: &[u16] = bytemuck::cast_slice(&pixels);
+        let texel = ((extent.height / 2) * extent.width + extent.width / 2) as usize * 4;
+        halves[texel] == half_from_f32(1.0) && halves[texel + 1] == 0 && halves[texel + 2] == 0
+    };
+
+    renderer.submit_overlay(Vec::new(), gizmo);
+    render(&mut renderer);
+    assert!(
+        centre_is_overlay(&mut renderer),
+        "the render the overlay was submitted for draws it"
+    );
+
+    // The thumbnail excursion: a different view, a fresh render, no overlay submitted.
+    renderer.set_active_view(ViewId::Thumbnail);
+    render(&mut renderer);
+    assert!(
+        !centre_is_overlay(&mut renderer),
+        "a render that submits no overlay draws none — the thumbnail must not inherit the \
+         viewport's gizmo"
+    );
+
+    renderer.device().wait_idle().expect("idle before teardown");
+    drop(renderer);
+
+    let after = validation_issue_count();
+    assert_eq!(
+        before,
+        after,
+        "the overlay renders must be validation-clean (saw {} new issue(s))",
         after.saturating_sub(before)
     );
 }

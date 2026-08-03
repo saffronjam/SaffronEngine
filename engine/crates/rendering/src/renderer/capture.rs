@@ -299,7 +299,7 @@ impl Renderer {
     /// [`Renderer::capture_viewport`], which needs the unconverted halves for tonemap/clamp
     /// encoding. The device is idled first because an in-flight frame may still sample the
     /// offscreen; the image is left in `ShaderReadOnlyOptimal`.
-    fn read_active_offscreen(&mut self) -> Result<(vk::Extent2D, vk::Format, Vec<u8>)> {
+    pub(super) fn read_active_offscreen(&mut self) -> Result<(vk::Extent2D, vk::Format, Vec<u8>)> {
         let raw = self.device.raw();
         let view = &mut self.views[self.active_view.index()];
         let extent = view.offscreen.extent;
