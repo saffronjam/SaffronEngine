@@ -50,6 +50,19 @@ export const projectCommands = {
   rememberRecentProject(project: RecentProject): Promise<RecentProjects> {
     return invoke<RecentProjects>("remember_recent_project", { project });
   },
+  /// Hide: drop the row from the recents MRU; the project's files are untouched.
+  removeRecentProject(path: string): Promise<RecentProjects> {
+    return invoke<RecentProjects>("remove_recent_project", { path });
+  },
+  /// Delete the project's directory tree and its recents row. The shell fences this to projects
+  /// under the userdata root; anything else is refused.
+  deleteProject(path: string): Promise<RecentProjects> {
+    return invoke<RecentProjects>("delete_project", { path });
+  },
+  /// Whether `userdata/<name>` is free — the create form's collision probe.
+  projectNameAvailable(name: string): Promise<boolean> {
+    return invoke<boolean>("project_name_available", { name });
+  },
   loadEditorSettings(): Promise<EditorSettings> {
     return invoke<EditorSettings>("load_editor_settings");
   },

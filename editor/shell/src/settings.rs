@@ -53,6 +53,13 @@ pub fn write_settings(settings: &EditorSettings) -> Result<(), String> {
     fs::write(settings_path(), text).map_err(|err| format!("write editor settings: {err}"))
 }
 
+/// Drop the recents row whose `path` matches. Returns whether a row was removed.
+pub fn remove_recent(recents: &mut RecentProjects, path: &str) -> bool {
+    let before = recents.projects.len();
+    recents.projects.retain(|project| project.path != path);
+    recents.projects.len() != before
+}
+
 pub fn read_recents() -> RecentProjects {
     let Ok(text) = fs::read_to_string(recents_path()) else {
         return RecentProjects::default();
