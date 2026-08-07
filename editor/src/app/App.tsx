@@ -8,7 +8,8 @@
 import { useEffect, useRef, useState } from "react";
 import { X } from "lucide-react";
 import { getCurrentWindow, listen, type UnlistenFn } from "../shell";
-import { client } from "../control/client";
+import { client, type SessionExited } from "../control/client";
+import { errorText, notifyError } from "../lib/flash";
 import { loadEditorSettings, startReconcile, useEditorStore } from "../state/store";
 import type { AssetEntry } from "../protocol";
 import { Topbar } from "../panels/Topbar";
@@ -21,7 +22,7 @@ import { useVegetationShortcuts } from "./useVegetationShortcuts";
 import { useMouseBindings } from "./useMouseBindings";
 import { useFocusPolicy } from "./useFocusPolicy";
 import { TooltipProvider } from "@/components/ui/tooltip";
-import { ProjectStartupModal } from "./ProjectStartupModal";
+import { Launcher } from "../launcher/Launcher";
 import { useProjectLoadPoll } from "./useProjectLoadPoll";
 import { SettingsModal } from "./SettingsModal";
 import { ExportModal } from "./ExportModal";
@@ -43,6 +44,8 @@ type EnginePhaseEvent = "starting" | "attaching";
 
 let didRevealWindow = false;
 let revealWindowPromise: Promise<void> | null = null;
+// One session-bootstrap decision per app run (StrictMode double-mounts effects in dev).
+let didBootstrapSession = false;
 
 function revealEditorWindow(): Promise<void> {
   if (revealWindowPromise === null) {
@@ -110,8 +113,6 @@ export function App() {
     }
   }, [activeKind, activeAssetEditorId, mountedAssetId, mountedAssetTabExists]);
   const [revealed, setRevealed] = useState(didRevealWindow);
-  const projectModalOpen = useEditorStore((s) => s.projectModalOpen);
-  const setProjectModalOpen = useEditorStore((s) => s.setProjectModalOpen);
   const sceneTabActive = activeViewTabId === "scene";
   // viewportHidden is the MODAL-only global hide (the startup / asset-image modals set it via the store).
   // Per-view park is derived from the active tab: each view's own surface is parked unless its tab is the
@@ -173,12 +174,32 @@ export function App() {
       const offError = await listen<string>("viewport-error", (event) => {
         setPhase("error", event.payload);
       });
+      // The session watcher reports every host exit; a requested stop (`session_stop`) is not an
+      // error, an unrequested one lands on the launcher's crash card. The dead session's editor
+      // state is unusable, so the project resets with it.
+      const offExited = await listen<SessionExited>("session-exited", (event) => {
+        const { code, expected, logTail } = event.payload;
+        if (expected) {
+          return;
+        }
+        const store = useEditorStore.getState();
+        store.setSessionCrash({
+          code,
+          logTail,
+          projectPath: store.project?.path ?? null,
+        });
+        store.setProject(null);
+        store.resetSceneState();
+        store.setPhase("idle");
+        store.setProjectLoad({ phase: "idle" });
+      });
       if (disposed) {
         offPhase();
         offError();
+        offExited();
         return;
       }
-      unlisteners.push(offPhase, offError);
+      unlisteners.push(offPhase, offError, offExited);
     };
 
     void register();
@@ -189,6 +210,38 @@ export function App() {
         off();
       }
     };
+  }, [setPhase]);
+
+  // The one session-bootstrap decision: an environment-named project (`SAFFRON_PROJECT` /
+  // `SAFFRON_SCRATCH_PROJECT`) starts its session immediately; otherwise the launcher (already
+  // showing — no project is loaded) waits for a pick. No host process exists until one of the two.
+  useEffect(() => {
+    if (didBootstrapSession) {
+      return;
+    }
+    didBootstrapSession = true;
+    void (async () => {
+      try {
+        const info = await client.appDataInfo();
+        if (info.envProject || info.scratchProject) {
+          // Show the boot card immediately (indeterminate until the status poll takes over).
+          useEditorStore.getState().setProjectLoad({
+            phase: "loading",
+            stage: "",
+            done: 0,
+            total: 0,
+            label: "",
+            currentItem: "",
+            error: undefined,
+            finalizing: false,
+          });
+          await client.sessionStart({});
+          setPhase("attaching");
+        }
+      } catch (err) {
+        notifyError(errorText(err));
+      }
+    })();
   }, [setPhase]);
 
   // Start the focus-gated reconcile poll once; it self-gates on phase === 'ready'.
@@ -296,23 +349,21 @@ export function App() {
     let cancelled = false;
     const syncProject = async (): Promise<void> => {
       try {
-        const [info, project] = await Promise.all([client.appDataInfo(), client.getProject()]);
-        if (cancelled) {
-          return;
-        }
-        setProject(project.loaded ? project : null);
-        setProjectModalOpen(!project.loaded && !info.envProject && !info.scratchProject);
-      } catch {
+        const project = await client.getProject();
         if (!cancelled) {
-          setProjectModalOpen(false);
+          // The launcher derives its own visibility from a `null` project, so nothing else
+          // needs flipping here.
+          setProject(project.loaded ? project : null);
         }
+      } catch {
+        // Transient (engine briefly busy); the load poll owns adoption anyway.
       }
     };
     void syncProject();
     return () => {
       cancelled = true;
     };
-  }, [phase, setProject, setProjectModalOpen]);
+  }, [phase, setProject]);
 
   // Push the full per-view state to the engine, gated on the control socket being up (phase === 'ready')
   // — the startup push must not fire before the engine answers (the calls would silently fail and never
@@ -437,7 +488,7 @@ export function App() {
             />
           </div>
         )}
-        <ProjectStartupModal open={projectModalOpen} />
+        <Launcher />
         <SettingsModal />
         <ExportModal />
         <Toaster />

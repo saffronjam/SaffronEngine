@@ -39,7 +39,7 @@ export function ProjectMenu() {
   const nativeDialogOpen = useEditorStore((s) => s.nativeDialogOpen);
   const devMode = useEditorStore((s) => s.devMode);
   const playState = useEditorStore((s) => s.playState);
-  const setProjectModalOpen = useEditorStore((s) => s.setProjectModalOpen);
+  const setLauncherOpen = useEditorStore((s) => s.setLauncherOpen);
   const setExportModalOpen = useEditorStore((s) => s.setExportModalOpen);
   const [recents, setRecents] = useState<RecentProject[]>([]);
 
@@ -50,10 +50,10 @@ export function ProjectMenu() {
   const editing = playState === "edit";
   const label = project?.displayName ?? "No project";
 
-  // "New Project" reuses the startup project picker (the one create/open flow); it is dismissable
+  // "New Project" reuses the launcher picker (the one create/open flow); it is dismissable
   // because a project is already loaded.
   const newProject = (): void => {
-    setProjectModalOpen(true);
+    setLauncherOpen(true);
   };
 
   // "Exit" closes the window; the shell's exit handler tears the engine down — the same path

@@ -1,7 +1,7 @@
 import { describe, expect, test } from "bun:test";
-import { validProjectName } from "./ProjectStartupModal";
+import { deriveProjectSlug, validProjectName } from "./projectName";
 
-// The naming contract (ProjectStartupModal.tsx):
+// The naming contract (projectName.ts):
 //   length must be 1..=63, and the whole string must match
 //   /^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?$/ — i.e. lowercase letters, digits, and
 //   hyphens, starting and ending with a letter or digit.
@@ -158,5 +158,64 @@ describe("validProjectName — rejected by disallowed characters", () => {
   test("non-ASCII letters", () => {
     expect(validProjectName("café")).toBe(false);
     expect(validProjectName("naïve")).toBe(false);
+  });
+});
+
+describe("deriveProjectSlug — plain names", () => {
+  test("lowercases and hyphenates spaces", () => {
+    expect(deriveProjectSlug("My Project")).toBe("my-project");
+    expect(deriveProjectSlug("A Name Like This")).toBe("a-name-like-this");
+  });
+  test("passes through an already-valid slug", () => {
+    expect(deriveProjectSlug("my-project")).toBe("my-project");
+    expect(deriveProjectSlug("level2")).toBe("level2");
+  });
+  test("hyphenates underscores and collapses runs", () => {
+    expect(deriveProjectSlug("my_cool__project")).toBe("my-cool-project");
+    expect(deriveProjectSlug("a  -  b")).toBe("a-b");
+  });
+});
+
+describe("deriveProjectSlug — junk stripping", () => {
+  test("drops symbols and punctuation", () => {
+    expect(deriveProjectSlug("Shooter! (2026)")).toBe("shooter-2026");
+    expect(deriveProjectSlug("name.json")).toBe("namejson");
+  });
+  test("drops non-ascii letters", () => {
+    expect(deriveProjectSlug("café naïve")).toBe("caf-nave");
+  });
+  test("trims junk edges", () => {
+    expect(deriveProjectSlug("  --My Project--  ")).toBe("my-project");
+  });
+  test("returns empty when nothing survives", () => {
+    expect(deriveProjectSlug("")).toBe("");
+    expect(deriveProjectSlug("!!! ???")).toBe("");
+    expect(deriveProjectSlug("---")).toBe("");
+    expect(deriveProjectSlug("日本語")).toBe("");
+  });
+});
+
+describe("deriveProjectSlug — always yields a valid name or nothing", () => {
+  test("clamps to 63 chars without a trailing hyphen", () => {
+    const long = deriveProjectSlug(`${"a".repeat(62)} b c`);
+    expect(long.length).toBeLessThanOrEqual(63);
+    expect(validProjectName(long)).toBe(true);
+  });
+  test("every non-empty derivation validates", () => {
+    const inputs = [
+      "My Project",
+      "  weird -- Name_here (v2) ",
+      "UPPER",
+      "7 dwarfs",
+      "a".repeat(200),
+      "x!y@z#",
+      "- leading trailing -",
+    ];
+    for (const input of inputs) {
+      const slug = deriveProjectSlug(input);
+      if (slug.length > 0) {
+        expect(validProjectName(slug)).toBe(true);
+      }
+    }
   });
 });

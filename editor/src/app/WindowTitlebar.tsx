@@ -26,7 +26,6 @@ import { Button } from "@/components/ui/button";
 const appWindow = getCurrentWindow();
 
 export function WindowTitlebar() {
-  const [maximized, setMaximized] = useState(false);
   const tabs = useEditorStore((s) => s.viewTabs);
   const activeTabId = useEditorStore((s) => s.activeViewTabId);
   const setActiveViewTab = useEditorStore((s) => s.setActiveViewTab);
@@ -36,40 +35,6 @@ export function WindowTitlebar() {
 
   // Drop the hovered-tab target when the strip unmounts so a stale id never lingers.
   useEffect(() => () => setHoveredTabId(null), [setHoveredTabId]);
-
-  useEffect(() => {
-    let cancelled = false;
-
-    const syncMaximized = async (): Promise<void> => {
-      const nextMaximized = await appWindow.isMaximized();
-      if (!cancelled) {
-        setMaximized(nextMaximized);
-      }
-    };
-
-    void syncMaximized();
-    const unlisten = appWindow.onResized(() => {
-      void syncMaximized();
-    });
-
-    return () => {
-      cancelled = true;
-      void unlisten.then((off) => off());
-    };
-  }, []);
-
-  const minimize = (): void => {
-    void appWindow.minimize();
-  };
-
-  const toggleMaximize = async (): Promise<void> => {
-    await appWindow.toggleMaximize();
-    setMaximized(await appWindow.isMaximized());
-  };
-
-  const close = (): void => {
-    void appWindow.close();
-  };
 
   const items = tabs.map((tab) => ({
     id: tab.id,
@@ -104,21 +69,59 @@ export function WindowTitlebar() {
       {/* The window controls are drawn here only where the window has no native ones. */}
       {!IS_MACOS && (
         <div className="flex w-33 flex-none justify-end" style={NO_DRAG_REGION}>
-          <TitlebarButton label="Minimize" onClick={minimize}>
-            <Minus />
-          </TitlebarButton>
-          <TitlebarButton
-            label={maximized ? "Restore" : "Maximize"}
-            onClick={() => void toggleMaximize()}
-          >
-            {maximized ? <Square /> : <Maximize2 />}
-          </TitlebarButton>
-          <TitlebarButton label="Close" onClick={close} variant="close">
-            <X />
-          </TitlebarButton>
+          <WindowControls />
         </div>
       )}
     </header>
+  );
+}
+
+/// The minimize / maximize-restore / close buttons with the maximized-state sync — shared by the
+/// editor titlebar and the launcher's, so both bars look and behave identically.
+export function WindowControls() {
+  const [maximized, setMaximized] = useState(false);
+
+  useEffect(() => {
+    let cancelled = false;
+
+    const syncMaximized = async (): Promise<void> => {
+      const nextMaximized = await appWindow.isMaximized();
+      if (!cancelled) {
+        setMaximized(nextMaximized);
+      }
+    };
+
+    void syncMaximized();
+    const unlisten = appWindow.onResized(() => {
+      void syncMaximized();
+    });
+
+    return () => {
+      cancelled = true;
+      void unlisten.then((off) => off());
+    };
+  }, []);
+
+  const toggleMaximize = async (): Promise<void> => {
+    await appWindow.toggleMaximize();
+    setMaximized(await appWindow.isMaximized());
+  };
+
+  return (
+    <>
+      <TitlebarButton label="Minimize" onClick={() => void appWindow.minimize()}>
+        <Minus />
+      </TitlebarButton>
+      <TitlebarButton
+        label={maximized ? "Restore" : "Maximize"}
+        onClick={() => void toggleMaximize()}
+      >
+        {maximized ? <Square /> : <Maximize2 />}
+      </TitlebarButton>
+      <TitlebarButton label="Close" onClick={() => void appWindow.close()} variant="close">
+        <X />
+      </TitlebarButton>
+    </>
   );
 }
 
