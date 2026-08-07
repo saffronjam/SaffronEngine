@@ -102,13 +102,17 @@ The macOS editor runs from an `.app` bundle. Its `Contents/Frameworks` directory
 
 ## Startup and recovery
 
-The shell installs the UI compositor and both viewport presenters when the toplevel resumes. Each presenter retries its shared-memory open until the host creates the segment. The shell spawns no host of its own: the frontend starts a project session (`session_start`) when a project is picked or when the environment names one, passing the project as the child's boot intent (`SAFFRON_PROJECT`, plus `SAFFRON_PROJECT_DISPLAY_NAME` for a created project). `start_session` arms a per-session watcher that reports startup failure and any exit — `session-exited` carries the exit code, whether the stop was requested, and the tail of the host log — while success remains owned by the frontend probe.
+The shell installs the UI compositor and both viewport presenters when the toplevel resumes. Each presenter retries its shared-memory open until the host creates the segment. The shell spawns no host of its own: the frontend starts a project session (`session_start`) when a project is picked or when the environment names one, passing the project as the child's boot intent (`SAFFRON_PROJECT`, plus `SAFFRON_PROJECT_DISPLAY_NAME` for a created project).
+
+`start_session` arms a per-session watcher that reports startup failure and any exit. The `session-exited` event carries the exit code, whether the stop was requested, and the tail of the host log; success remains owned by the frontend probe.
+
+Before a session exists, the launcher view owns the screen: an opaque surface with one centered card for picking a recent project, opening a `project.json`, or creating a project. Creation takes a display name and derives the on-disk folder name from it (`deriveProjectSlug`, previewed live with a collision probe); recents are a bounded most-recently-used list in editor appdata, where Hide drops a row and Delete removes the project from disk. Deletion is fenced to the userdata root — the shell refuses any path outside it (`resolve_project_delete_target`).
 
 `ViewportPanel` polls `viewport-native-info` with a 1.5-second per-attempt timeout and 150-millisecond retries. A successful reply changes the engine phase to `ready`. `LoadingOverlay` stays opaque over the viewport for every other phase, so an absent first frame never exposes the desktop through the transparent region. The `idle` phase means no session exists; a session start flips it to `attaching` once the child is spawned.
 
 The reconcile service checks `session_status` once per second while the editor is focused and a session may be live. `child_alive` uses `Child::try_wait`, which distinguishes a running child from an exited process. Failure changes the phase to `error` and restores the loading overlay.
 
-Retry starts a fresh session for the current project and returns to attachment probing. Restart first stops the session — `quit`, force-terminate any remaining child, remove the socket and both shared-memory names — then starts a fresh one.
+Retry starts a fresh session for the current project and returns to attachment probing. Restart first stops the session (quit, force-terminate any remaining child, remove the socket and both shared-memory names), then starts a fresh one.
 
 ## In the code
 

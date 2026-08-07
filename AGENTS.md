@@ -172,8 +172,10 @@ cargo run -p xtask -- shaders    # compile engine/assets/shaders/*.slang → SPI
   drives it over the control plane (typed via `@saffron/protocol`), asserting responses and a
   validation-clean log. It is the language-appropriate place for engine behaviour tests: the wire is
   JSON, so the driver need not be Rust.
-- Convenience recipes (all auto-enter the toolbox; `just help` lists them): `just run` starts the
-  editor, which spawns the host; `just run-engine` starts only the present-only host; `just run-docs`
+- Convenience recipes (all auto-enter the toolbox; `just help` lists them): `just run [project]`
+  starts the editor — the shell spawns the host as a per-project session when a project is picked,
+  and a project name/path argument boots straight into it (an unresolvable name opens the picker);
+  `just run-engine` starts only the present-only host; `just run-docs`
   serves the Hugo site. `just format` runs `cargo fmt` over the workspace and oxfmt over every
   `.ts`/`.tsx` in the tree; `just lint` runs `cargo fmt --check` + `cargo clippy --workspace -- -D
   warnings` + `oxfmt --check` + `oxlint --deny-warnings` over the same set; `just prepare-for-commit`
