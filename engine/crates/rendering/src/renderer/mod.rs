@@ -649,8 +649,8 @@ pub struct Renderer {
     gi_view: Option<crate::SceneVisibilityView>,
     /// The reach view's counters from the latest completed frame.
     gi_visibility_counters: [u32; crate::SCENE_VISIBILITY_COUNTER_WORDS as usize],
-    /// The dirty pages this frame rasterizes.
-    vsm_render_pages: Vec<crate::VsmRenderPage>,
+    /// The dirty pages and punctual blocks this frame rasterizes.
+    vsm_render_list: crate::VsmRenderList,
     /// The frame's directional virtual-shadow space.
     vsm_space: crate::VsmDirectionalSpace,
     /// The GPU receiver-demand apparatus (bitmap + request rings + layouts).

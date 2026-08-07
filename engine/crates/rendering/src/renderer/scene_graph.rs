@@ -241,8 +241,8 @@ impl Renderer {
             .iter()
             .filter(|(_, blend, _)| !*blend)
             .count() as u32;
-        let shadow_passes = u32::try_from(self.vsm_render_pages.len()).unwrap_or(u32::MAX);
-        self.stats.shadow_draw_calls = shadow_passes.saturating_mul(non_blend_buckets);
+        let shadow_draw_sets = u32::try_from(self.vsm_render_list.draw_sets()).unwrap_or(u32::MAX);
+        self.stats.shadow_draw_calls = shadow_draw_sets.saturating_mul(non_blend_buckets);
         let ibl_live = self.scene_ibl_mut().add_live_capture_passes(&mut graph);
         let ddgi_sh = if self.active_view == ViewId::Thumbnail {
             graph.import_buffer(self.ibl.sh_coefficients().handle(), None)

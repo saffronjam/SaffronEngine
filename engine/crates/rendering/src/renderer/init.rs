@@ -587,7 +587,7 @@ impl Renderer {
                 .collect(),
             gi_view: None,
             gi_visibility_counters: [0; crate::SCENE_VISIBILITY_COUNTER_WORDS as usize],
-            vsm_render_pages: Vec::new(),
+            vsm_render_list: crate::VsmRenderList::default(),
             vsm_space: crate::VsmDirectionalSpace::build(
                 saffron_geometry::glam::Vec3::NEG_Y,
                 saffron_geometry::glam::Vec3::ZERO,

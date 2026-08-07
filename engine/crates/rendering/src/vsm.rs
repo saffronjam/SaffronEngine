@@ -53,6 +53,42 @@ pub const VSM_POINT_FACES: u32 = 6;
 /// face `f` occupies the 64 entries at `base + f * 64`.
 pub const VSM_POINT_TABLE_BASE: u32 = VSM_SPOT_TABLE_BASE + VSM_SPOT_PAGES * VSM_SPOT_PAGES;
 
+/// Tile column/row of the spot space's fixed atlas block.
+///
+/// The punctual spaces are only ever demanded, dirtied, rendered, and published as whole
+/// grids, so each owns a fixed contiguous block of atlas tiles: a dirty space rasterizes as
+/// ONE viewport-sized draw over its block instead of one cropped draw per page, and the page
+/// table maps its pages into the block arithmetically.
+pub const VSM_SPOT_BLOCK_TILE: [u32; 2] = [0, 16];
+/// Tile column/row of each point cube face's fixed atlas block.
+pub const VSM_POINT_FACE_BLOCK_TILES: [[u32; 2]; VSM_POINT_FACES as usize] =
+    [[16, 16], [24, 16], [16, 24], [24, 24], [16, 8], [24, 8]];
+
+/// The physical tile of spot page `(x, y)` inside the spot block.
+#[must_use]
+pub fn vsm_spot_page_tile(x: u32, y: u32) -> u32 {
+    (VSM_SPOT_BLOCK_TILE[1] + y) * VSM_ATLAS_TILES + VSM_SPOT_BLOCK_TILE[0] + x
+}
+
+/// The physical tile of point page `(x, y)` inside `face`'s block.
+#[must_use]
+pub fn vsm_point_page_tile(face: u32, x: u32, y: u32) -> u32 {
+    let block = VSM_POINT_FACE_BLOCK_TILES[face as usize];
+    (block[1] + y) * VSM_ATLAS_TILES + block[0] + x
+}
+
+/// Whether atlas tile `(x, y)` belongs to a punctual block (and is therefore
+/// outside the directional page pool).
+fn vsm_tile_in_punctual_block(x: u32, y: u32) -> bool {
+    let in_block = |base: [u32; 2], side: u32| {
+        x >= base[0] && x < base[0] + side && y >= base[1] && y < base[1] + side
+    };
+    in_block(VSM_SPOT_BLOCK_TILE, VSM_SPOT_PAGES)
+        || VSM_POINT_FACE_BLOCK_TILES
+            .iter()
+            .any(|&block| in_block(block, VSM_POINT_FACE_PAGES))
+}
+
 /// One logical shadow page.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum VsmPageKey {
@@ -132,18 +168,7 @@ pub enum VsmDirtyReason {
     Dynamic,
     /// A moved caster dirtied the cache.
     MovedCaster,
-    /// A small punctual-light transform changed while the page grid stayed coherent.
-    CoherentLightTransform,
     /// A punctual light transform changed while the page grid stayed resident.
-    LightTransform,
-}
-
-/// Source of a page-space invalidation.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum VsmInvalidationReason {
-    /// A snapped directional window moved.
-    DirectionalWindow,
-    /// The light transform or range changed.
     LightTransform,
 }
 
@@ -157,7 +182,7 @@ impl VsmPageKey {
     }
 }
 
-/// One resident page's state.
+/// One resident directional page's state.
 #[derive(Clone, Copy, Debug)]
 struct VsmPageState {
     /// Physical tile index (`y · tiles + x`).
@@ -166,8 +191,6 @@ struct VsmPageState {
     last_demand_frame: u64,
     /// Whether the tile's content must re-render this frame.
     dirty: bool,
-    /// Whether the last rendered contents remain table-publishable while dirty.
-    publish_while_dirty: bool,
     /// Whether the tile has ever rasterized: a never-rendered page (a hole) beats
     /// any refresh in the per-frame render budget.
     rendered: bool,
@@ -175,7 +198,28 @@ struct VsmPageState {
 
 impl VsmPageState {
     fn table_publishable(self) -> bool {
-        !self.dirty || self.publish_while_dirty
+        !self.dirty
+    }
+}
+
+/// One punctual space's state (the spot plane or one point cube face). Its tiles
+/// are the space's fixed atlas block, so residency is a single flag and the whole
+/// grid demands, dirties, renders, and publishes atomically.
+#[derive(Clone, Copy, Debug, Default)]
+struct VsmSpaceState {
+    /// Whether the space is demanded into the atlas.
+    resident: bool,
+    /// Frame serial of the latest demand.
+    last_demand_frame: u64,
+    /// Whether the block's content must re-render.
+    dirty: bool,
+    /// Whether the block has ever rasterized.
+    rendered: bool,
+}
+
+impl VsmSpaceState {
+    fn table_publishable(self) -> bool {
+        self.resident && self.rendered && !self.dirty
     }
 }
 
@@ -186,13 +230,41 @@ struct CoolingTile {
     evicted_frame: u64,
 }
 
-/// One page the frame must rasterize: its physical tile and logical identity.
+/// One directional page the frame must rasterize: its physical tile and logical identity.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct VsmRenderPage {
     /// The page.
     pub key: VsmPageKey,
     /// Physical tile index.
     pub tile: u32,
+}
+
+/// Everything the frame must rasterize into the atlas: budget-paced directional
+/// pages plus the punctual blocks (each an atomic single-draw unit).
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct VsmRenderList {
+    /// Dirty directional pages, each drawn into its own tile.
+    pub directional: Vec<VsmRenderPage>,
+    /// Whether the spot block redraws.
+    pub spot: bool,
+    /// Which point face blocks redraw.
+    pub point_faces: [bool; VSM_POINT_FACES as usize],
+}
+
+impl VsmRenderList {
+    /// Whether the frame rasterizes nothing into the atlas.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.directional.is_empty() && !self.spot && !self.point_faces.iter().any(|face| *face)
+    }
+
+    /// Recorded draw-set count: one per directional page plus one per dirty block.
+    #[must_use]
+    pub fn draw_sets(&self) -> usize {
+        self.directional.len()
+            + usize::from(self.spot)
+            + self.point_faces.iter().filter(|face| **face).count()
+    }
 }
 
 /// The packed page-table entry: tile index (10 bits) | resident flag (bit 31).
@@ -260,11 +332,14 @@ pub struct VsmCounters {
     pub invalidated_light_transform: u32,
 }
 
-/// The CPU residency authority over the physical atlas.
+/// The CPU residency authority over the physical atlas: a page pool for the
+/// directional levels plus one fixed block per punctual space.
 pub struct VsmResidency {
     pages: HashMap<VsmPageKey, VsmPageState>,
     free_tiles: Vec<u32>,
     cooling: Vec<CoolingTile>,
+    spot: VsmSpaceState,
+    point_faces: [VsmSpaceState; VSM_POINT_FACES as usize],
     frame_counters: VsmCounters,
     counters: VsmCounters,
 }
@@ -273,13 +348,25 @@ impl Default for VsmResidency {
     fn default() -> Self {
         Self {
             pages: HashMap::new(),
-            free_tiles: (0..VSM_ATLAS_TILES * VSM_ATLAS_TILES).rev().collect(),
+            free_tiles: (0..VSM_ATLAS_TILES * VSM_ATLAS_TILES)
+                .rev()
+                .filter(|tile| {
+                    !vsm_tile_in_punctual_block(tile % VSM_ATLAS_TILES, tile / VSM_ATLAS_TILES)
+                })
+                .collect(),
             cooling: Vec::new(),
+            spot: VsmSpaceState::default(),
+            point_faces: [VsmSpaceState::default(); VSM_POINT_FACES as usize],
             frame_counters: VsmCounters::default(),
             counters: VsmCounters::default(),
         }
     }
 }
+
+/// Spot-space page count (the block's atomic render/publish unit).
+const VSM_SPOT_AREA: u32 = VSM_SPOT_PAGES * VSM_SPOT_PAGES;
+/// Point-face page count (the block's atomic render/publish unit).
+const VSM_POINT_FACE_AREA: u32 = VSM_POINT_FACE_PAGES * VSM_POINT_FACE_PAGES;
 
 impl VsmResidency {
     /// Returns tiles whose cooldown elapsed to the free list, and publishes the
@@ -298,18 +385,20 @@ impl VsmResidency {
         }
     }
 
-    /// Demands `key` for `frame`: allocates a tile when absent (evicting the
-    /// least-recently-demanded page if the free list is dry), marks fresh pages
-    /// dirty, and returns the page's tile — or `None` when the atlas is fully
-    /// hot (every tile demanded this frame or cooling).
-    pub fn demand(&mut self, key: VsmPageKey, frame: u64, reason: VsmDemandReason) -> Option<u32> {
-        self.frame_counters.requested += 1;
-        self.family_counters_mut(key.family()).requested += 1;
-        match reason {
-            VsmDemandReason::Bootstrap => self.frame_counters.requested_bootstrap += 1,
-            VsmDemandReason::Projective => self.frame_counters.requested_projective += 1,
-            VsmDemandReason::Receiver => self.frame_counters.requested_receiver += 1,
-        }
+    /// Demands directional page `(level, x, y)` for `frame`: allocates a pool tile when absent
+    /// (evicting the least-recently-demanded page if the free list is dry), marks fresh pages
+    /// dirty, and returns the page's tile — or `None` when the pool is fully hot (every tile
+    /// demanded this frame or cooling).
+    pub fn demand_directional(
+        &mut self,
+        level: u32,
+        x: u32,
+        y: u32,
+        frame: u64,
+        reason: VsmDemandReason,
+    ) -> Option<u32> {
+        let key = VsmPageKey::Directional { level, x, y };
+        self.count_requested(VsmPageFamily::Directional, 1, reason);
         if let Some(state) = self.pages.get_mut(&key) {
             state.last_demand_frame = frame;
             let tile = state.tile;
@@ -355,146 +444,113 @@ impl VsmResidency {
                 tile,
                 last_demand_frame: frame,
                 dirty: true,
-                publish_while_dirty: false,
                 rendered: false,
             },
         );
         Some(tile)
     }
 
-    /// Demands every page in the spot light's virtual plane.
+    /// Demands the spot block (its whole grid, counted in page units).
     pub fn demand_spot_space(&mut self, frame: u64, reason: VsmDemandReason) {
-        for y in 0..VSM_SPOT_PAGES {
-            for x in 0..VSM_SPOT_PAGES {
-                let _ = self.demand(VsmPageKey::Spot { x, y }, frame, reason);
-            }
-        }
+        self.count_requested(VsmPageFamily::Spot, VSM_SPOT_AREA, reason);
+        Self::demand_space(
+            &mut self.spot,
+            &mut self.frame_counters,
+            VsmPageFamily::Spot,
+            VSM_SPOT_AREA,
+            frame,
+        );
     }
 
-    /// Demands every page in one point-light cube face.
+    /// Demands one point cube face's block (its whole grid, counted in page units).
     pub fn demand_point_face(&mut self, face: u32, frame: u64, reason: VsmDemandReason) {
         if face >= VSM_POINT_FACES {
             return;
         }
-        for y in 0..VSM_POINT_FACE_PAGES {
-            for x in 0..VSM_POINT_FACE_PAGES {
-                let _ = self.demand(VsmPageKey::PointFace { face, x, y }, frame, reason);
-            }
+        self.count_requested(VsmPageFamily::Point, VSM_POINT_FACE_AREA, reason);
+        Self::demand_space(
+            &mut self.point_faces[face as usize],
+            &mut self.frame_counters,
+            VsmPageFamily::Point,
+            VSM_POINT_FACE_AREA,
+            frame,
+        );
+    }
+
+    fn demand_space(
+        state: &mut VsmSpaceState,
+        counters: &mut VsmCounters,
+        family: VsmPageFamily,
+        area: u32,
+        frame: u64,
+    ) {
+        state.last_demand_frame = frame;
+        let family_counters = match family {
+            VsmPageFamily::Directional => &mut counters.directional,
+            VsmPageFamily::Spot => &mut counters.spot,
+            VsmPageFamily::Point => &mut counters.point,
+        };
+        if state.resident {
+            counters.hits += area;
+            family_counters.hits += area;
+        } else {
+            state.resident = true;
+            state.dirty = true;
+            state.rendered = false;
+            counters.allocated += area;
+            family_counters.allocated += area;
         }
     }
 
-    /// Marks a resident page dirty (its casters moved or its window shifted).
+    fn count_requested(&mut self, family: VsmPageFamily, area: u32, reason: VsmDemandReason) {
+        self.frame_counters.requested += area;
+        self.family_counters_mut(family).requested += area;
+        match reason {
+            VsmDemandReason::Bootstrap => self.frame_counters.requested_bootstrap += area,
+            VsmDemandReason::Projective => self.frame_counters.requested_projective += area,
+            VsmDemandReason::Receiver => self.frame_counters.requested_receiver += area,
+        }
+    }
+
+    /// Marks a resident directional page dirty (its casters moved or its window shifted).
     pub fn mark_dirty(&mut self, key: VsmPageKey, reason: VsmDirtyReason) {
+        debug_assert!(
+            matches!(key, VsmPageKey::Directional { .. }),
+            "punctual spaces dirty as whole blocks"
+        );
         if let Some(state) = self.pages.get_mut(&key) {
             if state.dirty {
                 return;
             }
             state.dirty = true;
-            state.publish_while_dirty = matches!(reason, VsmDirtyReason::CoherentLightTransform);
-            self.frame_counters.dirtied += 1;
-            self.family_counters_mut(key.family()).dirtied += 1;
-            match reason {
-                VsmDirtyReason::Restaged => self.frame_counters.dirtied_restaged += 1,
-                VsmDirtyReason::Dynamic
-                | VsmDirtyReason::CoherentLightTransform
-                | VsmDirtyReason::LightTransform => {
-                    self.frame_counters.dirtied_dynamic += 1;
-                }
-                VsmDirtyReason::MovedCaster => self.frame_counters.dirtied_moved += 1,
+            self.count_dirtied(key.family(), 1, reason);
+        }
+    }
+
+    fn count_dirtied(&mut self, family: VsmPageFamily, area: u32, reason: VsmDirtyReason) {
+        self.frame_counters.dirtied += area;
+        self.family_counters_mut(family).dirtied += area;
+        match reason {
+            VsmDirtyReason::Restaged => self.frame_counters.dirtied_restaged += area,
+            VsmDirtyReason::Dynamic | VsmDirtyReason::LightTransform => {
+                self.frame_counters.dirtied_dynamic += area;
             }
+            VsmDirtyReason::MovedCaster => self.frame_counters.dirtied_moved += area,
         }
     }
 
     /// Drops every resident directional page of `level` (the snapped window moved).
     pub fn invalidate_directional_level(&mut self, level: u32, frame: u64) {
-        self.invalidate_matching(
-            frame,
-            VsmInvalidationReason::DirectionalWindow,
-            |key| matches!(key, VsmPageKey::Directional { level: l, .. } if *l == level),
-        );
-    }
-
-    /// Drops every resident spot page (the spot's transform changed).
-    pub fn invalidate_spot(&mut self, frame: u64) {
-        self.invalidate_matching(frame, VsmInvalidationReason::LightTransform, |key| {
-            matches!(key, VsmPageKey::Spot { .. })
-        });
-    }
-
-    /// Invalidates every point-face page (the light moved or its range changed:
-    /// all six projective spaces are stale).
-    pub fn invalidate_point(&mut self, frame: u64) {
-        self.invalidate_matching(frame, VsmInvalidationReason::LightTransform, |key| {
-            matches!(key, VsmPageKey::PointFace { .. })
-        });
-    }
-
-    /// Re-dirties every resident page whose texels can resolve continuous motion:
-    /// directional levels up to `max_directional_level` plus the spot and point
-    /// spaces (their ranges sit close to the action). The per-frame render budget
-    /// paces the resulting refresh churn; static pages on coarser levels stay
-    /// cached.
-    pub fn mark_dynamic_dirty(&mut self, max_directional_level: u32) {
-        let mut dirty = Vec::new();
-        for (key, state) in &mut self.pages {
-            let dynamic = match key {
-                VsmPageKey::Directional { level, .. } => *level <= max_directional_level,
-                VsmPageKey::Spot { .. } | VsmPageKey::PointFace { .. } => true,
-            };
-            if dynamic && !state.dirty {
-                dirty.push(*key);
-            }
-        }
-        for key in dirty {
-            self.mark_dirty(key, VsmDirtyReason::Dynamic);
-        }
-    }
-
-    /// Marks every resident spot page dirty.
-    pub fn mark_spot_dirty(&mut self, reason: VsmDirtyReason) {
-        self.mark_family_dirty(VsmPageFamily::Spot, reason);
-    }
-
-    /// Marks every resident point-face page dirty.
-    pub fn mark_point_dirty(&mut self, reason: VsmDirtyReason) {
-        self.mark_family_dirty(VsmPageFamily::Point, reason);
-    }
-
-    fn mark_family_dirty(&mut self, family: VsmPageFamily, reason: VsmDirtyReason) {
-        let dirty: Vec<VsmPageKey> = self
-            .pages
-            .iter()
-            .filter(|(key, state)| key.family() == family && !state.dirty)
-            .map(|(key, _)| *key)
-            .collect();
-        for key in dirty {
-            self.mark_dirty(key, reason);
-        }
-    }
-
-    fn invalidate_matching(
-        &mut self,
-        frame: u64,
-        reason: VsmInvalidationReason,
-        matches: impl Fn(&VsmPageKey) -> bool,
-    ) {
         let stale: Vec<VsmPageKey> = self
             .pages
             .keys()
-            .filter(|key| matches(key))
+            .filter(|key| matches!(key, VsmPageKey::Directional { level: l, .. } if *l == level))
             .copied()
             .collect();
         for key in stale {
             let state = self.pages.remove(&key).expect("stale page exists");
-            self.family_counters_mut(key.family()).invalidated += 1;
-            match reason {
-                VsmInvalidationReason::DirectionalWindow => {
-                    self.frame_counters.invalidated_directional_window += 1;
-                }
-                VsmInvalidationReason::LightTransform => {
-                    self.frame_counters.invalidated_light_transform += 1;
-                }
-            }
+            self.frame_counters.directional.invalidated += 1;
+            self.frame_counters.invalidated_directional_window += 1;
             self.cooling.push(CoolingTile {
                 tile: state.tile,
                 evicted_frame: frame,
@@ -502,88 +558,128 @@ impl VsmResidency {
         }
     }
 
-    /// The pages to rasterize this frame (dirty ones), clearing their dirty bits.
-    pub fn take_render_pages(&mut self, budget: usize) -> Vec<VsmRenderPage> {
-        self.take_render_pages_prioritizing_point_faces(budget, [false; VSM_POINT_FACES as usize])
+    /// Drops the spot block's residency (the spot's transform changed).
+    pub fn invalidate_spot(&mut self, _frame: u64) {
+        if std::mem::take(&mut self.spot).resident {
+            self.frame_counters.spot.invalidated += VSM_SPOT_AREA;
+            self.frame_counters.invalidated_light_transform += VSM_SPOT_AREA;
+        }
     }
 
-    /// The pages to rasterize this frame, prioritizing point faces receivers sampled recently.
-    pub fn take_render_pages_prioritizing_point_faces(
-        &mut self,
-        budget: usize,
-        point_face_priority: [bool; VSM_POINT_FACES as usize],
-    ) -> Vec<VsmRenderPage> {
-        let mut render = Vec::new();
-        self.take_complete_point_faces(&mut render, budget, point_face_priority);
-        // Holes first: a dirty page that never rasterized samples as unshadowed,
-        // while a re-dirtied page still holds usable last content.
+    /// Drops every point face block's residency (the light moved or its range
+    /// changed: all six projective spaces are stale).
+    pub fn invalidate_point(&mut self, _frame: u64) {
+        for face in &mut self.point_faces {
+            if std::mem::take(face).resident {
+                self.frame_counters.point.invalidated += VSM_POINT_FACE_AREA;
+                self.frame_counters.invalidated_light_transform += VSM_POINT_FACE_AREA;
+            }
+        }
+    }
+
+    /// Re-dirties every resident page whose texels can resolve continuous motion:
+    /// directional levels up to `max_directional_level` plus the spot and point
+    /// spaces (their ranges sit close to the action). The per-frame render budget
+    /// paces the directional refresh churn; static pages on coarser levels stay
+    /// cached.
+    pub fn mark_dynamic_dirty(&mut self, max_directional_level: u32) {
+        let mut dirty = Vec::new();
+        for (key, state) in &self.pages {
+            if let VsmPageKey::Directional { level, .. } = key
+                && *level <= max_directional_level
+                && !state.dirty
+            {
+                dirty.push(*key);
+            }
+        }
+        for key in dirty {
+            self.mark_dirty(key, VsmDirtyReason::Dynamic);
+        }
+        self.mark_spot_dirty(VsmDirtyReason::Dynamic);
+        self.mark_point_dirty(VsmDirtyReason::Dynamic);
+    }
+
+    /// Marks the resident spot block dirty.
+    pub fn mark_spot_dirty(&mut self, reason: VsmDirtyReason) {
+        if self.spot.resident && !self.spot.dirty {
+            self.spot.dirty = true;
+            self.count_dirtied(VsmPageFamily::Spot, VSM_SPOT_AREA, reason);
+        }
+    }
+
+    /// Marks every resident point face block dirty.
+    pub fn mark_point_dirty(&mut self, reason: VsmDirtyReason) {
+        for face in 0..VSM_POINT_FACES {
+            self.mark_point_face_dirty(face, reason);
+        }
+    }
+
+    /// Marks one resident point face block dirty.
+    pub fn mark_point_face_dirty(&mut self, face: u32, reason: VsmDirtyReason) {
+        let Some(state) = self.point_faces.get_mut(face as usize) else {
+            return;
+        };
+        if state.resident && !state.dirty {
+            state.dirty = true;
+            self.count_dirtied(VsmPageFamily::Point, VSM_POINT_FACE_AREA, reason);
+        }
+    }
+
+    /// Point faces that receivers sampled recently.
+    pub fn recent_point_faces(&self, frame: u64, max_age: u64) -> [bool; VSM_POINT_FACES as usize] {
+        std::array::from_fn(|face| {
+            let state = self.point_faces[face];
+            state.resident
+                && state.rendered
+                && frame.saturating_sub(state.last_demand_frame) <= max_age
+        })
+    }
+
+    /// The work to rasterize this frame, clearing the taken dirty bits.
+    ///
+    /// A dirty punctual block renders only when it was demanded THIS frame (`frame` equals its
+    /// latest demand serial): an off-screen face stays dirty-and-withheld instead of burning a
+    /// redraw nothing samples. Blocks are atomic single-draw units, so the page budget paces only
+    /// the directional pages — holes (never-rendered pages) drain before refreshes, since a hole
+    /// samples as unshadowed while a re-dirtied page still holds usable last content.
+    pub fn take_render_list(&mut self, frame: u64, budget: usize) -> VsmRenderList {
+        let mut list = VsmRenderList::default();
+        if self.spot.resident && self.spot.dirty && self.spot.last_demand_frame == frame {
+            self.spot.dirty = false;
+            self.spot.rendered = true;
+            list.spot = true;
+            self.frame_counters.rendered += VSM_SPOT_AREA;
+            self.frame_counters.spot.rendered += VSM_SPOT_AREA;
+        }
+        for face in 0..VSM_POINT_FACES as usize {
+            let state = &mut self.point_faces[face];
+            if state.resident && state.dirty && state.last_demand_frame == frame {
+                state.dirty = false;
+                state.rendered = true;
+                list.point_faces[face] = true;
+                self.frame_counters.rendered += VSM_POINT_FACE_AREA;
+                self.frame_counters.point.rendered += VSM_POINT_FACE_AREA;
+            }
+        }
         for fresh_pass in [true, false] {
             for (key, state) in &mut self.pages {
-                if render.len() >= budget {
+                if list.directional.len() >= budget {
                     break;
                 }
                 if state.dirty && state.rendered != fresh_pass {
                     state.dirty = false;
-                    state.publish_while_dirty = false;
                     state.rendered = true;
-                    render.push(VsmRenderPage {
+                    list.directional.push(VsmRenderPage {
                         key: *key,
                         tile: state.tile,
                     });
                 }
             }
         }
-        self.frame_counters.rendered += u32::try_from(render.len()).unwrap_or(u32::MAX);
-        for page in &render {
-            self.family_counters_mut(page.key.family()).rendered += 1;
-        }
-        render
-    }
-
-    fn take_complete_point_faces(
-        &mut self,
-        render: &mut Vec<VsmRenderPage>,
-        budget: usize,
-        priority: [bool; VSM_POINT_FACES as usize],
-    ) {
-        let faces = (0..VSM_POINT_FACES)
-            .filter(|face| priority[*face as usize])
-            .chain((0..VSM_POINT_FACES).filter(|face| !priority[*face as usize]));
-        for face in faces {
-            if render.len() >= budget {
-                return;
-            }
-            let mut dirty = Vec::new();
-            let mut complete = true;
-            for y in 0..VSM_POINT_FACE_PAGES {
-                for x in 0..VSM_POINT_FACE_PAGES {
-                    let key = VsmPageKey::PointFace { face, x, y };
-                    let Some(state) = self.pages.get(&key) else {
-                        complete = false;
-                        break;
-                    };
-                    if state.dirty {
-                        dirty.push(key);
-                    }
-                }
-                if !complete {
-                    break;
-                }
-            }
-            if !complete || dirty.is_empty() || render.len() + dirty.len() > budget {
-                continue;
-            }
-            for key in dirty {
-                let state = self.pages.get_mut(&key).expect("point face page exists");
-                state.dirty = false;
-                state.publish_while_dirty = false;
-                state.rendered = true;
-                render.push(VsmRenderPage {
-                    key,
-                    tile: state.tile,
-                });
-            }
-        }
+        let directional = u32::try_from(list.directional.len()).unwrap_or(u32::MAX);
+        self.frame_counters.rendered += directional;
+        self.frame_counters.directional.rendered += directional;
+        list
     }
 
     fn family_counters_mut(&mut self, family: VsmPageFamily) -> &mut VsmPageFamilyCounters {
@@ -599,59 +695,63 @@ impl VsmResidency {
         self.counters
     }
 
-    /// Resident page count.
+    /// Resident page count (directional pages plus the resident blocks' grids).
     pub fn resident(&self) -> usize {
         self.pages.len()
+            + usize::from(self.spot.resident) * VSM_SPOT_AREA as usize
+            + self.point_faces.iter().filter(|face| face.resident).count()
+                * VSM_POINT_FACE_AREA as usize
     }
 
-    /// The page's tile when resident.
+    /// The page's tile when resident: pool tiles for directional pages, block
+    /// arithmetic for the punctual spaces.
     pub fn tile(&self, key: VsmPageKey) -> Option<u32> {
-        self.pages.get(&key).map(|state| state.tile)
+        match key {
+            VsmPageKey::Directional { .. } => self.pages.get(&key).map(|state| state.tile),
+            VsmPageKey::Spot { x, y } => self.spot.resident.then(|| vsm_spot_page_tile(x, y)),
+            VsmPageKey::PointFace { face, x, y } => self
+                .point_faces
+                .get(face as usize)
+                .is_some_and(|state| state.resident)
+                .then(|| vsm_point_page_tile(face, x, y)),
+        }
     }
 
-    /// Every resident page and its tile, in arbitrary order.
-    ///
-    /// The page table is dense and residency is sparse, so publication scatters from this rather
-    /// than probing the map once per table slot.
-    pub fn resident_pages(&self) -> impl Iterator<Item = (VsmPageKey, u32)> + '_ {
-        self.pages.iter().map(|(key, state)| (*key, state.tile))
-    }
-
-    /// Resident pages whose physical tiles contain the logical page contents the current table may
-    /// sample.
+    /// Pages whose physical tiles contain the logical page contents the current table may sample.
     ///
     /// Dirty pages are deliberately withheld: sampling a refreshed page before the frame's page
-    /// pass reaches it exposes stale light-space contents as page-shaped lighting changes.
+    /// pass reaches it exposes stale light-space contents as page-shaped lighting changes. A
+    /// punctual block publishes its whole grid or nothing — the block renders atomically, so
+    /// partial-grid states cannot exist.
     pub fn publishable_pages(&self) -> impl Iterator<Item = (VsmPageKey, u32)> + '_ {
-        let spot_coherent = (0..VSM_SPOT_PAGES).all(|y| {
-            (0..VSM_SPOT_PAGES).all(|x| {
-                self.pages
-                    .get(&VsmPageKey::Spot { x, y })
-                    .is_some_and(|state| state.rendered && state.table_publishable())
-            })
-        });
-        let point_face_coherent: [bool; VSM_POINT_FACES as usize] = std::array::from_fn(|face| {
-            let face = u32::try_from(face).expect("point face index fits u32");
-            (0..VSM_POINT_FACE_PAGES).all(|y| {
-                (0..VSM_POINT_FACE_PAGES).all(|x| {
-                    self.pages
-                        .get(&VsmPageKey::PointFace { face, x, y })
-                        .is_some_and(|state| state.rendered && state.table_publishable())
+        let directional = self
+            .pages
+            .iter()
+            .filter(|(_, state)| state.rendered && state.table_publishable())
+            .map(|(key, state)| (*key, state.tile));
+        let spot = self
+            .spot
+            .table_publishable()
+            .then(|| {
+                (0..VSM_SPOT_AREA).map(|cell| {
+                    let (x, y) = (cell % VSM_SPOT_PAGES, cell / VSM_SPOT_PAGES);
+                    (VsmPageKey::Spot { x, y }, vsm_spot_page_tile(x, y))
                 })
             })
-        });
-        self.pages
-            .iter()
-            .filter(move |(key, state)| {
-                state.rendered
-                    && state.table_publishable()
-                    && match key {
-                        VsmPageKey::Directional { .. } => true,
-                        VsmPageKey::Spot { .. } => spot_coherent,
-                        VsmPageKey::PointFace { face, .. } => point_face_coherent[*face as usize],
-                    }
-            })
-            .map(|(key, state)| (*key, state.tile))
+            .into_iter()
+            .flatten();
+        let point = (0..VSM_POINT_FACES)
+            .filter(|face| self.point_faces[*face as usize].table_publishable())
+            .flat_map(|face| {
+                (0..VSM_POINT_FACE_AREA).map(move |cell| {
+                    let (x, y) = (cell % VSM_POINT_FACE_PAGES, cell / VSM_POINT_FACE_PAGES);
+                    (
+                        VsmPageKey::PointFace { face, x, y },
+                        vsm_point_page_tile(face, x, y),
+                    )
+                })
+            });
+        directional.chain(spot).chain(point)
     }
 }
 
@@ -1255,26 +1355,6 @@ impl Drop for VsmDemand {
     }
 }
 
-/// The crop matrix mapping a projective light's clip space so that page `(x, y)`
-/// of its `pages`² grid fills the viewport: `crop · lightViewProj` rasterizes
-/// exactly that page's content. The grid indexes `ndc.xy * 0.5 + 0.5` UV space —
-/// the same mapping the demand shader and samplers use, so raster rows and
-/// sampled texels agree without any flip.
-pub fn vsm_page_crop(pages: u32, x: u32, y: u32) -> Mat4 {
-    let pages = pages as f32;
-    // uv = ndc * 0.5 + 0.5; page (x, y) covers uv in [x, x+1)/pages. Solve for
-    // the ndc scale/offset that maps that sub-rect onto [-1, 1].
-    let scale = pages;
-    let offset_x = -(2.0 * (x as f32 + 0.5) / pages - 1.0) * scale;
-    let offset_y = -(2.0 * (y as f32 + 0.5) / pages - 1.0) * scale;
-    Mat4::from_cols(
-        saffron_geometry::glam::Vec4::new(scale, 0.0, 0.0, 0.0),
-        saffron_geometry::glam::Vec4::new(0.0, scale, 0.0, 0.0),
-        saffron_geometry::glam::Vec4::new(0.0, 0.0, 1.0, 0.0),
-        saffron_geometry::glam::Vec4::new(offset_x, offset_y, 0.0, 1.0),
-    )
-}
-
 /// Decodes a demand-request entry (a raw page-table index appended by
 /// `vsm_demand_compact.slang`) into its logical page.
 pub fn vsm_demand_key(index: u32) -> Option<VsmPageKey> {
@@ -1474,224 +1554,197 @@ mod tests {
     #[test]
     fn residency_allocates_evicts_lru_and_cools_tiles() {
         let mut residency = VsmResidency::default();
-        let key = |x: u32| VsmPageKey::Directional { level: 0, x, y: 0 };
-        let total = VSM_ATLAS_TILES * VSM_ATLAS_TILES;
-        for index in 0..total {
-            assert!(
-                residency
-                    .demand(
-                        VsmPageKey::Directional {
-                            level: index / VSM_LEVEL_PAGES,
-                            x: index % VSM_LEVEL_PAGES,
-                            y: 1,
-                        },
-                        1,
-                        VsmDemandReason::Receiver,
-                    )
-                    .is_some()
-            );
+        // The directional pool is the atlas minus the fixed punctual blocks.
+        let pool = (VSM_ATLAS_TILES * VSM_ATLAS_TILES
+            - VSM_SPOT_AREA
+            - VSM_POINT_FACES * VSM_POINT_FACE_AREA) as usize;
+        let mut allocated = 0_usize;
+        'fill: for level in 1..VSM_DIRECTIONAL_LEVELS {
+            for y in 0..VSM_LEVEL_PAGES {
+                for x in 0..VSM_LEVEL_PAGES {
+                    if allocated == pool {
+                        break 'fill;
+                    }
+                    assert!(
+                        residency
+                            .demand_directional(level, x, y, 1, VsmDemandReason::Receiver)
+                            .is_some()
+                    );
+                    allocated += 1;
+                }
+            }
         }
-        assert_eq!(residency.resident(), total as usize);
-        // The atlas is full and everything was demanded this frame: no tile is safe.
-        assert_eq!(residency.demand(key(0), 1, VsmDemandReason::Receiver), None);
+        assert_eq!(residency.resident(), pool);
+        // The pool is full and everything was demanded this frame: no tile is safe.
+        assert_eq!(
+            residency.demand_directional(0, 0, 0, 1, VsmDemandReason::Receiver),
+            None
+        );
         // Next frame the LRU victim evicts, but its tile cools — the SECOND demand
         // (after the cooldown) succeeds with the recycled tile.
-        assert_eq!(residency.demand(key(0), 2, VsmDemandReason::Receiver), None);
+        assert_eq!(
+            residency.demand_directional(0, 0, 0, 2, VsmDemandReason::Receiver),
+            None
+        );
         residency.begin_frame(5);
-        let tile = residency.demand(key(0), 5, VsmDemandReason::Receiver);
+        let tile = residency.demand_directional(0, 0, 0, 5, VsmDemandReason::Receiver);
         assert!(tile.is_some(), "cooled tile recycles");
         // A re-demand of a resident page returns its tile without churn.
-        assert_eq!(residency.demand(key(0), 6, VsmDemandReason::Receiver), tile);
+        assert_eq!(
+            residency.demand_directional(0, 0, 0, 6, VsmDemandReason::Receiver),
+            tile
+        );
 
         // Dirty pages drain once within the budget.
         let mut fresh = VsmResidency::default();
-        fresh.demand(key(3), 1, VsmDemandReason::Receiver);
-        fresh.demand(key(4), 1, VsmDemandReason::Receiver);
-        assert_eq!(fresh.take_render_pages(8).len(), 2);
-        assert!(fresh.take_render_pages(8).is_empty(), "dirty bits clear");
-        fresh.mark_dirty(key(3), VsmDirtyReason::MovedCaster);
-        assert_eq!(fresh.take_render_pages(8).len(), 1);
-    }
-
-    #[test]
-    fn only_clean_rendered_pages_publish_to_the_table() {
-        let mut residency = VsmResidency::default();
-        let a = VsmPageKey::PointFace {
-            face: 0,
-            x: 1,
-            y: 1,
-        };
-        let b = VsmPageKey::PointFace {
-            face: 0,
-            x: 2,
-            y: 1,
-        };
-        residency.demand(a, 1, VsmDemandReason::Projective);
-        residency.demand(b, 1, VsmDemandReason::Projective);
-
-        let first = residency.take_render_pages(1)[0].key;
-        let second = if first == a { b } else { a };
-        assert!(
-            residency.publishable_pages().next().is_none(),
-            "a point face with an over-budget hole publishes no partial page grid"
-        );
-
-        residency.mark_dirty(first, VsmDirtyReason::MovedCaster);
-        assert!(
-            residency.publishable_pages().next().is_none(),
-            "dirty rendered pages do not publish stale tile contents"
-        );
-
-        assert_eq!(
-            residency.take_render_pages(1)[0].key,
-            second,
-            "never-rendered holes still drain before refreshes"
-        );
-        assert!(
-            residency.publishable_pages().next().is_none(),
-            "a point face with a dirty refresh publishes no partial page grid"
-        );
-
-        assert_eq!(residency.take_render_pages(1)[0].key, first);
-        let mut published: Vec<_> = residency.publishable_pages().map(|(key, _)| key).collect();
-        published.sort_by_key(|key| vsm_table_index(*key).expect("test keys are valid"));
-        assert!(
-            published.is_empty(),
-            "a clean point subset still does not publish without the full face"
-        );
-
-        residency.demand_point_face(0, 2, VsmDemandReason::Receiver);
-        assert_eq!(
-            residency
-                .take_render_pages((VSM_POINT_FACE_PAGES * VSM_POINT_FACE_PAGES) as usize)
-                .len(),
-            (VSM_POINT_FACE_PAGES * VSM_POINT_FACE_PAGES) as usize - 2
-        );
-        assert_eq!(
-            residency
-                .publishable_pages()
-                .filter(|(key, _)| matches!(key, VsmPageKey::PointFace { face: 0, .. }))
-                .count(),
-            (VSM_POINT_FACE_PAGES * VSM_POINT_FACE_PAGES) as usize
-        );
-
-        residency.demand(
-            VsmPageKey::PointFace {
-                face: 1,
-                x: 0,
+        fresh.demand_directional(0, 3, 0, 1, VsmDemandReason::Receiver);
+        fresh.demand_directional(0, 4, 0, 1, VsmDemandReason::Receiver);
+        assert_eq!(fresh.take_render_list(1, 8).directional.len(), 2);
+        assert!(fresh.take_render_list(1, 8).is_empty(), "dirty bits clear");
+        fresh.mark_dirty(
+            VsmPageKey::Directional {
+                level: 0,
+                x: 3,
                 y: 0,
             },
-            3,
-            VsmDemandReason::Receiver,
+            VsmDirtyReason::MovedCaster,
         );
-        assert_eq!(residency.take_render_pages(1).len(), 1);
-        assert_eq!(
-            residency
-                .publishable_pages()
-                .filter(|(key, _)| matches!(key, VsmPageKey::PointFace { face: 1, .. }))
-                .count(),
-            0,
-            "another point face still withholds partial page grids"
-        );
+        assert_eq!(fresh.take_render_list(1, 8).directional.len(), 1);
+    }
+
+    /// The punctual blocks are fixed atlas real estate: they must not overlap each
+    /// other, and the directional pool must exclude exactly their tiles.
+    #[test]
+    fn punctual_blocks_are_disjoint_and_outside_the_directional_pool() {
+        let mut owners = vec![0_u32; (VSM_ATLAS_TILES * VSM_ATLAS_TILES) as usize];
+        for y in 0..VSM_SPOT_PAGES {
+            for x in 0..VSM_SPOT_PAGES {
+                owners[vsm_spot_page_tile(x, y) as usize] += 1;
+            }
+        }
+        for face in 0..VSM_POINT_FACES {
+            for y in 0..VSM_POINT_FACE_PAGES {
+                for x in 0..VSM_POINT_FACE_PAGES {
+                    owners[vsm_point_page_tile(face, x, y) as usize] += 1;
+                }
+            }
+        }
+        for (tile, claims) in owners.iter().enumerate() {
+            let tile = tile as u32;
+            let blocked =
+                vsm_tile_in_punctual_block(tile % VSM_ATLAS_TILES, tile / VSM_ATLAS_TILES);
+            assert!(*claims <= 1, "tile {tile} is claimed by two blocks");
+            assert_eq!(
+                blocked,
+                *claims == 1,
+                "tile {tile} pool membership disagrees with the block map"
+            );
+        }
     }
 
     #[test]
-    fn point_face_dirty_pages_drain_as_a_coherent_unit() {
+    fn punctual_blocks_publish_whole_grids_or_nothing() {
         let mut residency = VsmResidency::default();
         residency.demand_point_face(0, 1, VsmDemandReason::Receiver);
-        residency.demand_point_face(1, 1, VsmDemandReason::Receiver);
-
-        let rendered = residency.take_render_pages(VSM_DEFAULT_PAGE_BUDGET);
-        assert_eq!(
-            rendered.len(),
-            (VSM_POINT_FACE_PAGES * VSM_POINT_FACE_PAGES) as usize
-        );
         assert!(
-            rendered
-                .iter()
-                .all(|page| matches!(page.key, VsmPageKey::PointFace { face: 0, .. })),
-            "one complete face drains before a second partial face"
+            residency.publishable_pages().next().is_none(),
+            "a demanded-but-unrendered face publishes nothing"
         );
+        let list = residency.take_render_list(1, VSM_DEFAULT_PAGE_BUDGET);
+        assert!(list.point_faces[0] && !list.spot && list.directional.is_empty());
         assert_eq!(
             residency
                 .publishable_pages()
                 .filter(|(key, _)| matches!(key, VsmPageKey::PointFace { face: 0, .. }))
                 .count(),
-            (VSM_POINT_FACE_PAGES * VSM_POINT_FACE_PAGES) as usize
+            VSM_POINT_FACE_AREA as usize,
+            "a rendered clean face publishes its whole grid"
         );
         assert_eq!(
-            residency
-                .publishable_pages()
-                .filter(|(key, _)| matches!(key, VsmPageKey::PointFace { face: 1, .. }))
-                .count(),
-            0
+            residency.tile(VsmPageKey::PointFace {
+                face: 0,
+                x: 2,
+                y: 3
+            }),
+            Some(vsm_point_page_tile(0, 2, 3)),
+            "block pages map to their fixed tiles"
         );
-    }
-
-    #[test]
-    fn demanded_point_face_drains_before_lower_face_indices() {
-        let mut residency = VsmResidency::default();
-        residency.demand_point_face(0, 1, VsmDemandReason::Receiver);
-        residency.demand_point_face(4, 1, VsmDemandReason::Receiver);
-
-        let mut priority = [false; VSM_POINT_FACES as usize];
-        priority[4] = true;
-        let rendered =
-            residency.take_render_pages_prioritizing_point_faces(VSM_DEFAULT_PAGE_BUDGET, priority);
-
-        assert_eq!(
-            rendered.len(),
-            (VSM_POINT_FACE_PAGES * VSM_POINT_FACE_PAGES) as usize
-        );
+        residency.mark_point_dirty(VsmDirtyReason::LightTransform);
         assert!(
-            rendered
-                .iter()
-                .all(|page| matches!(page.key, VsmPageKey::PointFace { face: 4, .. })),
-            "the receiver-demanded face drains first"
+            residency.publishable_pages().next().is_none(),
+            "a dirty block withholds its stale grid until the refresh renders"
         );
     }
 
     #[test]
-    fn multiple_demanded_point_faces_drain_when_budget_expands() {
+    fn a_dirty_block_renders_only_when_demanded_this_frame() {
         let mut residency = VsmResidency::default();
+        residency.demand_point_face(2, 1, VsmDemandReason::Receiver);
+        assert!(
+            residency
+                .take_render_list(1, VSM_DEFAULT_PAGE_BUDGET)
+                .point_faces[2]
+        );
+        residency.mark_point_dirty(VsmDirtyReason::LightTransform);
+        assert!(
+            !residency
+                .take_render_list(2, VSM_DEFAULT_PAGE_BUDGET)
+                .point_faces[2],
+            "an undemanded dirty face stays withheld instead of burning a redraw"
+        );
+        residency.demand_point_face(2, 3, VsmDemandReason::Receiver);
+        assert!(
+            residency
+                .take_render_list(3, VSM_DEFAULT_PAGE_BUDGET)
+                .point_faces[2],
+            "the next receiver demand schedules the refresh"
+        );
+    }
+
+    #[test]
+    fn every_demanded_dirty_block_renders_in_one_frame() {
+        let mut residency = VsmResidency::default();
+        residency.demand_spot_space(1, VsmDemandReason::Receiver);
         for face in [1, 3, 4] {
             residency.demand_point_face(face, 1, VsmDemandReason::Receiver);
         }
-
-        let mut priority = [false; VSM_POINT_FACES as usize];
-        for face in [1_usize, 3, 4] {
-            priority[face] = true;
-        }
-        let budget = 3 * (VSM_POINT_FACE_PAGES * VSM_POINT_FACE_PAGES) as usize;
-        let rendered = residency.take_render_pages_prioritizing_point_faces(budget, priority);
-
-        assert_eq!(rendered.len(), budget);
+        let list = residency.take_render_list(1, 1);
+        assert!(list.spot, "blocks are atomic units outside the page budget");
+        assert_eq!(list.point_faces, [false, true, false, true, true, false]);
+        assert_eq!(list.draw_sets(), 4);
         for face in [1, 3, 4] {
             assert_eq!(
                 residency
                     .publishable_pages()
                     .filter(|(key, _)| matches!(key, VsmPageKey::PointFace { face: f, .. } if *f == face))
                     .count(),
-                (VSM_POINT_FACE_PAGES * VSM_POINT_FACE_PAGES) as usize
+                VSM_POINT_FACE_AREA as usize
             );
         }
+        assert_eq!(
+            residency
+                .publishable_pages()
+                .filter(|(key, _)| matches!(key, VsmPageKey::Spot { .. }))
+                .count(),
+            VSM_SPOT_AREA as usize
+        );
     }
 
     #[test]
     fn point_light_transform_dirty_publishes_only_the_scheduled_refresh() {
         let mut residency = VsmResidency::default();
         residency.demand_point_face(4, 1, VsmDemandReason::Receiver);
-        let rendered = residency.take_render_pages(VSM_DEFAULT_PAGE_BUDGET);
-        assert_eq!(
-            rendered.len(),
-            (VSM_POINT_FACE_PAGES * VSM_POINT_FACE_PAGES) as usize
+        assert!(
+            residency
+                .take_render_list(1, VSM_DEFAULT_PAGE_BUDGET)
+                .point_faces[4]
         );
         assert_eq!(
             residency
                 .publishable_pages()
                 .filter(|(key, _)| matches!(key, VsmPageKey::PointFace { face: 4, .. }))
                 .count(),
-            (VSM_POINT_FACE_PAGES * VSM_POINT_FACE_PAGES) as usize
+            VSM_POINT_FACE_AREA as usize
         );
 
         residency.mark_point_dirty(VsmDirtyReason::LightTransform);
@@ -1704,43 +1757,41 @@ mod tests {
             "dirty old point pages are withheld so they are not sampled with a new transform"
         );
 
-        let mut priority = [false; VSM_POINT_FACES as usize];
-        priority[4] = true;
-        let refreshed =
-            residency.take_render_pages_prioritizing_point_faces(VSM_DEFAULT_PAGE_BUDGET, priority);
+        residency.demand_point_face(4, 2, VsmDemandReason::Receiver);
         assert!(
-            refreshed
-                .iter()
-                .all(|page| matches!(page.key, VsmPageKey::PointFace { face: 4, .. }))
+            residency
+                .take_render_list(2, VSM_DEFAULT_PAGE_BUDGET)
+                .point_faces[4]
         );
         assert_eq!(
             residency
                 .publishable_pages()
                 .filter(|(key, _)| matches!(key, VsmPageKey::PointFace { face: 4, .. }))
                 .count(),
-            (VSM_POINT_FACE_PAGES * VSM_POINT_FACE_PAGES) as usize,
+            VSM_POINT_FACE_AREA as usize,
             "the scheduled refreshed face publishes before the scene pass samples it"
         );
     }
 
     #[test]
-    fn coherent_point_light_transform_keeps_last_face_published_until_refresh() {
+    fn recent_point_faces_track_rendered_receiver_history() {
         let mut residency = VsmResidency::default();
         residency.demand_point_face(4, 1, VsmDemandReason::Receiver);
-        let rendered = residency.take_render_pages(VSM_DEFAULT_PAGE_BUDGET);
-        assert_eq!(
-            rendered.len(),
-            (VSM_POINT_FACE_PAGES * VSM_POINT_FACE_PAGES) as usize
+        assert!(
+            residency
+                .take_render_list(1, VSM_DEFAULT_PAGE_BUDGET)
+                .point_faces[4]
         );
 
-        residency.mark_point_dirty(VsmDirtyReason::CoherentLightTransform);
         assert_eq!(
-            residency
-                .publishable_pages()
-                .filter(|(key, _)| matches!(key, VsmPageKey::PointFace { face: 4, .. }))
-                .count(),
-            (VSM_POINT_FACE_PAGES * VSM_POINT_FACE_PAGES) as usize,
-            "small light movement keeps the last coherent face visible during refresh"
+            residency.recent_point_faces(2, 2),
+            [false, false, false, false, true, false],
+            "recent receiver history identifies the point face to refresh after a light move"
+        );
+        assert_eq!(
+            residency.recent_point_faces(4, 2),
+            [false; VSM_POINT_FACES as usize],
+            "old receiver history ages out instead of refreshing unrelated faces indefinitely"
         );
     }
 
@@ -1782,29 +1833,35 @@ mod tests {
     }
 
     #[test]
-    fn spot_page_crop_agrees_with_the_sampler_grid() {
+    fn block_raster_and_sampler_grids_agree() {
         // A clip-space point maps to UV (ndc * 0.5 + 0.5); the sampler taps page
-        // uv*16 at tile fraction frac(uv*16). The crop matrix of that page must
-        // rasterize the same point at the same in-tile position: cropped ndc
-        // remapped to [0,1] equals the sampler's page fraction, both axes.
+        // uv*16 at tile fraction frac(uv*16). The block draw rasterizes the same
+        // clip space across the whole block viewport, so the pixel it lands on —
+        // block origin + uv · blockExtent — must sit inside that page's published
+        // tile at the same in-tile fraction, both axes.
         for &(ndc_x, ndc_y) in &[(-0.83_f32, 0.4_f32), (0.07, -0.66), (0.99, 0.99)] {
             let uv = [ndc_x * 0.5 + 0.5, ndc_y * 0.5 + 0.5];
             let scaled = [uv[0] * VSM_SPOT_PAGES as f32, uv[1] * VSM_SPOT_PAGES as f32];
             let page = [scaled[0] as u32, scaled[1] as u32];
             let frac = [scaled[0] - page[0] as f32, scaled[1] - page[1] as f32];
-            let crop = vsm_page_crop(VSM_SPOT_PAGES, page[0], page[1]);
-            let cropped = crop * saffron_geometry::glam::Vec4::new(ndc_x, ndc_y, 0.5, 1.0);
-            assert!(
-                (cropped.x * 0.5 + 0.5 - frac[0]).abs() < 1e-5,
-                "{cropped:?}"
-            );
-            assert!(
-                (cropped.y * 0.5 + 0.5 - frac[1]).abs() < 1e-5,
-                "{cropped:?}"
-            );
-            let neighbour = vsm_page_crop(VSM_SPOT_PAGES, (page[0] + 1) % VSM_SPOT_PAGES, page[1])
-                * saffron_geometry::glam::Vec4::new(ndc_x, ndc_y, 0.5, 1.0);
-            assert!(neighbour.x.abs() > 1.0, "{neighbour:?}");
+            let block_px = [
+                (VSM_SPOT_BLOCK_TILE[0] * VSM_PAGE_SIZE) as f32
+                    + uv[0] * (VSM_SPOT_PAGES * VSM_PAGE_SIZE) as f32,
+                (VSM_SPOT_BLOCK_TILE[1] * VSM_PAGE_SIZE) as f32
+                    + uv[1] * (VSM_SPOT_PAGES * VSM_PAGE_SIZE) as f32,
+            ];
+            let tile = vsm_spot_page_tile(page[0], page[1]);
+            let tile_px = [
+                ((tile % VSM_ATLAS_TILES) * VSM_PAGE_SIZE) as f32,
+                ((tile / VSM_ATLAS_TILES) * VSM_PAGE_SIZE) as f32,
+            ];
+            for axis in 0..2 {
+                let in_tile = block_px[axis] - tile_px[axis];
+                assert!(
+                    (in_tile - frac[axis] * VSM_PAGE_SIZE as f32).abs() < 1e-3,
+                    "axis {axis}: block pixel {block_px:?} lands off the sampled tile {tile}"
+                );
+            }
         }
     }
 
@@ -1848,36 +1905,36 @@ mod tests {
             x: 1,
             y: 1,
         };
-        let coarse = VsmPageKey::Directional {
-            level: 7,
-            x: 1,
-            y: 1,
-        };
-        let spot = VsmPageKey::Spot { x: 0, y: 0 };
-        residency.demand(fine, 1, VsmDemandReason::Receiver);
-        residency.demand(coarse, 1, VsmDemandReason::Receiver);
-        residency.demand(spot, 1, VsmDemandReason::Projective);
-        assert_eq!(residency.take_render_pages(8).len(), 3);
-        // The dynamic sweep re-dirties fine + spot pages; the coarse level stays
-        // cached.
+        residency.demand_directional(0, 1, 1, 1, VsmDemandReason::Receiver);
+        residency.demand_directional(7, 1, 1, 1, VsmDemandReason::Receiver);
+        residency.demand_spot_space(1, VsmDemandReason::Projective);
+        let first = residency.take_render_list(1, 8);
+        assert_eq!(first.directional.len(), 2);
+        assert!(first.spot);
+        // The dynamic sweep re-dirties fine directional pages plus the punctual
+        // blocks; the coarse level stays cached.
         residency.mark_dynamic_dirty(VSM_DYNAMIC_MAX_LEVEL);
-        let dynamic: Vec<VsmPageKey> = residency
-            .take_render_pages(8)
-            .into_iter()
-            .map(|page| page.key)
-            .collect();
-        assert_eq!(dynamic.len(), 2);
-        assert!(dynamic.contains(&fine) && dynamic.contains(&spot));
+        residency.demand_spot_space(2, VsmDemandReason::Receiver);
+        let dynamic = residency.take_render_list(2, 8);
+        assert_eq!(
+            dynamic
+                .directional
+                .iter()
+                .map(|page| page.key)
+                .collect::<Vec<_>>(),
+            vec![fine]
+        );
+        assert!(dynamic.spot);
         // A never-rendered hole beats a re-dirtied page under a budget of one.
         let hole = VsmPageKey::Directional {
             level: 2,
             x: 3,
             y: 3,
         };
-        residency.demand(hole, 2, VsmDemandReason::Receiver);
+        residency.demand_directional(2, 3, 3, 3, VsmDemandReason::Receiver);
         residency.mark_dirty(fine, VsmDirtyReason::MovedCaster);
-        let first = residency.take_render_pages(1);
-        assert_eq!(first[0].key, hole, "the hole renders first");
-        assert_eq!(residency.take_render_pages(1)[0].key, fine);
+        let drained = residency.take_render_list(3, 1);
+        assert_eq!(drained.directional[0].key, hole, "the hole renders first");
+        assert_eq!(residency.take_render_list(3, 1).directional[0].key, fine);
     }
 }

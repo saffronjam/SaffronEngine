@@ -312,7 +312,7 @@ pub use vsm::{
     VSM_DEMAND_CAPACITY, VSM_DEMAND_PUSH_SIZE, VSM_DIRECTIONAL_LEVELS, VSM_LEVEL_PAGES,
     VSM_LEVEL0_EXTENT_M, VSM_PAGE_SIZE, VSM_TABLE_RESIDENT, VsmCompactPush, VsmCounters, VsmDemand,
     VsmDemandPush, VsmDemandReason, VsmDirectionalSpace, VsmDirtyReason, VsmPageFamily,
-    VsmPageFamilyCounters, VsmPageKey, VsmRenderPage, VsmResidency, vsm_table_entry,
+    VsmPageFamilyCounters, VsmPageKey, VsmRenderList, VsmRenderPage, VsmResidency, vsm_table_entry,
 };
 
 use ash::vk;

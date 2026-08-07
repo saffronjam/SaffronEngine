@@ -240,7 +240,7 @@ impl Renderer {
         } else {
             None
         };
-        let shadow_pipeline = if self.vsm_render_pages.is_empty() {
+        let shadow_pipeline = if self.vsm_render_list.is_empty() {
             None
         } else {
             self.pipelines.request_shadow_depth_executor()

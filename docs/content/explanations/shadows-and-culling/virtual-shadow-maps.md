@@ -30,18 +30,29 @@ page is absent.
 
 ## Residency
 
-`VsmResidency` is the CPU authority over the atlas. A demand for a page returns its tile when
-resident, allocates a free tile otherwise, and evicts the least-recently-demanded page when the
-atlas is full. An evicted tile cools for two frames before reuse, so an in-flight frame never
-samples a tile that changed owners. Fresh allocations are dirty; dirty pages drain into the frame's
-render list under a per-frame budget, and pages the graph could not rasterize re-mark themselves.
+`VsmResidency` is the CPU authority over the atlas, and it treats the two page populations
+differently because they live differently.
+
+Directional pages come and go one at a time with the camera, so they draw from a pool of free
+tiles: a demand returns the page's tile when resident, allocates a free tile otherwise, and evicts
+the least-recently-demanded page when the pool is dry. An evicted tile cools for two frames before
+reuse, so an in-flight frame never samples a tile that changed owners. Fresh allocations are dirty;
+dirty pages drain into the frame's render list under a per-frame budget, and pages the graph could
+not rasterize re-mark themselves.
+
+The punctual spaces — the spot plane and each point cube face — are only ever demanded, dirtied,
+rendered, and published as whole grids, so each owns a fixed contiguous block of atlas tiles
+(`VSM_SPOT_BLOCK_TILE`, `VSM_POINT_FACE_BLOCK_TILES`). A block's residency is one flag, its page
+table entries are arithmetic over the block origin, and a dirty block rasterizes as a single draw
+over its region rather than one cropped draw per page. The blocks claim 640 of the 1,024 tiles;
+the directional pool holds the remaining 384.
 
 Whole spaces react when their mapping moves: a directional level whose snapped window shifted and
 the spot transform invalidate their pages, while a point-light transform dirties the resident cube
-faces. The point-light key tracks exact position and range changes. A small point-light move keeps
-the last coherent face visible during refresh; a larger move withholds dirty faces until the
-frame's refresh pass schedules them, so old face contents are not sampled with a visibly different
-light transform.
+faces. The point-light key tracks exact position and range changes. A dirty block is withheld from
+the table until its refresh renders, so old contents are never sampled with a new light transform —
+and it renders only on a frame that also demanded it, so an off-screen face waits instead of
+burning redraws nothing samples.
 
 ## What a mover dirties
 
@@ -66,16 +77,17 @@ on every axis, and each extra page in that margin is re-rasterized for geometry 
 it. A caster's aspect decides the cost, so an edge-on plank dirties a strip rather than a disc
 (`VsmDirectionalSpace::directional_page_span`).
 
-Spot and point pages publish as coherent projective grids. The spot plane and each point cube face
-are completed as page grids, and the sampler sees a grid only when every page in that grid is
-resident, rendered, and clean. A moved caster therefore dirties each armed projective grid once per
-frame; the directional levels keep the per-leaf page precision.
+Spot and point spaces dirty as whole blocks: a moved caster marks each armed projective grid once
+per frame, and the sampler sees a grid only when its block is resident, rendered, and clean. The
+directional levels keep the per-leaf page precision.
 
-Point faces also drain as coherent render units. One cube face is 64 pages, matching the default
-page budget, so a moving point light refreshes one complete face instead of scattering work across
-several partial, non-publishable faces. Receiver-demanded faces drain first, so visible shadow
-receivers steer the next refreshed face. A point-light transform change expands the frame's page
-budget to cover every receiver-demanded face.
+A block redraw is one draw set, so every demanded dirty block renders in the same frame — a moving
+point light refreshes all its sampled faces at once, outside the directional page budget. Which
+faces those are is receiver-steered: a light transform change consults the faces receivers sampled
+recently and re-demands them, so visible shadows refresh before the scene lighting pass samples the
+table while unseen faces stay withheld. Moved casters and receivers use the same visible-face
+refresh, so dragging geometry under a point light does not leave one cube face unpublished while
+another refreshes.
 
 Continuous wind is the one dirty source that is not per-caster: it re-marks the directional levels
 fine enough to resolve sway, capped at `VSM_DYNAMIC_MAX_LEVEL`, since levels whose texels span half
@@ -103,12 +115,14 @@ them.
 
 ## Page rendering
 
-Dirty pages group by space: each directional level, the spot, and each point face runs its own
-GPU cull → traversal → binning chain against that space's frustum, then one graphics pass rasterizes
-each page with viewport and scissor clamped to its atlas tile. The per-page transform is the space's
-sub-window: an ortho window for a directional page, a crop matrix times the light transform for a
-spot or point page (`vsm_page_crop`). The draws replay the binned executor stream through
-`record_executor_depth_family` — the same recorder every depth-family pass uses.
+Dirty work groups by space: each directional level, the spot, and each point face runs its own
+GPU cull → traversal → binning chain against that space's frustum, then one graphics pass draws
+into the atlas. A directional group rasterizes each page with viewport and scissor clamped to its
+pool tile, pushing the page's ortho sub-window. A punctual group is one draw over its whole block:
+the space matrix pushed once, the viewport spanning the block, the grid falling out of the viewport
+transform — the page-count-times-draw-records CPU cost a scattered layout would force never exists.
+Every draw replays the binned executor stream through `record_executor_depth_family` — the same
+recorder every depth-family pass uses.
 
 The scene pass declares the atlas `SampledRead`, so the [render graph](../../frame-and-render-graph/render-graph-overview/)
 derives the `DepthWrite → ShaderReadOnly` transition; no barrier is hand-written.
@@ -146,13 +160,13 @@ whole system; off publishes a disabled table, and every sampler reads unshadowed
 
 | What | File | Symbols |
 |---|---|---|
-| Constants + page keys | `crates/rendering/src/vsm.rs` | `VSM_PAGE_SIZE`, `VSM_ATLAS_SIZE`, `VsmPageKey` |
-| CPU residency | `crates/rendering/src/vsm.rs` | `VsmResidency`, `VsmCounters` |
+| Constants + page keys | `crates/rendering/src/vsm.rs` | `VSM_PAGE_SIZE`, `VSM_ATLAS_SIZE`, `VsmPageKey`, `VSM_SPOT_BLOCK_TILE`, `VSM_POINT_FACE_BLOCK_TILES` |
+| CPU residency | `crates/rendering/src/vsm.rs` | `VsmResidency`, `VsmRenderList`, `VsmCounters` |
 | Atlas + page table | `crates/rendering/src/vsm.rs` | `VsmGpu`, `publish_table`, `vsm_table_entry` |
 | GPU demand | `crates/rendering/src/vsm.rs`, `vsm_demand.slang`, `vsm_demand_compact.slang` | `VsmDemand`, `vsm_demand_key` |
 | Frame preparation | `crates/rendering/src/renderer.rs` | `prepare_vsm_frame` |
 | Mover invalidation | `crates/rendering/src/renderer/vsm_passes.rs`, `vsm.rs`, `persistent_gpu_scene/apply.rs`, `assets/src/gpu_scene_mirror/shared.rs` | `collect_vsm_directional_swept_bounds`, `mark_spot_dirty`, `mark_point_dirty`, `VsmDirectionalSpace::directional_page_span`, `instance_moved_bounds`, `note_instances_moved`, `leaf_page_bounds` |
-| Page raster passes | `crates/rendering/src/renderer.rs` | `add_vsm_page_passes`, `vsm_page_crop` |
+| Page raster passes | `crates/rendering/src/renderer/vsm_passes.rs` | `add_vsm_page_passes`, `take_render_list` |
 | Samplers | `assets/shaders/lighting_common.slang` | `vsmSampleDirectional`, `vsmSampleSpot`, `vsmSamplePoint`, `vsmTilePcf` |
 
 ## Related

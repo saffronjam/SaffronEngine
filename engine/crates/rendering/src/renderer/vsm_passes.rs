@@ -42,7 +42,7 @@ impl Renderer {
         // reads unshadowed via the `vsmParams.z` gate, so the demand marker writes
         // nothing) and stages no pages.
         if !self.lighting.use_shadows {
-            self.vsm_render_pages.clear();
+            self.vsm_render_list = crate::VsmRenderList::default();
             self.lighting.set_frame_vsm(
                 saffron_geometry::glam::Mat4::IDENTITY,
                 [saffron_geometry::glam::Vec4::ZERO; crate::VSM_DIRECTIONAL_LEVELS as usize],
@@ -51,10 +51,21 @@ impl Renderer {
             );
             return;
         }
-        // Pages staged last frame that the graph never rasterized stay dirty.
-        for page in std::mem::take(&mut self.vsm_render_pages) {
+        // Work staged last frame that the graph never rasterized stays dirty.
+        let unrasterized = std::mem::take(&mut self.vsm_render_list);
+        for page in unrasterized.directional {
             self.vsm_residency
                 .mark_dirty(page.key, crate::VsmDirtyReason::Restaged);
+        }
+        if unrasterized.spot {
+            self.vsm_residency
+                .mark_spot_dirty(crate::VsmDirtyReason::Restaged);
+        }
+        for (face, staged) in unrasterized.point_faces.into_iter().enumerate() {
+            if staged {
+                self.vsm_residency
+                    .mark_point_face_dirty(face as u32, crate::VsmDirtyReason::Restaged);
+            }
         }
         let space = crate::VsmDirectionalSpace::build(sun_direction, self.page_demand_view().eye);
         let serial = self.frame_serial;
@@ -73,12 +84,10 @@ impl Renderer {
             let bootstrap = crate::VSM_LEVEL_PAGES / 2;
             for y in (bootstrap - 4)..(bootstrap + 4) {
                 for x in (bootstrap - 4)..(bootstrap + 4) {
-                    let _ = self.vsm_residency.demand(
-                        crate::VsmPageKey::Directional {
-                            level: crate::VSM_DIRECTIONAL_LEVELS - 1,
-                            x,
-                            y,
-                        },
+                    let _ = self.vsm_residency.demand_directional(
+                        crate::VSM_DIRECTIONAL_LEVELS - 1,
+                        x,
+                        y,
                         serial,
                         crate::VsmDemandReason::Bootstrap,
                     );
@@ -98,28 +107,10 @@ impl Renderer {
             self.lighting.point_shadow_far(),
         );
         let point_light_moved = self.vsm_point_key != point_key;
-        let previous_point = saffron_geometry::glam::Vec3::new(
-            f32::from_bits(self.vsm_point_key[0]),
-            f32::from_bits(self.vsm_point_key[1]),
-            f32::from_bits(self.vsm_point_key[2]),
-        );
-        let previous_far = f32::from_bits(self.vsm_point_key[3]);
-        let point_texel_m = self.lighting.point_shadow_far().max(0.1)
-            / (crate::vsm::VSM_POINT_FACE_PAGES * crate::VSM_PAGE_SIZE) as f32;
-        let coherent_point_move = point_light_moved
-            && previous_far.is_finite()
-            && previous_far > 0.0
-            && previous_point.is_finite()
-            && previous_point.distance(self.lighting.point_shadow_pos()) <= point_texel_m * 2.0
-            && (previous_far - self.lighting.point_shadow_far()).abs() <= point_texel_m * 2.0;
         if point_light_moved {
             self.vsm_point_key = point_key;
-            let reason = if coherent_point_move {
-                crate::VsmDirtyReason::CoherentLightTransform
-            } else {
-                crate::VsmDirtyReason::LightTransform
-            };
-            self.vsm_residency.mark_point_dirty(reason);
+            self.vsm_residency
+                .mark_point_dirty(crate::VsmDirtyReason::LightTransform);
         }
         // Dynamic content re-dirties the pages it overlaps; static pages stay
         // cached. Discrete movers arrive as swept bounds from the persistent
@@ -169,6 +160,8 @@ impl Renderer {
                     .mark_point_dirty(crate::VsmDirtyReason::MovedCaster);
             }
         }
+        let point_space_dirty =
+            self.lighting.point_shadow_pending() && (point_light_moved || moved_projective);
         let mut demand_spot = false;
         let mut demand_point_faces = [false; crate::vsm::VSM_POINT_FACES as usize];
         for &index in &self.vsm_demanded {
@@ -180,14 +173,27 @@ impl Renderer {
                             *slot = true;
                         }
                     }
-                    crate::VsmPageKey::Directional { .. } => {
-                        let _ = self.vsm_residency.demand(
-                            key,
+                    crate::VsmPageKey::Directional { level, x, y } => {
+                        let _ = self.vsm_residency.demand_directional(
+                            level,
+                            x,
+                            y,
                             serial,
                             crate::VsmDemandReason::Receiver,
                         );
                     }
                 }
+            }
+        }
+        if point_space_dirty {
+            let recent = self.vsm_residency.recent_point_faces(serial, 2);
+            let mut has_point_face = false;
+            for (demanded, recent) in demand_point_faces.iter_mut().zip(recent) {
+                *demanded |= recent;
+                has_point_face |= *demanded;
+            }
+            if !has_point_face {
+                demand_point_faces.fill(true);
             }
         }
         if demand_spot && self.lighting.spot_shadow_pending() {
@@ -205,20 +211,9 @@ impl Renderer {
                 }
             }
         }
-        let demanded_point_faces = demand_point_faces
-            .iter()
-            .filter(|demanded| **demanded)
-            .count();
-        let point_move_budget = demanded_point_faces
-            * (crate::vsm::VSM_POINT_FACE_PAGES * crate::vsm::VSM_POINT_FACE_PAGES) as usize;
-        let page_budget = if point_light_moved && !coherent_point_move && point_move_budget > 0 {
-            self.vsm_page_budget.max(point_move_budget)
-        } else {
-            self.vsm_page_budget
-        };
-        self.vsm_render_pages = self
+        self.vsm_render_list = self
             .vsm_residency
-            .take_render_pages_prioritizing_point_faces(page_budget, demand_point_faces);
+            .take_render_list(serial, self.vsm_page_budget);
         let table = self
             .vsm_gpu
             .publish_table(&self.device, frame, &self.vsm_residency);
@@ -270,7 +265,7 @@ impl Renderer {
         micro_template: (u32, u32),
         instance_capacity: u32,
     ) -> Result<Option<RgResource>> {
-        if self.vsm_render_pages.is_empty() {
+        if self.vsm_render_list.is_empty() {
             return Ok(None);
         }
         let Some(pyramid) = self.views[self.active_view.index()].hzb_pyramid.as_ref() else {
@@ -282,7 +277,7 @@ impl Renderer {
         let previous_layout = pyramid.previous_layout();
         let hzb_extent = [pyramid.extent().width, pyramid.extent().height];
         let hzb_mips = pyramid.mip_count();
-        let pages = std::mem::take(&mut self.vsm_render_pages);
+        let list = std::mem::take(&mut self.vsm_render_list);
         let address_slice = (
             self.gpu_scene_uploader.address_buffer(),
             frame as u64 * self.gpu_scene_uploader.address_block_stride(),
@@ -300,12 +295,29 @@ impl Renderer {
         let space = self.vsm_space;
         let spot_view_proj = self.lighting.spot_shadow_view_proj();
         let frame_stamp = self.frame_serial as u32;
-        // Page groups: one per directional level, the spot space, and each point
-        // cube face — every group culls with its own frustum and derives per-page
-        // matrices from its own space.
-        let mut groups: Vec<(usize, Mat4, Vec<crate::VsmRenderPage>)> = Vec::new();
+        // One group per directional level with staged pages, plus one per dirty
+        // punctual block — every group culls with its own frustum. A directional
+        // group draws each page into its own tile through the page's ortho
+        // sub-window; a block group is ONE draw set over its contiguous block, the
+        // space matrix mapping the whole grid through the viewport transform.
+        enum VsmGroupDraw {
+            Pages(Vec<crate::VsmRenderPage>),
+            Block(vk::Rect2D),
+        }
+        let block_rect = |tile: [u32; 2], side: u32| vk::Rect2D {
+            offset: vk::Offset2D {
+                x: (tile[0] * crate::VSM_PAGE_SIZE) as i32,
+                y: (tile[1] * crate::VSM_PAGE_SIZE) as i32,
+            },
+            extent: vk::Extent2D {
+                width: side * crate::VSM_PAGE_SIZE,
+                height: side * crate::VSM_PAGE_SIZE,
+            },
+        };
+        let mut groups: Vec<(usize, Mat4, VsmGroupDraw)> = Vec::new();
         for level in 0..crate::VSM_DIRECTIONAL_LEVELS {
-            let level_pages: Vec<crate::VsmRenderPage> = pages
+            let level_pages: Vec<crate::VsmRenderPage> = list
+                .directional
                 .iter()
                 .copied()
                 .filter(|page| {
@@ -313,19 +325,21 @@ impl Renderer {
                 })
                 .collect();
             if !level_pages.is_empty() {
-                groups.push((level as usize, space.level_view_proj(level), level_pages));
+                groups.push((
+                    level as usize,
+                    space.level_view_proj(level),
+                    VsmGroupDraw::Pages(level_pages),
+                ));
             }
         }
-        let spot_pages: Vec<crate::VsmRenderPage> = pages
-            .iter()
-            .copied()
-            .filter(|page| matches!(page.key, crate::VsmPageKey::Spot { .. }))
-            .collect();
-        if !spot_pages.is_empty() {
+        if list.spot {
             groups.push((
                 crate::VSM_DIRECTIONAL_LEVELS as usize,
                 spot_view_proj,
-                spot_pages,
+                VsmGroupDraw::Block(block_rect(
+                    crate::vsm::VSM_SPOT_BLOCK_TILE,
+                    crate::vsm::VSM_SPOT_PAGES,
+                )),
             ));
         }
         let point_faces = crate::point_shadow_face_matrices(
@@ -333,23 +347,19 @@ impl Renderer {
             self.lighting.point_shadow_far(),
         );
         for face in 0..crate::vsm::VSM_POINT_FACES {
-            let face_pages: Vec<crate::VsmRenderPage> = pages
-                .iter()
-                .copied()
-                .filter(|page| {
-                    matches!(page.key, crate::VsmPageKey::PointFace { face: f, .. } if f == face)
-                })
-                .collect();
-            if !face_pages.is_empty() {
+            if list.point_faces[face as usize] {
                 groups.push((
                     (crate::VSM_DIRECTIONAL_LEVELS + 1 + face) as usize,
                     point_faces[face as usize],
-                    face_pages,
+                    VsmGroupDraw::Block(block_rect(
+                        crate::vsm::VSM_POINT_FACE_BLOCK_TILES[face as usize],
+                        crate::vsm::VSM_POINT_FACE_PAGES,
+                    )),
                 ));
             }
         }
         let shadow_tuning = self.traversal_tuning(crate::SceneViewClass::ShadowPage);
-        for (view_slot, cull_view_proj, group_pages) in groups {
+        for (view_slot, cull_view_proj, group_draw) in groups {
             let needs_view = self.vsm_views[view_slot]
                 .as_ref()
                 .is_none_or(|view| view.capacity() < instance_capacity);
@@ -461,7 +471,6 @@ impl Renderer {
             let draws = executor_draws.to_vec();
             let pages_buffer = self.global_gpu_data.pages.buffer();
             let draw_count_supported = self.device.capabilities.draw_indirect_count;
-            let render_pages = group_pages.clone();
             let extent = vk::Extent2D {
                 width: crate::VSM_ATLAS_SIZE,
                 height: crate::VSM_ATLAS_SIZE,
@@ -474,6 +483,7 @@ impl Renderer {
                 resolve: None,
             });
             let pass_inputs = inputs;
+            let group_view_proj = cull_view_proj;
             let mut pass = pass.body(move |cmd, _scopes: &mut NestedScopeRecorder| {
                 // SAFETY: the ash seam; `cmd` is recording inside the pass.
                 unsafe {
@@ -484,22 +494,12 @@ impl Renderer {
                         crate::lighting::SHADOW_DEPTH_BIAS_SLOPE,
                     );
                 }
-                for page in &render_pages {
-                    let tile = vk::Rect2D {
-                        offset: vk::Offset2D {
-                            x: ((page.tile % crate::VSM_ATLAS_TILES) * crate::VSM_PAGE_SIZE) as i32,
-                            y: ((page.tile / crate::VSM_ATLAS_TILES) * crate::VSM_PAGE_SIZE) as i32,
-                        },
-                        extent: vk::Extent2D {
-                            width: crate::VSM_PAGE_SIZE,
-                            height: crate::VSM_PAGE_SIZE,
-                        },
-                    };
+                let draw_rect = |rect: vk::Rect2D, view_proj: Mat4| {
                     let viewport = vk::Viewport {
-                        x: tile.offset.x as f32,
-                        y: tile.offset.y as f32,
-                        width: crate::VSM_PAGE_SIZE as f32,
-                        height: crate::VSM_PAGE_SIZE as f32,
+                        x: rect.offset.x as f32,
+                        y: rect.offset.y as f32,
+                        width: rect.extent.width as f32,
+                        height: rect.extent.height as f32,
                         min_depth: 0.0,
                         max_depth: 1.0,
                     };
@@ -514,35 +514,22 @@ impl Renderer {
                         },
                     };
                     let clear_rect = vk::ClearRect {
-                        rect: tile,
+                        rect,
                         base_array_layer: 0,
                         layer_count: 1,
                     };
-                    // SAFETY: the ash seam; the tile lies inside the atlas attachment.
+                    // SAFETY: the ash seam; the rect lies inside the atlas attachment.
                     unsafe {
                         raw_body.cmd_set_viewport(cmd, 0, &[viewport]);
-                        raw_body.cmd_set_scissor(cmd, 0, &[tile]);
+                        raw_body.cmd_set_scissor(cmd, 0, &[rect]);
                         raw_body.cmd_clear_attachments(cmd, &[clear], &[clear_rect]);
                     }
-                    let page_view_proj = match page.key {
-                        crate::VsmPageKey::Directional { level, x, y } => {
-                            space.page_view_proj(level, x, y)
-                        }
-                        crate::VsmPageKey::Spot { x, y } => {
-                            crate::vsm::vsm_page_crop(crate::vsm::VSM_SPOT_PAGES, x, y)
-                                * spot_view_proj
-                        }
-                        crate::VsmPageKey::PointFace { face, x, y } => {
-                            crate::vsm::vsm_page_crop(crate::vsm::VSM_POINT_FACE_PAGES, x, y)
-                                * point_faces[face as usize]
-                        }
-                    };
                     record_executor_depth_family(
                         &raw_body,
                         cmd,
                         (shadow_pipeline, shadow_layout),
                         vk::ShaderStageFlags::VERTEX,
-                        bytemuck::bytes_of(&page_view_proj),
+                        bytemuck::bytes_of(&view_proj),
                         bindless_set,
                         instance_set,
                         pass_inputs,
@@ -551,6 +538,29 @@ impl Renderer {
                         &draws,
                         false,
                     );
+                };
+                match &group_draw {
+                    VsmGroupDraw::Pages(pages) => {
+                        for page in pages {
+                            let crate::VsmPageKey::Directional { level, x, y } = page.key else {
+                                continue;
+                            };
+                            let tile = vk::Rect2D {
+                                offset: vk::Offset2D {
+                                    x: ((page.tile % crate::VSM_ATLAS_TILES) * crate::VSM_PAGE_SIZE)
+                                        as i32,
+                                    y: ((page.tile / crate::VSM_ATLAS_TILES) * crate::VSM_PAGE_SIZE)
+                                        as i32,
+                                },
+                                extent: vk::Extent2D {
+                                    width: crate::VSM_PAGE_SIZE,
+                                    height: crate::VSM_PAGE_SIZE,
+                                },
+                            };
+                            draw_rect(tile, space.page_view_proj(level, x, y));
+                        }
+                    }
+                    VsmGroupDraw::Block(rect) => draw_rect(*rect, group_view_proj),
                 }
                 drop(shadow_keep);
             });
