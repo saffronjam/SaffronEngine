@@ -36,6 +36,9 @@ export type {
   ProfilerMode,
   RecentProject,
   RecentProjects,
+  SessionExited,
+  SessionIntent,
+  SessionStatus,
   ViewId,
   ViewportBounds,
 } from "./types";

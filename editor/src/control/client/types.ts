@@ -48,6 +48,28 @@ export interface AppDataInfo {
   scratchProject: boolean;
 }
 
+/// A host session's boot intent: open a project selection, create a fresh project, or empty (the
+/// host resolves `SAFFRON_PROJECT` / `SAFFRON_SCRATCH_PROJECT` / a cwd `project.json` from the
+/// environment).
+export interface SessionIntent {
+  path?: string;
+  create?: { name: string; displayName: string };
+}
+
+/// The `session_status` reply: whether a host is live and the boot intent it started with.
+export interface SessionStatus {
+  running: boolean;
+  path: string;
+}
+
+/// The `session-exited` shell event payload: the host exit code, whether the stop was requested
+/// (`session_stop`), and the tail of the host log for the crash report.
+export interface SessionExited {
+  code: number;
+  expected: boolean;
+  logTail: string[];
+}
+
 /// Editor-wide settings persisted in appdata/settings.json. `keyBindings` holds only the user's
 /// overrides (command id → key-string); defaults live in lib/keybindings.
 export interface EditorSettings {

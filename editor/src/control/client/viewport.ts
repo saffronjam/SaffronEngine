@@ -1,6 +1,12 @@
 import { invoke } from "../../shell";
 import { call } from "./call";
-import type { GizmoPointerPhase, ViewId, ViewportBounds } from "./types";
+import type {
+  GizmoPointerPhase,
+  SessionIntent,
+  SessionStatus,
+  ViewId,
+  ViewportBounds,
+} from "./types";
 import type { CommandResultMap, EditorCamera, EntityRef, GizmoState, Vec3 } from "../../protocol";
 
 /// The gizmo, the editor and preview cameras, input streaming, and the engine-lifecycle and
@@ -52,28 +58,16 @@ export const viewportCommands = {
     return call("viewport-native-info");
   },
 
-  /// Stream editor fly-cam input (pointer-lock look deltas in pixels + move keys).
-  flyInput(input: {
-    active: boolean;
-    lookDx?: number;
-    lookDy?: number;
-    forward?: boolean;
-    back?: boolean;
-    left?: boolean;
-    right?: boolean;
-    up?: boolean;
-    down?: boolean;
-  }): Promise<{ active: boolean }> {
-    return call("fly-input", input);
-  },
   scriptInput(keys: string[]): Promise<{ keys: string[] }> {
     return call("script-input", { keys });
   },
 
-  /// Engine lifecycle + presenter calls go through dedicated Rust commands, not the
-  /// generic control passthrough.
-  startEngine(): Promise<void> {
-    return invoke<void>("start_engine");
+  /// Session lifecycle + presenter calls go through dedicated Rust commands, not the
+  /// generic control passthrough. A session is one host process born for one project: the
+  /// intent names the project to open or create (empty = the host resolves it from the
+  /// environment), and stopping the session ends the process.
+  sessionStart(intent: SessionIntent = {}): Promise<void> {
+    return invoke<void>("session_start", { ...intent });
   },
   /// Route one view's pane rect to its own permanently-glued subsurface. `resizeEngine` also commits
   /// that view's device-pixel render size, so send it on settled bounds, not on live drag ticks.
@@ -90,10 +84,10 @@ export const viewportCommands = {
   viewportRefreshHz(): Promise<number> {
     return invoke<number>("viewport_refresh_hz");
   },
-  quitEngine(): Promise<void> {
-    return invoke<void>("quit_engine");
+  sessionStop(): Promise<void> {
+    return invoke<void>("session_stop");
   },
-  engineAlive(): Promise<boolean> {
-    return invoke<boolean>("engine_alive");
+  sessionStatus(): Promise<SessionStatus> {
+    return invoke<SessionStatus>("session_status");
   },
 };
