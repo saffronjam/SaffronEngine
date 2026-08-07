@@ -34,9 +34,9 @@ The split keeps a divider drag responsive: the native surface follows the panel 
 
 ## Startup and parking
 
-The Viewport panel owns renderer readiness. Until the control socket answers `viewport-native-info`, it probes with a 1.5-second timeout and retries after 150 ms. A successful response moves the editor to `ready`; `LoadingOverlay` covers the viewport until then.
+The Viewport panel owns renderer readiness. Once a project session starts, it probes `viewport-native-info` with a 1.5-second timeout and 150 ms retries until the control socket answers. A successful response moves the editor to `ready`; `LoadingOverlay` covers the viewport until then. With no session live the phase stays `idle` and nothing probes.
 
-`App` decides which view is visible. A modal parks both views. A Scene tab unparks `scene`, while an asset-editor or material-graph tab unparks `assetPreview` and calls `set-active-view` so the engine routes the matching scene, camera, and render target.
+`App` decides which view is visible. The launcher or a modal parks both views. A Scene tab unparks `scene`, while an asset-editor or material-graph tab unparks `assetPreview` and calls `set-active-view` so the engine routes the matching scene, camera, and render target.
 
 Parking hides the AppKit layer or detaches the Wayland buffer. The shared-frame ring keeps the last image, but that image is not visible while parked. Unparking happens immediately and reattaches the retained frame before a new render arrives. Parking is delayed by two animation frames so the incoming opaque tab paints before the outgoing native surface disappears.
 
@@ -57,7 +57,7 @@ A press that [Vegetation mode](../vegetation-mode/) claims owns the whole gestur
 
 ## Editor camera and gameplay keys
 
-Holding the right mouse button asks the shell to lock and hide the cursor. CEF windowless rendering does not supply usable DOM motion while the native grab is active, so the shell emits relative `fly-look` events. The panel accumulates those deltas and the configured fly-key state, then sends `fly-input` at most every 16 ms. Releasing the button, pressing Escape, losing focus, or unmounting ends the grab and sends an inactive state.
+Holding the right mouse button sends `fly_stream_start` with the configured fly bindings; the shell locks and hides the cursor and streams `fly-input` samples straight to the engine at the monitor refresh — motion and key state never cross the webview (see [Editor camera](../editor-camera/)). The shell ends the gesture itself on right-button release, Escape, or focus loss and announces `fly-ended`; the panel just mirrors that into its gesture state, swallows the bound move keys so they don't fire DOM shortcuts, and sends `fly_stream_stop` on unmount.
 
 Fly bindings use physical key codes from Editor Settings. Their defaults are W, S, A, D, Space, and Left Shift for forward, back, left, right, up, and down. The camera remains available in Play as the fallback when the scene has no primary camera.
 
@@ -73,7 +73,7 @@ Drop sends one final preview position followed by `phase: "commit"`; leaving the
 
 | What | File | Symbols |
 |---|---|---|
-| Scene host, input, and model drop | `editor/src/panels/ViewportPanel/` | `ViewportPanel`, `eventToUv`, `DRAG_THRESHOLD_PX`, `FLY_STREAM_MS` |
+| Scene host, input, and model drop | `editor/src/panels/ViewportPanel/` | `ViewportPanel`, `eventToUv`, `DRAG_THRESHOLD_PX`, `useFlyCamera` |
 | Two-tier per-view geometry | `editor/src/lib/useSubsurfaceBounds.ts` | `useSubsurfaceBounds`, `computeBounds`, `liveSync`, `scheduleEndCommit` |
 | View selection and parking policy | `editor/src/app/App.tsx` | `activeRenderView`, `sceneParked`, `assetParked` |
 | Shell command bridge | `editor/shell/src/commands.rs` | `set_viewport_bounds`, `set_viewport_parked` |
