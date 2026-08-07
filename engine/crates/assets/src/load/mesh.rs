@@ -1,5 +1,6 @@
 use std::path::Path;
 use std::sync::Arc;
+use std::time::Instant;
 
 use saffron_core::Uuid;
 use saffron_geometry::{
@@ -66,6 +67,7 @@ impl AssetServer {
         source: &ByteSource,
         sdf_bake: Option<SdfBake>,
     ) -> Option<Arc<GpuMesh>> {
+        let read_started = Instant::now();
         let bytes = match source.read() {
             Ok(bytes) => bytes,
             Err(err) => {
@@ -73,6 +75,8 @@ impl AssetServer {
                 return None;
             }
         };
+        let read_ms = read_started.elapsed().as_millis();
+        let decode_started = Instant::now();
         let mesh = match load_mesh_from_bytes(&bytes) {
             Ok(mesh) => mesh,
             Err(err) => {
@@ -92,6 +96,8 @@ impl AssetServer {
         // `.smesh` carries its sparse deltas; the deform pass reads them on the GPU.
         let skin = load_mesh_skin_from_bytes(&bytes).unwrap_or_default();
         let morph = load_mesh_morph_from_bytes(&bytes).ok().flatten();
+        let decode_ms = decode_started.elapsed().as_millis();
+        let upload_started = Instant::now();
         match gpu.upload_mesh(
             &mesh,
             &hierarchy,
@@ -99,7 +105,15 @@ impl AssetServer {
             morph.as_ref(),
             sdf_bake.as_ref().map_or(SdfSource::None, SdfSource::Bake),
         ) {
-            Ok(mesh_ref) => Some(mesh_ref),
+            Ok(mesh_ref) => {
+                tracing::debug!(
+                    "mesh {} resident — read {read_ms} ms ({} KiB), decode {decode_ms} ms, upload {} ms",
+                    sub_id.value(),
+                    bytes.len() / 1024,
+                    upload_started.elapsed().as_millis()
+                );
+                Some(mesh_ref)
+            }
             Err(err) => {
                 tracing::warn!("mesh {}: {err}", sub_id.value());
                 None

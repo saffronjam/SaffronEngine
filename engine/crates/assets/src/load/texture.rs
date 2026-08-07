@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::time::Instant;
 
 use saffron_core::Uuid;
 use saffron_geometry::{
@@ -279,6 +280,7 @@ fn upload_texture_from_source(
     space: Colorspace,
     as_height: bool,
 ) -> Option<Arc<GpuTexture>> {
+    let read_started = Instant::now();
     let bytes = match source.read() {
         Ok(bytes) => bytes,
         Err(err) => {
@@ -286,11 +288,25 @@ fn upload_texture_from_source(
             return None;
         }
     };
+    let read_ms = read_started.elapsed().as_millis();
+    let decode_started = Instant::now();
     if space == Colorspace::Hdr && !as_height {
         return match decode_image_from_memory_hdr(&bytes) {
             Ok(decoded) => {
+                let decode_ms = decode_started.elapsed().as_millis();
+                let upload_started = Instant::now();
                 match gpu.upload_texture_float(&decoded.rgba, decoded.width, decoded.height) {
-                    Ok(texture) => Some(texture),
+                    Ok(texture) => {
+                        tracing::debug!(
+                            "texture {} resident — {}x{} hdr, read {read_ms} ms ({} KiB), decode {decode_ms} ms, upload {} ms",
+                            sub_id.value(),
+                            decoded.width,
+                            decoded.height,
+                            bytes.len() / 1024,
+                            upload_started.elapsed().as_millis()
+                        );
+                        Some(texture)
+                    }
                     Err(err) => {
                         tracing::warn!("texture {}: {err}", sub_id.value());
                         None
@@ -305,6 +321,8 @@ fn upload_texture_from_source(
     }
     match decode_image_from_memory(&bytes) {
         Ok(decoded) => {
+            let decode_ms = decode_started.elapsed().as_millis();
+            let upload_started = Instant::now();
             let result = if as_height {
                 gpu.upload_height_texture(&decoded.rgba, decoded.width, decoded.height)
             } else {
@@ -312,7 +330,18 @@ fn upload_texture_from_source(
                 gpu.upload_texture(&decoded.rgba, decoded.width, decoded.height, srgb)
             };
             match result {
-                Ok(texture) => Some(texture),
+                Ok(texture) => {
+                    tracing::debug!(
+                        "texture {} resident — {}x{}{}, read {read_ms} ms ({} KiB), decode {decode_ms} ms, upload {} ms",
+                        sub_id.value(),
+                        decoded.width,
+                        decoded.height,
+                        if as_height { " height" } else { "" },
+                        bytes.len() / 1024,
+                        upload_started.elapsed().as_millis()
+                    );
+                    Some(texture)
+                }
                 Err(err) => {
                     tracing::warn!("texture {}: {err}", sub_id.value());
                     None

@@ -489,6 +489,7 @@ impl AssetServer {
         if !matches!(entry.asset_type, AssetType::Model | AssetType::Material) {
             return None;
         }
+        let opened = std::time::Instant::now();
         let full_path = format!("{}/{}", self.root.display(), entry.path);
         let meta = match read_container_metadata(&full_path) {
             Ok(meta) => meta,
@@ -504,6 +505,12 @@ impl AssetServer {
                 return None;
             }
         };
+        tracing::debug!(
+            "container {} opened — '{}' in {} ms",
+            container_id.value(),
+            entry.path,
+            opened.elapsed().as_millis()
+        );
         Some(Arc::new(ModelAsset { meta, reader }))
     }
 
