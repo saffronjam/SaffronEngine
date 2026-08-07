@@ -146,8 +146,8 @@ impl HostLayer {
         if !self.editor.transform_smoothing.is_empty() {
             reasons.push("smoothing");
         }
-        // The camera eases toward its target over a few frames after the last input — the
-        // fly-cam look tail and the preview orbit's `set-camera smooth` samples both.
+        // Free fly holds continuous render while RMB is down (`controlling`); the preview
+        // orbit's eased `set-camera` samples hold it via `is_easing` until the sweep settles.
         if self.editor.camera.controlling || self.editor.camera.is_easing() {
             reasons.push("camera");
         }
