@@ -1,14 +1,19 @@
-/// Dev-mode render-frequency logger: components call `logRender("Name")` at the top of their render
-/// and per-component counts flush to the console once a second while dev mode is on. Reads the store
-/// through `getState()` so the logger never subscribes and adds no re-renders of its own. Counts
-/// include renders React later discards, so the numbers are relative, not exact.
-import { useEditorStore } from "../state/store";
+/// Render-frequency logger: components call `logRender("Name")` at the top of their render and
+/// per-component counts flush to the console once a second while explicitly enabled. Counts include
+/// renders React later discards, so the numbers are relative, not exact.
 
 const counts = new Map<string, number>();
 let flushTimer: number | null = null;
 
+function renderLogEnabled(): boolean {
+  return (
+    import.meta.env.VITE_SAFFRON_RENDER_LOG === "1" ||
+    localStorage.getItem("saffron.renderLog") === "1"
+  );
+}
+
 export function logRender(name: string): void {
-  if (!useEditorStore.getState().devMode) {
+  if (!renderLogEnabled()) {
     return;
   }
   counts.set(name, (counts.get(name) ?? 0) + 1);
