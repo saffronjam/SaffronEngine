@@ -15,6 +15,7 @@ mod barriers;
 mod hierarchy;
 mod lut;
 mod mesh;
+mod pyramid;
 mod sdf;
 mod staging;
 mod texture;
@@ -32,6 +33,7 @@ use crate::resources::DeviceResources;
 use crate::{Device, Result, checked};
 use accel::accel_timestamp_pool;
 use bake_pipelines::BakePipelines;
+use pyramid::PyramidPipeline;
 
 pub use texture::TextureMipLevel;
 
@@ -216,6 +218,10 @@ pub struct Uploader {
     /// renderer's frame PSO cache because the bake runs on the upload path. `None` when the
     /// pipelines fail to build: the mesh then uploads with no field.
     bake: Option<BakePipelines>,
+    /// The min/max height-pyramid compute pipeline, dispatched on the one-off command buffer
+    /// after a displacement height upload. `None` when it fails to build: the pyramid then
+    /// degrades to a 1×1 conservative bound.
+    pyramid: Option<PyramidPipeline>,
     /// Two-timestamp pool bracketing the out-of-graph acceleration-structure submits. The static
     /// BLAS build and its compaction run on this private one-off pool, so no graph pass scope
     /// covers them, and they scale with content rather than with frame rate.
@@ -252,6 +258,13 @@ impl Uploader {
                 None
             }
         };
+        let pyramid = match PyramidPipeline::new(&resources) {
+            Ok(pyramid) => Some(pyramid),
+            Err(err) => {
+                tracing::warn!("height pyramid pipeline unavailable: {err}");
+                None
+            }
+        };
         Ok(Self {
             resources,
             queue: queue.clone(),
@@ -262,6 +275,7 @@ impl Uploader {
             cluster: crate::rt_cluster::ClusterBlasBuilder::new(device),
             omm_max_subdivision: device.omm_max_subdivision(),
             bake,
+            pyramid,
             accel_timestamps: accel_timestamp_pool(device),
         })
     }

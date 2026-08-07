@@ -43,7 +43,7 @@ The renderer submits `tess-emit` with direct dispatches. The command written by 
 
 The factor kernel measures the angular screen extent of an edge from its two welded endpoints. If either endpoint crosses the near-plane guard, it uses a finite length-over-distance fallback. Both forms divide the projected extent by the target pixels per micro-edge.
 
-Displacement detail also affects the factor. Each displacement height texture owns an `R32G32_SFLOAT` min/max pyramid at bindless binding 4. The kernel chooses a mip from the edge's tiled UV span, reads a conservative local height range, projects `height_range * height_scale`, and uses the larger of base-edge and displacement extents.
+Displacement detail also affects the factor. Each displacement height texture owns an `R32G32_SFLOAT` min/max pyramid at bindless binding 4, built on the GPU at upload time: the `height_minmax` compute chain writes level 0 as `(h, h)` per texel and reduces each coarser mip as the exact min/max of its children, so every texel is a conservative bound and the pyramid must be point-sampled with explicit LOD. The kernel chooses a mip from the edge's tiled UV span, reads a conservative local height range, projects `height_range * height_scale`, and uses the larger of base-edge and displacement extents.
 
 The calculation uses mesh-local endpoints and a camera position transformed into local space. It is exact for uniform object scale; non-uniform scale distorts the angular metric.
 

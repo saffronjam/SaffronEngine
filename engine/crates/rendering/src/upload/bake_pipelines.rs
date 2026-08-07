@@ -252,7 +252,7 @@ impl Drop for BakePipelines {
 
 /// Loads `<dir>/<file>` SPIR-V and builds a compute pipeline (entry `computeMain`) against
 /// `layout`. The shader module is freed after pipeline creation.
-fn compute_pipeline(
+pub(super) fn compute_pipeline(
     raw: &ash::Device,
     dir: &Path,
     file: &str,

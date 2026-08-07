@@ -38,7 +38,7 @@ pub use alpha_card::{
 };
 pub use conditioning::{
     EDGE_BOUNDARY, EDGE_NON_MANIFOLD, EDGE_SEAM, EDGE_SEAM_OBJECT_SPACE, Edge, MeshConditioning,
-    MinMaxLevel, TriEdges, WeldedVertex, build_min_max_pyramid,
+    TriEdges, WeldedVertex,
 };
 pub use error::{Error, Result};
 pub use gltf_import::import_gltf_model;

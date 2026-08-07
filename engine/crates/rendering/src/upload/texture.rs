@@ -1,7 +1,6 @@
 use std::sync::Arc;
 
 use ash::vk;
-use saffron_geometry::build_min_max_pyramid;
 use vk_mem::Alloc;
 
 use super::barriers::{
@@ -56,7 +55,7 @@ struct UploadedImage {
 }
 
 /// Full mip-chain length for a `width × height` image (down to 1×1).
-fn mip_count(width: u32, height: u32) -> u32 {
+pub(super) fn mip_count(width: u32, height: u32) -> u32 {
     let mut d = width.max(height);
     let mut levels = 1;
     while d > 1 {
@@ -90,19 +89,11 @@ impl Uploader {
         } else {
             vk::Format::R8G8B8A8_UNORM
         };
-        self.upload_mipped_rgba8(
-            descriptors,
-            rgba,
-            (width, height),
-            format,
-            "upload_texture",
-            None,
-        )
+        self.upload_mipped_rgba8(descriptors, rgba, (width, height), format, "upload_texture")
     }
 
-    /// Stages `rgba` into a `format` image with a blitted mip chain and finishes it into a bindless
-    /// slot, attaching `min_max` when the caller built one. Every resource allocated before a
-    /// failure — including `min_max` — is freed before returning.
+    /// Stages `rgba` into a `format` image with a blitted mip chain and finishes it into a
+    /// bindless slot. Every resource allocated before a failure is freed before returning.
     fn upload_mipped_rgba8(
         &self,
         descriptors: &Descriptors,
@@ -110,54 +101,51 @@ impl Uploader {
         extent: (u32, u32),
         format: vk::Format,
         label: &'static str,
-        min_max: Option<MinMaxPyramid>,
     ) -> Result<Arc<GpuTexture>> {
+        let uploaded = self.stage_mipped_rgba8(rgba, extent, format, label)?;
+        self.finish_texture(descriptors, uploaded, None)
+    }
+
+    /// Stages `rgba` into a `format` image, blits its full mip chain, and leaves it in
+    /// `SHADER_READ_ONLY` — the shared front half of every mipped RGBA8 upload.
+    fn stage_mipped_rgba8(
+        &self,
+        rgba: &[u8],
+        extent: (u32, u32),
+        format: vk::Format,
+        label: &'static str,
+    ) -> Result<UploadedImage> {
         let (width, height) = extent;
         if width == 0 || height == 0 {
-            if let Some(pyramid) = min_max {
-                self.free_pyramid(pyramid);
-            }
             return Err(Error::ZeroSizedImage);
         }
         let bytes = (width as vk::DeviceSize) * (height as vk::DeviceSize) * 4;
         let mip_levels = mip_count(width, height);
 
-        let staged = (|| -> Result<UploadedImage> {
-            let mut staging = StagingBuffer::new(self.allocator(), bytes)?;
-            staging.mapped_slice()[..bytes as usize].copy_from_slice(&rgba[..bytes as usize]);
-            staging.flush();
-            let uploaded = self.create_sampled_image(width, height, mip_levels, format)?;
-            let image = uploaded.image;
-            let recorded = self.with_one_off_commands(label, |cmd| {
-                // SAFETY: the ash seam. The image/staging buffer outlive the submit-wait.
-                unsafe {
-                    record_texture_upload(
-                        self.raw(),
-                        cmd,
-                        image,
-                        staging.handle(),
-                        width,
-                        height,
-                        mip_levels,
-                    );
-                }
-            });
-            drop(staging);
-            match recorded {
-                Ok(()) => Ok(uploaded),
-                Err(err) => {
-                    self.destroy_image(uploaded.image, uploaded.allocation);
-                    Err(err)
-                }
+        let mut staging = StagingBuffer::new(self.allocator(), bytes)?;
+        staging.mapped_slice()[..bytes as usize].copy_from_slice(&rgba[..bytes as usize]);
+        staging.flush();
+        let uploaded = self.create_sampled_image(width, height, mip_levels, format)?;
+        let image = uploaded.image;
+        let recorded = self.with_one_off_commands(label, |cmd| {
+            // SAFETY: the ash seam. The image/staging buffer outlive the submit-wait.
+            unsafe {
+                record_texture_upload(
+                    self.raw(),
+                    cmd,
+                    image,
+                    staging.handle(),
+                    width,
+                    height,
+                    mip_levels,
+                );
             }
-        })();
-
-        match staged {
-            Ok(uploaded) => self.finish_texture(descriptors, uploaded, min_max),
+        });
+        drop(staging);
+        match recorded {
+            Ok(()) => Ok(uploaded),
             Err(err) => {
-                if let Some(pyramid) = min_max {
-                    self.free_pyramid(pyramid);
-                }
+                self.destroy_image(uploaded.image, uploaded.allocation);
                 Err(err)
             }
         }
@@ -433,9 +421,9 @@ impl Uploader {
     }
 
     /// Uploads an RGBA8 image as a sampled, mipmapped **displacement height** texture *and* builds its
-    /// per-height min/max pyramid, writing both into the same bindless slot (the texture at binding 0,
-    /// the pyramid at binding 4). Mirrors [`Uploader::upload_texture`] with `srgb = false` (height is
-    /// linear data), then attaches the pyramid so the tessellation factor kernel refines per-region.
+    /// per-height min/max pyramid on the GPU, writing both into the same bindless slot (the texture at
+    /// binding 0, the pyramid at binding 4). Mirrors [`Uploader::upload_texture`] with `srgb = false`
+    /// (height is linear data); the pyramid lets the tessellation factor kernel refine per-region.
     ///
     /// # Errors
     ///
@@ -448,141 +436,20 @@ impl Uploader {
         width: u32,
         height: u32,
     ) -> Result<Arc<GpuTexture>> {
-        if width == 0 || height == 0 {
-            return Err(Error::ZeroSizedImage);
-        }
-        let pyramid = self.build_and_upload_pyramid(rgba, width, height)?;
-        self.upload_mipped_rgba8(
-            descriptors,
+        let uploaded = self.stage_mipped_rgba8(
             rgba,
             (width, height),
             vk::Format::R8G8B8A8_UNORM,
             "upload_height_texture",
-            Some(pyramid),
-        )
-    }
-
-    /// Builds the min/max pyramid over the height channel (R, normalized `[0, 1]`) on the CPU and
-    /// uploads it into an `R32G32_SFLOAT` image (min in R / max in G, one mip per pyramid level). Each
-    /// level is written directly (no blit — a blit would linearly filter, breaking the conservative
-    /// bound); the CPU levels are the exact per-texel `(min, max)`.
-    fn build_and_upload_pyramid(
-        &self,
-        rgba: &[u8],
-        width: u32,
-        height: u32,
-    ) -> Result<MinMaxPyramid> {
-        let texel_count = (width as usize) * (height as usize);
-        let heights: Vec<f32> = (0..texel_count)
-            .map(|i| f32::from(rgba[i * 4]) / 255.0)
-            .collect();
-        let levels = build_min_max_pyramid(&heights, width, height);
-        // A degenerate input yields no levels; fall back to a single 1×1 `(min, max)` over the image so
-        // the slot always holds a valid pyramid (the factor kernel clamps the LOD).
-        let mip_levels = levels.len().max(1) as u32;
-
-        // Stage every level's `[min, max]` texels contiguously; each level starts 8-byte aligned (the
-        // texel block size), satisfying the buffer-image copy offset alignment.
-        let mut packed: Vec<[f32; 2]> = Vec::new();
-        let mut level_offsets: Vec<vk::DeviceSize> = Vec::with_capacity(levels.len());
-        for level in &levels {
-            level_offsets.push((packed.len() * std::mem::size_of::<[f32; 2]>()) as vk::DeviceSize);
-            packed.extend_from_slice(&level.texels);
-        }
-        if packed.is_empty() {
-            packed.push([0.0, 0.0]);
-            level_offsets.push(0);
-        }
-        let bytes = (packed.len() * std::mem::size_of::<[f32; 2]>()) as vk::DeviceSize;
-        let mut staging = StagingBuffer::new(self.allocator(), bytes)?;
-        staging.mapped_slice()[..bytes as usize].copy_from_slice(bytemuck::cast_slice(&packed));
-        staging.flush();
-
-        let uploaded =
-            self.create_sampled_image(width, height, mip_levels, vk::Format::R32G32_SFLOAT)?;
-        let image = uploaded.image;
-        let dims: Vec<(u32, u32)> = if levels.is_empty() {
-            vec![(1, 1)]
-        } else {
-            levels.iter().map(|l| (l.width, l.height)).collect()
-        };
-        let recorded = self.with_one_off_commands("build_and_upload_pyramid", |cmd| {
-            // SAFETY: the ash seam. The image/staging buffer outlive the submit-wait.
-            unsafe {
-                let raw = self.raw();
-                transition_image(
-                    raw,
-                    cmd,
-                    image,
-                    mip_levels,
-                    vk::ImageLayout::UNDEFINED,
-                    vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-                    vk::PipelineStageFlags2::TOP_OF_PIPE,
-                    vk::AccessFlags2::empty(),
-                    vk::PipelineStageFlags2::COPY,
-                    vk::AccessFlags2::TRANSFER_WRITE,
-                );
-                for (mip, &(w, h)) in dims.iter().enumerate() {
-                    copy_buffer_to_image_mip(
-                        raw,
-                        cmd,
-                        staging.handle(),
-                        image,
-                        level_offsets[mip],
-                        mip as u32,
-                        vk::Extent2D {
-                            width: w,
-                            height: h,
-                        },
-                    );
-                }
-                transition_image(
-                    raw,
-                    cmd,
-                    image,
-                    mip_levels,
-                    vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-                    vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
-                    vk::PipelineStageFlags2::COPY,
-                    vk::AccessFlags2::TRANSFER_WRITE,
-                    vk::PipelineStageFlags2::COMPUTE_SHADER,
-                    vk::AccessFlags2::SHADER_SAMPLED_READ,
-                );
-            }
-        });
-        drop(staging);
-        if let Err(err) = recorded {
-            self.destroy_image(uploaded.image, uploaded.allocation);
-            return Err(err);
-        }
-
-        let view_info = vk::ImageViewCreateInfo::default()
-            .image(image)
-            .view_type(vk::ImageViewType::TYPE_2D)
-            .format(vk::Format::R32G32_SFLOAT)
-            .subresource_range(vk::ImageSubresourceRange {
-                aspect_mask: vk::ImageAspectFlags::COLOR,
-                base_mip_level: 0,
-                level_count: mip_levels,
-                base_array_layer: 0,
-                layer_count: 1,
-            });
-        // SAFETY: the ash seam. The view references the pyramid image just uploaded.
-        let view = match unsafe { self.raw().create_image_view(&view_info, None) } {
-            Ok(view) => view,
-            Err(result) => {
+        )?;
+        let pyramid = match self.build_height_pyramid(uploaded.image, width, height) {
+            Ok(pyramid) => pyramid,
+            Err(err) => {
                 self.destroy_image(uploaded.image, uploaded.allocation);
-                return Err(Error::Vk {
-                    context: "create_image_view (min/max pyramid)",
-                    result,
-                });
+                return Err(err);
             }
         };
-        Ok(MinMaxPyramid {
-            image,
-            view,
-            allocation: uploaded.allocation,
-        })
+        self.finish_texture(descriptors, uploaded, Some(pyramid))
     }
 
     /// Frees a not-yet-owned [`MinMaxPyramid`] on an upload error path (before a `GpuTexture` takes it).

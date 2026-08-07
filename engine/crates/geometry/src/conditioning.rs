@@ -261,69 +261,6 @@ impl MeshConditioning {
     }
 }
 
-/// One level of a [`build_min_max_pyramid`]: the `(min, max)` height bound per texel.
-#[derive(Clone, Debug, Default, PartialEq)]
-pub struct MinMaxLevel {
-    /// Level width in texels.
-    pub width: u32,
-    /// Level height in texels.
-    pub height: u32,
-    /// `[min, max]` height per texel, row-major.
-    pub texels: Vec<[f32; 2]>,
-}
-
-/// Builds a min-max (max-mipmap) pyramid over a height channel: level 0 is `(h, h)` per texel,
-/// each coarser level the exact per-texel `(min, max)` of its up-to-2×2 children, down to 1×1.
-///
-/// This is not a linear mip average. The prism march and offset-limited parallax need a
-/// conservative bound, so the pyramid must be point-sampled with explicit LOD — linear filtering
-/// blends min with max and breaks the bound. A zero-extent input yields an empty pyramid.
-pub fn build_min_max_pyramid(height: &[f32], width: u32, height_px: u32) -> Vec<MinMaxLevel> {
-    if width == 0 || height_px == 0 || (width as usize * height_px as usize) != height.len() {
-        return Vec::new();
-    }
-    let level0 = MinMaxLevel {
-        width,
-        height: height_px,
-        texels: height.iter().map(|&h| [h, h]).collect(),
-    };
-    let mut levels = vec![level0];
-    while levels
-        .last()
-        .map(|l| l.width > 1 || l.height > 1)
-        .unwrap_or(false)
-    {
-        let prev = levels.last().unwrap();
-        let nw = prev.width.div_ceil(2).max(1);
-        let nh = prev.height.div_ceil(2).max(1);
-        let mut texels = Vec::with_capacity(nw as usize * nh as usize);
-        for y in 0..nh {
-            for x in 0..nw {
-                let mut mn = f32::INFINITY;
-                let mut mx = f32::NEG_INFINITY;
-                for dy in 0..2 {
-                    for dx in 0..2 {
-                        let sx = x * 2 + dx;
-                        let sy = y * 2 + dy;
-                        if sx < prev.width && sy < prev.height {
-                            let t = prev.texels[(sy * prev.width + sx) as usize];
-                            mn = mn.min(t[0]);
-                            mx = mx.max(t[1]);
-                        }
-                    }
-                }
-                texels.push([mn, mx]);
-            }
-        }
-        levels.push(MinMaxLevel {
-            width: nw,
-            height: nh,
-            texels,
-        });
-    }
-    levels
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -468,34 +405,5 @@ mod tests {
             assert_eq!(wu[2], 0.0);
             assert_eq!(wu[3], 0.0);
         }
-    }
-
-    #[test]
-    fn pyramid_levels_are_exact_min_max_of_children() {
-        // 3×3 (odd extents) so the down-step exercises the clamped 2×2 gather.
-        let w = 3u32;
-        let h = 3u32;
-        let data: Vec<f32> = (0..9).map(|i| i as f32).collect();
-        let p = build_min_max_pyramid(&data, w, h);
-        assert_eq!(p[0].width, 3);
-        assert_eq!(p[0].height, 3);
-        assert_eq!(p[0].texels[4], [4.0, 4.0], "level 0 is (h,h)");
-        // Level 1 is 2×2.
-        assert_eq!(p[1].width, 2);
-        assert_eq!(p[1].height, 2);
-        // texel (0,0) covers source (0,0),(1,0),(0,1),(1,1) = {0,1,3,4}.
-        assert_eq!(p[1].texels[0], [0.0, 4.0]);
-        // texel (1,0) covers source (2,0),(2,1) (x=3 clamped) = {2,5}.
-        assert_eq!(p[1].texels[1], [2.0, 5.0]);
-        // The last level is 1×1 and bounds the whole image.
-        let top = p.last().unwrap();
-        assert_eq!((top.width, top.height), (1, 1));
-        assert_eq!(top.texels[0], [0.0, 8.0]);
-    }
-
-    #[test]
-    fn pyramid_rejects_mismatched_extent() {
-        assert!(build_min_max_pyramid(&[1.0, 2.0], 4, 4).is_empty());
-        assert!(build_min_max_pyramid(&[], 0, 0).is_empty());
     }
 }
