@@ -3,13 +3,14 @@
 
 use crate::backend::{self, UiCompositor};
 use crate::dnd::DndEvent;
+use crate::fly::{FlyBindings, FlyStream};
 use crate::handlers::{ClientBuilder, DragRegions, DragState, ShellRenderHandler};
 use crate::keymap::{
     EVENTFLAG_ALT_DOWN, EVENTFLAG_COMMAND_DOWN, EVENTFLAG_CONTROL_DOWN,
     EVENTFLAG_LEFT_MOUSE_BUTTON, EVENTFLAG_MIDDLE_MOUSE_BUTTON, EVENTFLAG_RIGHT_MOUSE_BUTTON,
     EVENTFLAG_SHIFT_DOWN, vk_from_keycode,
 };
-use crate::state::{self, ResizeEdge, ShellState, WindowAction};
+use crate::state::{self, FlyRequest, ResizeEdge, ShellState, WindowAction};
 use crate::window::ShellWindow;
 use crate::{engine, geometry};
 use cef::wrapper::message_router::BrowserSideRouter;
@@ -80,11 +81,14 @@ pub(crate) struct Shell {
     drag_regions: DragRegions,
     /// Whether the RMB fly-cam has grabbed the pointer (CEF's windowless OSR can't do DOM pointer lock,
     /// so the shell locks the cursor natively). While set, `CursorMoved` stops and the relative motion
-    /// arrives as `DeviceEvent::MouseMotion`, accumulated in `look_accum` and streamed to the frontend
-    /// as a `fly-look` event.
+    /// arrives as `DeviceEvent::MouseMotion`, accumulated in `look_accum` for the fly stream.
     pub(crate) pointer_locked: bool,
-    /// Raw relative-motion delta accumulated since the last `fly-look` emit (only while `pointer_locked`).
+    /// Raw relative-motion delta accumulated since the last fly-input sample (only while
+    /// `pointer_locked`).
     pub(crate) look_accum: (f64, f64),
+    /// The live fly-input stream while the RMB fly-cam is engaged: the pump loop sends one sample
+    /// per iteration straight to the engine socket — no input sample crosses CEF.
+    pub(crate) fly: Option<FlyStream>,
     /// The staged-exit state (see `new_events`): `None` while running; `Some(n)` counts the grace
     /// iterations between teardown and `event_loop.exit()` that let the platform replay the
     /// window close's queued events into the still-installed handler.
@@ -123,6 +127,7 @@ impl Shell {
             drag_regions: Rc::new(RefCell::new(Vec::new())),
             pointer_locked: false,
             look_accum: (0.0, 0.0),
+            fly: None,
             teardown_grace: None,
         }
     }
@@ -281,15 +286,70 @@ impl Shell {
                 };
                 shell_window.drag_resize(direction);
             }
-            WindowAction::SetPointerLock(locked) => {
-                shell_window.set_pointer_lock(locked);
-                self.pointer_locked = locked;
-                self.look_accum = (0.0, 0.0);
-            }
             WindowAction::Show => {
                 shell_window.reveal();
                 self.revealed = true;
             }
+        }
+    }
+
+    /// Start/stop the RMB fly-cam: the native pointer lock plus the direct engine input stream.
+    /// On start the first sample goes out at once (so the engine engages fly mode before the next
+    /// pump tick). A failed connect leaves the fly off — the engine socket is gone, so there is
+    /// nothing to stream to. The `Stop` request is the frontend's teardown path (panel unmount);
+    /// the live gesture ends shell-side in [`Self::stop_fly`].
+    pub(crate) fn apply_fly(&mut self, request: FlyRequest, socket_path: &str) {
+        match request {
+            FlyRequest::Start {
+                forward,
+                back,
+                left,
+                right,
+                up,
+                down,
+            } => {
+                let Some(shell_window) = self.shell_window.as_ref() else {
+                    return;
+                };
+                let bindings = FlyBindings {
+                    forward,
+                    back,
+                    left,
+                    right,
+                    up,
+                    down,
+                };
+                match FlyStream::connect(socket_path, bindings) {
+                    Ok(mut stream) => {
+                        shell_window.set_pointer_lock(true);
+                        self.pointer_locked = true;
+                        self.look_accum = (0.0, 0.0);
+                        stream.send_sample((0.0, 0.0), true);
+                        self.fly = Some(stream);
+                    }
+                    Err(err) => {
+                        tracing::warn!(target: "shell", "fly stream connect failed: {err}");
+                    }
+                }
+            }
+            FlyRequest::Stop => self.stop_fly(),
+        }
+    }
+
+    /// Ends the fly gesture: releases the pointer lock, sends the final inactive sample, and
+    /// tells the frontend (`fly-ended`) so its gesture state clears. The shell owns every live
+    /// end trigger — the RMB release, Escape, and focus loss all land here synchronously from
+    /// this process's own event handlers, so a stop can never be lost in transit. Idempotent:
+    /// with no live stream only the pointer-lock release runs.
+    pub(crate) fn stop_fly(&mut self) {
+        if let Some(shell_window) = self.shell_window.as_ref() {
+            shell_window.set_pointer_lock(false);
+        }
+        self.pointer_locked = false;
+        self.look_accum = (0.0, 0.0);
+        if let Some(stream) = self.fly.take() {
+            stream.finish();
+            self.emit_to_js("fly-ended", "{}");
         }
     }
 
@@ -532,6 +592,15 @@ impl ApplicationHandler for Shell {
                 }
             }
             WindowEvent::MouseInput { state, button, .. } => {
+                // The fly gesture ends on its own trigger, synchronously — the release still
+                // forwards to CEF below so the DOM's button state stays consistent.
+                if matches!(
+                    (state, button),
+                    (ElementState::Released, MouseButton::Right)
+                ) && self.fly.is_some()
+                {
+                    self.stop_fly();
+                }
                 // A left press inside a frontend-declared titlebar drag region starts a NATIVE
                 // window drag, synchronously — the winit mousedown is still the platform's current
                 // event, so the OS anchors the drag to the grab point. (A round-tripped request
@@ -659,6 +728,10 @@ impl ApplicationHandler for Shell {
                 }
             }
             WindowEvent::Focused(focused) => {
+                // Losing focus mid-fly would strand the locked cursor and the held keys.
+                if !focused && self.fly.is_some() {
+                    self.stop_fly();
+                }
                 if let Some(host) = self.browser.as_ref().and_then(|b| b.host()) {
                     host.set_focus(focused as i32);
                 }
@@ -685,7 +758,23 @@ impl ApplicationHandler for Shell {
                 event,
                 is_synthetic: false,
                 ..
-            } => self.send_key(&event),
+            } => {
+                // The fly stream tracks its move keys here (the main thread sees the event
+                // first), and Escape ends the gesture; the event still forwards to CEF either
+                // way so the DOM's key state stays consistent.
+                if self.fly.is_some()
+                    && let PhysicalKey::Code(code) = event.physical_key
+                {
+                    if code == winit::keyboard::KeyCode::Escape
+                        && event.state == ElementState::Pressed
+                    {
+                        self.stop_fly();
+                    } else if let Some(fly) = self.fly.as_mut() {
+                        fly.on_key(code, event.state == ElementState::Pressed, event.repeat);
+                    }
+                }
+                self.send_key(&event);
+            }
             // OS file drag-drop is not a winit `WindowEvent` on Wayland (winit's Wayland backend has no
             // `wl_data_device`); it's received on the compositor's connection and drained in the pump
             // loop (`emit_dnd`).
@@ -694,7 +783,7 @@ impl ApplicationHandler for Shell {
     }
 
     /// Raw relative pointer motion (delivered while the fly-cam has the cursor locked). Accumulate it;
-    /// the pump loop streams it to the frontend as a `fly-look` event. Ignored when not locked (a
+    /// the pump loop folds it into the next fly-input sample. Ignored when not locked (a
     /// normal mouse move rides `WindowEvent::CursorMoved` → CEF instead).
     fn device_event(&mut self, _: &ActiveEventLoop, _: DeviceId, event: DeviceEvent) {
         if self.pointer_locked

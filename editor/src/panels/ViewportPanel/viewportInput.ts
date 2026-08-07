@@ -2,10 +2,6 @@
 /// (ray-pick) rather than a gizmo drag.
 export const DRAG_THRESHOLD_PX = 3;
 
-/// Throttle for streamed fly-cam input while pointer lock is held, in milliseconds.
-/// Look deltas accumulate between sends, so nothing is lost to the throttle.
-export const FLY_STREAM_MS = 16;
-
 /// Throttle for streamed gizmo pointer phases (hover/drag), in milliseconds.
 export const GIZMO_STREAM_MS = 16;
 

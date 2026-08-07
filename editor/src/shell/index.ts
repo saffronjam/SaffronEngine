@@ -197,11 +197,6 @@ export function getCurrentWindow() {
     close: (): Promise<void> => invoke<void>("window_close"),
     startResizeDragging: (direction: ResizeDirection): Promise<void> =>
       invoke<void>("window_start_resize", { direction }),
-    /// Grab + hide the cursor for the RMB fly-cam (`true`), or release it (`false`). CEF's windowless
-    /// OSR can't service DOM pointer lock, so the shell locks the cursor natively and streams relative
-    /// motion back as `fly-look` events.
-    setPointerLock: (locked: boolean): Promise<void> =>
-      invoke<void>("set_pointer_lock", { locked }),
     show: (): Promise<void> => invoke<void>("window_show"),
     onResized: (callback: () => void): Promise<UnlistenFn> =>
       listen<unknown>("window-resized", () => callback()),
