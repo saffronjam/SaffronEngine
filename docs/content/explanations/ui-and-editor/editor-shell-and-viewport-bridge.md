@@ -102,13 +102,13 @@ The macOS editor runs from an `.app` bundle. Its `Contents/Frameworks` directory
 
 ## Startup and recovery
 
-The shell installs the UI compositor and both viewport presenters when the toplevel resumes. Each presenter retries its shared-memory open until the host creates the segment. `auto_start` launches the host and runs a failure watchdog that checks child liveness and control-socket availability; success remains owned by the frontend probe.
+The shell installs the UI compositor and both viewport presenters when the toplevel resumes. Each presenter retries its shared-memory open until the host creates the segment. The shell spawns no host of its own: the frontend starts a project session (`session_start`) when a project is picked or when the environment names one, passing the project as the child's boot intent (`SAFFRON_PROJECT`, plus `SAFFRON_PROJECT_DISPLAY_NAME` for a created project). `start_session` arms a per-session watcher that reports startup failure and any exit — `session-exited` carries the exit code, whether the stop was requested, and the tail of the host log — while success remains owned by the frontend probe.
 
-`ViewportPanel` polls `viewport-native-info` with a 1.5-second per-attempt timeout and 150-millisecond retries. A successful reply changes the engine phase to `ready`. `LoadingOverlay` stays opaque over the viewport for every other phase, so an absent first frame never exposes the desktop through the transparent region.
+`ViewportPanel` polls `viewport-native-info` with a 1.5-second per-attempt timeout and 150-millisecond retries. A successful reply changes the engine phase to `ready`. `LoadingOverlay` stays opaque over the viewport for every other phase, so an absent first frame never exposes the desktop through the transparent region. The `idle` phase means no session exists; a session start flips it to `attaching` once the child is spawned.
 
-The reconcile service checks `engineAlive` once per second while the editor is focused and the host may be running. `child_alive` uses `Child::try_wait`, which distinguishes a running child from an exited process. Failure changes the phase to `error` and restores the loading overlay.
+The reconcile service checks `session_status` once per second while the editor is focused and a session may be live. `child_alive` uses `Child::try_wait`, which distinguishes a running child from an exited process. Failure changes the phase to `error` and restores the loading overlay.
 
-Retry calls the idempotent `start_engine` handler and returns to attachment probing. Restart first sends `quit`, force-terminates any remaining child, removes the socket and both shared-memory names, then starts a fresh host.
+Retry starts a fresh session for the current project and returns to attachment probing. Restart first stops the session — `quit`, force-terminate any remaining child, remove the socket and both shared-memory names — then starts a fresh one.
 
 ## In the code
 
@@ -119,7 +119,7 @@ Retry calls the idempotent `start_engine` handler and returns to attachment prob
 | CEF query router | `editor/shell/src/ipc.rs` | `CommandQueryHandler`, `browser_router` |
 | Native dispatch | `editor/shell/src/commands.rs` | `dispatch` |
 | Socket passthrough | `editor/shell/src/control.rs` | `control_request_with_params`, `ControlError` |
-| Host supervision | `editor/shell/src/engine.rs` | `spawn_engine`, `auto_start`, `child_alive`, `teardown` |
+| Host supervision | `editor/shell/src/engine.rs` | `start_session`, `stop_session`, `child_alive`, `teardown` |
 | Backend contract | `editor/shell/src/backend/mod.rs` | `Handles`, `UiCompositor`, `presenter`, `bootstrap` |
 | Readiness and overlay | `editor/src/panels/ViewportPanel.tsx`, `editor/src/app/LoadingOverlay.tsx` | `ViewportPanel`, `LoadingOverlay` |
 

@@ -102,9 +102,9 @@ user confirms it against real output — say "this should fix it, please verify 
   desktop never shows through.
 - **The control client is one generic passthrough.** Rust exposes a single
   `control(cmd, params)` command (it rejects on `ok:false`); the ~120 typed wrappers in
-  `client.ts` layer on top. Dedicated lifecycle/presenter commands (`start_engine`,
-  `set_viewport_bounds`, `set_viewport_parked`, `viewport_refresh_hz`, `quit_engine`,
-  `engine_alive`) are their own dedicated shell commands, separate from the passthrough. There is **no**
+  `client.ts` layer on top. Dedicated lifecycle/presenter commands (`session_start`,
+  `session_stop`, `session_status`, `set_viewport_bounds`, `set_viewport_parked`,
+  `viewport_refresh_hz`) are their own dedicated shell commands, separate from the passthrough. There is **no**
   runtime escape hatch for an untyped command: to add one, add its DTO in
   `engine/crates/protocol/src/dto.rs`, run `bun run gen:protocol`, then add a typed wrapper in
   `client.ts` — every dispatched name is checked against the generated `CommandName` union.
@@ -129,7 +129,7 @@ user confirms it against real output — say "this should fix it, please verify 
   bug — the user must see why an action did nothing). The Inspector's add/remove/fit-collider, every
   panel button, every drag-drop op: all route here. Use `notify(...)` for a non-error *result* toast
   (save/load/import) and `toast.error/warning` directly only for the fingerprint-keyed alarm stream
-  (`alarmToasts.ts`). Panel-anchored *status* — the startup modal's inline name/validation line — is a
+  (`alarmToasts.ts`). Panel-anchored *status* — the launcher create form's inline name/collision line — is a
   local `useState` message inside that panel's own DOM, never a stand-in for a toast on a transient
   operation failure and never over the viewport.
 - **State sync is a focus-gated poll, not push.** `store.ts` runs a cheap state lane at ~20 Hz
@@ -243,11 +243,14 @@ user confirms it against real output — say "this should fix it, please verify 
   during play. Shortcuts in `app/useUndoRedoShortcuts.ts`, buttons in `panels/Topbar.tsx`. When you add a
   mutating action, record its inverse — an edit with no `pushEdit` is silently un-undoable.
 - **Two independent lifecycle axes — do not conflate them.** `engineStatus.phase` (`EnginePhase`:
-  idle → starting → attaching → ready → error) tracks the host/renderer process; `projectLoad.phase`
-  (`ProjectLoadPhase`: idle / loading / ready / error) tracks project loading and can run while the engine
-  stays `ready` (a reload) or before it is (bootstrap). One entry point (`startProjectLoad`), polled by
-  `app/useProjectLoadPoll.ts`, surfaced by the single `app/ProjectStartupModal.tsx` (picker / loading /
-  error). Gate viewport-ready UI on the engine axis, project-content UI on the load axis.
+  idle → starting → attaching → ready → error) tracks the host session, and `idle` means **no session
+  exists** — the attach probe and the crash watchdog stay quiet until a session start flips it to
+  `attaching`. `projectLoad.phase` (`ProjectLoadPhase`: idle / loading / ready / error) tracks project
+  loading and can run while the engine stays `ready` (a menu reload) or before it is (a session boot).
+  One entry point (`startProjectLoad` — it starts a host session when none is live, since the pick is
+  the session's boot intent), polled by `app/useProjectLoadPoll.ts`, surfaced by the launcher's cards
+  (`launcher/Launcher.tsx`: picker / boot / load-error / crash). Gate viewport-ready UI on the engine
+  axis, project-content UI on the load axis.
 - **Shortcuts are a registry, never inline key comparisons.** Every shortcut is a command in
   `lib/keybindings.ts` (`COMMANDS`) with a kind (`press`/`hold`/`mouse`) and a scope
   (`global`/`hierarchy`/`assets`/`fly`/`tabs`); handlers match with `matchesBinding`, never by comparing

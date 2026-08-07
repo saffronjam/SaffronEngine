@@ -33,7 +33,7 @@ The [Zustand](https://zustand.docs.pmnd.rs/) store holds editor-facing state. It
 
 | Page | Covers | Code |
 |---|---|---|
-| [Editor shell and the viewport bridge](editor-shell-and-viewport-bridge/) | CEF lifecycle, native IPC, host supervision, and platform backends | `App`, `CommandQueryHandler`, `backend`, `start_engine` |
+| [Editor shell and the viewport bridge](editor-shell-and-viewport-bridge/) | CEF lifecycle, native IPC, host supervision, and platform backends | `App`, `CommandQueryHandler`, `backend`, `start_session` |
 | [Viewport compositing](viewport-compositing/) | Shared-memory rings and platform surface stacking | `ShmPublish`, `Viewports`, `presenter::install` |
 | [Viewport panel](viewport-panel/) | Bounds sync, parking, picking, gizmo, and fly input | `ViewportPanel`, `useSubsurfaceBounds` |
 | [Editor camera](editor-camera/) | Fly navigation and control-plane camera state | `SceneEditCamera`, `update_scene_edit_camera` |
