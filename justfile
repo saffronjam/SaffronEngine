@@ -295,12 +295,25 @@ bench-foliage-check:
 
 # start the editor: build the engine host + the CEF shell, verify CEF's staged runtime, start Vite,
 # then launch the shell pointed at it (the shell spawns the host as a child).
-# `just run inspect` additionally opens Chrome DevTools remote debugging on :9222 (Console, Network,
-# Performance tracing) — then open http://localhost:9222 in Chrome and click the page.
-run mode="":
+# `just run <project>` opens that project directly (a userdata name, a project dir, or a
+# project.json path); a name that doesn't resolve opens the project picker instead.
+# `just run inspect` (or `just run <project> inspect`) additionally opens Chrome DevTools remote
+# debugging on :9222 — then chrome://inspect -> Configure -> add localhost:9222 -> inspect the page.
+run project="" mode="":
     #!/usr/bin/env bash
     set -euo pipefail
     RECIPE=run; {{reenter}}
+    # `just run inspect` keeps its meaning: a lone first arg of "inspect" is the mode.
+    project="{{project}}"; mode="{{mode}}"
+    if [ "$project" = "inspect" ] && [ -z "$mode" ]; then mode=inspect; project=""; fi
+    if [ -n "$project" ]; then
+      if [ -f "$project" ] || [ -f "$project/project.json" ] || [ -f "{{repo}}/appdata/userdata/$project/project.json" ]; then
+        export SAFFRON_PROJECT="$project"
+        echo "[run] opening project '$project'"
+      else
+        echo "[run] no project '$project' — opening the project picker"
+      fi
+    fi
     cd "{{engine}}"
     cargo build --bin saffron-host
     cargo run -p xtask -- shaders
@@ -312,7 +325,7 @@ run mode="":
     cef_profile=debug; {{cef_gate}}
     {{cef_switches}}
     # `remote-allow-origins` is required or the DevTools websocket is refused.
-    if [ "{{mode}}" = "inspect" ]; then
+    if [ "$mode" = "inspect" ]; then
       export SAFFRON_CEF_SWITCHES="${SAFFRON_CEF_SWITCHES},remote-debugging-port=9222,remote-allow-origins=*"
       echo "[run] remote debugging: Chrome -> chrome://inspect -> Configure -> add localhost:9222 -> inspect the editor page."
     fi
