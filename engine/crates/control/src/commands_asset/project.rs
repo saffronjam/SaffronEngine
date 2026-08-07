@@ -37,7 +37,8 @@ pub(crate) fn apply_project_info(ctx: &mut EngineContext<'_>, project: &ProjectI
 
 /// Brings the host's project up from the editor-set environment by seeding the loader inbox, the
 /// same non-blocking path the lifecycle commands use. `SAFFRON_PROJECT` names a project to open or
-/// create, else `SAFFRON_SCRATCH_PROJECT` makes a deterministic per-shell scratch project, else a
+/// create (a created project takes its display name from `SAFFRON_PROJECT_DISPLAY_NAME` when set),
+/// else `SAFFRON_SCRATCH_PROJECT` makes a deterministic per-shell scratch project, else a
 /// `project.json` in the working directory is opened. With none set the phase stays `Unloaded` and
 /// the host waits for the editor's project picker.
 pub fn bootstrap_project_from_env(scene_edit: &mut SceneEditContext) {
@@ -48,9 +49,10 @@ pub fn bootstrap_project_from_env(scene_edit: &mut SceneEditContext) {
         let create_new =
             valid_project_name(&selected) && !saffron_assets::project_json_path(&selected).exists();
         if create_new {
+            let display_name = std::env::var("SAFFRON_PROJECT_DISPLAY_NAME").unwrap_or_default();
             ProjectLoadRequest::New(NewProjectSpec {
                 name: selected,
-                display_name: String::new(),
+                display_name,
                 root: String::new(),
             })
         } else {
