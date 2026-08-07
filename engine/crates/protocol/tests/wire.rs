@@ -151,6 +151,108 @@ fn unknown_enum_value_is_an_error() {
 }
 
 #[test]
+fn control_failures_are_internally_tagged_objects() {
+    let cases = [
+        (
+            ControlFailureDto::Command {
+                message: "a".into(),
+            },
+            "command",
+        ),
+        (
+            ControlFailureDto::Params {
+                message: "b".into(),
+            },
+            "params",
+        ),
+        (
+            ControlFailureDto::BusyLoading {
+                message: "c".into(),
+            },
+            "busy-loading",
+        ),
+        (
+            ControlFailureDto::InvalidRequest {
+                message: "d".into(),
+            },
+            "invalid-request",
+        ),
+        (
+            ControlFailureDto::Transport {
+                message: "e".into(),
+            },
+            "transport",
+        ),
+        (
+            ControlFailureDto::MalformedReply {
+                message: "f".into(),
+            },
+            "malformed-reply",
+        ),
+        (
+            ControlFailureDto::Bridge {
+                message: "g".into(),
+            },
+            "bridge",
+        ),
+    ];
+    for (failure, code) in cases {
+        let value = serde_json::to_value(&failure).unwrap();
+        assert_eq!(
+            value,
+            serde_json::json!({ "code": code, "message": failure.message() })
+        );
+        assert_eq!(
+            serde_json::from_value::<ControlFailureDto>(value).unwrap(),
+            failure
+        );
+    }
+}
+
+#[test]
+fn vegetation_graph_diagnostic_preserves_exact_wire_fields() {
+    let failure = ControlFailureDto::Diagnostic {
+        message: "edge mismatch".to_owned(),
+        diagnostic: ControlDiagnosticDto::VegetationGraph(
+            VegetationGraphDiagnosticDto::TypeMismatch {
+                from_node: VegetationGuid("00000000000000000000000000000001".to_owned()),
+                from_pin: "points".to_owned(),
+                from_domain: "candidate-stream".to_owned(),
+                to_node: VegetationGuid("00000000000000000000000000000002".to_owned()),
+                to_pin: "density".to_owned(),
+                to_domain: "scalar-field".to_owned(),
+            },
+        ),
+    };
+    let value = serde_json::to_value(&failure).unwrap();
+    assert_eq!(value["code"], "diagnostic");
+    assert_eq!(value["diagnostic"]["domain"], "vegetation-graph");
+    assert_eq!(value["diagnostic"]["detail"]["category"], "type-mismatch");
+    assert_eq!(
+        value["diagnostic"]["detail"]["fromNode"],
+        "00000000000000000000000000000001"
+    );
+    assert_eq!(value["diagnostic"]["detail"]["toPin"], "density");
+    assert_eq!(
+        serde_json::from_value::<ControlFailureDto>(value).unwrap(),
+        failure
+    );
+}
+
+#[test]
+fn control_failure_rejects_unknown_fields_and_string_errors() {
+    assert!(
+        serde_json::from_value::<ControlFailureDto>(serde_json::json!({
+            "code": "command",
+            "message": "nope",
+            "legacy": true,
+        }))
+        .is_err()
+    );
+    assert!(serde_json::from_value::<ControlFailureDto>(serde_json::json!("nope")).is_err());
+}
+
+#[test]
 fn vegetation_estimates_and_diagnostics_use_complete_camel_case_fields() {
     let estimate = VegetationGraphEstimateDto {
         candidates: "10".to_owned(),
@@ -298,6 +400,244 @@ fn vegetation_estimates_and_diagnostics_use_complete_camel_case_fields() {
     assert_eq!(
         serde_json::from_value::<VegetationNodeEvaluationDiagnosticDto>(diagnostic_json).unwrap(),
         diagnostic
+    );
+}
+
+#[test]
+fn vegetation_preflight_is_complete_and_has_no_redundant_cell_count() {
+    let limits = VegetationGraphLimitsDto {
+        workers: 8,
+        output_cells: "64".to_owned(),
+        global_stage_tiles: "32".to_owned(),
+        input_tiles: "128".to_owned(),
+        candidates: "4096".to_owned(),
+        macro_points: "2048".to_owned(),
+        micro_samples: "8192".to_owned(),
+        memory_bytes: "1048576".to_owned(),
+        transfer_bytes: "524288".to_owned(),
+        module_depth: 8,
+        time_ms: "30000".to_owned(),
+    };
+    let preflight = VegetationEvaluationPreflightDto {
+        output_cells: "2".to_owned(),
+        global_stage_tiles: "3".to_owned(),
+        input_tiles: "4".to_owned(),
+        retained_input_bytes: "1024".to_owned(),
+        generated_input_bytes: "512".to_owned(),
+        candidate_count: "10".to_owned(),
+        accepted_count: "5".to_owned(),
+        micro_samples: "20".to_owned(),
+        preflight_peak_bytes: "3072".to_owned(),
+        execution_peak_bytes: "4096".to_owned(),
+        memory_bytes: "4096".to_owned(),
+        transfer_bytes: "512".to_owned(),
+        worker_count: 2,
+        time_limit_ms: "30000".to_owned(),
+        limits,
+    };
+    let job = VegetationEvaluationJobDto {
+        job: "7".to_owned(),
+        state: VegetationEvaluationJobStateDto::Prepared,
+        preflight,
+    };
+
+    let json = serde_json::to_value(&job).unwrap();
+
+    assert_eq!(json["state"], "prepared");
+    assert_eq!(json["preflight"]["outputCells"], "2");
+    assert_eq!(json["preflight"]["globalStageTiles"], "3");
+    assert_eq!(json["preflight"]["retainedInputBytes"], "1024");
+    assert_eq!(json["preflight"]["generatedInputBytes"], "512");
+    assert_eq!(json["preflight"]["preflightPeakBytes"], "3072");
+    assert_eq!(json["preflight"]["executionPeakBytes"], "4096");
+    assert_eq!(json["preflight"]["memoryBytes"], "4096");
+    assert_eq!(json["preflight"]["workerCount"], 2);
+    assert_eq!(json["preflight"]["limits"]["outputCells"], "64");
+    assert!(json["preflight"].get("inputBytes").is_none());
+    assert!(json.get("cells").is_none());
+    assert_eq!(
+        serde_json::from_value::<VegetationEvaluationJobDto>(json).unwrap(),
+        job
+    );
+}
+
+#[test]
+fn vegetation_phase_four_contracts_preserve_exact_identity_fields() {
+    let dependency = VegetationManifestDependencyDto {
+        address: VegetationManifestDependencyAddressDto::MapObject {
+            map: Uuid(41),
+            key: VegetationMapChunkKeyDto {
+                layer: VegetationGuid("0000000000000000000000000000002a".to_owned()),
+                tile: VegetationMapTileKeyDto::Cell {
+                    cell: WorldCellDto {
+                        coordinates: ["-7".to_owned(), "0".to_owned(), "11".to_owned()],
+                        level: 3,
+                    },
+                },
+                kind: VegetationMapChunkKindDto::Field,
+            },
+        },
+        content_hash: "ab".repeat(32),
+        bounds: None,
+        halo_bits: 65_536,
+        ancestor_level: Some(5),
+    };
+    let value = serde_json::to_value(&dependency).unwrap();
+
+    assert_eq!(value["address"]["kind"], "map-object");
+    assert_eq!(value["address"]["map"], "41");
+    assert_eq!(value["address"]["key"]["tile"]["kind"], "cell");
+    assert_eq!(
+        value["address"]["key"]["tile"]["cell"]["coordinates"][0],
+        "-7"
+    );
+    assert_eq!(value["address"]["key"]["kind"], "field");
+    assert_eq!(value["contentHash"], "ab".repeat(32));
+    assert_eq!(value["haloBits"], 65_536);
+    assert!(value.get("bounds").is_none());
+    assert_eq!(
+        serde_json::from_value::<VegetationManifestDependencyDto>(value).unwrap(),
+        dependency
+    );
+
+    let source_file = VegetationManifestDependencyAddressDto::SourceFile {
+        uri: "project://plants/oak.glb".to_owned(),
+    };
+    let source_file_value = serde_json::to_value(&source_file).unwrap();
+    assert_eq!(source_file_value["kind"], "source-file");
+    assert_eq!(source_file_value["uri"], "project://plants/oak.glb");
+    assert_eq!(
+        serde_json::from_value::<VegetationManifestDependencyAddressDto>(source_file_value)
+            .unwrap(),
+        source_file
+    );
+
+    let statistics = VegetationCookStatisticsDto {
+        nodes: "18446744073709551615".to_owned(),
+        elapsed_micros: "2".to_owned(),
+        peak_memory_bytes: "3".to_owned(),
+        input_bytes: "4".to_owned(),
+        output_bytes: "5".to_owned(),
+        cache_hits: "6".to_owned(),
+        cache_misses: "7".to_owned(),
+        published_cells: "8".to_owned(),
+        rejections: vec![VegetationCookRejectionTotalDto {
+            reason: VegetationCandidateRejectionReasonDto::Threshold,
+            count: "9".to_owned(),
+        }],
+    };
+    let value = serde_json::to_value(statistics).unwrap();
+    assert_eq!(value["nodes"], "18446744073709551615");
+    assert_eq!(value["rejections"][0]["reason"], "threshold");
+}
+
+#[test]
+fn vegetation_cell_toc_and_cook_scope_are_closed_unions() {
+    let kinds = [
+        (VegetationCellSectionKindDto::MacroPoints, "macro-points"),
+        (VegetationCellSectionKindDto::MicroFields, "micro-fields"),
+        (VegetationCellSectionKindDto::Provenance, "provenance"),
+        (
+            VegetationCellSectionKindDto::RejectionDiagnostics,
+            "rejection-diagnostics",
+        ),
+        (
+            VegetationCellSectionKindDto::SurfaceAttachments,
+            "surface-attachments",
+        ),
+        (
+            VegetationCellSectionKindDto::SurfaceDependencies,
+            "surface-dependencies",
+        ),
+        (
+            VegetationCellSectionKindDto::RenderReferences,
+            "render-references",
+        ),
+        (VegetationCellSectionKindDto::RenderBounds, "render-bounds"),
+        (
+            VegetationCellSectionKindDto::CollisionInputs,
+            "collision-inputs",
+        ),
+        (
+            VegetationCellSectionKindDto::NavigationContributions,
+            "navigation-contributions",
+        ),
+        (
+            VegetationCellSectionKindDto::EcologyBoundary,
+            "ecology-boundary",
+        ),
+        (
+            VegetationCellSectionKindDto::EcologyCheckpoint,
+            "ecology-checkpoint",
+        ),
+    ];
+    for (kind, spelling) in kinds {
+        assert_eq!(serde_json::to_value(kind).unwrap(), spelling);
+    }
+    assert_eq!(
+        serde_json::to_value(VegetationArtifactSectionCodecDto::Raw).unwrap(),
+        "raw"
+    );
+    assert_eq!(
+        serde_json::to_value(VegetationArtifactSectionCodecDto::Zstd).unwrap(),
+        "zstd"
+    );
+
+    let scope = VegetationCookScopeDto::Bounds {
+        bounds: WorldBoundsDto {
+            min_ticks: ["-10".to_owned(), "0".to_owned(), "4".to_owned()],
+            max_ticks_exclusive: ["10".to_owned(), "20".to_owned(), "40".to_owned()],
+        },
+        level: 6,
+    };
+    let value = serde_json::to_value(scope).unwrap();
+    assert_eq!(value["kind"], "bounds");
+    assert_eq!(value["bounds"]["minTicks"][0], "-10");
+    assert_eq!(value["level"], 6);
+    assert!(
+        serde_json::from_value::<VegetationCookScopeDto>(serde_json::json!({
+            "kind": "legacy-region",
+        }))
+        .is_err()
+    );
+}
+
+#[test]
+fn plant_reimport_conflicts_are_structured_diagnostics() {
+    let failure = ControlFailureDto::Diagnostic {
+        message: "semantic target disappeared".to_owned(),
+        diagnostic: ControlDiagnosticDto::ReimportConflict(ReimportConflictDiagnosticDto {
+            plant: Uuid(73),
+            conflicts: vec![ReimportConflictEntryDto {
+                target: VegetationGuid("00000000000000000000000000000010".to_owned()),
+                source: VegetationGuid("00000000000000000000000000000011".to_owned()),
+                selector: PlantSourceSelectorDto::Submesh {
+                    element: VegetationGuid("00000000000000000000000000000012".to_owned()),
+                    index: 2,
+                },
+                destination: PlantSemanticDestinationDto::MaterialSlot { slot: 4 },
+                reason: PlantReimportConflictReasonDto::MissingElement,
+            }],
+        }),
+    };
+    let value = serde_json::to_value(&failure).unwrap();
+
+    assert_eq!(value["diagnostic"]["domain"], "reimport-conflict");
+    assert_eq!(
+        value["diagnostic"]["detail"]["conflicts"][0]["selector"]["kind"],
+        "submesh"
+    );
+    assert_eq!(
+        value["diagnostic"]["detail"]["conflicts"][0]["destination"]["kind"],
+        "material-slot"
+    );
+    assert_eq!(
+        value["diagnostic"]["detail"]["conflicts"][0]["reason"],
+        "missing-element"
+    );
+    assert_eq!(
+        serde_json::from_value::<ControlFailureDto>(value).unwrap(),
+        failure
     );
 }
 

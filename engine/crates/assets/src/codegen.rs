@@ -12,11 +12,8 @@
 //!   resolves, and emits `materials/<uuid>_mesh.spv` plus the RT-off
 //!   `materials/<uuid>_mesh_nort.spv` sibling.
 //!
-//! # The slangc invocation
-//!
-//! [`build_slangc_command`] uses [`Command::new`] with discrete [`Command::arg`] calls
-//! for the flag set, [`Stdio::null`] for both pipes, and inspects `status.success()`
-//! plus the `.spv` existence — no shell string, no path-quoting surface.
+//! Every invocation is a discrete argv through [`Command`] with both pipes at
+//! [`Stdio::null`] — no shell string, so no path-quoting surface.
 
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
@@ -71,29 +68,13 @@ fn resolve_slangc(
     PathBuf::from("slangc")
 }
 
-/// The fixed `slangc` flag set the runtime compiles share, matching the static
-/// xtask shader flags: `-profile glsl_450 -target spirv -emit-spirv-directly
-/// -fvk-use-entrypoint-name -matrix-layout-column-major -capability <atoms>`. The capabilities are
-/// declared so Slang does not implicitly upgrade the profile (see `xtask`'s `SLANGC_CAPABILITIES`).
-const SLANGC_FLAGS: &[&str] = &[
-    "-profile",
-    "glsl_450",
-    "-target",
-    "spirv",
-    "-emit-spirv-directly",
-    "-fvk-use-entrypoint-name",
-    "-matrix-layout-column-major",
-    "-capability",
-    "SPV_KHR_non_semantic_info+SPV_GOOGLE_user_type+spvSparseResidency+spvMinLod+spvFragmentFullyCoveredEXT+spvShaderNonUniformEXT+spvRayQueryKHR",
-];
+/// The `slangc` flag set every compile shares, offline and at runtime. It lives in
+/// `saffron-core` so the offline and runtime compilers cannot drift apart.
+use saffron_core::SLANGC_SPV_FLAGS as SLANGC_FLAGS;
 
-/// Builds the full `slangc` argv (program first) for compiling `slang_path` to
-/// `spv_path`, optionally adding `-I <include_dir>` (the mesh variant, so `import
-/// lighting` resolves).
-///
-/// This is the single source of the argv shape, shared by [`build_slangc_command`] and
-/// the argv test. No element is shell-quoted and none carries a redirection token —
-/// each path is one discrete argv element.
+/// Builds the full `slangc` argv (program first) for compiling `slang_path` to `spv_path`,
+/// optionally adding `-I <include_dir>` (the mesh variant, so `import lighting` resolves). No element
+/// is shell-quoted or carries a redirection token: each path is one discrete argv element.
 fn slangc_argv(
     slangc: &Path,
     slang_path: &Path,
@@ -169,12 +150,12 @@ fn write_and_compile(
 }
 
 /// The self-contained fragment shader for a material graph: a `[[vk::push_constant]] Mat`
-/// push, bindless `textures[]`, and the 5-field `SurfaceData`, with `evalSurface` filled
+/// push, bindless `textures[]`, and the complete `SurfaceData`, with `evalSurface` filled
 /// by the emitted surface body.
 fn graph_shader_source(surface_body: &str) -> String {
     format!(
         "[[vk::binding(0, 0)]] Sampler2D textures[1024];\n\
-         struct SurfaceData {{ float3 albedo; float metallic; float roughness; float3 normal; float3 emissive; }};\n\
+         struct SurfaceData {{ float3 albedo; float metallic; float roughness; float3 normal; float3 sheetNormal; float3 emissive; float occlusion; float opacity; uint surfaceModel; float frontFace; float frontResponse; float backResponse; float thickness; float3 absorption; float3 transmission; float energyLimit; }};\n\
          struct Mat {{ float4 baseColor; uint4 tex; }};\n\
          [[vk::push_constant]] Mat mat;\n\
          SurfaceData evalSurface(float2 uv)\n{{\n    SurfaceData s;\n\
@@ -273,15 +254,10 @@ impl AssetServer {
         Ok(spv_path)
     }
 
-    /// `<root>/materials/<uuid><suffix>` — the codegen artifact path for a material id
-    /// (`suffix` is e.g. `.slang`, `.spv`, `_mesh.slang`).
-    ///
-    /// Absolutized (against the cwd) so the `.spv` variants handed to the renderer load
-    /// directly: the renderer's shader loaders treat a relative path as relative to the
-    /// engine's *shader* directory (joining `resolve_shader_dir()`), so a project-relative
-    /// artifact root (`appdata/userdata/<project>/assets`) would mis-resolve to
-    /// `shaders/appdata/…`. An absolute path bypasses that join (the scene loader takes the
-    /// `is_absolute` branch verbatim).
+    /// `<root>/materials/<uuid><suffix>` — the codegen artifact path for a material id (`suffix` is
+    /// e.g. `.slang`, `.spv`, `_mesh.slang`), absolutized against the cwd: the renderer's shader
+    /// loaders join a relative path onto the engine's *shader* directory, so a project-relative
+    /// artifact root would mis-resolve to `shaders/appdata/…`.
     fn material_artifact_path(&self, id: Uuid, suffix: &str) -> PathBuf {
         let relative = self
             .root
@@ -315,17 +291,12 @@ mod tests {
 
     /// The fixed flag set every variant carries, in order, between the `.slang` input and
     /// the `-o <spv>` tail (and, for the mesh variant, the `-I <dir>` insertion).
-    const EXPECTED_FLAGS: &[&str] = &[
-        "-profile",
-        "glsl_450",
-        "-target",
-        "spirv",
-        "-emit-spirv-directly",
-        "-fvk-use-entrypoint-name",
-        "-matrix-layout-column-major",
-        "-capability",
-        "SPV_KHR_non_semantic_info+SPV_GOOGLE_user_type+spvSparseResidency+spvMinLod+spvFragmentFullyCoveredEXT+spvShaderNonUniformEXT+spvRayQueryKHR",
-    ];
+    ///
+    /// This is the shared constant, not a transcription of it. A local copy here is what let
+    /// the runtime compiler drift away from the offline one unnoticed: the test happily pinned
+    /// the stale list it carried itself, so a capability missing from the real compile looked
+    /// correct right up until a shader needed it.
+    const EXPECTED_FLAGS: &[&str] = SLANGC_FLAGS;
 
     /// No argv element may contain a shell quote or a redirection token.
     fn assert_no_shell_tokens(argv: &[OsString]) {
@@ -446,15 +417,10 @@ mod tests {
         let body = "    s.albedo = float3(1.0, 0.0, 0.0);\n    s.opacity = 1.0;\n";
         let spliced = splice_mesh_source(src, body).expect("splice");
 
-        // The begin-marker line survives.
         assert!(spliced.contains("    // @graph-begin\n"));
-        // The default body is gone.
         assert!(!spliced.contains("float4 base = sampleDefault();"));
-        // The emitted surface is present.
         assert!(spliced.contains("s.albedo = float3(1.0, 0.0, 0.0);"));
-        // It resumes at the end marker.
         assert!(spliced.contains("// @graph-end\n    return s;"));
-        // The begin marker precedes the emitted body, which precedes the end marker.
         let begin = spliced.find("// @graph-begin").unwrap();
         let emitted = spliced.find("s.albedo = float3(1.0, 0.0, 0.0)").unwrap();
         let end = spliced.find("// @graph-end").unwrap();
@@ -475,9 +441,7 @@ mod tests {
         };
         let body = emit_graph_surface(&small_graph(), true);
         let spliced = splice_mesh_source(&src, &body).expect("real mesh.slang splices");
-        // The default glTF metallic-roughness body is dropped.
         assert!(!spliced.contains("float4 base = albedoTextures"));
-        // The emitted surface body is in place.
         assert!(spliced.contains("float4 n_mul = n_c1 * n_tx;"));
         // `import lighting` survives at the top (the -I resolves it).
         assert!(spliced.starts_with("import lighting;"));
@@ -490,7 +454,6 @@ mod tests {
             splice_mesh_source(no_markers, "    s.albedo = float3(1.0);\n"),
             Err(Error::SlangcFailed(_))
         ));
-        // Out-of-order markers are also rejected.
         let swapped = "// @graph-end\n// @graph-begin\n";
         assert!(matches!(
             splice_mesh_source(swapped, "    body\n"),
@@ -513,7 +476,7 @@ mod tests {
         // Byte-for-byte the graph shader template (empty surfaceBody).
         let expected = concat!(
             "[[vk::binding(0, 0)]] Sampler2D textures[1024];\n",
-            "struct SurfaceData { float3 albedo; float metallic; float roughness; float3 normal; float3 emissive; };\n",
+            "struct SurfaceData { float3 albedo; float metallic; float roughness; float3 normal; float3 sheetNormal; float3 emissive; float occlusion; float opacity; uint surfaceModel; float frontFace; float frontResponse; float backResponse; float thickness; float3 absorption; float3 transmission; float energyLimit; };\n",
             "struct Mat { float4 baseColor; uint4 tex; };\n",
             "[[vk::push_constant]] Mat mat;\n",
             "SurfaceData evalSurface(float2 uv)\n{\n    SurfaceData s;\n",

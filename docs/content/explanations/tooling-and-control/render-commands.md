@@ -77,13 +77,13 @@ the toggle. `render-stats` is where each new flag surfaces.
 
 | What | File | Symbols |
 |---|---|---|
-| Registration | `engine/crates/control/src/commands_render.rs` | `register_render_commands` |
-| Stats read-back | `engine/crates/control/src/commands_render.rs` | `render_stats_dto`; the `*_enabled` accessors on `ControlRenderer` |
-| AA enum decode | `engine/crates/control/src/commands_render.rs` | `aa_mode_from_name`; `ControlRenderer::set_aa`, `aa_mode` |
-| RT gating | `engine/crates/control/src/commands_render.rs` | the `set-rt-shadows`/`set-restir` rows; `ControlRenderer::rt_supported` |
-| Exposure | `engine/crates/control/src/commands_render.rs` | the `set-exposure` row; `ControlRenderer::set_exposure`, `exposure_ev` |
+| Registration | `engine/crates/control/src/commands_render/` | `register_render_commands` |
+| Stats read-back | `engine/crates/control/src/commands_render/` | `render_stats_dto`; the `*_enabled` accessors on `ControlRenderer` |
+| AA enum decode | `engine/crates/control/src/commands_render/` | `aa_mode_from_name`; `ControlRenderer::set_aa`, `aa_mode` |
+| RT gating | `engine/crates/control/src/commands_render/` | the `set-rt-shadows`/`set-restir` rows; `ControlRenderer::rt_supported` |
+| Exposure | `engine/crates/control/src/commands_render/` | the `set-exposure` row; `ControlRenderer::set_exposure`, `exposure_ev` |
 | Renderer seam | `engine/crates/control/src/registry.rs` | the `ControlRenderer` trait |
-| Stats DTO | `engine/crates/protocol/src/dto.rs` | `RenderStatsDto` |
+| Stats DTO | `engine/crates/protocol/src/dto/` | `RenderStatsDto` |
 
 ## Related
 - [Tonemapping and exposure](../../screen-space-and-post/tonemap-and-exposure/) — what `set-exposure` drives

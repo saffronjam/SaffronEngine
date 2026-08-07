@@ -1,16 +1,5 @@
-//! The uuid-keyed negative-cache.
-//!
-//! A GPU asset cache maps a `u64` id to `Option<Arc<T>>`. The outer presence (the
-//! key exists) and the inner success (`Some(arc)` vs `None`) are two distinct
-//! facts, and conflating them is the bug this shape exists to prevent:
-//!
-//! - **A present key with `None` is a negative-cache marker, not a miss.** A failed
-//!   load inserts `None` so the asset is not retried — or re-warned — every frame.
-//! - Only an *absent* key triggers a load attempt.
-//!
-//! Presence is the `Option` returned by [`HashMap::get`], wrapping an `Option<Arc<T>>`
-//! (success). [`resolve_cached`] is the one place the get-or-load-or-negative-cache
-//! shape lives, so the five resolve functions share a single code path.
+//! The uuid-keyed negative cache: a *present* key holding `None` means the load already failed and
+//! must not be retried; only an *absent* key triggers a load attempt.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -19,17 +8,8 @@ use std::sync::Arc;
 /// the negative-cache marker for a load that failed.
 pub type AssetCache<T> = HashMap<u64, Option<Arc<T>>>;
 
-/// Returns the asset for `key`, loading it on the first miss and caching the
-/// outcome (including failure).
-///
-/// - A **present** key returns its cached `Option<Arc<T>>` verbatim — a live
-///   `Arc` or the cached `None`. The loader does **not** run; the negative-cache
-///   marker is honored.
-/// - An **absent** key runs `load`, inserts its `Option<Arc<T>>` (so a returned
-///   `None` becomes the negative marker), and returns a clone.
-///
-/// `load` is `FnOnce` because it runs at most once per `resolve_cached` call, and
-/// only on a true cache miss.
+/// Returns the asset for `key`, running `load` only on an absent key and caching its outcome —
+/// including a `None`, which becomes the negative marker.
 pub fn resolve_cached<T, F>(cache: &mut AssetCache<T>, key: u64, load: F) -> Option<Arc<T>>
 where
     F: FnOnce() -> Option<Arc<T>>,
@@ -47,8 +27,7 @@ mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    /// A counting stub standing in for a GPU resource: it increments a shared
-    /// counter on `Drop`, so a test can assert the teardown fired exactly once.
+    /// Increments a shared counter on `Drop`, so a test can assert teardown fired exactly once.
     struct DropCounter {
         counter: Arc<AtomicUsize>,
     }
@@ -92,7 +71,6 @@ mod tests {
     #[test]
     fn present_none_is_negative_cache_not_a_miss() {
         let mut cache: AssetCache<u32> = AssetCache::new();
-        // A prior failed load seeded the negative marker.
         cache.insert(13, None);
         let calls = AtomicUsize::new(0);
         let got = resolve_cached(&mut cache, 13, || {
@@ -111,13 +89,11 @@ mod tests {
     fn failed_load_caches_the_negative_marker() {
         let mut cache: AssetCache<u32> = AssetCache::new();
         let calls = AtomicUsize::new(0);
-        // First call: the loader fails and the negative marker is cached.
         let first = resolve_cached(&mut cache, 1, || {
             calls.fetch_add(1, Ordering::SeqCst);
             None
         });
         assert!(first.is_none());
-        // Second call: the negative marker is honored; the loader does not re-run.
         let second = resolve_cached(&mut cache, 1, || {
             calls.fetch_add(1, Ordering::SeqCst);
             None
@@ -140,17 +116,14 @@ mod tests {
                 counter: Arc::clone(&counter),
             })),
         );
-        // A clone keeps the resource alive while the cache holds its own Arc.
         let alive = resolve_cached(&mut cache, 1, || None);
         assert_eq!(counter.load(Ordering::SeqCst), 0);
-        // Dropping the cache drops its Arc, but the clone still keeps it alive.
         cache.clear();
         assert_eq!(
             counter.load(Ordering::SeqCst),
             0,
             "an outstanding Arc keeps it alive"
         );
-        // Dropping the last Arc runs Drop exactly once.
         drop(alive);
         assert_eq!(
             counter.load(Ordering::SeqCst),

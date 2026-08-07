@@ -73,13 +73,13 @@ device with `fillModeNonSolid` (llvmpipe and real GPUs have it).
 
 | What | File | Symbols |
 |---|---|---|
-| AA / clustered / depth-prepass / exposure | `engine/crates/control/src/commands_render.rs` | `set-aa`, `set-clustered`, `set-depth-prepass`, `set-exposure` |
-| Shadows / IBL / SSAO / GI | `engine/crates/control/src/commands_render.rs` | `set-shadows`, `set-ibl`, `set-ssao`, `set-gi` |
-| View modes (enum + channel map) | `engine/crates/rendering/src/renderer.rs` | `ViewMode`, `ViewMode::debug_channel`, `set_view_mode` |
+| AA / clustered / depth-prepass / exposure | `engine/crates/control/src/commands_render/` | `set-aa`, `set-clustered`, `set-depth-prepass`, `set-exposure` |
+| Shadows / IBL / SSAO / GI | `engine/crates/control/src/commands_render/` | `set-shadows`, `set-ibl`, `set-ssao`, `set-gi` |
+| View modes (enum + channel map) | `engine/crates/rendering/src/renderer/` | `ViewMode`, `ViewMode::debug_channel`, `set_view_mode` |
 | View-mode shading paths | `engine/assets/shaders/lighting.slang` | `evalViewMode`, `heatmap`, `evalLighting` |
-| Lit-wireframe / motion-vector passes | `engine/crates/rendering/src/renderer.rs` | `add_lit_wireframe_pass`, `add_motion_visualize_pass` |
+| Lit-wireframe / motion-vector passes | `engine/crates/rendering/src/renderer/` | `add_lit_wireframe_pass`, `add_motion_visualize_pass` |
 | Toolbar View Modes dropdown | `editor/src/panels/Topbar.tsx`, `editor/src/lib/view-modes.ts` | `ViewModeMenu`, `VIEW_MODES` |
-| Live flag readout | `engine/crates/control/src/commands_render.rs` | `render-stats` (`aaMode`, `clusteredEnabled`, …) |
+| Live flag readout | `engine/crates/control/src/commands_render/` | `render-stats` (`aaMode`, `clusteredEnabled`, …) |
 
 ## Related
 

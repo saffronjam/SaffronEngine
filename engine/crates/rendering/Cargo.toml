@@ -14,8 +14,9 @@ tracing.workspace = true
 saffron-core = { path = "../core" }
 saffron-window = { path = "../window" }
 saffron-geometry = { path = "../geometry" }
+saffron-material = { path = "../material" }
 saffron-spatial = { path = "../spatial" }
-saffron-vegetation = { path = "../vegetation" }
+saffron-wind = { path = "../wind" }
 ash.workspace = true
 ash-window.workspace = true
 raw-window-handle.workspace = true

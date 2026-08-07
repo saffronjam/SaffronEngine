@@ -1,7 +1,7 @@
 //! Deterministic multi-source facet residency and generation-safe publication.
 
 use std::cmp::Ordering;
-use std::collections::{BTreeMap, BTreeSet, BinaryHeap};
+use std::collections::{BTreeMap, BTreeSet};
 use std::num::NonZeroUsize;
 use std::sync::{Arc, RwLock};
 
@@ -54,9 +54,7 @@ impl ResidencyFacet {
 pub struct ResidencyMask(u8);
 
 impl ResidencyMask {
-    /// No facets.
     pub const NONE: Self = Self(0);
-    /// Every defined facet.
     pub const ALL: Self = Self((1 << FACET_COUNT) - 1);
 
     /// A mask containing one facet.
@@ -65,16 +63,20 @@ impl ResidencyMask {
         Self(1 << facet as u8)
     }
 
-    /// Adds a facet.
     #[must_use]
     pub const fn with(self, facet: ResidencyFacet) -> Self {
         Self(self.0 | (1 << facet as u8))
     }
 
-    /// Whether the facet is present.
     #[must_use]
     pub const fn contains(self, facet: ResidencyFacet) -> bool {
         self.0 & (1 << facet as u8) != 0
+    }
+
+    /// The packed facet bits, for hashing a source's demand into its revision.
+    #[must_use]
+    pub const fn bits(self) -> u8 {
+        self.0
     }
 
     /// Facets in canonical order.
@@ -150,6 +152,61 @@ impl SpatialSource {
     }
 }
 
+/// Derives a source's world velocity from successive observed positions.
+///
+/// A viewpoint has no rigidbody to read a velocity from, so the prediction horizon on
+/// [`SpatialSource`] has nothing to lead with unless the motion is measured here. A raw
+/// frame-to-frame difference is too noisy to lead a claim cube with — one long frame doubles the
+/// apparent speed and drags the claim centre a cell ahead and back — so the estimate is
+/// exponentially smoothed over [`Self::SMOOTHING_SECONDS`] and clamped to [`Self::MAX_SPEED_MPS`].
+/// A teleport (a jump farther than the horizon could explain) restarts the estimate at rest rather
+/// than reporting the jump as speed.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct SourceMotion {
+    previous: Option<WorldPosition>,
+    velocity: DVec3,
+}
+
+impl SourceMotion {
+    /// Time constant of the exponential smoothing.
+    pub const SMOOTHING_SECONDS: f64 = 0.25;
+    /// Speed above which an observation is treated as a teleport rather than travel.
+    pub const MAX_SPEED_MPS: f64 = 400.0;
+
+    /// Folds one observed position into the estimate and returns the smoothed velocity.
+    ///
+    /// `delta_seconds` is the wall interval since the previous observation; a non-positive or
+    /// non-finite interval leaves the estimate untouched.
+    pub fn observe(&mut self, position: WorldPosition, delta_seconds: f64) -> DVec3 {
+        let Some(previous) = self.previous.replace(position) else {
+            return self.velocity;
+        };
+        if !delta_seconds.is_finite() || delta_seconds <= 0.0 {
+            return self.velocity;
+        }
+        let instantaneous = (position.world_meters() - previous.world_meters()) / delta_seconds;
+        if !instantaneous.is_finite() || instantaneous.length() > Self::MAX_SPEED_MPS {
+            self.velocity = DVec3::ZERO;
+            return self.velocity;
+        }
+        let blend = (delta_seconds / Self::SMOOTHING_SECONDS).clamp(0.0, 1.0);
+        self.velocity += (instantaneous - self.velocity) * blend;
+        self.velocity
+    }
+
+    /// The current smoothed velocity without folding in a new observation.
+    #[must_use]
+    pub fn velocity(&self) -> DVec3 {
+        self.velocity
+    }
+
+    /// Drops the tracked history so the next observation restarts the estimate at rest.
+    pub fn reset(&mut self) {
+        self.previous = None;
+        self.velocity = DVec3::ZERO;
+    }
+}
+
 /// One cell's resolved reference counts and scheduling priority.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ResidencySnapshot {
@@ -161,16 +218,41 @@ pub struct ResidencySnapshot {
     pub priority: i32,
 }
 
+impl ResidencySnapshot {
+    /// The one admission order consumers spend a facet budget in: highest priority first, then
+    /// ascending cell. Total over any snapshot set, so worker count and arrival order change
+    /// latency only.
+    #[must_use]
+    pub fn admission_order(&self, other: &Self) -> Ordering {
+        other
+            .priority
+            .cmp(&self.priority)
+            .then_with(|| self.cell.cmp(&other.cell))
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 struct Claim {
     cell: WorldCellKey,
     facet: ResidencyFacet,
 }
 
+/// One source's resolved claims, keyed by everything that determines them.
+///
+/// The key is what lets a source that has not crossed a cell boundary keep its claims instead of
+/// rebuilding an identical set: a viewpoint's smoothed velocity changes every frame by a hair, so
+/// comparing the source itself would never match, while the cells it claims stay put.
+struct SourceClaims {
+    claims: BTreeSet<Claim>,
+    centres: Vec<WorldCellKey>,
+    levels: Vec<SourceLevel>,
+    facets: ResidencyMask,
+}
+
 /// Deterministically resolves multiple predicted sources into per-facet cell reference counts.
 pub struct ResidencyManager {
     sources: BTreeMap<SpatialSourceId, SpatialSource>,
-    claims: BTreeMap<SpatialSourceId, BTreeSet<Claim>>,
+    claims: BTreeMap<SpatialSourceId, SourceClaims>,
     source_claim_budget: NonZeroUsize,
 }
 
@@ -183,7 +265,6 @@ impl Default for ResidencyManager {
 }
 
 impl ResidencyManager {
-    /// Creates an empty manager.
     #[must_use]
     pub fn new() -> Self {
         Self::default()
@@ -202,36 +283,59 @@ impl ResidencyManager {
     /// Adds or replaces one source, applying load and cleanup hysteresis exactly.
     pub fn update_source(&mut self, source: SpatialSource) -> Result<()> {
         source.validate()?;
-        let center = source.predicted_position()?;
-        let previous = self.claims.get(&source.id).cloned().unwrap_or_default();
+        let centre = source.predicted_position()?;
+        let centres = source
+            .levels
+            .iter()
+            .map(|level| centre.cell().ancestor(level.level))
+            .collect::<Result<Vec<_>>>()?;
+        // A source whose centre cells, levels, and facets all match claims exactly what it already
+        // claims. Only `priority` and `revision` can still differ, and neither selects cells.
+        if let Some(resolved) = self.claims.get(&source.id)
+            && resolved.centres == centres
+            && resolved.levels == source.levels
+            && resolved.facets == source.facets
+        {
+            self.sources.insert(source.id, source);
+            return Ok(());
+        }
+
+        let previous = self
+            .claims
+            .get(&source.id)
+            .map(|resolved| resolved.claims.clone())
+            .unwrap_or_default();
         let mut next = BTreeSet::new();
-        for level in &source.levels {
-            let center_cell = center.cell().ancestor(level.level)?;
+        for (level, centre_cell) in source.levels.iter().zip(&centres) {
             let load = cells_in_cube(
-                center_cell,
+                *centre_cell,
                 level.load_radius_cells,
                 self.source_claim_budget.get(),
             )?;
-            let cleanup = cells_in_cube(
-                center_cell,
-                level.cleanup_radius_cells,
-                self.source_claim_budget.get(),
-            )?;
+            cube_cardinality(level.cleanup_radius_cells, self.source_claim_budget.get())?;
             for facet in source.facets.iter() {
                 next.extend(load.iter().copied().map(|cell| Claim { cell, facet }));
                 next.extend(previous.iter().copied().filter(|claim| {
                     claim.facet == facet
                         && claim.cell.level() == level.level
-                        && cleanup.contains(&claim.cell)
+                        && within_cube(*centre_cell, claim.cell, level.cleanup_radius_cells)
                 }));
             }
             if next.len() > self.source_claim_budget.get() {
                 return Err(Error::ResidencyBudgetExceeded);
             }
         }
-        self.claims.insert(source.id, next);
+        self.claims.insert(
+            source.id,
+            SourceClaims {
+                claims: next,
+                centres,
+                levels: source.levels.clone(),
+                facets: source.facets,
+            },
+        );
         self.sources.insert(source.id, source);
-        self.validate_counts()
+        Ok(())
     }
 
     /// Removes a source and all its references.
@@ -250,9 +354,9 @@ impl ResidencyManager {
     /// Resolved non-empty cell snapshots in canonical key order.
     pub fn snapshots(&self) -> Result<Vec<ResidencySnapshot>> {
         let mut result: BTreeMap<WorldCellKey, ResidencySnapshot> = BTreeMap::new();
-        for (source_id, claims) in &self.claims {
+        for (source_id, resolved) in &self.claims {
             let source = &self.sources[source_id];
-            for claim in claims {
+            for claim in &resolved.claims {
                 let entry = result.entry(claim.cell).or_insert(ResidencySnapshot {
                     cell: claim.cell,
                     reference_counts: [0; FACET_COUNT],
@@ -267,18 +371,10 @@ impl ResidencyManager {
         }
         Ok(result.into_values().collect())
     }
-
-    fn validate_counts(&self) -> Result<()> {
-        let _ = self.snapshots()?;
-        Ok(())
-    }
 }
 
-fn cells_in_cube(
-    center: WorldCellKey,
-    radius: u32,
-    cell_budget: usize,
-) -> Result<BTreeSet<WorldCellKey>> {
+/// The cell count a cube of `radius` materializes, rejected when it exceeds `cell_budget`.
+fn cube_cardinality(radius: u32, cell_budget: usize) -> Result<u128> {
     let diameter = u128::from(radius)
         .checked_mul(2)
         .and_then(|value| value.checked_add(1))
@@ -289,12 +385,40 @@ fn cells_in_cube(
     if cardinality > cell_budget as u128 {
         return Err(Error::ResidencyBudgetExceeded);
     }
+    Ok(cardinality)
+}
+
+/// Whether `cell` lies within the Chebyshev `radius` cube around `centre`, both at the same level.
+///
+/// The retention test the cleanup radius performs, answered arithmetically. Materializing the
+/// cleanup cube to call `contains` costs a tree node per cell for a question that is three
+/// comparisons.
+fn within_cube(centre: WorldCellKey, cell: WorldCellKey, radius: u32) -> bool {
+    if cell.level() != centre.level() {
+        return false;
+    }
+    let origin = centre.coordinates();
+    let target = cell.coordinates();
+    let radius = u64::from(radius);
+    (0..3).all(|axis| {
+        target[axis]
+            .checked_sub(origin[axis])
+            .is_some_and(|delta| delta.unsigned_abs() <= radius)
+    })
+}
+
+fn cells_in_cube(
+    centre: WorldCellKey,
+    radius: u32,
+    cell_budget: usize,
+) -> Result<BTreeSet<WorldCellKey>> {
+    cube_cardinality(radius, cell_budget)?;
     let radius = i64::from(radius);
     let mut cells = BTreeSet::new();
     for z in -radius..=radius {
         for y in -radius..=radius {
             for x in -radius..=radius {
-                cells.insert(center.neighbour([x, y, z])?);
+                cells.insert(centre.neighbour([x, y, z])?);
             }
         }
     }
@@ -420,102 +544,10 @@ impl<T> GenerationSlot<T> {
     }
 }
 
-/// A total deterministic priority key. Higher priority pops first; every tie uses stable identity.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct JobPriorityKey {
-    /// Source priority.
-    pub priority: i32,
-    /// Target cell.
-    pub cell: WorldCellKey,
-    /// Target facet.
-    pub facet: ResidencyFacet,
-    /// Generation.
-    pub generation: u64,
-    /// Stable logical job identity assigned by the producer.
-    pub job_id: u128,
-}
-
-impl Ord for JobPriorityKey {
-    fn cmp(&self, other: &Self) -> Ordering {
-        self.priority
-            .cmp(&other.priority)
-            .then_with(|| other.cell.cmp(&self.cell))
-            .then_with(|| other.facet.cmp(&self.facet))
-            .then_with(|| other.generation.cmp(&self.generation))
-            .then_with(|| other.job_id.cmp(&self.job_id))
-    }
-}
-
-impl PartialOrd for JobPriorityKey {
-    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        Some(self.cmp(other))
-    }
-}
-
-struct JobEntry<T> {
-    key: JobPriorityKey,
-    payload: T,
-}
-
-impl<T> PartialEq for JobEntry<T> {
-    fn eq(&self, other: &Self) -> bool {
-        self.key == other.key
-    }
-}
-
-impl<T> Eq for JobEntry<T> {}
-
-impl<T> Ord for JobEntry<T> {
-    fn cmp(&self, other: &Self) -> Ordering {
-        self.key.cmp(&other.key)
-    }
-}
-
-impl<T> PartialOrd for JobEntry<T> {
-    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        Some(self.cmp(other))
-    }
-}
-
-/// A deterministic job queue whose insertion/worker order cannot change priority order.
-pub struct SpatialJobQueue<T> {
-    heap: BinaryHeap<JobEntry<T>>,
-}
-
-impl<T> Default for SpatialJobQueue<T> {
-    fn default() -> Self {
-        Self {
-            heap: BinaryHeap::new(),
-        }
-    }
-}
-
-impl<T> SpatialJobQueue<T> {
-    /// Pushes a job with a complete total key.
-    pub fn push(&mut self, key: JobPriorityKey, payload: T) {
-        self.heap.push(JobEntry { key, payload });
-    }
-
-    /// Pops the next job.
-    pub fn pop(&mut self) -> Option<(JobPriorityKey, T)> {
-        self.heap.pop().map(|entry| (entry.key, entry.payload))
-    }
-
-    /// Number of queued jobs.
-    #[must_use]
-    pub fn len(&self) -> usize {
-        self.heap.len()
-    }
-
-    /// Whether the queue is empty.
-    #[must_use]
-    pub fn is_empty(&self) -> bool {
-        self.heap.is_empty()
-    }
-}
-
 #[cfg(test)]
 mod tests {
+    use std::sync::Barrier;
+
     use super::*;
 
     fn source(id: u64, position: WorldPosition) -> SpatialSource {
@@ -533,6 +565,29 @@ mod tests {
             facets: ResidencyMask::one(ResidencyFacet::Render),
             priority: id as i32,
         }
+    }
+
+    fn resident_cells(manager: &ResidencyManager) -> BTreeSet<WorldCellKey> {
+        manager
+            .snapshots()
+            .unwrap()
+            .into_iter()
+            .map(|snapshot| snapshot.cell)
+            .collect()
+    }
+
+    /// Number of separate resident runs each cell goes through across an ordered walk. One run is
+    /// hysteresis working; two or more is load/unload thrash.
+    fn resident_runs(history: &[BTreeSet<WorldCellKey>]) -> BTreeMap<WorldCellKey, usize> {
+        let mut runs: BTreeMap<WorldCellKey, usize> = BTreeMap::new();
+        let mut previous = BTreeSet::new();
+        for step in history {
+            for cell in step.difference(&previous) {
+                *runs.entry(*cell).or_default() += 1;
+            }
+            previous = step.clone();
+        }
+        runs
     }
 
     #[test]
@@ -565,14 +620,201 @@ mod tests {
     }
 
     #[test]
-    fn late_generation_is_rejected_without_partial_publication() {
-        let slot = GenerationSlot::new(WorldCellKey::base(0, 0, 0), Arc::new(vec![1, 2, 3]));
-        let old = slot.begin(10).unwrap();
-        let current = slot.begin(11).unwrap();
-        assert!(!slot.try_publish(old, Arc::new(vec![4])).unwrap());
-        assert_eq!(&*slot.read(), &[1, 2, 3]);
-        assert!(slot.try_publish(current, Arc::new(vec![5, 6])).unwrap());
-        assert_eq!(&*slot.read(), &[5, 6]);
+    fn observed_motion_converges_on_the_travelled_velocity() {
+        let mut motion = SourceMotion::default();
+        let step = 0.05;
+        let mut x = 0.0;
+        let mut velocity = DVec3::ZERO;
+        for _ in 0..64 {
+            x += 12.0 * step;
+            velocity = motion.observe(
+                WorldPosition::from_world_meters(DVec3::X * x).unwrap(),
+                step,
+            );
+        }
+        assert!(
+            (velocity.x - 12.0).abs() < 0.1,
+            "smoothed velocity {velocity:?} did not converge on 12 m/s"
+        );
+        assert!(velocity.y.abs() < 1e-6 && velocity.z.abs() < 1e-6);
+    }
+
+    #[test]
+    fn observed_motion_smooths_a_single_long_frame() {
+        let mut motion = SourceMotion::default();
+        motion.observe(WorldPosition::origin(), 0.016);
+        let jumped = motion.observe(
+            WorldPosition::from_world_meters(DVec3::X * 1.6).unwrap(),
+            0.016,
+        );
+        // 100 m/s instantaneous, blended in at 0.016 / SMOOTHING_SECONDS.
+        assert!(
+            (jumped.x - 6.4).abs() < 0.05,
+            "one 1.6 m frame reported {jumped:?}, not the smoothed 6.4 m/s"
+        );
+    }
+
+    #[test]
+    fn a_teleport_restarts_the_estimate_at_rest() {
+        let mut motion = SourceMotion::default();
+        for step in 1..16 {
+            motion.observe(
+                WorldPosition::from_world_meters(DVec3::X * f64::from(step) * 0.2).unwrap(),
+                0.05,
+            );
+        }
+        assert!(motion.velocity().x > 1.0);
+        let after = motion.observe(
+            WorldPosition::from_world_meters(DVec3::X * 100_000.0).unwrap(),
+            0.05,
+        );
+        assert_eq!(after, DVec3::ZERO);
+    }
+
+    #[test]
+    fn a_non_advancing_clock_leaves_the_estimate_untouched() {
+        let mut motion = SourceMotion::default();
+        motion.observe(WorldPosition::origin(), 0.05);
+        motion.observe(
+            WorldPosition::from_world_meters(DVec3::X * 0.5).unwrap(),
+            0.05,
+        );
+        let before = motion.velocity();
+        let held = motion.observe(
+            WorldPosition::from_world_meters(DVec3::X * 5.0).unwrap(),
+            0.0,
+        );
+        assert_eq!(held, before);
+    }
+
+    #[test]
+    fn moving_sources_hold_refcounts_without_load_unload_thrash() {
+        let moving = |id: u64, x: f64, velocity: f64| {
+            let mut source = source(id, WorldPosition::from_world_meters(DVec3::X * x).unwrap());
+            source.velocity_mps = DVec3::X * velocity;
+            source.prediction_seconds = 0.5;
+            source.levels[0].load_radius_cells = 1;
+            source.levels[0].cleanup_radius_cells = 2;
+            source
+        };
+
+        // The prediction horizon picks the centre cell: the same exact position resolved without
+        // velocity lands one cell lower.
+        let mut still = moving(1, 60.0, 8.0);
+        still.velocity_mps = DVec3::ZERO;
+        let mut without_prediction = ResidencyManager::new();
+        without_prediction.update_source(still).unwrap();
+        let mut with_prediction = ResidencyManager::new();
+        with_prediction.update_source(moving(1, 60.0, 8.0)).unwrap();
+        assert_ne!(
+            resident_cells(&with_prediction),
+            resident_cells(&without_prediction)
+        );
+
+        let mut manager = ResidencyManager::new();
+        let mut history = Vec::new();
+        let mut steady = Vec::new();
+        // Both sources ping-pong across a cell face inside the hysteresis band, and their claim
+        // cubes overlap so the shared cells carry two references.
+        for step in 0..8 {
+            let offset = f64::from(step % 2) * 8.0;
+            manager
+                .update_source(moving(1, 56.0 + offset, 8.0))
+                .unwrap();
+            manager
+                .update_source(moving(2, 200.0 - offset, -8.0))
+                .unwrap();
+            history.push(resident_cells(&manager));
+            if step == 1 {
+                steady = manager.snapshots().unwrap();
+            } else if step > 1 {
+                assert_eq!(
+                    manager.snapshots().unwrap(),
+                    steady,
+                    "oscillating inside the cleanup band moved a reference count"
+                );
+            }
+        }
+        let shared = steady
+            .iter()
+            .filter(|snapshot| snapshot.reference_counts[ResidencyFacet::Render.index()] == 2)
+            .count();
+        assert_eq!(shared, 18, "the two claim cubes must overlap");
+
+        // Walking both sources away releases each cell once and never reclaims it.
+        for step in 1..12 {
+            let distance = 64.0 * f64::from(step);
+            manager
+                .update_source(moving(1, 56.0 + distance, 8.0))
+                .unwrap();
+            manager
+                .update_source(moving(2, 200.0 + distance, -8.0))
+                .unwrap();
+            history.push(resident_cells(&manager));
+        }
+        for (cell, runs) in resident_runs(&history) {
+            assert_eq!(runs, 1, "{cell:?} was loaded {runs} separate times");
+        }
+    }
+
+    #[test]
+    fn late_generation_is_rejected_under_concurrent_publication() {
+        const WRITERS: u64 = 8;
+        const WIDTH: usize = 4096;
+
+        let cell = WorldCellKey::base(0, 0, 0);
+        let slot = Arc::new(GenerationSlot::new(cell, Arc::new(vec![0_u64; WIDTH])));
+        let mut published = 0_u64;
+        for _ in 0..16 {
+            let opened = Arc::new(Barrier::new(WRITERS as usize + 1));
+            let staged = Arc::new(Barrier::new(WRITERS as usize + 1));
+            let writers = (1..=WRITERS)
+                .map(|revision| {
+                    let slot = Arc::clone(&slot);
+                    let opened = Arc::clone(&opened);
+                    let staged = Arc::clone(&staged);
+                    std::thread::spawn(move || {
+                        let token = slot.begin(revision).unwrap();
+                        opened.wait();
+                        let value = Arc::new(vec![token.generation; WIDTH]);
+                        staged.wait();
+                        (token, slot.try_publish(token, value).unwrap())
+                    })
+                })
+                .collect::<Vec<_>>();
+            opened.wait();
+            staged.wait();
+            // Racing the publications: every read must see one whole generation, never a mix and
+            // never a generation older than one already observed.
+            for _ in 0..WIDTH {
+                let value = slot.read();
+                let generation = value[0];
+                assert!(value.iter().all(|entry| *entry == generation));
+                assert!(generation >= published);
+                published = generation;
+            }
+            let results = writers
+                .into_iter()
+                .map(|writer| writer.join().unwrap())
+                .collect::<Vec<_>>();
+            let current = results
+                .iter()
+                .map(|(token, _)| token.generation)
+                .max()
+                .unwrap();
+            assert_eq!(
+                results.iter().filter(|(_, accepted)| *accepted).count(),
+                1,
+                "exactly the newest generation may publish"
+            );
+            assert!(
+                results
+                    .iter()
+                    .all(|(token, accepted)| *accepted == (token.generation == current))
+            );
+            assert_eq!(&*slot.read(), &vec![current; WIDTH]);
+            published = current;
+        }
     }
 
     #[test]
@@ -627,74 +869,70 @@ mod tests {
     }
 
     #[test]
-    fn shuffled_queue_insertion_has_one_pop_order() {
-        let cell = WorldCellKey::base(0, 0, 0);
-        let keys = [
-            JobPriorityKey {
-                priority: 1,
-                cell,
-                facet: ResidencyFacet::Render,
-                generation: 1,
-                job_id: 9,
-            },
-            JobPriorityKey {
-                priority: 2,
-                cell,
-                facet: ResidencyFacet::Render,
-                generation: 1,
-                job_id: 7,
-            },
-            JobPriorityKey {
-                priority: 2,
-                cell,
-                facet: ResidencyFacet::Render,
-                generation: 1,
-                job_id: 3,
-            },
-        ];
-        let mut first = SpatialJobQueue::default();
-        let mut second = SpatialJobQueue::default();
-        for key in keys {
-            first.push(key, key.job_id);
+    fn restating_a_source_is_a_fixed_point() {
+        // The claim recurrence is `load ∪ (previous ∩ cleanup)`, and `load ⊆ cleanup`, so one
+        // update settles it. Holding a stationary source's claims instead of rebuilding them is
+        // only sound while that is true — a cleanup radius that stopped covering load, or a
+        // recurrence that accumulated, would break here first.
+        let mut manager = ResidencyManager::new();
+        let origin = WorldPosition::origin();
+        let moved =
+            WorldPosition::from_render_relative(glam::Vec3::new(320.0, 0.0, 0.0), origin).unwrap();
+
+        manager.update_source(source(1, moved)).unwrap();
+        manager.update_source(source(1, origin)).unwrap();
+        let settled = manager.snapshots().unwrap();
+        assert!(!settled.is_empty());
+
+        for revision in 2..8_u64 {
+            let mut restated = source(1, origin);
+            restated.revision = revision;
+            manager.update_source(restated).unwrap();
+            assert_eq!(manager.snapshots().unwrap(), settled);
         }
-        for key in keys.into_iter().rev() {
-            second.push(key, key.job_id);
-        }
-        let drain = |queue: &mut SpatialJobQueue<u128>| {
-            std::iter::from_fn(|| queue.pop().map(|(_, payload)| payload)).collect::<Vec<_>>()
-        };
-        assert_eq!(drain(&mut first), drain(&mut second));
-        assert_eq!(drain(&mut SpatialJobQueue::default()), Vec::<u128>::new());
     }
 
     #[test]
-    fn worker_count_cannot_change_canonical_result_bytes() {
-        let cell = WorldCellKey::base(-4, 7, 2);
-        let keys: Vec<JobPriorityKey> = (0_u128..128)
-            .map(|job_id| JobPriorityKey {
-                priority: (job_id % 7) as i32,
-                cell,
-                facet: ResidencyFacet::Simulation,
-                generation: 3,
-                job_id,
-            })
-            .collect();
-        let evaluate = |workers: usize| {
-            let mut queue = SpatialJobQueue::default();
-            for key in keys.iter().rev() {
-                queue.push(*key, key.job_id.to_be_bytes());
-            }
-            let mut outputs = vec![Vec::<[u8; 16]>::new(); workers];
-            let mut worker = 0;
-            while let Some((_, bytes)) = queue.pop() {
-                outputs[worker].push(bytes);
-                worker = (worker + 1) % workers;
-            }
-            let mut merged: Vec<[u8; 16]> = outputs.into_iter().flatten().collect();
-            merged.sort_unstable();
-            merged
+    fn a_held_source_still_republishes_its_priority() {
+        // Priority does not select cells, so it must survive the stationary-source hold — a hold
+        // that skipped the source write would pin the old scheduling order forever.
+        let mut manager = ResidencyManager::new();
+        let origin = WorldPosition::origin();
+        manager.update_source(source(1, origin)).unwrap();
+
+        let mut raised = source(1, origin);
+        raised.priority = 77;
+        manager.update_source(raised).unwrap();
+
+        assert!(
+            manager
+                .snapshots()
+                .unwrap()
+                .iter()
+                .all(|snapshot| snapshot.priority == 77)
+        );
+    }
+
+    #[test]
+    fn shuffled_snapshots_reach_one_admission_order() {
+        let snapshot = |x: i64, priority: i32| ResidencySnapshot {
+            cell: WorldCellKey::base(x, 0, 0),
+            reference_counts: [1; FACET_COUNT],
+            priority,
         };
-        assert_eq!(evaluate(1), evaluate(2));
-        assert_eq!(evaluate(1), evaluate(17));
+        let expected = vec![
+            snapshot(1, 7),
+            snapshot(4, 7),
+            snapshot(9, 7),
+            snapshot(-2, 3),
+            snapshot(5, 3),
+        ];
+        for rotation in 0..expected.len() {
+            let mut shuffled = expected.clone();
+            shuffled.rotate_left(rotation);
+            shuffled.reverse();
+            shuffled.sort_unstable_by(ResidencySnapshot::admission_order);
+            assert_eq!(shuffled, expected, "rotation {rotation}");
+        }
     }
 }

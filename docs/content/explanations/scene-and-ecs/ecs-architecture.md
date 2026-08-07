@@ -9,10 +9,9 @@ An entity-component-system (ECS) is a data-oriented architecture: game state is 
 storage, entities are identifiers that group components, and logic runs as functions over that data.
 The layout suits a renderer that walks thousands of objects per frame.
 
-The scene crate builds its world on `hecs` for the storage, but that choice is wrapped, never
-exposed. `Scene` is a struct that owns a `hecs::World`; the world field is private, and every
-operation downstream code performs goes through a method on `Scene`. No other crate ever names
-`hecs::` directly, so swapping the storage backend (a future `bevy_ecs`, say) is a one-crate change.
+The scene crate builds its world on [`hecs`](https://docs.rs/hecs/0.11/hecs/) for storage, but that
+choice stays wrapped. `Scene` owns a private `hecs::World`, and downstream operations go through
+methods on `Scene`. Other crates depend on the scene access contract rather than the storage API.
 
 ## The world is a struct
 
@@ -27,6 +26,8 @@ pub struct Scene {
     world: hecs::World,
     pub environment: SceneEnvironment,
     pub catalog: Option<Arc<AssetCatalog>>,  // borrowed; set per-frame, never serialized
+    revision: SceneRevision,
+    journal: VecDeque<SceneMutation>,
 }
 
 pub struct Entity(hecs::Entity);
@@ -61,28 +62,27 @@ for a small `Copy` component. A stale handle or a missing component is a typed
 with a new [`Uuid`](../scene-serialization/), a `Name`, a default `Transform`, a root
 `Relationship`, and a `ComponentOrder`. `destroy_entity` removes it and its whole subtree.
 
+Every successful mutation also enters the [scene mutation journal](../scene-mutation-journal/).
+Derived renderer and tool state can consume revisioned changes or rebuild from a snapshot when its
+cursor falls outside retained history.
+
 ## Iteration: for_each over a query
 
 The one iteration primitive is `for_each`, generic over a `hecs` query tuple of component
 references. It runs a callback for each entity that carries all of them:
 
 ```rust
-pub fn for_each<Q, F>(&mut self, mut f: F)
-where
-    Q: Query,
-    F: for<'a> FnMut(Entity, <Q as Query>::Item<'a>),
-{
-    for (handle, item) in self.world.query_mut::<(hecs::Entity, Q)>() {
-        f(Entity(handle), item);
-    }
-}
+scene.for_each::<(&Transform, &mut Camera), _>(|entity, (transform, camera)| {
+    update_camera(entity, transform, camera);
+});
 ```
 
 The query tuple spells the access exactly: `for_each::<&Transform, _>` reads, `for_each::<(&Transform,
 &mut Camera), _>` reads one and mutates the other. A system is just a function that calls `for_each`
 with the components it cares about — `render_scene` walks `(&Transform, &Mesh)` to gather
 renderables; `primary_camera` walks `(&Transform, &Camera)` to find the first primary camera and
-inverts its world matrix into a view.
+inverts its world matrix into a view. Mutable query members produce journal updates for every matched
+entity.
 
 ## Why this shape
 
@@ -101,6 +101,7 @@ which is data, not a trait hierarchy.
 | Component access | `scene/src/scene.rs` | `add_component`, `has_component`, `remove_component`, `with_component`, `with_component_mut`, `component` |
 | Lifecycle | `scene/src/scene.rs` | `create_entity`, `spawn_with_id`, `destroy_entity` |
 | Iteration | `scene/src/scene.rs` | `for_each` |
+| Mutation tracking | `scene/src/journal.rs` | `SceneMutation`, `SceneJournalCursor`, `SceneJournalRead` |
 | Re-exported storage traits | `scene/src/scene.rs` | `Component`, `Query` |
 | Camera resolve | `scene/src/hierarchy.rs` | `primary_camera`, `CameraView`, `camera_projection` |
 | A system that walks it | `assets/src/render_scene.rs` | `render_scene` |
@@ -108,4 +109,5 @@ which is data, not a trait hierarchy.
 ## Related
 - [Component registry](../component-registry/) — per-component behavior as data, not methods
 - [Components](../built-in-components/) — the value structs `for_each` iterates
+- [Scene mutation journal](../scene-mutation-journal/) — incremental derived-state synchronization
 - [Go-flavored design](../../core-and-conventions/go-flavored-design/) — why structs + free-standing methods

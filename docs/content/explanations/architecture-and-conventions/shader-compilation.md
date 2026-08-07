@@ -56,8 +56,9 @@ pub const SLANGC_SPV_FLAGS: &[&str] = &[
 `-o <out>`, and one `-D<name>` per feature define.
 
 - `-emit-spirv-directly` emits SPIR-V from Slang's own IR instead of routing through GLSL.
-- `-fvk-use-entrypoint-name` preserves entry-point names, so one `mesh.spv` serves `vertexMain`,
-  `vertexMainSkinned`, `fragmentMain`, and `depthPrepassFragment` to different PSOs.
+- `-fvk-use-entrypoint-name` preserves entry-point names, so one `mesh.spv` serves
+  `vertexMainExecutor`, `meshMainExecutor`, `fragmentMain`, and `depthPrepassFragment` to
+  different PSOs.
 - `-matrix-layout-column-major` matches glam's column-major matrices; a CPU-side transform
   arrives in the shader unchanged.
 - `-capability` declares everything the shaders use beyond `glsl_450` (bindless non-uniform
@@ -107,9 +108,7 @@ Material codegen applies the same rule to `<uuid>_mesh.spv` and `<uuid>_mesh_nor
 variants compile from the source-only import tree, so `SAFFRON_NO_RT` reaches `lighting.slang` and
 removes its ray-query declarations.
 
-No other shader needs a variant. The meshlet path is gated on
-[`VK_EXT_mesh_shader`](https://www.khronos.org/blog/mesh-shading-for-vulkan), and a device
-without ray tracing lacks mesh shaders as well, so `meshlet.spv` never loads there.
+No other shader needs a variant.
 
 ## Finding slangc
 

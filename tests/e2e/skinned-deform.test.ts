@@ -16,6 +16,7 @@
 
 import { afterAll, beforeAll, expect, test } from "bun:test";
 import { join } from "node:path";
+import type { EntityListEntry, SkinnedMesh } from "@saffron/protocol";
 import { Engine, REPO } from "./harness.ts";
 import { bootEngine, captureViewport, Cleaner, prepareScene } from "./test-utils.ts";
 
@@ -29,26 +30,14 @@ const ANIMATED = join(REPO, "engine", "assets", "models", "animated-strip.gltf")
 const MORPH = join(REPO, "tests", "e2e", "fixtures", "AnimatedMorphCube.gltf");
 const cleaner = new Cleaner();
 
-interface Entry {
-  id: string;
-  name: string;
-  parentId?: string;
-  bone?: boolean;
+async function entries(): Promise<EntityListEntry[]> {
+  return (await engine.call("list-entities")).entities;
 }
 
-interface AnimState {
-  clip: string;
-  playing: boolean;
-}
-
-async function entries(): Promise<Entry[]> {
-  return (await engine.call<{ entities: Entry[] }>("list-entities")).entities;
-}
-
-/// Find the entity in the imported hierarchy that actually carries the AnimationPlayer component.
+// Find the entity in the imported hierarchy that actually carries the AnimationPlayer component.
 async function findPlayerEntity(): Promise<string | undefined> {
   for (const e of await entries()) {
-    const info = await engine.call<{ components: Record<string, unknown> }>("inspect", {
+    const info = await engine.call("inspect", {
       entity: e.id,
     });
     if (info.components.AnimationPlayer) {
@@ -58,11 +47,11 @@ async function findPlayerEntity(): Promise<string | undefined> {
   return undefined;
 }
 
-/// The mesh-bearing entity carrying the durable `Morph` component (import seeds it on the mesh node,
-/// which the single-node model may collapse onto the instantiated root).
+// The mesh-bearing entity carrying the durable `Morph` component (import seeds it on the mesh node,
+// which the single-node model may collapse onto the instantiated root).
 async function morphEntity(): Promise<string> {
   for (const e of await entries()) {
-    const info = await engine.call<{ components: Record<string, unknown> }>("inspect", {
+    const info = await engine.call("inspect", {
       entity: e.id,
     });
     if (info.components.Morph) {
@@ -72,7 +61,7 @@ async function morphEntity(): Promise<string> {
   throw new Error("no entity carries a Morph component");
 }
 
-/// Capture the viewport and wait for the deferred write to land on disk.
+// Capture the viewport and wait for the deferred write to land on disk.
 async function screenshot(tag: string): Promise<Buffer> {
   return captureViewport(engine, cleaner, `deform-${tag}`);
 }
@@ -106,10 +95,9 @@ test("the skinned mesh resolves its joints by uuid through inspect", async () =>
   const ids = new Set(list.map((e) => e.id));
   // A rigged import places the SkinnedMesh on the mesh descendant of the imported root (the root
   // carries ModelInstance + Relationship), so find the entity that actually holds the component.
-  type Skin = { mesh: string; rootBone: string; bones: string[] };
-  let skin: Skin | undefined;
+  let skin: SkinnedMesh | undefined;
   for (const e of list) {
-    const info = await engine.call<{ components: { SkinnedMesh?: Skin } }>("inspect", {
+    const info = await engine.call("inspect", {
       entity: e.id,
     });
     if (info.components.SkinnedMesh) {
@@ -128,7 +116,7 @@ test("the skinned mesh resolves its joints by uuid through inspect", async () =>
 });
 
 test("a bone reparents like any entity and inspect reflects it", async () => {
-  const anchor = await engine.call<{ id: string }>("create-entity", { args: ["skin-anchor"] });
+  const anchor = await engine.call("create-entity", { args: ["skin-anchor"] });
   const list = await entries();
   const tip = list.find((e) => e.name === "TipJoint")!;
   await engine.call("set-parent", { entity: tip.id, parent: anchor.id });
@@ -167,16 +155,14 @@ test("the imported rig carries a stopped AnimationPlayer bound to the clip", asy
   playerId = (await findPlayerEntity()) ?? "";
 
   expect(playerId).not.toBe(""); // the rig descendant carrying AnimationPlayer must exist
-  const info = await engine.call<{
-    components: Record<string, { clip: string; autoplay: boolean }>;
-  }>("inspect", {
+  const info = await engine.call("inspect", {
     entity: playerId,
   });
-  const player = info.components.AnimationPlayer;
+  const player = info.components.AnimationPlayer!;
   expect(player).toBeDefined();
   expect(player.autoplay).toBe(false);
   expect(player.clip).not.toBe("0"); // bound to the imported "Bend" clip
-  const state = await engine.call<AnimState>("get-animation-state", { entity: playerId });
+  const state = await engine.call("get-animation-state", { entity: playerId });
   expect(state.playing).toBe(false);
   expect(state.clip).toBe(player.clip);
 });
@@ -213,7 +199,7 @@ test("the morph mesh seeds rest weights + names", async () => {
   await engine.call("focus", { entity: morphId });
   await engine.settle();
 
-  const got = await engine.call<{ weights: number[]; names: string[] }>("get-morph-weights", {
+  const got = await engine.call("get-morph-weights", {
     entity: morphId,
   });
   expect(got.weights).toEqual([0]);
@@ -221,12 +207,12 @@ test("the morph mesh seeds rest weights + names", async () => {
 });
 
 test("set-morph-weights round-trips a 0..1 vector", async () => {
-  const set = await engine.call<{ weights: number[] }>("set-morph-weights", {
+  const set = await engine.call("set-morph-weights", {
     entity: morphId,
     weights: [0.75],
   });
   expect(set.weights).toEqual([0.75]);
-  const got = await engine.call<{ weights: number[] }>("get-morph-weights", { entity: morphId });
+  const got = await engine.call("get-morph-weights", { entity: morphId });
   expect(got.weights).toEqual([0.75]);
 });
 
@@ -245,11 +231,19 @@ test("playing the weight clip deforms the geometry on the GPU", async () => {
   await engine.call("set-morph-weights", { entity: morphId, weights: [0] });
   await engine.settle(200);
   const rest = await screenshot("morph-rest");
-  // Full bulge (weight 1) — the top face lifts by +1, a large silhouette change. If the morph
-  // compute pass did not run, the two frames would be identical.
+  // Full bulge (weight 1) — the top face lifts by +1, a large silhouette change. If the
+  // morph compute pass did not run, the frames would stay identical. The capture polls:
+  // the deformed frame lands within the deadline or the morph genuinely never ran.
   await engine.call("set-morph-weights", { entity: morphId, weights: [1] });
-  await engine.settle(300);
-  const bulged = await screenshot("morph-bulged");
+  const deadline = Date.now() + 10_000;
+  let bulged = rest;
+  for (;;) {
+    await engine.settle(300);
+    bulged = await screenshot("morph-bulged");
+    if (!bulged.equals(rest) || Date.now() >= deadline) {
+      break;
+    }
+  }
   expect(bulged.equals(rest)).toBe(false);
 });
 

@@ -1,5 +1,4 @@
-//! The Poly Haven connector — keyless (`AuthKind::None`), CC0 assets. Phase 1 emits
-//! `kind: Model` results only; texture/HDRI mapping arrives in Phase 4.
+//! The Poly Haven connector — keyless (`AuthKind::None`), CC0 assets, models only.
 //!
 //! Every request carries the framework's unique `User-Agent`, which Poly Haven requires.
 //! The model deliverable is a glTF with external buffers/images, so `download()` fetches
@@ -288,8 +287,7 @@ impl StoreConnector for PolyHaven {
         query: &SearchQuery,
         cursor: Option<StoreCursor>,
     ) -> Result<SearchPage, ConnectorError> {
-        // Phase 1: Poly Haven contributes models only; a `type:` filter for anything else
-        // yields nothing here (textures/HDRIs arrive in Phase 4).
+        // Poly Haven contributes models only, so a `type:` filter for anything else matches nothing.
         if matches!(query.kind, Some(k) if k != StoreKind::Model) {
             return Ok(SearchPage {
                 results: Vec::new(),

@@ -1,33 +1,28 @@
 //! glam math plus the CPU mesh/skin/vertex/ray types, the animation track/clip
-//! types, and the import-graph aggregates.
+//! types, the import-graph aggregates, the `.smesh`/`.sanim` byte formats, the
+//! picking math, the glTF/OBJ importers, and the stable sub-asset id hash.
 //!
-//! This crate adopts `glam` as the engine's math vocabulary with three locked
-//! decisions that cascade through every downstream crate:
+//! Two locked decisions cascade through every downstream crate:
 //!
-//! - **`Vec3` is 12 bytes, never `Vec3A`.** All format-bearing fields use
-//!   `Vec3`/`Vec4`/`Vec2`/`Mat4`, never the 16-byte SIMD `A` variants, so the
-//!   byte strides match the frozen disk/GPU layouts (`Vertex` = 32, etc.).
-//! - **Quaternion order is `xyzw`.** glam's `Quat` is the glTF storage order:
+//! - **`Vec3` is 12 bytes, never `Vec3A`.** Format-bearing fields use
+//!   `Vec3`/`Vec4`/`Vec2`/`Mat4`, never the 16-byte SIMD `A` variants, so the byte
+//!   strides match the frozen disk and GPU layouts.
+//! - **Quaternion order is `xyzw`.** glam's `Quat` is the glTF storage order, so
 //!   [`ImportedNode::rotation`] reads the four glTF floats in declaration order.
-//! - **No global depth flag.** The `[0, 1]` Vulkan clip depth is a per-projection
-//!   choice (`Mat4::perspective_rh`). No projection lives in this crate, so the rule
-//!   is recorded for downstream crates and not exercised here.
-//!
-//! Beyond the types it carries the byte formats (`.smesh`/`.sanim`), the picking
-//! math, the model importers (glTF via the `gltf` crate, OBJ via `tobj`), the raster
-//! image decoders (the `image` crate), and the stable sub-asset id hash.
-//!
-//! Depends on `saffron-core`.
 
 #![deny(unsafe_code)]
 
+mod alpha_card;
 mod conditioning;
 mod error;
 mod gltf_import;
+mod gltf_instancing;
+mod hierarchy_reference;
 mod image_decode;
-mod meshlet;
 mod obj_import;
+mod opacity_micromap;
 mod picking;
+mod portable_binary;
 mod primitives;
 mod sanim;
 mod sdf;
@@ -36,20 +31,28 @@ mod smodel;
 mod sub_id;
 mod translate;
 mod types;
+mod virtual_hierarchy;
 
+pub use alpha_card::{
+    ALPHA_CARD_CONTOUR_MAX_EXTENT, ContouredAlphaCard, ContouredCardVertex, contour_alpha_card,
+};
 pub use conditioning::{
     EDGE_BOUNDARY, EDGE_NON_MANIFOLD, EDGE_SEAM, EDGE_SEAM_OBJECT_SPACE, Edge, MeshConditioning,
-    MinMaxLevel, TriEdges, WeldedVertex, build_min_max_pyramid,
+    TriEdges, WeldedVertex,
 };
 pub use error::{Error, Result};
 pub use gltf_import::import_gltf_model;
+pub use gltf_instancing::{GltfInstance, GltfInstanceSet, GltfInstancing, read_gltf_instancing};
+pub use hierarchy_reference::*;
 pub use image_decode::{
     decode_image, decode_image_from_memory, decode_image_from_memory_hdr, decode_image_hdr,
 };
-pub use meshlet::{
-    MESHLET_MAX_TRIANGLES, MESHLET_MAX_VERTICES, Meshlet, MeshletSet, build_meshlets,
-};
 pub use obj_import::import_obj_model;
+pub use opacity_micromap::{
+    AlphaBounds, CoverageRule, CoverageSourcePlane, MAX_SUBDIVISION_LEVEL, MicroState,
+    MicromapClasses, MicromapTriangle, MicromapUsage, OPACITY_FORMAT_4_STATE, OpacityMicromapBuild,
+    barycentrics_to_index, derive_opacity_micromap, micro_triangle_corners, subdivision_level,
+};
 pub use picking::{
     MeshBvh, MeshNearestHit, MeshRayHit, TriangleClosestPoint, TriangleRayHit,
     closest_point_coordinates, closest_point_on_triangle, generate_normals, ray_aabb_slab,
@@ -67,8 +70,9 @@ pub use sdf::{
 };
 pub use smesh::{
     MESH_FORMAT_VERSION, load_mesh, load_mesh_conditioning_from_bytes, load_mesh_from_bytes,
-    load_mesh_morph_from_bytes, load_mesh_skin, load_mesh_skin_from_bytes, mesh_counts_from_bytes,
-    mesh_file_counts, save_mesh, save_mesh_to_buffer,
+    load_mesh_hierarchy_from_bytes, load_mesh_morph_from_bytes, load_mesh_skin,
+    load_mesh_skin_from_bytes, mesh_counts_from_bytes, mesh_file_counts, save_mesh,
+    save_mesh_to_buffer,
 };
 pub use smodel::{
     CONTAINER_FORMAT_VERSION, ChunkKind, ContainerChunk, ContainerReader, METADATA_SCHEMA_VERSION,
@@ -78,17 +82,18 @@ pub use sub_id::sub_id_for;
 pub use translate::translate_model;
 pub use types::{
     AlphaMode, AnimClip, AnimInterp, AnimPath, AnimTarget, AnimTrack, DecodedImage,
-    DecodedImageFloat, ImportedMaterial, ImportedModel, ImportedNode, ImportedSkin,
+    DecodedImageFloat, ImportedMaterial, ImportedModel, ImportedNode, ImportedOrigin, ImportedSkin,
     MaterialMapRole, Mesh, MeshCounts, MorphData, MorphDelta, MorphTarget, Ray, SkinPayload,
     Submesh, TextureSource, Vertex, VertexSkin, compute_tangents,
 };
+pub use virtual_hierarchy::*;
 
-// Re-export glam so downstream crates share this crate's pinned math vocabulary
-// rather than depending on glam directly and risking a version split.
+// Re-exported so downstream crates share this crate's pinned math vocabulary rather
+// than depending on glam directly and risking a version split.
 pub use glam;
 
-/// The format-bearing strides, pinned at compile time. A stray `Vec3A` or a glam
-/// bump that changed a layout fails the build here, not at a torn-mesh runtime.
+/// The format-bearing strides, pinned at compile time: a stray `Vec3A` or a glam bump
+/// that moved a layout fails the build here rather than at a torn-mesh runtime.
 const _: () = assert!(size_of::<Vertex>() == 48, "Vertex must stay 48 bytes");
 const _: () = assert!(size_of::<Submesh>() == 16, "Submesh must stay 16 bytes");
 const _: () = assert!(
@@ -101,8 +106,7 @@ mod tests {
     use super::*;
     use glam::{Vec2, Vec3, Vec4};
 
-    /// A `const fn` that only compiles for a `Pod` type — proves the derive held
-    /// for each format struct without naming `unsafe`.
+    /// Only compiles for a `Pod` type, so it proves the derive held without naming `unsafe`.
     const fn assert_pod<T: bytemuck::Pod>() {}
 
     #[test]
@@ -161,8 +165,6 @@ mod tests {
 
     #[test]
     fn slice_cast_preserves_count_and_order() {
-        // A Vec of format structs casts to bytes and back as a slice — the wire the
-        // .smesh writer/reader uses (proves cast_slice is wired, no unsafe).
         let vertices = vec![
             Vertex {
                 position: Vec3::X,
@@ -185,7 +187,6 @@ mod tests {
 
     #[test]
     fn anim_byte_discriminants_are_pinned() {
-        // The on-disk byte values must stay fixed (the .sanim record stores them raw).
         assert_eq!(AnimPath::Translation as u8, 0);
         assert_eq!(AnimPath::Rotation as u8, 1);
         assert_eq!(AnimPath::Scale as u8, 2);
@@ -195,7 +196,6 @@ mod tests {
         assert_eq!(AnimInterp::CubicSpline as u8, 2);
         assert_eq!(AnimTarget::Bone as u8, 0);
         assert_eq!(AnimTarget::Node as u8, 1);
-        // The discriminant round-trips through `from_u8`; out-of-range is rejected.
         assert_eq!(AnimPath::from_u8(3).unwrap(), AnimPath::Weights);
         assert_eq!(AnimTarget::from_u8(1).unwrap(), AnimTarget::Node);
         assert!(AnimPath::from_u8(4).is_err());
@@ -203,21 +203,18 @@ mod tests {
     }
 
     #[test]
-    fn defaults_match_the_cpp_seed_values() {
-        // ImportedNode: parent -1 (root), identity rotation, unit scale.
+    fn import_defaults_are_root_identity_white_and_forward_z() {
         let node = ImportedNode::default();
         assert_eq!(node.parent, -1);
         assert_eq!(node.rotation, glam::Quat::IDENTITY);
         assert_eq!(node.scale, Vec3::ONE);
 
-        // ImportedMaterial: white base color, dielectric, fully rough.
         let material = ImportedMaterial::default();
         assert_eq!(material.base_color, Vec4::ONE);
         assert_eq!(material.metallic, 0.0);
         assert_eq!(material.roughness, 1.0);
         assert!(material.albedo.is_none());
 
-        // Ray: forward -Z, origin at the world center.
         let ray = Ray::default();
         assert_eq!(ray.origin, Vec3::ZERO);
         assert_eq!(ray.dir, Vec3::new(0.0, 0.0, -1.0));
@@ -225,8 +222,6 @@ mod tests {
 
     #[test]
     fn quat_reads_gltf_xyzw_in_declaration_order() {
-        // glam's xyzw is the glTF storage order, so the four source floats map
-        // straight through.
         let r = [0.1f32, 0.2, 0.3, 0.9];
         let q = glam::Quat::from_xyzw(r[0], r[1], r[2], r[3]);
         assert_eq!(q.x, r[0]);

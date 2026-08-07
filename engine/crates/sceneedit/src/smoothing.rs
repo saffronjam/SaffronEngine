@@ -3,7 +3,7 @@
 //! A `smooth:1` edit merges its per-field targets into an entry here instead of writing
 //! the component directly; [`SceneEditContext::step_edit_smoothing`] converges the entity's
 //! component toward the target each rendered frame (the same `tau = 0.025` exponential the
-//! gizmo pointer drag and the look-drain share), snapping exactly and dropping the entry
+//! gizmo pointer drag and the preview orbit share), snapping exactly and dropping the entry
 //! once converged.
 
 use glam::Vec3;
@@ -13,11 +13,11 @@ use saffron_scene::{Entity, Transform};
 use crate::context::SceneEditContext;
 
 /// The exponential smoothing time constant (seconds), shared by the gizmo pointer drag, the
-/// camera pose ease, and the edit-smoothing stepper.
+/// preview orbit's camera ease, and the edit-smoothing stepper.
 ///
 /// At ~25 ms a 60 Hz control sample is reached in roughly two frames' worth of lag while
-/// the sample staircase becomes continuous motion. The single named source; the camera's
-/// eye-toward-target ease ([`crate::camera`]) and the gizmo drag both step
+/// the sample staircase becomes continuous motion. The single named source; the orbit
+/// camera's ease ([`crate::camera`]) and the gizmo drag both step
 /// `alpha = 1 - exp(-dt/TAU)` against it.
 pub(crate) const SMOOTH_TAU: f32 = 0.025;
 

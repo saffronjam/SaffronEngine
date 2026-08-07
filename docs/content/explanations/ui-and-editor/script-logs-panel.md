@@ -63,7 +63,7 @@ Multiple entity chips are ORed together. Free text is ANDed with that entity set
 | Editor buffer and gated polling | `editor/src/state/store.ts` | `SCRIPT_LOG_LIMIT`, `appendScriptLogs`, `clearScriptLogs`, `startReconcile` |
 | Client command wrapper | `editor/src/control/client.ts` | `drainScriptLogs` |
 | Script binding and runtime sink | `engine/crates/script/src/bindings.rs` · `engine/crates/runtime/src/bridge.rs` | `register_scene_globals`, `ScriptHostBridge::log_sink`, `RuntimeScriptBridge` |
-| Engine ring and drain command | `engine/crates/sceneedit/src/play.rs` · `engine/crates/control/src/commands_scene.rs` | `ScriptLog`, `SCRIPT_LOG_RING_CAP`, `push_script_log`, `drain-script-logs` |
+| Engine ring and drain command | `engine/crates/sceneedit/src/play.rs` · `engine/crates/control/src/commands_scene/` | `ScriptLog`, `SCRIPT_LOG_RING_CAP`, `push_script_log`, `drain-script-logs` |
 
 ## Related
 

@@ -1,21 +1,15 @@
-//! The viewport shm publish: the byte-exact seqlock producer the editor's Wayland
-//! presenter reads.
+//! The viewport shm publish: the byte-exact seqlock producer the editor's Wayland presenter reads.
 //!
-//! The segment is a **frozen wire contract**: a 32-byte header of eight `u32`s
-//! `[magic, width, height, seq, ring_slots, slot_capacity, generation_lo, generation_hi]` followed by
-//! `ring_slots` fixed-capacity BGRA8 frames. Frame `s` lands in ring slot
-//! `s % ring_slots`; `seq` is bumped last under a [`Ordering::Release`] fence so a
-//! reader that observes the new `seq` is guaranteed the matching width/height + pixels
-//! (the seqlock). The reader oracle is `editor/shell/src/presenter.rs`,
-//! which reads slot `seq % ring_slots` after checking `magic` and a `seq` change.
+//! The segment is a frozen wire contract: a 32-byte header of eight `u32`s
+//! `[magic, width, height, seq, ring_slots, slot_capacity, generation_lo, generation_hi]` followed
+//! by `ring_slots` fixed-capacity BGRA8 frames. Frame `s` lands in ring slot `s % ring_slots`;
+//! `seq` is bumped last under a [`Ordering::Release`] fence, so a reader that observes the new
+//! `seq` is guaranteed the matching width/height + pixels. The reader is
+//! `editor/shell/src/presenter.rs`, which reads slot `seq % ring_slots` after checking `magic` and
+//! a `seq` change.
 //!
-//! # The `unsafe` seam
-//!
-//! This is the README §6 / phase grounding shm seam: `rustix` opens the POSIX shared
-//! memory object, `ftruncate`s it, and `mmap`s it `MAP_SHARED`; the producer writes
-//! the header + the ring via a raw pointer into that mapping. The seqlock ordering is
-//! the load-bearing invariant — `fence(Release)` between the pixel/dimension writes
-//! and the final `seq` store.
+//! `rustix` opens the POSIX shared memory object, `ftruncate`s it, and `mmap`s it `MAP_SHARED`; the
+//! producer writes the header + the ring through a raw pointer into that mapping.
 
 use std::ffi::CString;
 use std::os::fd::{AsFd, OwnedFd};

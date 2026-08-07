@@ -2149,6 +2149,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d6790f58c7ff633d8771f42965289203411a5e5c68388703c06e14f24770b41e"
 
 [[package]]
+name = "optimesh"
+version = "1.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1b6d84424d4988ac9fed66567d917e435ff6ff69bd3db5a81f14f6ff5a288afe"
+dependencies = [
+ "cc",
+ "libm",
+]
+
+[[package]]
 name = "orbclient"
 version = "0.3.55"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2755,6 +2765,7 @@ dependencies = [
  "saffron-core",
  "saffron-geometry",
  "saffron-json",
+ "saffron-material",
  "saffron-rendering",
  "saffron-scene",
  "saffron-spatial",
@@ -2781,10 +2792,12 @@ dependencies = [
  "saffron-physics",
  "saffron-protocol",
  "saffron-rendering",
+ "saffron-runtime",
  "saffron-scene",
  "saffron-sceneedit",
  "saffron-spatial",
  "saffron-vegetation",
+ "saffron-wind",
  "saffron-window",
  "schemars 1.2.1",
  "serde",
@@ -2816,7 +2829,6 @@ dependencies = [
 name = "saffron-e2e"
 version = "0.1.0"
 dependencies = [
- "rustix 0.38.44",
  "saffron-control-client",
  "saffron-protocol",
  "serde",
@@ -2832,9 +2844,12 @@ dependencies = [
  "glam",
  "gltf",
  "image",
+ "optimesh",
  "saffron-core",
+ "saffron-material",
  "saffron-test-support",
  "serde_json",
+ "sha2",
  "thiserror 2.0.18",
  "tobj",
  "tracing",
@@ -2864,6 +2879,8 @@ dependencies = [
  "saffron-signal",
  "saffron-spatial",
  "saffron-test-support",
+ "saffron-vegetation-gpu",
+ "saffron-wind",
  "saffron-window",
  "serde_json",
  "tracing",
@@ -2891,6 +2908,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "saffron-material"
+version = "0.1.0"
+dependencies = [
+ "saffron-core",
+ "saffron-spatial",
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "saffron-physics"
 version = "0.1.0"
 dependencies = [
@@ -2901,6 +2927,8 @@ dependencies = [
  "saffron-geometry",
  "saffron-physics-sys",
  "saffron-scene",
+ "saffron-spatial",
+ "saffron-wind",
  "thiserror 2.0.18",
  "tracing",
 ]
@@ -2921,11 +2949,13 @@ dependencies = [
  "saffron-app",
  "saffron-assets",
  "saffron-core",
+ "saffron-geometry",
  "saffron-log",
  "saffron-protocol",
  "saffron-rendering",
  "saffron-runtime",
  "saffron-scene",
+ "saffron-spatial",
  "saffron-window",
  "serde_json",
  "tracing",
@@ -2957,9 +2987,10 @@ dependencies = [
  "rustix 0.38.44",
  "saffron-core",
  "saffron-geometry",
+ "saffron-material",
  "saffron-spatial",
  "saffron-test-support",
- "saffron-vegetation",
+ "saffron-wind",
  "saffron-window",
  "serde",
  "serde_json",
@@ -2975,12 +3006,16 @@ name = "saffron-runtime"
 version = "0.1.0"
 dependencies = [
  "glam",
+ "rustix 0.38.44",
  "saffron-animation",
  "saffron-assets",
  "saffron-core",
  "saffron-physics",
  "saffron-scene",
  "saffron-script",
+ "saffron-spatial",
+ "saffron-vegetation",
+ "thiserror 2.0.18",
  "tracing",
 ]
 
@@ -2993,6 +3028,8 @@ dependencies = [
  "hecs",
  "saffron-core",
  "saffron-json",
+ "saffron-spatial",
+ "saffron-wind",
  "serde",
  "serde_json",
  "thiserror 2.0.18",
@@ -3021,6 +3058,7 @@ dependencies = [
  "mlua",
  "saffron-core",
  "saffron-scene",
+ "saffron-spatial",
  "serde_json",
  "thiserror 2.0.18",
  "tracing",
@@ -3052,11 +3090,34 @@ dependencies = [
 name = "saffron-vegetation"
 version = "0.1.0"
 dependencies = [
+ "glam",
  "saffron-core",
  "saffron-geometry",
  "saffron-json",
+ "saffron-material",
  "saffron-spatial",
+ "sha2",
  "thiserror 2.0.18",
+ "zstd",
+]
+
+[[package]]
+name = "saffron-vegetation-gpu"
+version = "0.1.0"
+dependencies = [
+ "saffron-rendering",
+ "saffron-vegetation",
+ "serde",
+ "serde_json",
+ "sha2",
+ "thiserror 2.0.18",
+]
+
+[[package]]
+name = "saffron-wind"
+version = "0.1.0"
+dependencies = [
+ "glam",
 ]
 
 [[package]]
@@ -4340,8 +4401,13 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "atomic-write-file",
+ "image",
+ "saffron-core",
+ "saffron-geometry",
  "saffron-protocol",
  "saffron-script",
+ "saffron-spatial",
+ "saffron-vegetation",
  "serde",
  "serde_json",
  "sha2",
@@ -4378,6 +4444,34 @@ name = "zmij"
 version = "1.0.21"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b8848ee67ecc8aedbaf3e4122217aff892639231befc6a1b58d29fff4c2cabaa"
+
+[[package]]
+name = "zstd"
+version = "0.13.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e91ee311a569c327171651566e07972200e76fcfe2242a4fa446149a3881c08a"
+dependencies = [
+ "zstd-safe",
+]
+
+[[package]]
+name = "zstd-safe"
+version = "7.2.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8f49c4d5f0abb602a93fb8736af2a4f4dd9512e36f7f570d66e65ff867ed3b9d"
+dependencies = [
+ "zstd-sys",
+]
+
+[[package]]
+name = "zstd-sys"
+version = "2.0.16+zstd.1.5.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "91e19ebc2adc8f83e43039e79776e3fda8ca919132d68a1fed6a5faca2683748"
+dependencies = [
+ "cc",
+ "pkg-config",
+]
 
 [[package]]
 name = "zune-core"

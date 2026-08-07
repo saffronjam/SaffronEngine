@@ -1,13 +1,11 @@
-// Selected via BookTheme = 'saffron' in hugo.toml. A dark, low-colour variant:
-// the theme's Nord-based dark with the blue links flattened to neutral grey.
+// Selected via BookTheme = 'saffron' in hugo.toml.
 @mixin theme-saffron {
   @include theme-dark;
   --color-link: #c7ccd6;
   --color-visited-link: #aeb4c0;
 }
 
-// Roboto for text, Roboto Mono for code (loaded in
-// layouts/_partials/docs/inject/head.html).
+// Both families are loaded in layouts/_partials/docs/inject/head.html.
 body {
   font-family: "Roboto", "Helvetica Neue", Arial, sans-serif;
 }

@@ -24,7 +24,7 @@ pub fn submit(&mut self, body: impl FnOnce(vk::CommandBuffer) + 'static) {
 
 Nothing executes at the call. The closure is stored as a `RenderFn`, and when the renderer builds
 the frame graph, the scene pass body replays every stored closure in its `scene-submissions`
-scope: after the batched opaque draw list, before the translucent draws.
+scope: after the opaque indirect draws, before the GPU-sorted translucent draws.
 
 The closure receives the frame's `vk::CommandBuffer` (Vulkan via the
 [`ash`](https://github.com/ash-rs/ash) bindings) inside a rendering scope the graph has opened
@@ -44,6 +44,12 @@ an `on_top` range (gizmo handles, entity billboards) that always shows. The vert
 dedicated `editor-overlay` graphics pass at the end of the frame graph, after the tonemap,
 loading the 1× scene depth read-only so occlusion tests against the finished frame. The
 [gizmo page](../../ui-and-editor/gizmo/) covers the geometry itself.
+
+The geometry belongs to one render, exactly like a `submit` closure: `render_scene_offscreen`
+drains it when it uploads the vertex buffer, so the overlay pass arms only for the render the
+geometry was submitted for. That is what keeps the gizmo out of the asset thumbnails — a
+thumbnail is a `ViewId::Thumbnail` excursion through the same renderer that submits no overlay,
+and so draws none.
 
 ## Render-graph seam: the loop's graph pass
 

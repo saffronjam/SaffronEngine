@@ -35,7 +35,7 @@ The march takes up to 12 sphere-trace steps over at most 12 m, stepping by the f
 
 The cone reads the Global Distance Field clipmap: three camera-centered `R16_SNORM` volumes of
 128³ voxels, the finest spanning 32 m (a 0.25 m voxel) and each coarser cascade doubling the
-extent. `gdfDistance` selects the finest cascade containing the sample, converts world position to
+extent. `gdfDistanceOccupancy` selects the finest cascade containing the sample, converts world position to
 that cascade's toroidal UVW, and takes one trilinear tap; near a cascade's outer face it blends
 into the next coarser one so the handoff shows no shell. One tap costs the same regardless of
 scene size, because the cone never iterates an instance list.
@@ -89,17 +89,28 @@ It runs in the `dfao` half-res prepass with an eight-position azimuth jitter per
 bilateral upsample plus a temporal accumulator average the rotated cone rings into a denser
 hemisphere. Sky visibility is view-independent, so temporal reuse is safe here.
 
-The resolved sky visibility multiplies the analytic sky irradiance inside the half-res
-`gi-resolve` pass. Where [DDGI](../ddgi-overview/) has coverage, its probe irradiance overrides
-that analytic term by coverage weight, so the distance-field occlusion shapes only the residual
-sky. Contact-scale diffuse occlusion stays with GTAO and the material occlusion texture.
+The accumulator is the chain's answer, not a polish stage on it. Each frame's cones sit at a
+different azimuth, so the blurred per-frame estimate carries that rotation as variance forever,
+while the clamp-free EMA in `dfao-accum` converges to the rotation-invariant mean a still surface
+should hold. Every consumer therefore reads `dfao_resolved`, and the three passes resolve as a unit
+— a chain that cannot accumulate does not trace either.
+
+The accumulated sky visibility multiplies the analytic sky irradiance inside the half-res
+`gi-resolve` pass, which runs after `dfao-accum` in the same frame. Where
+[DDGI](../ddgi-overview/) has coverage, its probe irradiance overrides that analytic term by
+coverage weight, so the distance-field occlusion shapes only the residual sky — and where DDGI is
+off, the analytic term carries the map at full weight, which is why the cone ring's variance has to
+be gone before this pass reads it. Contact-scale diffuse occlusion stays with GTAO and the material
+occlusion texture.
 
 ## One gate
 
 `want_sky_occlusion` arms the whole apparatus per frame: IBL must be on and ready, the
-`sky_occlusion` toggle set, and the GDF clipmap composited. The same predicate resolves the two
-prepass PSOs and writes the `sdfOcclusion.y` bit into the light UBO, so the fragment never samples
-a map no pass produced. The toggle is scriptable:
+`sky_occlusion` toggle set, and the GDF clipmap composited. The same predicate resolves both
+prepasses and writes the `sdfOcclusion.y` bit into the light UBO, so the fragment never samples
+a map no pass produced. The diffuse half adds one condition of its own — its accumulator
+reprojects through the motion target, so the DFAO chain also needs motion. The toggle is
+scriptable:
 
 ```sh
 sa set-sky-occlusion 0   # reflections keep the full sky everywhere
@@ -113,16 +124,72 @@ the cones march never composites.
 
 | What | File | Symbols |
 |---|---|---|
-| Reflection cone march | `assets/shaders/sdf.slang` | `sdfReflectionOcclusion`, `gdfDistance`, `gdfEnabled` |
+| Reflection cone march | `assets/shaders/sdf.slang` | `sdfReflectionOcclusion`, `gdfDistanceOccupancy`, `gdfEnabled` |
 | Diffuse sky-visibility cones | `assets/shaders/sdf.slang` | `sdfSkyVisibility` |
 | Specular prepass | `assets/shaders/specocc.slang` | `computeMain` |
 | Diffuse (DFAO) prepass | `assets/shaders/dfao.slang` | `computeMain` |
+| Diffuse temporal accumulator | `assets/shaders/dfao_accum.slang` | `computeMain` |
 | Mesh application | `assets/shaders/lighting.slang` | `speoccMap`, `globals.sdfOcclusion` |
 | Diffuse application | `assets/shaders/gi_resolve.slang` | `computeMain`, `dfaoMap` |
-| Frame gate + pass wiring | `crates/rendering/src/renderer.rs` | `want_sky_occlusion`, `set_sky_occlusion` |
+| Frame gate + pass wiring | `crates/rendering/src/renderer.rs` | `want_sky_occlusion`, `set_sky_occlusion`, `DfaoPipelines` |
 | Lighting UBO bit | `crates/rendering/src/lighting.rs` | `set_frame_sdf_occlusion` |
 | GDF cascade constants | `crates/rendering/src/global_sdf.rs` | `GDF_CASCADES`, `GDF_RES`, `GDF_CASCADE0_EXTENT` |
+| The reach predicate | `crates/rendering/src/global_sdf.rs`, `crates/assets/src/render_scene.rs` | `gi_occluder_bounds`, `gi_reachable` |
+| The occluder scatter | `assets/shaders/gi_occluder_scatter.slang`, `renderer.rs`, `global_sdf.rs` | `GiOccluderScatterPush`, `GlobalSdf::write_scatter_inputs`, `SDF_META_SLOT_BYTES` |
+| Micro-field slab occluders | `assets/shaders/gi_occluder_micro.slang`, `assets/shaders/scene_micro_common.slang` | `GiOccluderMicroPush`, `microTileSlab`, `MICRO_FIELD_FULL_LEAF_AREA`, `AGGREGATE_MAX_OCCUPANCY` |
+| The unit-box brick a slab is backed by | `crates/rendering/src/upload/sdf.rs` | `Uploader::upload_unit_box_sdf` |
+| The resident SDF table | `global_gpu_data.rs`, `gpu_scene_mirror.rs` | `GpuSdfTableRecord`, `GpuScenePrototypeGpuRecord::sdf_range`, `insert_mesh_sdfs` |
 | Control command | `crates/control/src/commands_render.rs` | `set-sky-occlusion` |
+
+## What the field is composited from
+
+The clipmap the cones tap is composited from an occluder set the GPU produces: the
+[reach view](../../frame-and-render-graph/hierarchical-visibility/) culls instance slots
+against `gi_occluder_bounds(eye)` — the coarsest cascade's window dilated by one
+cascade-0 extent, the last position from which anything can affect a march — and the
+`gi-occluder-scatter` pass turns its visible list into one `SdfInstance` per baked field
+of each surviving instance. The fields are many and tight on purpose (one per primitive
+and per spatial chunk), and the scatter re-tests each field's own world AABB against the
+window, so an instance straddling the window edge keeps only the fields inside it. The
+CPU never sees the occluder list; the count reaches the GDF cull and the DDGI near-field
+march through the scatter's meta words, because a GPU-produced count cannot ride a push
+constant.
+
+Reach is the predicate everywhere: the ray list still cuts against the same function
+(`rtInstancesCulled`), and the scatter reports `sdfInstancesCulled` for its per-field
+window rejects. *Culled* is a claim about reach and nothing else — geometry lost to
+capacity is counted as *dropped*, separately, because the two say opposite things about
+whether the picture is right.
+
+One class of matter has no instance for that walk to classify: a micro vegetation field's
+grass blades exist only as a device-side reconstruction of the field tile's density
+samples, so no visible slot names one and no cooked field describes one. The
+`gi-occluder-micro` pass appends those from the other end — one aggregate slab occluder
+per resident tile of the same directory the reconstruction dispatches over, into the same
+region and through the same meta counter. The slab spans the volume that tile's blades
+occupy: its owner cell's footprint, and vertically the tile's rooting grid plus the blade
+height envelope. Its occupancy comes from the tile's own authored density — the
+authoritative field, not the card count the reconstruction happens to draw at this cut —
+spread over the slab's height as optical depth, so a shorter grass field is denser matter
+for the same leaf area. It is always porous, never solid: a field is matter the marches go
+through.
+
+A slab still arrives as a real brick-backed field, because the consumers know exactly one
+way to read an occluder. Its `worldToLocal` maps the world box onto a unit-box brick
+synthesized once at renderer bring-up, whose every voxel reads negative, which is what
+makes the composite splat the tile's occupancy across the whole slab.
+
+The near cascade reconverges on occluder motion through the same staggered round-robin
+full refresh the far cascades always used: the occluder set is GPU-produced, so no
+CPU-side AABB diff can dirty the near field ahead of it.
+
+## Porous matter
+
+Porous aggregate matter (foliage-classed materials) contributes no distance to the field; the cones
+instead accumulate Beer–Lambert extinction through its per-cascade occupancy volumes using the
+shared `sdfExtinctionStep`. A canopy therefore dims a reflection or the sky by its density rather
+than sealing the cone the way a wall does. The [software ray trace](../software-ray-trace/) applies
+the same step along its probe rays.
 
 ## Related
 

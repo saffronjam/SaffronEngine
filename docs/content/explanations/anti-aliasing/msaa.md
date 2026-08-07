@@ -30,19 +30,23 @@ The pair is not cheap. At 1920×1080 and 4×, `msaa_color` holds 2,073,600 pixel
 samples ≈ 63 MiB and `msaa_depth` another ≈ 32 MiB, roughly four times the single-sample scene
 targets.
 
-## One resolve, owned by the scene pass
+## One resolve, owned by the last raster pass
 
 Several passes rasterize against the multisampled pair, and exactly one resolves it. The sky pass,
 when it draws, clears and stores the multisampled color; the depth pre-pass, when enabled, clears
 and stores the multisampled depth. The scene pass loads whatever an earlier pass wrote (clearing
-the rest itself), draws the batched scene, and carries the resolve on its attachments, so the
-samples exist for one pass chain and collapse at its end.
+the rest itself) and replays the visibility traversal's counted indirect draws.
+
+When the survivor raster runs — the `scene-survivors` pass that redraws the occlusion-retest
+survivors over the provisional scene — the scene pass stores its samples through to it and the
+survivor pass carries the resolve on its attachments; otherwise the scene pass carries it. Either
+way the samples exist for one pass chain and collapse at its end.
 
 ```mermaid
 flowchart LR
     sky[sky clear] --> B
     prepass[depth pre-pass] --> C
-    A[scene draws] --> B[msaa_color<br/>N samples]
+    A[scene + survivor draws] --> B[msaa_color<br/>N samples]
     A --> C[msaa_depth<br/>N samples]
     B -- AVERAGE --> S[scene scratch<br/>1 sample]
     C -- SAMPLE_ZERO --> D[scene depth<br/>1 sample]
@@ -57,8 +61,9 @@ depth, which the post-tonemap grid and gizmo overlays depth-test against.
 
 ## Resolve in the graph
 
-`record_scene_graph` declares the resolve on the scene pass's attachments: the multisampled image
-is the attachment and `RgAttachment.resolve` names the single-sample target. The
+`record_scene_graph` declares the resolve on the resolving pass's attachments — the scene pass, or
+the survivor pass when it runs: the multisampled image is the attachment and
+`RgAttachment.resolve` names the single-sample target. The
 [render graph](../../frame-and-render-graph/render-graph-overview/) treats a resolve target as a
 second write of the attachment's kind — `derive_pass_barriers` runs it through the same
 `ColorWrite` or `DepthWrite` usage, so its barrier and layout come out as for any other attachment.
@@ -67,19 +72,19 @@ The graph builds the dynamic-rendering attachment info with resolve mode `AVERAG
 `SAMPLE_ZERO` for depth, the two modes the
 [Vulkan render-pass chapter](https://docs.vulkan.org/spec/latest/chapters/renderpass.html) defines
 for multisample resolve operations. Averaging N HDR samples is the anti-aliasing itself; depth
-takes sample zero because an average of depths lies on no surface. Both multisampled attachments
-store with `DONT_CARE`: after the resolve their samples are discarded, and only the resolved
-images leave the pass.
+takes sample zero because an average of depths lies on no surface. The resolving pass stores both
+multisampled attachments with `DONT_CARE`: after the resolve their samples are discarded, and only
+the resolved images leave the pass.
 
 ## Sample count baked into PSOs
 
 A graphics pipeline's multisample state fixes the sample count it rasterizes against, and Vulkan
 requires it to match the attachment. The übershader cache keys every mesh pipeline on
-`PsoKey.sample_count`, and the depth pre-pass, meshlet, and sky PSOs bake the count too. Changing
+`PsoKey.sample_count`, and the depth pre-pass and sky PSOs bake the count too. Changing
 the MSAA level therefore cannot just swap targets; every one of those pipelines goes stale.
 
 On a count change `Renderer::set_aa` idles the GPU, then `Pipelines::set_sample_count` clears the
-mesh PSO cache and drops the depth pre-pass and meshlet PSOs so they rebuild lazily at the new
+mesh PSO cache and drops the depth pre-pass PSOs so they rebuild lazily at the new
 count. The sky PSO rebuilds immediately via `Sky::set_sample_count`, since the next frame's sky
 pass draws before any lazy request. The [AA modes](../aa-modes/) page covers the full switch
 sequence.
@@ -89,16 +94,19 @@ sequence.
 MSAA also upgrades masked (alpha-tested) materials. Under any other mode a masked fragment is a
 hard per-pixel `discard`, which aliases exactly like a geometric edge. With a sample count above
 1× the PSO cache mints an alpha-to-coverage permutation (`PsoKey.alpha_to_coverage`), and the
-fragment sharpens its alpha into a coverage value the hardware spreads across the samples:
+fragment passes a canonical coverage value to the hardware sample mask:
 
 ```hlsl
-float coverage = saturate((surf.opacity - cutoff) / max(fwidth(surf.opacity), 1e-4) + 0.5);
+CoverageSample coverage = sampleCanonicalCoverage(
+    source, uv, coverageAnchor, sourceKind, classification, baseColorAlpha,
+    sourceExtent, salt, temporalPhase, cutoff, canonicalProbability, true
+);
 ```
 
-Rescaling alpha around the cutoff by its screen-space derivative makes the lit-to-clipped
-transition span about one pixel, so foliage and cutout edges resolve as smoothly as triangle
-edges. A masked material at 1× shares the plain opaque PSO; the permutation exists only where the
-samples do.
+Standard alpha is rescaled around the cutoff by its screen-space derivative. Thin-sheet coverage
+textures already store probability at each mip and bypass that reconstruction. Both paths give the
+hardware a continuous value, so foliage and cutout edges resolve as smoothly as triangle edges. A
+masked material at 1× shares the plain opaque PSO; the permutation exists only where the samples do.
 
 ## In the code
 
@@ -108,8 +116,8 @@ samples do.
 | Count selection + clamp | `aa.rs`, `device.rs` | `Aa::set`, `Aa::sample_count`, `clamp_sample_count`, `Device::supported_sample_counts` |
 | Scene attachment + resolve wiring | `renderer.rs` | `record_scene_graph`, `scene_output`, `add_scene_resolve_pass` |
 | Resolve in the graph | `render_graph.rs` | `RgAttachment.resolve`, `derive_pass_barriers` |
-| Sample count in PSOs | `pipelines.rs` | `PsoKey`, `Pipelines::set_sample_count`, `Pipelines::request_mesh_pipeline` |
-| Alpha-to-coverage cutout | `mesh.slang` | `fragmentMain`, `kAlphaToCoverage` |
+| Sample count in PSOs | `pipelines.rs` | `PsoKey`, `Pipelines::set_sample_count`, `Pipelines::request_executor_mesh_pipeline` |
+| Alpha-to-coverage cutout | `mesh.slang`, `coverage.slang` | `fragmentMain`, `sampleCanonicalCoverage` |
 
 ## Related
 

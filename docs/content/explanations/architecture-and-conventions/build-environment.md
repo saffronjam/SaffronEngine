@@ -36,7 +36,7 @@ The `justfile` at the repo root drives everything through `cargo`, the `xtask` h
 ```sh
 just engine    # cargo build --workspace + cargo run -p xtask -- shaders
 just test      # cargo test --workspace
-just lint      # cargo fmt --check + cargo clippy --workspace -- -D warnings + editor oxlint
+just lint      # cargo fmt --check + cargo clippy --workspace -- -D warnings + oxfmt/oxlint over all TypeScript
 just run       # build the host, compile shaders, start the CEF editor shell
 just e2e       # the tests/e2e bun suite against a headless host
 just check     # the full reproducible gate
@@ -99,6 +99,27 @@ The recipe also wires the GPU prelude and a per-run control socket, so parallel 
 collide. `tools/ci/check.sh`, the gate `just check` wraps, boots the host the same bounded way for
 its validation-clean smoke step.
 
+## Performance budgets in the gate
+
+`benchmarks/foliage-veg/phase-1-<device>.json` records what one fixed scene costs on one named
+device: the scene-gather and frame-time distributions, draw and shadow submission, exact instance
+traffic, and retained mesh memory. Each record derives acceptance ceilings from its own
+steady-state p95, and the gate grades a fresh measurement against them. A recorded number nothing
+reads back is a note, not a budget.
+
+The comparison is per device, never per vendor. `check.ts` re-measures the fixture through the same
+`measureBaseline` the recording recipe uses, finds the record whose `platform.gpu` matches this
+machine, and fails when a live p95 or counter exceeds that record's ceiling. A machine with no
+record of its own defers, as does one that lands on the software rasterizer or serves no GPU
+timestamps — so a checkout on unmeasured hardware reports a deferral instead of borrowing a
+threshold measured elsewhere. `just bench-foliage-check` runs the step alone.
+
+A ceiling gets no extra allowance at comparison time, because the 25% headroom is already in the
+derivation. What a breach must do instead is reproduce: the step measures a second time and fails
+only if the same leg goes over twice, which rejects a sample contaminated by other load without
+ever moving the threshold. A companion `cargo test` holds the records themselves to that
+derivation, so a hand-edited ceiling fails the gate on a machine with no GPU at all.
+
 ## Build profiles
 
 A debug build optimizes its dependencies:
@@ -108,19 +129,43 @@ full speed while engine crates stay at `opt-level = 0` for fast incremental rebu
 profile keeps `debug = true` and `panic = "unwind"`, because the FFI seams must unwind cleanly
 across the Rust/C++ boundary.
 
+## One TypeScript arrangement
+
+The repo's TypeScript is not one app. It is the editor frontend, the e2e driver, two contract and
+budget tools, and the packager — separate programs with different dependencies. They all answer to
+one formatter, one linter, and one install. A per-directory toolchain buys nothing and costs
+coverage: whichever directory owns its own config is the directory the gate forgets, and a suite
+outside the gate drifts silently.
+
+So the arrangement lives at the repo root. `package.json` declares a Bun workspace whose members are
+`editor`, `packager`, `tests/e2e`, and `tools`, so one `bun install` resolves the whole tree against
+one lockfile. `.oxfmtrc.json` and `.oxlintrc.json` govern every `.ts`/`.tsx` in the tree;
+`just format` writes and `just lint` checks, and oxlint runs with `--deny-warnings` so a warning
+fails the same way a `clippy` warning does. Types split along the only line that is real — the
+runtime a file executes in: `editor/tsconfig.json` is the browser program (DOM, React, JSX), and the
+root `tsconfig.json` is the Bun program covering the tools, the e2e suite, the packager, and the
+editor's own build scripts. `just typecheck` runs both.
+
+The generated `editor/src/protocol/sa-types.ts` is the one source file excluded from all three,
+because `xtask gen-protocol` owns its contents.
+
 ## In the code
 
 | What | File | Symbols |
 |---|---|---|
 | Recipe preludes + opt-out | `justfile` | `reenter`, `gpu_driver`, `SAFFRON_NO_TOOLBOX` |
+| TypeScript workspace + style + types | `package.json`, `.oxfmtrc.json`, `.oxlintrc.json`, `tsconfig.json`, `editor/tsconfig.json` | `workspaces`, `format`, `lint`, `typecheck`, `ignorePatterns` |
 | Toolchain pin | `rust-toolchain.toml` | `channel`, `components` |
 | MSRV + profile knobs | `engine/Cargo.toml` | `rust-version`, `[profile.dev]`, `[profile.dev.package."*"]`, `[profile.release]` |
 | `slangc` resolution + shader step | `engine/xtask/src/shaders.rs` | `Config::resolve`, `find_slangc`, `run` |
 | Bounded + headless run | `crates/app/src/lib.rs` | `frame_limit_from_env`, `HostMode` |
 | The reproducible gate | `tools/ci/check.sh` | `probe_host`, `pass_step`, `defer_step` |
+| Baseline measurement + grading | `tools/bench-foliage-phase1/` | `measureBaseline`, `deriveBudgets`, `requireComparable`, `grade` |
+| The records and their derivation test | `benchmarks/foliage-veg/`, `crates/vegetation-gpu/tests/baseline_records.rs` | `phase-1-<device>.json`, `ceiling`, `class_from_file_name` |
 
 ## Related
 
 - [Cargo workspace and crate model](../cargo-workspace/) — what `cargo build --workspace` builds
 - [Shader compilation](../shader-compilation/) — what `cargo run -p xtask -- shaders` does with the resolved `slangc`
 - [Dependencies](../dependencies/) — the pins the toolbox `cargo` resolves
+- [Performance telemetry](../../frame-and-render-graph/performance-telemetry/) — the counters and distributions a baseline record samples

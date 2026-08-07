@@ -1,10 +1,9 @@
-// Predict + scan (Phase 3b), per-instance dispatch: one compute thread per base triangle of one
-// displaced instance. Reads the triangle's three per-edge factors (Phase-3a output, indexed by the
-// Phase-2 per-triangle edge references), derives the integer dice level, computes the EXACT output
-// vertex/index counts of the Phase-4 dice, and prefix-sums them (atomic carry) to packed write offsets
-// inside the instance's worst-case-reserved slice.
+// Predict + scan, per-instance dispatch: one compute thread per base triangle of one displaced
+// instance. Reads the triangle's three per-edge factors, derives the integer dice level, computes
+// the exact output vertex/index counts `tessellate.slang` will emit, and prefix-sums them (atomic
+// carry) to packed write offsets inside the instance's worst-case-reserved slice.
 //
-// The dice contract (Phase 3 defines it; Phase 4 must emit exactly this):
+// The dice contract this defines and `tessellate.slang` must emit exactly:
 //   m          = clamp(max(f0, f1, f2), 1, factorCap)       — driving factor (the coarsest edge)
 //   (lv, leaf) = dicePlan(m)                                 — SPLIT pass: 4^lv barycentric subpatches, each
 //                                                             diced at leaf = ceil(m / 2^lv), leaf <= 11 so
@@ -13,14 +12,14 @@
 //   tris       = 4^lv * leaf * leaf                          — grid triangles  (indices = tris * 3)
 // A triangle within the dice cap needs no split (lv = 0, one leaf at ceil(m)). Sibling subpatches share
 // their interior split edges bit-identically (parent-relative dyadic midpoints); the parent's OUTER edges
-// stay watertight because Phase 4 snaps every boundary micro-vertex onto that edge's SHARED per-edge factor
-// (both incident base triangles read the same slot regardless of either side's split depth). The count is a
-// closed form of dicePlan — Phase 3's prediction and Phase 4's emission cannot diverge (both call dicePlan).
+// stay watertight because the emit snaps every boundary micro-vertex onto that edge's SHARED per-edge
+// factor (both incident base triangles read the same slot regardless of either side's split depth). The
+// count is a closed form of dicePlan, so prediction and emission cannot diverge — both call it.
 
 // TriEdges: 16 B — e[3] (uint) @0, pad @12.
 [[vk::binding(0, 0)]] ByteAddressBuffer triEdges;            // TriEdges[] (16 B stride)
 [[vk::binding(1, 0)]] StructuredBuffer<float> factors;      // per-edge factors (instance slice)
-// Per-triangle dice record for Phase 4: (vertOffset, indexOffset, level, pad), at triBase + t.
+// Per-triangle dice record: (vertOffset, indexOffset, level, pad), at triBase + t.
 [[vk::binding(2, 0)]] RWStructuredBuffer<uint4> perTri;
 // Per-instance running totals [vertCount, indexCount], two uints per instance — atomically accumulated.
 [[vk::binding(3, 0)]] RWStructuredBuffer<uint> instanceCounters;
@@ -49,8 +48,8 @@ static const uint TESS_MAX_SPLIT_LEVELS = 15u;
 
 // The GPU split-pass dice plan for a driving factor `m`: how many `4^levels` barycentric subpatches to
 // enumerate and the integer leaf dice level each is diced at. Mirrors `dice_plan` / `split_recursion`
-// (tessellation.rs) EXACTLY so the CPU reservation and this scan's counts cannot diverge from Phase 4's
-// emission. `ceil` (not round) on the leaf so each edge always has >= ceil(f_e)+1 grid points, enough to
+// (tessellation.rs) EXACTLY so the CPU reservation, this scan's counts, and the emit cannot diverge.
+// `ceil` (not round) on the leaf so each edge always has >= ceil(f_e)+1 grid points, enough to
 // represent the geomorph's floor->ceil boundary segments without running short.
 void dicePlan(float m, out uint levels, out uint leafLevel)
 {
@@ -84,7 +83,7 @@ void computeMain(uint3 tid: SV_DispatchThreadID)
     const float f2 = factors[e2];
 
     // Split pass: resolve the driving factor into subpatches + a CLAS-sized leaf dice level. The count is
-    // the closed form over all `4^levels` subpatches, each a `leaf`-grid; Phase 4 emits exactly this.
+    // the closed form over all `4^levels` subpatches, each a `leaf`-grid; the emit reproduces it exactly.
     const float m = clamp(max(f0, max(f1, f2)), 1.0, push.factorCap);
     uint levels;
     uint leaf;
@@ -101,11 +100,11 @@ void computeMain(uint3 tid: SV_DispatchThreadID)
     InterlockedAdd(instanceCounters[push.counterBase], verts, vertOffset);
     InterlockedAdd(instanceCounters[push.counterBase + 1u], indices, indexOffset);
 
-    // Global micro-geometry totals for the emit-dispatch size (Phase 4) + RT worst-case (Phase 7).
+    // Global micro-geometry totals for the emit-dispatch size + the RT worst case.
     InterlockedAdd(globalTotals[0], verts);
     InterlockedAdd(globalTotals[1], tris);
 
-    // Phase-4 dice record: (vertOffset, indexOffset, leafLevel, splitLevels). The emit enumerates
+    // Dice record: (vertOffset, indexOffset, leafLevel, splitLevels). The emit enumerates
     // `4^splitLevels` subpatches, each diced at `leafLevel`, packed contiguously from `vertOffset`.
     perTri[push.triBase + t] = uint4(vertOffset, indexOffset, leaf, levels);
 }

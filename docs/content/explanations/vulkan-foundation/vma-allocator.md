@@ -87,12 +87,12 @@ tests ownership independently of optional heap-budget telemetry.
 
 | What | File | Symbols |
 |---|---|---|
-| Allocator setup | `engine/crates/rendering/src/device.rs` | `create_allocator`, `AllocatorCreateFlags::BUFFER_DEVICE_ADDRESS` |
-| Shared allocator lifetime | `engine/crates/rendering/src/resources.rs` | `DeviceResources`, `DeviceResources::drop` |
-| General buffer and image allocation | `engine/crates/rendering/src/resources.rs` | `Buffer::new`, `Image::new`, `Image3D::new` |
-| Upload staging and device-local buffers | `engine/crates/rendering/src/upload.rs` | `StagingBuffer`, `StagingBuffer::flush`, `make_device_buffer` |
-| Readback cache invalidation | `engine/crates/rendering/src/upload.rs` | `Uploader::bake_look_lut`, `Uploader::run_bake_passes` |
-| Allocation leak probe | `engine/crates/rendering/src/resources.rs` | `live_allocations`, `wrappers_drop_reclaims_every_allocation` |
+| Allocator setup | `engine/crates/rendering/src/device/` | `create_allocator`, `AllocatorCreateFlags::BUFFER_DEVICE_ADDRESS` |
+| Shared allocator lifetime | `engine/crates/rendering/src/resources/` | `DeviceResources`, `DeviceResources::drop` |
+| General buffer and image allocation | `engine/crates/rendering/src/resources/` | `Buffer::new`, `Image::new`, `Image3D::new` |
+| Upload staging and device-local buffers | `engine/crates/rendering/src/upload/` | `StagingBuffer`, `StagingBuffer::flush`, `make_device_buffer` |
+| Readback cache invalidation | `engine/crates/rendering/src/upload/` | `Uploader::bake_look_lut`, `Uploader::run_bake_passes` |
+| Allocation leak probe | `engine/crates/rendering/src/resources/` | `live_allocations`, `wrappers_drop_reclaims_every_allocation` |
 
 ## Related
 

@@ -1,6 +1,6 @@
 # Phase 5 — Runtime cell store, queries, and persistence baseline
 
-**Status:** NOT STARTED
+**Status:** COMPLETED
 
 **Depends on:** Phases 1 and 4
 
@@ -10,50 +10,50 @@ snapshot/compaction correctness before rendering or physics can create competing
 
 ## `VegetationWorld`
 
-- [ ] Add a data-oriented runtime owner in `saffron-vegetation` or `saffron-runtime` over immutable
+- [x] Add a data-oriented runtime owner in `saffron-vegetation` or `saffron-runtime` over immutable
   cell generations plus reduced deltas. Rendering and Jolt access snapshots/adapters, never its
   mutable internals.
-- [ ] Store macro state as typed SoA columns keyed externally by `PlantId`. Internal `PlantSlot` is
+- [x] Store macro state as typed SoA columns keyed externally by `PlantId`. Internal `PlantSlot` is
   ephemeral and generation-tagged; compaction/reordering never escapes.
-- [ ] Store micro vegetation as quantized density/attribute field tiles plus persistent disturbance
+- [x] Store micro vegetation as quantized density/attribute field tiles plus persistent disturbance
   masks, not one record per blade.
-- [ ] Maintain a cell-local spatial hash/BVH for macro radius/AABB/ray/nearest queries by plant,
+- [x] Maintain a cell-local spatial hash/BVH for macro radius/AABB/ray/nearest queries by plant,
   family, tag, lifecycle state, or interaction policy.
-- [ ] Carry source cell generation through every derived index and snapshot; stale handles fail.
+- [x] Carry source cell generation through every derived index and snapshot; stale handles fail.
 
 ## Facet residency and scheduling
 
-- [ ] Use Phase-1 `SpatialSource` demand to load render, physics, simulation, editing, nav, and
+- [x] Use Phase-1 `SpatialSource` demand to load render, physics, simulation, editing, nav, and
   network-interest sections independently with separate refcounts, budgets, and hysteresis.
-- [ ] Support multiple simultaneous sources and predictive prefetch from velocity/camera motion.
-- [ ] Load/generate into private staging, validate manifest/hash/version, then atomically publish a
+- [x] Support multiple simultaneous sources and predictive prefetch from velocity/camera motion.
+- [x] Load/generate into private staging, validate manifest/hash/version, then atomically publish a
   complete cell generation.
-- [ ] Discard late async work through `GenerationToken`; fence/read guards keep old generations alive
+- [x] Discard late async work through `GenerationToken`; fence/read guards keep old generations alive
   until every reader releases them.
-- [ ] Coarse/global outputs are referenced, not regenerated in each fine cell.
+- [x] Coarse/global outputs are referenced, not regenerated in each fine cell.
 
 ## State reduction and persistence
 
-- [ ] Apply state precedence exactly: authored/cooked base, confirmed persistent runtime delta,
+- [x] Apply state precedence exactly: authored/cooked base, confirmed persistent runtime delta,
   transient prediction/cosmetic.
-- [ ] Implement compact per-cell canonical snapshots plus ordered mutation tails using the one reducer.
+- [x] Implement compact per-cell canonical snapshots plus ordered mutation tails using the one reducer.
   Snapshot+tail and uncompacted history must reduce identically.
-- [ ] Bind state headers to exact world manifest, graph/compiler/numeric/simulation versions, and seed
+- [x] Bind state headers to exact world manifest, graph/compiler/numeric/simulation versions, and seed
   namespaces. Reject mismatch instead of trying to migrate clean-slate data.
-- [ ] Keep editor-authoring journals separate from runtime state storage while sharing mutations and
+- [x] Keep editor-authoring journals separate from runtime state storage while sharing mutations and
   reducer semantics.
-- [ ] Provide serialization codecs for future savegame/network containers without implementing a
+- [x] Provide serialization codecs for future savegame/network containers without implementing a
   second game-save framework or network transport in this phase.
-- [ ] Confirmed prediction enters persistent state only after authority confirmation.
+- [x] Confirmed prediction enters persistent state only after authority confirmation.
 
 ## Query semantics
 
-- [ ] Add read-only vegetation AABB/radius/ray/nearest queries over any CPU-resident macro cell,
+- [x] Add read-only vegetation AABB/radius/ray/nearest queries over any CPU-resident macro cell,
   independent of renderer visibility or collision residency.
-- [ ] Return `PlantId`, position/bounds, family/tags/state, and provenance; never `PlantSlot`.
-- [ ] Keep physics raycast semantics separate: it returns only collision-resident objects after the
+- [x] Return `PlantId`, position/bounds, family/tags/state, and provenance; never `PlantSlot`.
+- [x] Keep physics raycast semantics separate: it returns only collision-resident objects after the
   Phase-12 tagged-target cutover. `sa.raycast` must not silently start hitting non-collidable grass.
-- [ ] Add control/`sa` commands to query cells/plants, inspect state/provenance, export/import a
+- [x] Add control/`sa` commands to query cells/plants, inspect state/provenance, export/import a
   vegetation state snapshot for tests, and report queues/residency/budgets.
 
 ## Runtime generation
@@ -65,20 +65,35 @@ macro generation remains authoritative.
 
 ## Acceptance
 
-- [ ] Load/unload/reload preserves exact macro state and query results.
-- [ ] Cache recook under an existing runtime delta cannot resurrect tombstoned plants or remove
+- [x] Load/unload/reload preserves exact macro state and query results.
+- [x] Cache recook under an existing runtime delta cannot resurrect tombstoned plants or remove
   runtime additions.
-- [ ] Snapshot compaction, duplicate idempotent tails, and interrupted writes preserve reducer output.
-- [ ] Manifest mismatch, corrupt section, stale generation, and canceled work fail deterministically.
-- [ ] Multiple moving spatial sources produce stable refcounts and no unload/load thrash beyond the
+- [x] Snapshot compaction, duplicate idempotent tails, and interrupted writes preserve reducer output.
+- [x] Manifest mismatch, corrupt section, stale generation, and canceled work fail deterministically.
+- [x] Multiple moving spatial sources produce stable refcounts and no unload/load thrash beyond the
   specified hysteresis.
-- [ ] CPU memory and query work scale with resident cell facets/macro plants, never micro blade count.
-- [ ] `sa` query/state commands and protocol DTOs use opaque string `PlantId`s and generated TS.
-- [ ] Standard gate and runtime vegetation/persistence docs are green.
+- [x] CPU memory and query work scale with resident cell facets/macro plants, never micro blade count.
+- [x] `sa` query/state commands and protocol DTOs use opaque string `PlantId`s and generated TS.
+- [x] Standard gate and runtime vegetation/persistence docs are green.
+  (`tools/ci/check.sh` is the gate; the docs pages carrying these concepts are `vegetation-state.md`,
+  `plant-promotion.md`, `ecology-catchup.md`, and `vegetation-telemetry.md`, checked by the docs-page
+  skill's `hugo --gc` + `check_links.py` + `check_style.py`.
+  What proves each mechanism, by name: residency —
+  `load_query_unload_and_reload_preserve_persistent_tombstones`,
+  `source_budget_limits_admission_without_losing_demand`, and
+  `residency_revision_discards_late_staged_work` in `vegetation/src/runtime_world/tests.rs`, plus
+  `tests/e2e/vegetation-churn.test.ts` driving camera-driven residency over the control plane; the
+  reducer — `snapshot_compaction_and_duplicate_tail_replay_are_equivalent` and
+  `complete_reduced_snapshot_round_trips_every_delta_family` in `vegetation/src/state_codec/tests.rs`
+  with `snapshot_tail_compaction_matches_full_reduction` in `mutation/tests.rs`; the snapshot
+  round-trip — `export_state_snapshot` → `import_state_snapshot` inside
+  `load_query_unload_and_reload_preserve_persistent_tombstones` and
+  `prediction_overlay_is_transient_until_authority_confirmation`, which is world-level coverage: the
+  `vegetation-state-export`/`vegetation-state-import` commands over it carry a manifest `skip` because
+  they need an exact bound runtime generation, so no harness dispatches them.)
 
 ## NO-LEGACY gate
 
 The macro SoA plus reducer is the plant authority. Render instances, physics bodies, promoted entities,
 editor selection, and future replication may only reference or derive from its stable IDs and
 generation-tagged snapshots.
-

@@ -1,17 +1,12 @@
-//! The `sa.Entity` handle: a `'static` userdata holding only an [`Entity`] id, with
-//! its scene-only surface resolved through the [session guard](crate::session) each
-//! call.
+//! The `sa.Entity` handle: a `'static` userdata holding only an [`Entity`] id, resolving its
+//! scene-only surface through the [session guard](crate::session) each call.
 //!
-//! The handle caches no scene borrow, only the id and an implicit reach to the live
-//! session. Every accessor runs the three-check pattern — session active? entity
-//! valid? (for transforms) `Transform` present? — and degrades to a logged no-op
-//! returning the documented default otherwise (`vec3{0}` position/rotation, `vec3{1}`
-//! scale, `"0"` uuid, `""` name). A handle stashed in a Lua global and used after its
-//! session ends therefore resolves to those defaults, never a dangling deref.
+//! Caching no scene borrow means a handle stashed in a Lua global and used after its session ends
+//! degrades to a logged no-op returning the documented default, rather than a dangling deref.
 //!
-//! Transforms cross the boundary as [`SaVec3`]; rotation is engine ZYX-Euler
-//! radians, so `get_world_rotation` decomposes the world quaternion to euler and the
-//! result round-trips through `set_rotation`.
+//! Transforms cross the boundary as [`SaVec3`]. Rotation is engine ZYX-Euler radians, so
+//! `get_world_rotation` decomposes the world quaternion to euler and the result round-trips through
+//! `set_rotation`.
 
 use mlua::{Lua, UserData, UserDataMethods, Value as LuaValue};
 use serde_json::Value as JsonValue;

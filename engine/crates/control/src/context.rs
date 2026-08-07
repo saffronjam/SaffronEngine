@@ -10,6 +10,7 @@ use saffron_assets::AssetServer;
 use saffron_physics::World;
 use saffron_sceneedit::SceneEditContext;
 use saffron_spatial::ResidencyManager;
+use saffron_vegetation::VegetationWorld;
 use saffron_window::Window;
 
 use crate::error::Result;
@@ -19,20 +20,52 @@ use crate::registry::{
     register_builtin_commands,
 };
 use crate::server::{ControlServer, control_socket_path, start_control_server};
+use crate::vegetation_cook_jobs::VegetationCookJobs;
 use crate::vegetation_jobs::VegetationEvaluationJobs;
 
-/// Owns the command registry and the listening socket. The registry is built
-/// once at startup (it has no per-frame mutation); the `EngineContext` is rebuilt
-/// each frame in [`ControlContext::poll`].
+/// Live subsystem borrows and vegetation state consumed by one control-plane drain.
+pub struct ControlPollContext<'a> {
+    /// Window command target.
+    pub window: &'a mut Window,
+    /// Renderer command target and GPU upload seam.
+    pub renderer: &'a mut dyn ControlRenderer,
+    /// Editor scene and selection state.
+    pub scene_edit: &'a mut SceneEditContext,
+    /// Project asset server.
+    pub assets: &'a mut AssetServer,
+    /// Shared spatial residency manager.
+    pub spatial: &'a mut ResidencyManager,
+    /// Published vegetation world, when one is bound.
+    pub vegetation: &'a mut Option<VegetationWorld>,
+    /// Runtime vegetation binding state.
+    pub vegetation_status: saffron_runtime::VegetationRuntimeBindingStatus,
+    /// Cells whose derived vegetation needs regeneration.
+    pub vegetation_regeneration_cells: Vec<saffron_spatial::WorldCellKey>,
+    /// Collision-facet residency counters, present only with a live play world.
+    pub vegetation_collision: Option<saffron_runtime::VegetationCollisionReport>,
+    /// The promotion authority, present only with a live play world.
+    pub vegetation_promotion: Option<&'a mut saffron_runtime::VegetationPromotion>,
+    /// The navigation contribution seam.
+    pub vegetation_navigation: Option<&'a mut saffron_runtime::VegetationNavigationSeam>,
+    /// The world simulation clock biology advances on.
+    pub vegetation_ecology: Option<&'a mut saffron_runtime::VegetationEcologyClock>,
+    /// The vegetation runtime's compact telemetry.
+    pub vegetation_telemetry: Option<&'a mut saffron_runtime::VegetationTelemetry>,
+    /// Live play-mode physics world, absent in edit mode.
+    pub physics: Option<&'a mut World>,
+}
+
+/// Owns the command registry and the listening socket. The registry is built once at startup; the
+/// `EngineContext` is rebuilt each frame in [`ControlContext::poll`].
 ///
-/// A bind failure is non-fatal: the context is constructed with `server: None`
-/// and runs inactive, so the engine still runs without a control socket.
+/// A bind failure is non-fatal: the context runs inactive with `server: None`.
 pub struct ControlContext {
     registry: CommandRegistry,
     server: Option<ControlServer>,
     /// The once-per-frame non-blocking project loader, advanced from the host each frame.
     loader: ProjectLoader,
     vegetation_jobs: VegetationEvaluationJobs,
+    vegetation_cook_jobs: VegetationCookJobs,
     vegetation_compute: Option<Option<VegetationComputeExecutor>>,
 }
 
@@ -66,6 +99,7 @@ impl ControlContext {
             server,
             loader: ProjectLoader::default(),
             vegetation_jobs: VegetationEvaluationJobs::default(),
+            vegetation_cook_jobs: VegetationCookJobs::default(),
             vegetation_compute: None,
         }
     }
@@ -76,14 +110,12 @@ impl ControlContext {
         self.server.is_some()
     }
 
-    /// Closes the listening socket (dropping its [`ControlServer`]) so it stops serving.
-    ///
-    /// The host calls this during teardown to release the socket promptly, before the
-    /// renderer is dropped; the registry stays so a late palette/manifest read still
-    /// resolves. Idempotent.
+    /// Closes the listening socket so it stops serving, keeping the registry so a late
+    /// palette/manifest read still resolves. Idempotent.
     pub fn shutdown(&mut self) {
         self.server = None;
         self.vegetation_jobs.shutdown();
+        self.vegetation_cook_jobs.shutdown();
     }
 
     /// The command registry (for the manifest / command-palette generators).
@@ -108,11 +140,9 @@ impl ControlContext {
         self.registry.register(name, help, handler);
     }
 
-    /// Seeds the project-load inbox from the editor-set environment once at startup: `SAFFRON_PROJECT`
-    /// opens/creates a named project, else `SAFFRON_SCRATCH_PROJECT` makes a per-shell scratch
-    /// project, else a working-directory `project.json` opens; otherwise nothing is seeded and the
-    /// host waits for the editor's picker. The load itself runs non-blocking through
-    /// [`Self::advance_project_load`] on the first frames — startup never blocks.
+    /// Seeds the project-load inbox from the editor-set environment once at startup. The load runs
+    /// non-blocking through [`Self::advance_project_load`] on the first frames, so startup never
+    /// blocks.
     pub fn bootstrap_project_from_env(&mut self, scene_edit: &mut SceneEditContext) {
         crate::commands_asset::bootstrap_project_from_env(scene_edit);
     }
@@ -125,29 +155,73 @@ impl ControlContext {
         scene_edit: &mut SceneEditContext,
         assets: &mut AssetServer,
     ) -> bool {
+        if scene_edit.project_load_inbox.is_some() || !scene_edit.project_ready() {
+            self.vegetation_cook_jobs.shutdown();
+        }
         self.loader.advance(renderer, scene_edit, assets)
     }
 
-    /// Drains and runs any pending control requests on the calling (main) thread.
-    /// Call once per frame with the live subsystem borrows. A no-op when the socket
-    /// failed to bind.
+    /// Drains and runs any pending control requests on the calling (main) thread. Call once per
+    /// frame with the live subsystem borrows; a no-op when the socket failed to bind.
     ///
-    /// `physics` is the live play world (non-owning) or `None` in Edit.
-    ///
-    /// Returns `true` when at least one **mutating** command ran this drain (anything not
-    /// [`is_read_only_command`] that completed `ok`), so the host can request a viewport redraw
-    /// while a static scene's read-only pollers leave the GPU idle.
-    pub fn poll(
-        &mut self,
-        window: &mut Window,
-        renderer: &mut dyn ControlRenderer,
-        scene_edit: &mut SceneEditContext,
-        assets: &mut AssetServer,
-        spatial: &mut ResidencyManager,
-        physics: Option<&mut World>,
-    ) -> bool {
+    /// `true` when at least one mutating command completed `ok` this drain, so the host can request
+    /// a viewport redraw while a static scene's read-only pollers leave the GPU idle.
+    pub fn poll(&mut self, context: ControlPollContext<'_>) -> bool {
+        let ControlPollContext {
+            window,
+            renderer,
+            scene_edit,
+            assets,
+            spatial,
+            vegetation,
+            vegetation_status,
+            vegetation_regeneration_cells,
+            vegetation_collision,
+            vegetation_promotion,
+            vegetation_navigation,
+            vegetation_ecology,
+            vegetation_telemetry,
+            physics,
+        } = context;
+        let mut mutated = false;
+        let ready = match self.vegetation_cook_jobs.poll_ready() {
+            Ok(ready) => ready,
+            Err(error) => {
+                tracing::error!("vegetation cook manager failed: {error}");
+                Vec::new()
+            }
+        };
+        for ready_cook in ready {
+            let mut snapshots = None;
+            renderer.with_gpu_uploader(&mut |gpu| {
+                snapshots = Some(saffron_assets::scene_surface_field_snapshots(
+                    gpu,
+                    scene_edit.active_scene(),
+                    assets,
+                ));
+            });
+            let result = match snapshots {
+                Some(Ok(surfaces)) => saffron_assets::commit_staged_vegetation_cook(
+                    assets,
+                    &surfaces,
+                    ready_cook.staged,
+                    &ready_cook.cancellation,
+                ),
+                Some(Err(error)) => Err(error),
+                None => Err(saffron_assets::Error::Io(
+                    "renderer did not provide a vegetation surface snapshot".to_owned(),
+                )),
+            };
+            mutated |= result.is_ok();
+            if let Err(error) = self
+                .vegetation_cook_jobs
+                .complete_commit(ready_cook.job, result)
+            {
+                tracing::error!("vegetation cook commit state failed: {error}");
+            }
+        }
         let Some(server) = self.server.as_mut() else {
-            return false;
+            return mutated;
         };
         let mut ctx = EngineContext {
             window,
@@ -155,12 +229,20 @@ impl ControlContext {
             scene_edit,
             assets,
             spatial,
+            vegetation,
+            vegetation_status,
+            vegetation_regeneration_cells,
+            vegetation_collision,
+            vegetation_promotion,
+            vegetation_navigation,
+            vegetation_ecology,
+            vegetation_telemetry,
             physics,
             vegetation_jobs: &mut self.vegetation_jobs,
+            vegetation_cook_jobs: &mut self.vegetation_cook_jobs,
             vegetation_compute: &mut self.vegetation_compute,
         };
         let registry = &self.registry;
-        let mut mutated = false;
         server.drain(|line| match saffron_json::parse_json(line) {
             Ok(request) => {
                 let reply = registry.dispatch(&mut ctx, &request);
@@ -176,9 +258,11 @@ impl ControlContext {
                 saffron_json::dump_json(&reply, -1)
             }
             Err(_) => {
-                // A non-JSON line gets the frozen invalid-request envelope, with
-                // no `id` to echo.
-                r#"{"ok":false,"error":"invalid JSON request"}"#.to_owned()
+                let reply = crate::registry::failure_reply(
+                    Value::Null,
+                    crate::Error::InvalidRequest("invalid JSON request".to_owned()),
+                );
+                saffron_json::dump_json(&reply, -1)
             }
         });
         mutated

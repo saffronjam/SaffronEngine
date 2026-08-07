@@ -15,10 +15,15 @@ path = "src/main.rs"
 workspace = true
 
 [dependencies]
+saffron-core = { path = "../crates/core" }
+saffron-geometry = { path = "../crates/geometry" }
+saffron-spatial = { path = "../crates/spatial" }
+saffron-vegetation = { path = "../crates/vegetation" }
 saffron-protocol = { path = "../crates/protocol" }
 saffron-script = { path = "../crates/script" }
 anyhow = { workspace = true }
 atomic-write-file = { workspace = true }
+image = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 sha2 = { workspace = true }

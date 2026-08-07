@@ -39,6 +39,91 @@ pub enum Error {
     #[error("vegetation error: {0}")]
     Vegetation(#[from] saffron_vegetation::Error),
 
+    /// A material surface or coverage contract failed validation.
+    #[error("material error: {0}")]
+    Material(#[from] saffron_material::Error),
+
+    /// The GPU-scene mirror could not represent canonical state as device records.
+    #[error("gpu scene mirror error: {0}")]
+    GpuSceneMirror(String),
+
+    /// Two different byte streams resolved to the same vegetation CAS path.
+    #[error("vegetation artifact content-address collision at {path}")]
+    VegetationArtifactCollision {
+        /// Final cache path whose bytes disagreed.
+        path: String,
+    },
+
+    /// A stored vegetation artifact does not match the hash encoded by its path.
+    #[error("vegetation artifact hash mismatch at {path}")]
+    VegetationArtifactHash {
+        /// Corrupt cache path.
+        path: String,
+    },
+
+    /// An artifact length cannot be represented by the public byte-count contract.
+    #[error("vegetation artifact size exceeds the supported range")]
+    VegetationArtifactSize,
+
+    /// A manifest plant row declares tags that differ from its compiled plant artifact.
+    #[error("vegetation manifest tags disagree with compiled plant family {family}")]
+    VegetationPlantTagMismatch {
+        /// Plant-family catalog identity.
+        family: u64,
+    },
+
+    /// A plant family failed source resolution or normalization and cannot be published.
+    #[error("plant family {family} failed validation")]
+    PlantCompilationRejected {
+        /// Plant-family catalog identity.
+        family: u64,
+    },
+
+    /// Another vegetation generation advanced the current root before this cook committed.
+    #[error(
+        "vegetation generation for map {map} was superseded (expected {expected}, current {current})"
+    )]
+    VegetationGenerationSuperseded {
+        /// Vegetation-map identity.
+        map: u64,
+        /// Root identity captured when the cook began.
+        expected: String,
+        /// Root identity observed under the publication lock.
+        current: String,
+    },
+
+    /// An exact authored file changed while a background vegetation cook was staged.
+    #[error("vegetation cook input changed while cooking: {path}")]
+    VegetationCookInputChanged {
+        /// Canonical source path whose bytes no longer match the staged input.
+        path: String,
+    },
+
+    /// A durable source/root transaction observed an unrelated generation root.
+    #[error("vegetation transaction for map {map} conflicts with visible generation {current}")]
+    VegetationTransactionConflict {
+        /// Vegetation-map identity.
+        map: u64,
+        /// Unexpected visible generation identity.
+        current: String,
+    },
+
+    /// An authored map transaction was prepared against a different visible root generation.
+    #[error("vegetation-map generation conflict: expected {expected}, found {actual}")]
+    VegetationMapGenerationConflict {
+        /// Generation captured when the transaction was prepared.
+        expected: u64,
+        /// Generation visible after acquiring the map lock.
+        actual: u64,
+    },
+
+    /// Two different authored object streams resolved to one immutable map-object path.
+    #[error("vegetation-map object content-address collision at {path}")]
+    VegetationMapObjectCollision {
+        /// Final object path whose bytes disagreed.
+        path: String,
+    },
+
     /// A runtime `slangc` invocation for a material graph exited non-zero or
     /// produced no `.spv`. The payload names the material / shader.
     #[error("slangc failed for {0}")]

@@ -41,7 +41,7 @@ Dragging a texture onto a Mesh field does nothing: the same type comparison guar
 
 The scene viewport accepts model assets from the browser. During `dragover`, `ViewportPanel` reads the first model id in the asset payload, converts the cursor to viewport UV, and sends `asset-placement { phase:"preview", asset, u, v }`. The host computes the placement from the scene camera: it ray-tests rendered scene geometry first, falls back to the world `Y=0` ground plane, and offsets the model so its bounds bottom-center sits on that point.
 
-The preview is a transient `Scene` stored on `SceneEditContext`, not an authored project entity. The host renders it by merging the transient scene into the same draw-list build as the authored scene. `drop` sends a final preview at the release UV and then `asset-placement { phase:"commit" }`; commit instantiates the model into the authored scene with the stored transform, selects it, bumps the scene version, and clears the preview. `dragleave`, cancellation, or unmount sends `phase:"clear"`.
+The preview is a `PreviewGhost`-tagged subtree instantiated into the authored scene and tracked as `PlacementPreview` on `SceneEditContext`; it renders through the ordinary scene gather like any entity, and each drag-over moves it with a transform write. `drop` sends a final preview at the release UV and then `asset-placement { phase:"commit" }`; commit untags the ghost subtree into authored entities, selects the root, bumps the scene version, and clears the preview. `dragleave`, cancellation, or unmount sends `phase:"clear"`, which destroys the subtree.
 
 ## In the code
 
@@ -51,12 +51,12 @@ The preview is a transient `Scene` stored on `SceneEditContext`, not an authored
 | Drag payload + reader | `editor/src/components/AssetTile.tsx` | `ASSET_DND_MIME`, `AssetDragPayload`, `readAssetPayload` |
 | Viewport placement target | `editor/src/panels/ViewportPanel.tsx` | `ViewportPanel`, `clientPointToUv` |
 | Placement client calls | `editor/src/control/client.ts` | `previewAssetPlacement`, `commitAssetPlacement`, `clearAssetPlacement` |
-| Placement command | `engine/crates/control/src/commands_asset.rs` | `asset-placement`, `preview_asset_placement`, `commit_asset_placement` |
+| Placement command | `engine/crates/control/src/commands_asset/` | `asset-placement`, `preview_asset_placement`, `commit_asset_placement` |
 | Transient render state | `engine/crates/sceneedit/src/context.rs` | `PlacementPreview`, `SceneEditContext::placement_preview` |
-| Draw-list merge | `engine/crates/assets/src/render_scene.rs` | `render_scene_with_transient`, `pick_scene_surface`, `viewport_ray` |
+| Ghost render + placement ray | `engine/crates/assets/src/render_scene/` | `render_scene`, `pick_scene_surface`, `viewport_ray` |
 | Where it's mounted | `editor/src/components/fieldRenderer.tsx` | the `uuid` case in `renderField`, `FieldHint.asset` |
 | The write (client) | `editor/src/panels/InspectorPanel.tsx` | `sendWrite` (`assignAsset` / `setComponentField`) |
-| Assign (engine) | `engine/crates/control/src/commands_asset.rs` | `assign-asset` |
+| Assign (engine) | `engine/crates/control/src/commands_asset/` | `assign-asset` |
 
 ## Related
 

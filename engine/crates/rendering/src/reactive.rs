@@ -1,11 +1,10 @@
 //! Observability mirror for the reactive render loop.
 //!
 //! The loop's redraw verdict lives on `saffron_app::RedrawController`, above this crate in the DAG,
-//! so the host pushes a per-frame snapshot down into the renderer ([`Renderer::set_reactive_state`])
-//! and the editor's window-visibility signal sets the [`PowerState`] back up
-//! ([`Renderer::set_power_state`]). The control plane then reports the snapshot in `render-stats`
-//! and the host reads the power state each frame to suppress rendering when the viewport is hidden —
-//! one place the otherwise-invisible idle/convergence state surfaces for the CLI, HUD, and e2e.
+//! so the host pushes a per-frame snapshot down into the renderer and the editor's
+//! window-visibility signal sets the [`PowerState`] back up. The control plane reports the snapshot
+//! in `render-stats`, and the host reads the power state each frame to suppress rendering when the
+//! viewport is hidden.
 
 /// Whether the editor viewport is on-screen, so the host can throttle a hidden viewport.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]

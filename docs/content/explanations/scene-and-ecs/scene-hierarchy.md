@@ -33,9 +33,8 @@ relationship handles nor bone handles cross a save/load boundary.
 
 ## World transforms
 
-`Transform` stores local translation, Euler rotation, and scale. Once per frame,
-`update_world_transforms` starts at every root and follows the cached child lists. For an entity $e$
-with parent $p$, it writes:
+`Transform` stores local translation, Euler rotation, and scale. `update_world_transforms` starts at
+every root and follows the cached child lists. For an entity $e$ with parent $p$, it composes:
 
 $$
 W_e = W_p L_e
@@ -44,6 +43,11 @@ $$
 where $L_e$ is the entity's local matrix. The pass carries a full `Mat4`, so parent rotation and
 non-uniform scale remain part of the child's world transform. `WorldTransform` is unregistered and
 therefore absent from scene documents.
+
+The [scene mutation journal](../scene-mutation-journal/) records local, hierarchy, and published
+world revisions. Composition skips a clean subtree and propagates a changed parent revision through
+descendants once. Each published matrix retains its preceding value and revision for temporal
+consumers.
 
 Animation can supply a runtime `PoseOverride`. `local_matrix` uses that quaternion-based TRS while
 the override exists, otherwise it uses the authored `Transform`. Consumers read the cached result
@@ -108,5 +112,6 @@ skinning through the same hierarchy composition.
 
 - [Transform and matrices](../transform-and-matrices/) — local TRS conventions and matrix composition.
 - [Scene serialization](../scene-serialization/) — document structure and UUID preservation.
+- [Scene mutation journal](../scene-mutation-journal/) — dirty propagation and transform revisions.
 - [Animation](../../animation/) — runtime pose overrides and joint palettes.
 - [Picking](../picking/) — resolving a hit child to its model root.

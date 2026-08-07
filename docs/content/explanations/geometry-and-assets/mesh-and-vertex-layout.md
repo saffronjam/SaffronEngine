@@ -11,7 +11,7 @@ vertex struct shared by every importer.
 
 A single fixed layout lets one mesh pipeline, one `.smesh` on-disk stride, and one upload path
 serve [glTF and OBJ](../gltf-and-obj-import/) alike. The bytes are the same in memory, on disk,
-and in the GPU vertex buffer.
+and in the GPU vertex arena the executor vertex path pulls from.
 
 ## One 48-byte vertex
 
@@ -111,17 +111,15 @@ An unskinned mesh with no blend shapes pays nothing for either stream.
 
 ## Submeshes at draw time
 
-A submesh lets one logical model carry several draw ranges over one bound buffer pair.
-`record_batch_submeshes` walks a batch's submesh list and issues one instanced `drawIndexed`
-per submesh, adding the batch's deformed-buffer offset to the submesh's own `vertex_offset`. A
-model with three glTF primitives is three draw ranges, not three meshes; the same `submeshes`
-table rides `GpuMesh` after upload.
+A submesh lets one logical model carry several draw ranges over one shared vertex/index pair.
+A model with three glTF primitives is three draw ranges, not three meshes; the same
+`submeshes` table rides `GpuMesh` after upload.
 
 Each submesh selects its material through `material_slot`, an index into the entity's
 [`MaterialSet`](../../scene-and-ecs/built-in-components/) slots. `resolve_entity_materials`
 clamps the index to the last slot, so a single-slot set covers every submesh of a
-single-material mesh. The [draw list](../draw-list/) carries one item per submesh, keyed by the
-same slot.
+single-material mesh. An emitted [executor draw record](../draw-list/) resolves its material
+through the same slot.
 
 ## In the code
 
@@ -133,7 +131,7 @@ same slot.
 | Normal regeneration | `geometry/src/picking.rs` | `generate_normals` |
 | Disk round-trip | `geometry/src/smesh.rs` | `save_mesh_to_buffer`, `load_mesh_from_bytes` |
 | GPU side | `rendering/src/resources.rs` | `GpuMesh` |
-| Per-submesh draw loop | `rendering/src/scene_pass.rs` | `record_batch_submeshes` |
+| Executor pass recording | `rendering/src/scene_pass.rs` | `record_executor_buckets`, `record_executor_depth_family` |
 | Slot → material resolve | `assets/src/render_material.rs` | `resolve_entity_materials` |
 
 ## Related
@@ -141,5 +139,5 @@ same slot.
 - [Model import](../gltf-and-obj-import/) — what fills these vectors
 - [.smesh format](../smesh-format/) — the byte image that pins these strides
 - [Mesh upload](../gpu-mesh-upload/) — `Mesh` → `GpuMesh`
-- [Draw list](../draw-list/) — how submeshes become draws
+- [Executor draws](../draw-list/) — how submeshes become draws
 - [Built-in components](../../scene-and-ecs/built-in-components/) — the `MaterialSet` the slots index

@@ -4,39 +4,34 @@ These are byte-exact reference artifacts for the frozen on-disk and GPU-upload f
 They are the detector for the **silent byte-drift class**: a `.smesh`/`.smat`/`.sanim` byte
 that shifts, an std430 offset that moves, or a shm header field that changes. None of those
 throw or fail validation — they corrupt a mesh, mis-hash a material for dedup, or tear a
-frame — so the only detector is a byte comparison against a fixture generated from the C++
-engine's output.
+frame — so the detector is a byte comparison against an independently emitted fixture.
 
 ## How they were generated (not back-compat)
 
-Every fixture was emitted **once** by `gen/gen_golden.cpp` — a standalone C++ program whose
-writer logic is transcribed **verbatim** from the C++ engine's format owners (the disk
-formats are pure `#[repr(C)]`/JSON data, independent of Vulkan/Jolt/SDL, so the generator
-needs none of them). The `.smat`/META JSON is produced with the same `nlohmann::json` the
-engine vendors, so its f64-promoted float formatting and `std::map` sorted keys match the
-engine byte-for-byte.
+Every fixture is emitted by `gen/gen_golden.cpp`, a standalone C++ program. Disk-format writers and
+the retained reference GPU structs reproduce the C++ format owners. `MaterialParamsData` mirrors the
+current Rust/Slang ABI because thin-sheet optics, canonical coverage, and aggregate material moments
+have no legacy owner. The generator needs no Vulkan/Jolt/SDL runtime. The `.smat`/META JSON uses the
+same `nlohmann::json` version as the reference writer.
 
-| Fixture | Format owner (C++) | Symbol |
+| Fixture | Format owner | Symbol |
 |---|---|---|
 | `cube.smesh` | `engine-old/source/saffron/geometry/geometry.cppm` | `encodeMeshImage` / `SMeshHeader` (`:386`, `:1400`) |
 | `cube.sanim` | `geometry.cppm` | `saveAnimationToBuffer` / `SANimHeader` / `SANimTrackRecord` (`:406`, `:1619`) |
 | `cube.smodel` | `geometry.cppm` | `writeContainer` / `SModelHeader` / `TocEntry` (`:296`) |
 | `material.smat` | `engine-old/source/saffron/assets/assets.cppm` | `materialAssetToJson` + `.dump(2)` (`:1488`, `:2137`) |
-| `instance_data.offsets` | `engine-old/source/saffron/rendering/renderer_types.cppm` | `InstanceData` (`:1868`) |
-| `material_params_data.offsets` | `renderer_types.cppm` | `MaterialParamsData` (`:1884`) |
+| `material_params_data.offsets` | `engine/crates/rendering/src/gpu_types.rs`, `engine/assets/shaders/material_params.slang` | `MaterialParamsData` |
 | `gpu_light.offsets` | `renderer_types.cppm` | `GpuLight` (`:2018`) |
 | `shm_header.layout` | `engine-old/source/saffron/rendering/renderer_capture.cpp` | `recreateShmSegment` header init (`:129`) |
 
-- **Source tree commit:** `d8b4cea` (the `feat/to-rust` worktree at fixture-generation time;
-  `engine-old/` is the verbatim C++ reference the generator transcribes).
+- **C++ reference commit:** `d8b4cea` (`engine-old/` supplies the retained reference formats).
 - **nlohmann/json:** `v3.12.0` (the engine's `cmake/Dependencies.cmake` pin) — the `.smat`
   and `.smodel` META float/key formatting is reproduced from this exact version.
 - **Compiler:** clang++ 21 (`-std=c++26`) in the `saffron-build` toolbox.
 
-The byte equality is independently corroborated: the C++ engine's struct layouts are pinned
-by `static_assert(sizeof(...) == N)` and the Rust ports carry the matching
-`const _: () = assert!(size_of::<T>() == N)` + `offset_of!` unit tests, so the snapshot
-fixtures and the per-struct layout asserts agree from two directions.
+The byte equality is independently corroborated by `static_assert(sizeof(...) == N)` in the C++
+generator and matching Rust `const` size assertions plus `offset_of!` tests. Slang consumes the same
+sixteen 16-byte `MaterialParams` blocks from `material_params.slang`.
 
 ## Regenerating (seed / intentional change only)
 

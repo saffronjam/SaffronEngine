@@ -12,13 +12,16 @@ workspace = true
 [dependencies]
 tracing.workspace = true
 saffron-core = { path = "../core" }
+saffron-material = { path = "../material" }
 glam = { workspace = true, features = ["bytemuck"] }
 bytemuck = { workspace = true }
 thiserror = { workspace = true }
-gltf = { workspace = true, features = ["KHR_materials_emissive_strength"] }
+gltf = { workspace = true, features = ["KHR_materials_emissive_strength", "extensions"] }
 serde_json.workspace = true
 tobj = { workspace = true }
 image = { workspace = true }
+optimesh.workspace = true
+sha2.workspace = true
 
 [dev-dependencies]
 saffron-test-support = { path = "../test-support" }

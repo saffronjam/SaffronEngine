@@ -86,14 +86,15 @@ Parameter meanings and defaults live in the `.smat` asset (see [native materials
 | `Bone` | `Bone` | `tag: u8` — marks a skeleton joint (serialized as an empty object) |
 | `AnimationPlayer` | `AnimationPlayer` | `clip: Uuid`; `time: f32`; `speed: f32 1.0`; `wrap: Wrap (Loop)`; `playing: bool`; plus runtime transition state (`prev_clip`, `transition`, `loop_blend`, `transition_mode: Transition`) |
 | `FootIk` | `FootIk` | `enabled: bool`; `ground_height: f32`; `chains: Vec<FootChain>` (each `{upper, mid, end: i32, pole_vector: Vec3}`, indices into `SkinnedMesh::bones`) |
+| `MorphComponent` | `Morph` | `weights: Vec<f32>` (canonical `0..1`, one per target); `names: Vec<String>` (parallel slider labels) |
 
-`Wrap` is `Once | Loop | PingPong` (default `Loop`); `Transition` is `Inertialize | CrossFade` (default `Inertialize`). `PoseOverride { translation: Vec3, rotation: Quat, scale: Vec3 }` is the runtime, non-serialized animated local TRS the evaluator writes onto a driven bone (preferred over the bone's `Transform`).
+`Wrap` is `Once | Loop | PingPong` (default `Loop`); `Transition` is `Inertialize | CrossFade` (default `Inertialize`). `PoseOverride { translation: Vec3, rotation: Quat, scale: Vec3 }` is the runtime, non-serialized animated local TRS the evaluator writes onto a driven bone (preferred over the bone's `Transform`). `MorphWeightOverride { weights: Vec<f32> }` is the animated counterpart the GPU morph deform reads; it is removed when the rig stops animating, so the mesh reverts to the durable `Morph` weights.
 
 ## Physics
 
 | Type | JSON key | Fields (default) |
 |---|---|---|
-| `Rigidbody` | `Rigidbody` | `motion: Motion (Dynamic)`; `mass: f32 1.0`; `linear_damping: f32 0.05`; `angular_damping: f32 0.05`; `gravity_factor: f32 1.0`; `lock_position: BVec3`; `lock_rotation: BVec3`; `collision_layer: i32 0` |
+| `Rigidbody` | `Rigidbody` | `motion: Motion (Dynamic)`; `mass: f32 1.0`; `linear_damping: f32 0.05`; `angular_damping: f32 0.05`; `gravity_factor: f32 1.0`; `wind_factor: f32 0.0`; `lock_position: BVec3`; `lock_rotation: BVec3`; `collision_layer: i32 0` |
 | `Collider` | `Collider` | `shape: Shape (Box)`; `half_extents: Vec3 {0.5,0.5,0.5}`; `source_mesh: Uuid 0`; `offset: Vec3 {0,0,0}`; `material: PhysicsMaterial`; `is_sensor: bool false` |
 | `KinematicBones` | `KinematicBones` | `enabled: bool true`; `driven: Vec<i32>` (joint indices; empty = every joint) |
 | `CharacterController` | `CharacterController` | `max_speed: f32 4.0`; `max_slope_angle: f32 ~0.785`; `max_step_height: f32 0.3`; `gravity_factor: f32 1.0`; plus runtime velocity/ground state |
@@ -108,6 +109,16 @@ Parameter meanings and defaults live in the `.smat` asset (see [native materials
 | `Script` | `Script` | `scripts: Vec<ScriptSlot>`, run top-to-bottom each play tick |
 
 `ScriptSlot` is `{ script_path: String, overrides: serde_json::Value }` — a `.lua` path relative to the project `src/` plus opaque per-instance field overrides (defaulted to `{}`; the engine never interprets them).
+
+## Environment and vegetation
+
+| Type | JSON key | Fields (default) |
+|---|---|---|
+| `VegetationField` | `VegetationField` | `map: Uuid {0}` (the `.svegmap` asset); `enabled: bool true` |
+| `WindSource` | `WindSource` | `kind: WindSourceKind (Directional)`; `strength: f32 5.0` (m/s; `Volume` scales the global field); `radius: f32 20.0`; `falloff: f32 0.5` (fraction of radius); `enabled: bool true` |
+| `FogVolume` | `FogVolume` | `shape: FogShape (Box)`; `extents: Vec3 {5,5,5}`; `radius: f32 5.0`; `edge_falloff: f32 1.0`; `density: f32 0.5`; `albedo: Vec3 {0.9,0.9,0.9}`; `emissive: Vec3 {0,0,0}`; `phase_g: f32 0.0`; `height_falloff: f32 0.0`; `noise_scale: f32 0.2`; `noise_intensity: f32 0.0`; `noise_detail: f32 0.5`; `wind: Vec3 {0,0,0}`; `speed: f32 0.1` |
+
+`VegetationField` is the one scene-level vegetation component: local regions are layers inside the referenced map, not further field components. `FogShape` is `Box | Sphere` (default `Box`); a `Box` is bounded by local-space `extents`, a `Sphere` by `radius` around the entity origin, and density smoothsteps to zero over `edge_falloff` inside the bound. `WindSourceKind` is owned by `saffron-wind`.
 
 ## Related
 

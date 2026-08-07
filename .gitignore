@@ -4,13 +4,15 @@
 /install/
 /appdata/
 engine/target/
-# Private per-agent target dirs (CARGO_TARGET_DIR=engine/target-<name>, per AGENTS.md).
+editor/dist/
+# oxfmt reads only the repo-root ignore file, so every generated tree it must skip lives here.
+node_modules/
+*.log
+# Private per-agent target dirs (CARGO_TARGET_DIR=engine/target-<name>).
 engine/target-*/
-# Vendored Jolt 5.3.0 source — compiled by saffron-physics-sys/build.rs.
-# Ignored to keep it out of review; to become a download-on-demand build target (PP-11).
+# Vendored Jolt source, compiled by saffron-physics-sys/build.rs.
 engine/crates/physics-sys/vendor/
-# ts-rs scratch output from `#[ts(export)]` `cargo test` runs; the real editor TS is
-# emitted by `xtask gen-protocol` (10-protocol-codegen phase 5), not these.
+# ts-rs scratch output from `#[ts(export)]` `cargo test` runs.
 engine/crates/protocol/bindings/
 
 engine/appdata
@@ -26,6 +28,5 @@ testscenes/
 # OS
 .DS_Store
 
-# The CEF editor shell's build output (a sibling crate outside the engine workspace; it links
-# libcef.so + its resource pack, so its target dir is many GB — never commit it).
+# The CEF editor shell's build output.
 editor/shell/target/

@@ -1,13 +1,6 @@
-/// A thumbnail combo for a `Uuid` component field. It lists `(none)` + every catalog
-/// asset of `assetType`; selecting one calls `onChange(id)`, `(none)` calls
-/// `onChange("0")`. It is ALSO an HTML5 drop TARGET accepting `application/x-sa-asset`,
-/// but only when the dragged asset's type matches `assetType`.
-///
-/// The caller (the inspector's fieldRenderer) owns the write: mesh/albedo go through
-/// `assignAsset`, everything else (sky texture, other Uuid fields) through
-/// `setComponentField`. The picker is field-agnostic — it only emits `onChange`.
-///
-/// Lives in the side docks (inspector / environment); the popover anchors there.
+/// A thumbnail combo for a `Uuid` component field: `(none)` plus every catalog asset of `assetType`.
+/// Also an HTML5 drop target, but only for a dragged asset whose type matches. The picker is
+/// field-agnostic — it only emits `onChange`, and the caller owns the write.
 import { useEffect, useState } from "react";
 import {
   Box,
@@ -46,6 +39,7 @@ export type PickerAssetKind =
   | "material"
   | "model"
   | "animation"
+  | "plant"
   | "vegetation-map";
 
 /// The native built-in primitive meshes, mirroring the engine's `BuiltinMesh` reserved

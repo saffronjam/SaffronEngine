@@ -8,6 +8,7 @@ import { tmpdir } from "node:os";
 import { join, dirname, isAbsolute } from "node:path";
 import { fileURLToPath } from "node:url";
 import net from "node:net";
+import { BoundedTextLog, HostFaultWatch, drainHostStream, withHostLog } from "./harness-utils.ts";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const REPO = join(HERE, "..", "..");
@@ -17,13 +18,14 @@ const MANIFEST = join(SCHEMA_DIR, "command-manifest.generated.json");
 const ENGINE =
   process.env.SAFFRON_ANIMA_BIN ?? join(REPO, "engine", "target", "debug", "saffron-host");
 const SOCK = process.env.SAFFRON_CONTROL_SOCK ?? `/tmp/saffron-contract-${process.pid}.sock`;
-const APPDATA =
-  process.env.SAFFRON_APPDATA_DIR ?? mkdtempSync(join(tmpdir(), "saffron-contract-appdata."));
 const CALL_TIMEOUT_MS = Number(process.env.SAFFRON_SCHEMA_CALL_TIMEOUT_MS) || 15_000;
-const FIXTURES = mkdtempSync(join(tmpdir(), "saffron-contract-fixtures."));
-const MODEL_FIXTURE = join(FIXTURES, "contract-triangle.obj");
+const HOST_LOG_CAPACITY = 256 * 1024;
+const HOST_LOG_TAIL = 16 * 1024;
 const RT_COMMANDS = new Set(["set-rt-shadows", "set-restir", "set-rt-reflections"]);
 const PROJECT_TRANSITIONS = new Set(["new-project", "open-project", "load-project"]);
+let appDataPath = "";
+let fixturesPath = "";
+let modelFixturePath = "";
 
 interface ManifestCommand {
   name: string;
@@ -43,6 +45,9 @@ const openrpc = JSON.parse(readFileSync(OPENRPC, "utf8"));
 const manifest = JSON.parse(readFileSync(MANIFEST, "utf8")) as Manifest;
 const generatedSchemas = openrpc.components.schemas as Record<string, unknown>;
 const envelopeSchema = JSON.parse(readFileSync(join(SCHEMA_DIR, "envelope.schema.json"), "utf8"));
+const hostLog = new BoundedTextLog(HOST_LOG_CAPACITY);
+const hostFaults = new HostFaultWatch();
+let callTimedOut = false;
 
 function typeOk(v: unknown, t: string): boolean {
   switch (t) {
@@ -65,7 +70,15 @@ function typeOk(v: unknown, t: string): boolean {
   }
 }
 
-function resolveRef(ref: string): unknown {
+function resolveRef(ref: string, rootSchema: any): unknown {
+  const defsPrefix = "#/$defs/";
+  if (ref.startsWith(defsPrefix)) {
+    const schema = rootSchema?.$defs?.[ref.slice(defsPrefix.length)];
+    if (!schema) {
+      throw new Error(`missing envelope definition ${ref}`);
+    }
+    return schema;
+  }
   const prefix = "#/components/schemas/";
   if (!ref.startsWith(prefix)) {
     throw new Error(`unsupported schema ref ${ref}`);
@@ -78,15 +91,21 @@ function resolveRef(ref: string): unknown {
   return schema;
 }
 
-function validate(schema: any, value: any, path: string, errors: string[]): void {
+function validate(
+  schema: any,
+  value: any,
+  path: string,
+  errors: string[],
+  rootSchema: any = schema,
+): void {
   if (schema.$ref) {
-    validate(resolveRef(schema.$ref), value, path, errors);
+    validate(resolveRef(schema.$ref, rootSchema), value, path, errors, rootSchema);
     return;
   }
   if (schema.oneOf) {
     const passes = schema.oneOf.filter((sub: any) => {
       const nested: string[] = [];
-      validate(sub, value, path, nested);
+      validate(sub, value, path, nested, rootSchema);
       return nested.length === 0;
     });
     if (passes.length !== 1) {
@@ -121,7 +140,7 @@ function validate(schema: any, value: any, path: string, errors: string[]): void
     }
     for (const [key, sub] of Object.entries<any>(schema.properties)) {
       if (key in value) {
-        validate(sub, value[key], `${path}.${key}`, errors);
+        validate(sub, value[key], `${path}.${key}`, errors, rootSchema);
       }
     }
     if (schema.additionalProperties === false) {
@@ -133,7 +152,9 @@ function validate(schema: any, value: any, path: string, errors: string[]): void
     }
   }
   if (typeOk(value, "array") && schema.items) {
-    value.forEach((item: any, i: number) => validate(schema.items, item, `${path}[${i}]`, errors));
+    value.forEach((item: any, i: number) =>
+      validate(schema.items, item, `${path}[${i}]`, errors, rootSchema),
+    );
   }
 }
 
@@ -159,40 +180,70 @@ function assertRawU64(raw: string, label: string, errors: string[]): void {
 }
 
 let nextId = 1;
+function roundTrip(line: string, label: string): Promise<{ envelope: any; raw: string }> {
+  return new Promise((resolve, reject) => {
+    const socket = net.connect({ path: SOCK });
+    let buf = "";
+    let settled = false;
+    const rejectOnce = (error: Error) => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      clearTimeout(timer);
+      socket.destroy();
+      reject(error);
+    };
+    const timer = setTimeout(() => {
+      callTimedOut = true;
+      rejectOnce(new Error(`timeout ${label}`));
+    }, CALL_TIMEOUT_MS);
+    socket.on("connect", () => socket.write(line));
+    socket.on("data", (d) => {
+      buf += d.toString("utf8");
+      const nl = buf.indexOf("\n");
+      if (nl < 0 || settled) {
+        return;
+      }
+      settled = true;
+      clearTimeout(timer);
+      socket.end();
+      const raw = buf.slice(0, nl);
+      try {
+        resolve({ envelope: JSON.parse(raw), raw });
+      } catch (error) {
+        socket.destroy();
+        reject(new Error(`invalid JSON reply ${label}: ${String(error)}`));
+      }
+    });
+    socket.on("error", (e) => {
+      rejectOnce(new Error(`control transport failed ${label}: ${String(e)}`));
+    });
+  });
+}
+
 function call(
   cmd: string,
   params: Record<string, unknown> = {},
 ): Promise<{ envelope: any; raw: string }> {
-  return new Promise((resolve, reject) => {
-    const socket = net.connect({ path: SOCK });
-    let buf = "";
-    const timer = setTimeout(() => {
-      socket.destroy();
-      reject(new Error(`timeout calling ${cmd}`));
-    }, CALL_TIMEOUT_MS);
-    socket.on("connect", () => socket.write(JSON.stringify({ id: nextId++, cmd, params }) + "\n"));
-    socket.on("data", (d) => {
-      buf += d.toString("utf8");
-      const nl = buf.indexOf("\n");
-      if (nl >= 0) {
-        clearTimeout(timer);
-        socket.end();
-        const raw = buf.slice(0, nl);
-        resolve({ envelope: JSON.parse(raw), raw });
-      }
-    });
-    socket.on("error", (e) => {
-      clearTimeout(timer);
-      reject(e);
-    });
-  });
+  return roundTrip(`${JSON.stringify({ id: nextId++, cmd, params })}\n`, `calling ${cmd}`);
+}
+
+function callRaw(line: string): Promise<{ envelope: any; raw: string }> {
+  return roundTrip(`${line}\n`, "calling raw control request");
+}
+
+function failureMessage(envelope: any): string {
+  return typeof envelope?.error?.message === "string"
+    ? envelope.error.message
+    : JSON.stringify(envelope?.error);
 }
 
 async function waitForProjectReady(): Promise<void> {
   for (let attempt = 0; attempt < 300; attempt += 1) {
     const status = await call("project-status");
     if (status.envelope.ok !== true) {
-      throw new Error(`failed to poll project status: ${status.envelope.error}`);
+      throw new Error(`failed to poll project status: ${failureMessage(status.envelope)}`);
     }
     if (status.envelope.result?.phase === "ready") {
       return;
@@ -226,7 +277,9 @@ function schemaForResult(dto: string): unknown {
 async function entityId(name: string): Promise<string> {
   const created = await call("create-entity", { name });
   if (created.envelope.ok !== true) {
-    throw new Error(`failed to create fixture entity '${name}': ${created.envelope.error}`);
+    throw new Error(
+      `failed to create fixture entity '${name}': ${failureMessage(created.envelope)}`,
+    );
   }
   const id = firstResultId(created.raw);
   if (!id) {
@@ -238,12 +291,12 @@ async function entityId(name: string): Promise<string> {
 async function meshAssetId(): Promise<string> {
   let assets = await call("list-assets");
   if (assets.envelope.ok !== true) {
-    throw new Error(`failed to list assets: ${assets.envelope.error}`);
+    throw new Error(`failed to list assets: ${failureMessage(assets.envelope)}`);
   }
   let id = firstAssetId(assets.envelope.result);
   if (!id) {
     writeFileSync(
-      MODEL_FIXTURE,
+      modelFixturePath,
       [
         "o ContractTriangle",
         "v -0.5 0 0",
@@ -257,9 +310,9 @@ async function meshAssetId(): Promise<string> {
         "",
       ].join("\n"),
     );
-    const imported = await call("import-model", { path: MODEL_FIXTURE });
+    const imported = await call("import-model", { path: modelFixturePath });
     if (imported.envelope.ok !== true) {
-      throw new Error(`failed to import mesh fixture: ${imported.envelope.error}`);
+      throw new Error(`failed to import mesh fixture: ${failureMessage(imported.envelope)}`);
     }
     assets = await call("list-assets");
     id = firstAssetId(assets.envelope.result);
@@ -314,7 +367,9 @@ async function paramsForFixture(
       const inspected = await call("inspect", { entity: state.cubeId });
       const components = inspected.envelope.result?.componentOrder;
       if (inspected.envelope.ok !== true || !Array.isArray(components)) {
-        throw new Error(`failed to read component-order fixture: ${inspected.envelope.error}`);
+        throw new Error(
+          `failed to read component-order fixture: ${failureMessage(inspected.envelope)}`,
+        );
       }
       return {
         entity: state.cubeId,
@@ -327,7 +382,9 @@ async function paramsForFixture(
       const light = await call("add-entity", { preset: "directional-light" });
       const id = firstResultId(light.raw);
       if (light.envelope.ok !== true || !id) {
-        throw new Error(`failed to create directional-light fixture: ${light.envelope.error}`);
+        throw new Error(
+          `failed to create directional-light fixture: ${failureMessage(light.envelope)}`,
+        );
       }
       return { entity: id, intensity: 3 };
     }
@@ -355,7 +412,9 @@ async function paramsForFixture(
       const profile =
         reference && typeof reference === "object" && "id" in reference ? reference.id : null;
       if (saved.envelope.ok !== true || typeof profile !== "string") {
-        throw new Error(`failed to create environment-profile fixture: ${saved.envelope.error}`);
+        throw new Error(
+          `failed to create environment-profile fixture: ${failureMessage(saved.envelope)}`,
+        );
       }
       return { profile };
     }
@@ -378,6 +437,14 @@ async function paramsForFixture(
       return { enabled: false };
     case "wind-calm":
       return { speed: 0, gust: 0 };
+    case "interaction-impulse":
+      return { positionM: [0, 0], radiusM: 2, strength: 3 };
+    case "interaction-field-coarse":
+      return { cascade: 0, resolution: 8 };
+    case "wind-sample-origin":
+      return { positionM: [0, 1, 0] };
+    case "surface-ray-down":
+      return { originM: [0, 5, 0], direction: [0, -1, 0] };
     case "time-of-day-noon":
       return { timeOfDay: 0.5 };
     case "cube-preset":
@@ -497,7 +564,7 @@ async function paramsForFixture(
   }
 }
 
-async function main(): Promise<number> {
+async function runContract(): Promise<number> {
   if (!existsSync(ENGINE)) {
     console.error(`engine binary not found: ${ENGINE}`);
     return 2;
@@ -507,71 +574,90 @@ async function main(): Promise<number> {
     env: {
       ...process.env,
       SAFFRON_CONTROL_SOCK: SOCK,
-      SAFFRON_APPDATA_DIR: APPDATA,
+      SAFFRON_APPDATA_DIR: appDataPath,
       SAFFRON_SCRATCH_PROJECT: "1",
+      // No window, no compositor: the host takes the no-surface offscreen device, so the
+      // contract test runs anywhere the GPU (or llvmpipe) does.
+      SAFFRON_EDITOR_NATIVE_VIEWPORT: "1",
     },
-    stdout: "ignore",
-    stderr: "ignore",
+    stdout: "pipe",
+    stderr: "pipe",
   });
+  const logDrains = [
+    drainHostStream(proc.stdout, hostLog, hostFaults),
+    drainHostStream(proc.stderr, hostLog, hostFaults),
+  ];
 
-  let up = false;
-  for (let i = 0; i < 60 && !up; i++) {
-    if (proc.exitCode !== null) {
-      console.error(`engine exited early (code ${proc.exitCode})`);
-      return 2;
-    }
-    if (existsSync(SOCK)) {
-      try {
-        await call("ping");
-        up = true;
-      } catch {
-        /* not ready yet; keep polling */
+  try {
+    let up = false;
+    for (let i = 0; i < 60 && !up; i++) {
+      if (proc.exitCode !== null) {
+        await Promise.all(logDrains);
+        console.error(
+          withHostLog(`engine exited early (code ${proc.exitCode})`, hostLog, HOST_LOG_TAIL),
+        );
+        return 2;
+      }
+      if (existsSync(SOCK)) {
+        try {
+          await call("ping");
+          up = true;
+        } catch {
+          /* not ready yet; keep polling */
+        }
+      }
+      if (!up) {
+        await sleep(500);
       }
     }
     if (!up) {
-      await sleep(500);
+      console.error(withHostLog("engine control socket never came up", hostLog, HOST_LOG_TAIL));
+      return 2;
     }
-  }
-  if (!up) {
-    proc.kill();
-    console.error("engine control socket never came up");
-    return 2;
-  }
 
-  let projectReady = false;
-  for (let i = 0; i < 120 && !projectReady; i++) {
-    const status = await call("project-status");
-    if (status.envelope.ok !== true) {
-      proc.kill();
-      console.error(`project-status failed during startup: ${status.envelope.error}`);
-      return 2;
+    let projectReady = false;
+    for (let i = 0; i < 120 && !projectReady; i++) {
+      const status = await call("project-status");
+      if (status.envelope.ok !== true) {
+        console.error(
+          withHostLog(
+            `project-status failed during startup: ${failureMessage(status.envelope)}`,
+            hostLog,
+            HOST_LOG_TAIL,
+          ),
+        );
+        return 2;
+      }
+      const phase = status.envelope.result?.phase;
+      if (phase === "failed") {
+        console.error(
+          withHostLog(
+            `scratch project failed to load: ${status.envelope.result?.error ?? ""}`,
+            hostLog,
+            HOST_LOG_TAIL,
+          ),
+        );
+        return 2;
+      }
+      projectReady = phase === "ready";
+      if (!projectReady) {
+        await sleep(100);
+      }
     }
-    const phase = status.envelope.result?.phase;
-    if (phase === "failed") {
-      proc.kill();
-      console.error(`scratch project failed to load: ${status.envelope.result?.error ?? ""}`);
-      return 2;
-    }
-    projectReady = phase === "ready";
     if (!projectReady) {
-      await sleep(100);
+      console.error(withHostLog("scratch project did not become ready", hostLog, HOST_LOG_TAIL));
+      return 2;
     }
-  }
-  if (!projectReady) {
-    proc.kill();
-    console.error("scratch project did not become ready");
-    return 2;
-  }
 
-  const errors: string[] = [];
-  const checked: string[] = [];
+    const errors: string[] = [];
+    const checked: string[] = [];
 
-  try {
     const help = await call("help");
     if (help.envelope.ok !== true || !Array.isArray(help.envelope.result?.commands)) {
       errors.push("help: expected ok:true with result.commands");
     } else {
-      const live = new Set(help.envelope.result.commands.map((command: any) => command.name));
+      const liveCommands = help.envelope.result.commands as { name: string }[];
+      const live = new Set(liveCommands.map((command) => command.name));
       const known = new Set([
         ...manifest.commands.map((command) => command.name),
         ...manifest.skips.map((skip) => skip.name),
@@ -593,7 +679,7 @@ async function main(): Promise<number> {
 
     const cube = await call("add-entity", { preset: "cube" });
     if (cube.envelope.ok !== true) {
-      errors.push(`fixture add-entity: ${cube.envelope.error}`);
+      errors.push(`fixture add-entity: ${failureMessage(cube.envelope)}`);
       throw new Error("cannot seed cube fixture");
     }
     const cubeId = firstResultId(cube.raw);
@@ -603,7 +689,9 @@ async function main(): Promise<number> {
     }
     const capabilityStats = await call("render-stats");
     if (capabilityStats.envelope.ok !== true) {
-      throw new Error(`failed to read renderer capabilities: ${capabilityStats.envelope.error}`);
+      throw new Error(
+        `failed to read renderer capabilities: ${failureMessage(capabilityStats.envelope)}`,
+      );
     }
     const state = {
       cubeId,
@@ -621,11 +709,12 @@ async function main(): Promise<number> {
       }
       const params = await paramsForFixture(command.fixture, state);
       const { envelope, raw } = await call(command.name, params);
+      validate(envelopeSchema, envelope, `${command.name} envelope`, errors);
       if (RT_COMMANDS.has(command.name) && !state.rtSupported) {
-        validate(envelopeSchema, envelope, command.name, errors);
         if (
           envelope.ok !== false ||
-          envelope.error !== "ray tracing not supported on this device"
+          envelope.error?.code !== "command" ||
+          envelope.error?.message !== "ray tracing not supported on this device"
         ) {
           errors.push(`${command.name}: expected the unsupported-device error`);
         } else {
@@ -634,7 +723,7 @@ async function main(): Promise<number> {
         continue;
       }
       if (envelope.ok !== true) {
-        errors.push(`${command.name}: ok=${envelope.ok} error=${envelope.error}`);
+        errors.push(`${command.name}: ok=${envelope.ok} error=${failureMessage(envelope)}`);
         continue;
       }
       validate(schemaForResult(command.result), envelope.result, command.name, errors);
@@ -653,7 +742,7 @@ async function main(): Promise<number> {
       const childId = await entityId(`Contract Hierarchy Child ${process.pid}`);
       const reparent = await call("set-parent", { entity: childId, parent: hierParentId });
       if (reparent.envelope.ok !== true) {
-        errors.push(`hierarchy set-parent: ${reparent.envelope.error}`);
+        errors.push(`hierarchy set-parent: ${failureMessage(reparent.envelope)}`);
       }
       const listed = await call("list-entities");
       validate(
@@ -675,8 +764,9 @@ async function main(): Promise<number> {
       const cycle = await call("set-parent", { entity: hierParentId, parent: childId });
       if (
         cycle.envelope.ok !== false ||
-        typeof cycle.envelope.error !== "string" ||
-        cycle.envelope.error.length === 0
+        cycle.envelope.error?.code !== "command" ||
+        typeof cycle.envelope.error?.message !== "string" ||
+        cycle.envelope.error.message.length === 0
       ) {
         errors.push("hierarchy: parenting an entity under its own child must fail (cycle)");
       } else {
@@ -685,7 +775,7 @@ async function main(): Promise<number> {
 
       const detach = await call("set-parent", { entity: childId, parent: "0" });
       if (detach.envelope.ok !== true) {
-        errors.push(`hierarchy detach: ${detach.envelope.error}`);
+        errors.push(`hierarchy detach: ${failureMessage(detach.envelope)}`);
       }
       const relisted = await call("list-entities");
       const detached = (relisted.envelope.result as any)?.entities?.find(
@@ -700,37 +790,118 @@ async function main(): Promise<number> {
 
     const bad = await call("definitely-not-a-command");
     validate(envelopeSchema, bad.envelope, "bad-command", errors);
-    if (bad.envelope.ok !== false || typeof bad.envelope.error !== "string") {
-      errors.push("bad-command: expected ok:false + string error");
+    if (
+      bad.envelope.ok !== false ||
+      bad.envelope.error?.code !== "command" ||
+      typeof bad.envelope.error?.message !== "string"
+    ) {
+      errors.push("bad-command: expected a typed command failure");
     } else {
       checked.push("bad-command -> envelope (ok:false)");
     }
-  } finally {
-    await call("quit").catch(() => {});
-    proc.kill();
-    if (process.env.SAFFRON_APPDATA_DIR === undefined) {
-      rmSync(APPDATA, { recursive: true, force: true });
-    }
-    rmSync(FIXTURES, { recursive: true, force: true });
-  }
 
-  for (const item of checked) {
-    console.log(`  ok  ${item}`);
-  }
-  if (errors.length) {
-    console.error(`\n${errors.length} contract failure(s):`);
-    for (const error of errors) {
-      console.error(`  FAIL ${error}`);
+    const invalid = await callRaw("{not json");
+    validate(envelopeSchema, invalid.envelope, "invalid-request", errors);
+    if (
+      invalid.envelope.id !== null ||
+      invalid.envelope.ok !== false ||
+      invalid.envelope.error?.code !== "invalid-request" ||
+      invalid.envelope.error?.message !== "invalid JSON request"
+    ) {
+      errors.push("invalid-request: expected the generated invalid-request failure");
+    } else {
+      checked.push("invalid JSON -> typed invalid-request envelope");
     }
-    return 1;
+
+    const diagnosticFixture = {
+      id: "schema-fixture",
+      ok: false,
+      error: {
+        code: "diagnostic",
+        message: "graph candidates limit exceeded: requested 16, limit 4",
+        diagnostic: {
+          domain: "vegetation-graph",
+          detail: {
+            category: "limit",
+            resource: "candidates",
+            requested: "16",
+            limit: "4",
+          },
+        },
+      },
+    };
+    validate(envelopeSchema, diagnosticFixture, "diagnostic-fixture", errors);
+    checked.push("structured graph diagnostic -> generated envelope schema");
+
+    const legacyFailureErrors: string[] = [];
+    validate(
+      envelopeSchema,
+      { id: "schema-fixture", ok: false, error: "graph failed" },
+      "string-failure-fixture",
+      legacyFailureErrors,
+    );
+    if (legacyFailureErrors.length === 0) {
+      errors.push("string-failure-fixture: generated envelope accepted the retired string shape");
+    } else {
+      checked.push("string failure shape -> rejected by generated envelope schema");
+    }
+
+    // A run whose host lost the device or reported a wedged submission answered its commands from
+    // a renderer that was already failing, so the results below cannot be trusted.
+    const faults = hostFaults.report();
+    for (const fault of faults) {
+      errors.push(`host GPU fault: ${fault}`);
+    }
+    if (faults.length === 0) {
+      checked.push("host log free of device-loss and hang reports");
+    }
+
+    for (const item of checked) {
+      console.log(`  ok  ${item}`);
+    }
+    if (errors.length) {
+      console.error(`\n${errors.length} contract failure(s):`);
+      for (const error of errors) {
+        console.error(`  FAIL ${error}`);
+      }
+      return 1;
+    }
+    console.log(`\nall ${checked.length} manifest-driven control checks passed`);
+    return 0;
+  } finally {
+    if (proc.exitCode === null && !callTimedOut) {
+      await call("quit").catch(() => {});
+    }
+    if (proc.exitCode === null) {
+      proc.kill("SIGTERM");
+    }
+    await proc.exited;
+    await Promise.all(logDrains);
   }
-  console.log(`\nall ${checked.length} manifest-driven control checks passed`);
-  return 0;
+}
+
+async function main(): Promise<number> {
+  const ownsAppData = process.env.SAFFRON_APPDATA_DIR === undefined;
+  try {
+    appDataPath =
+      process.env.SAFFRON_APPDATA_DIR ?? mkdtempSync(join(tmpdir(), "saffron-contract-appdata."));
+    fixturesPath = mkdtempSync(join(tmpdir(), "saffron-contract-fixtures."));
+    modelFixturePath = join(fixturesPath, "contract-triangle.obj");
+    return await runContract();
+  } finally {
+    if (fixturesPath) {
+      rmSync(fixturesPath, { recursive: true, force: true });
+    }
+    if (ownsAppData && appDataPath) {
+      rmSync(appDataPath, { recursive: true, force: true });
+    }
+  }
 }
 
 main()
   .then((code) => process.exit(code))
   .catch((err) => {
-    console.error(err);
+    const message = err instanceof Error ? (err.stack ?? err.message) : String(err);
+    console.error(withHostLog(message, hostLog, HOST_LOG_TAIL));
     process.exit(2);
   });

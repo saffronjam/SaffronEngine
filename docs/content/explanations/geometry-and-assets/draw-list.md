@@ -1,172 +1,158 @@
 +++
-title = 'Draw list'
+title = 'Executor draws'
 weight = 8
 math = true
 +++
 
-# Draw list
+# Executor draws
 
-A draw list is a flat snapshot of everything the scene wants drawn this frame, gathered once
-from the ECS into plain data and then replayed by every geometry pass. It sits between the
-scene description and the Vulkan commands: the world is walked one time into a list of items,
-and the [render graph](../../frame-and-render-graph/render-graph-overview/) passes consume
-that list instead of querying the live scene.
+Every geometry pass draws from the [persistent GPU scene](../../frame-and-render-graph/persistent-gpu-scene/):
+the visibility traversal emits a per-view stream of semantic draw records on the GPU, binning
+kernels scatter them into indirect-command slices, and each pass replays those commands with
+counted indirect draws. The CPU never builds a per-frame list of things to draw — render
+preparation scales with scene *changes*, not with visible-instance count.
 
 A frame draws the same geometry several times: shaded color, depth, shadows, G-buffer, motion
-vectors. Decoupling the gather from the record keeps the scene traversal in one place, and
-each pass reads the one prepared list.
+vectors. All of them consume the one record stream the traversal produced for the view.
 
-## Gather: ECS into DrawItem
+## Records: the semantic draw vocabulary
 
-`render_scene` walks the `hecs` world in two sweeps. `gather_static_draw_list` visits every
-entity with a `Transform` and a `MeshComponent`, resolves the mesh through the
-[asset server](../asset-server-and-catalog/) (`load_mesh_asset`) and its materials through
-`resolve_entity_materials`, and pushes one `DrawItem`. `gather_skinned_draw_list` does the
-same for `SkinnedMesh` entities, concatenating each one's joint palette into the frame's
-joint array.
+The [visibility chain](../../frame-and-render-graph/hierarchical-visibility/) culls instances
+against the previous frame's HZB, then traverses each survivor's resident page hierarchy by
+projected appearance error. Every emitted `GpuDrawRecord` names one drawable cut:
 
-```rust
-pub struct DrawItem {
-    pub mesh: Arc<GpuMesh>,
-    pub model: Mat4,
-    pub normal_matrix: Mat4,
-    pub submesh_materials: Vec<SubmeshMaterial>, // one per submesh (clamped)
-    pub material: Material,      // the PSO base: shader + unlit
-    pub skinned: bool,
-    pub joint_offset: u32,       // this instance's slice of the joint palette
-    pub joint_count: u32,
-    pub morph_weights: Vec<f32>, // empty = not a morph draw
-    pub entity: u64,             // keys the cross-frame motion caches
-}
+```text
+(geometry, instance, part, representation, material, deformation, psoBin, shaderIndex)
 ```
 
-`SubmeshMaterial` is the fully resolved surface for one submesh: texture handles (each `None`
-falls back to the default white slot), PBR factors, UV tiling and offset, the blend mode, and
-the height mode. `resolve_entity_materials` builds one per mesh submesh from the entity's
-`MaterialSet`: each submesh's `material_slot` picks a slot (clamped to the slot count), and
-each slot loads its referenced `.smat` asset with the slot's sparse overrides layered on top.
-The whole-mesh `unlit` flag and the codegen shader follow slot 0; an entity with no
-`MaterialSet` resolves to engine defaults.
+The record carries everything a draw needs to reconstruct itself on the GPU: the instance's
+transform (via the instance table), the material's parameter block and textures (via the
+material table), and the cluster or voxel-surface index range (via the resident page).
 
-The static sweep also accumulates the world-space scene bounds by transforming each mesh's
-local AABB by its model matrix; the
-[directional shadow](../../shadows-and-culling/directional-shadows/) frustum is fit to that
-box. `render_scene` then collects lights and camera state and hands the items plus the joint
-palette to the renderer's `submit_draw_list`, a `SceneRenderer` trait method.
+## Buckets: records into indirect commands
 
-## Bucket: DrawItem into instanced batches
+The CPU enumerates the frame's *draw buckets* — the live `(shaderIndex, psoBin)` combos the
+[GPU-scene mirror](../../frame-and-render-graph/persistent-gpu-scene/) reports — and
+partitions the command buffer into equal per-bucket slices (`build_executor_buckets`,
+`SceneBucketTable`). The binning kernels count each record's bucket, seed per-bucket cursors,
+and scatter one `VkDrawIndexedIndirectCommand` per record into its bucket's slice. A record's
+command indexes the global pages arena (the executor's index buffer) with `firstInstance`
+carrying the record index.
 
-`Instancing::submit_draw_list` merges items into buckets keyed on the mesh, the shader, the
-unlit flag, and the per-submesh blend pattern. The key omits every texture: albedo and the
-other maps are [bindless](../../materials-and-pipelines/bindless-textures/) indices carried
-in the per-instance data, so two items that differ only by texture batch together. A skinned,
-morph-active, displaced, or translucent-carrying item never merges — it keeps its own
-deformed-buffer slice or depth-sort key.
+Each pass then issues one `vkCmdDrawIndexedIndirectCount` per bucket over its slice, with the
+per-bucket count buffer supplying the draw count. The scene pass binds one mesh PSO per
+bucket (the bucket's material class + registered shader decode to the PSO request). The depth
+family (depth prepass, the virtual-shadow pages, G-buffer, motion) uses one
+vertex-only executor PSO per pass for every opaque/masked bucket.
 
-Each item expands to one `InstanceData` row per submesh: model matrix, normal matrix,
-previous model, base color, bindless texture indices, and an index into the frame's
-deduplicated material table, packed to a 256-byte
-[std430](https://docs.vulkan.org/guide/latest/shader_memory_layout.html) row. The rows
-flatten *submesh-major*: a bucket of $N$ instances over a mesh with $S$ submeshes stores
-submesh 0's $N$ rows, then submesh 1's $N$ rows, and so on.
+## Vertex pulling
 
-Drawing submesh $s$ then offsets `firstInstance` by $s \times N$
-(`base_instance + s * instance_count` in `record_batch_submeshes`). Vulkan's instance index
-[includes `firstInstance`](https://docs.vulkan.org/spec/latest/chapters/drawing.html), so the
-[übershader](../../materials-and-pipelines/ubershader-and-specialization/) reads each
-instance's per-submesh material straight from the instance buffer with no per-submesh
-descriptor or PSO change.
-
-The PSO is resolved per submesh from the bucket's base material plus that submesh's blend
-mode, and submeshes sharing a PSO group into one `DrawBatch` (see
-[materials & PSOs](../../materials-and-pipelines/material-and-pso-selection/)). Opaque and
-masked groups land in `batches`; translucent ones become lone-instance batches in
-`transparent_batches`, sorted back-to-front by clip-space $w$. Every batch from the same mesh
-reads the one shared submesh-major instance block.
-
-```rust
-pub struct SceneDrawList {
-    pub view_proj: Mat4,
-    pub batches: Vec<DrawBatch>,             // opaque + masked, first-seen order
-    pub transparent_batches: Vec<DrawBatch>, // back-to-front translucent draws
-    pub skin_dispatches: Vec<SkinDispatch>,  // + morph/displace + prev-pose lists
-    pub deformed_rt_instances: Vec<DeformedRtInstance>,
-    pub live_textures: Vec<Arc<GpuTexture>>, // pins indexed textures for the frame
-    pub valid: bool,
-}
-```
-
-`live_textures` holds an `Arc` to every texture an instance row indexed, so a texture cannot
-be freed mid-frame while a bindless slot still points at it. A deforming item
-([skinned](../../frame-and-render-graph/compute-skinning/), morph-active, or
-[displaced](../../frame-and-render-graph/compute-displacement/)) is written once by its
-compute pre-pass into a slice of the frame's deformed-vertex buffer, then drawn as a static
-instance reading that slice.
-
-## Replay: one list, many passes
-
-A single `SceneDrawList` feeds every geometry pass in the frame, each recording the same
-batches with a different pipeline and push constant:
+The übershader's `vertexMainExecutor` entry runs with no vertex input state:
+`SV_VulkanVertexID` is the pulled index value plus the command's `vertexOffset`,
+`SV_VulkanInstanceID` is the record index. Both semantics are the Vulkan-flavoured ones on
+purpose — Slang's `SV_VertexID`/`SV_InstanceID` follow D3D and subtract the draw's base
+values back out, which for a displaced row would discard its slice base in the amplification
+arena. The vertex loads its record, resolves the instance transform and material through the
+[address block](../../frame-and-render-graph/persistent-gpu-scene/), and pulls positions
+through buffer device addresses — the static vertex arena for a rigid instance, the
+per-frame deformed buffer for a [skinned or morphing](../../frame-and-render-graph/compute-skinning/)
+one. The emitted interface matches the instanced vertex path exactly, so every fragment
+shades identically.
 
 ```mermaid
 flowchart TD
-    A[render_scene gathers DrawItems] --> B[submit_draw_list buckets + stores SceneDrawList]
-    B --> C[record_scene_draw_list — shaded opaque + masked]
-    B --> D[record_transparent_draw_list — sorted translucent]
-    B --> E[record_depth_prepass — depth only]
-    B --> F[record_shadow_depth — light-space depth]
-    B --> G[record_gbuffer — view normal + Z]
-    B --> H[record_motion — motion vectors]
-    B --> I[record_point_shadow — cube faces]
+    A[cull — previous-HZB occlusion] --> B[traversal — GpuDrawRecord stream]
+    B --> C[binning — per-bucket indirect commands]
+    C --> D[scene — per-bucket mesh PSOs]
+    C --> E[depth family — one PSO per pass]
+    B --> F[transparent sort — keys, radix, reorder]
+    F --> G[translucent scope — per-blend-bucket slices]
 ```
 
-The shaded pass `record_scene_draw_list` binds the bindless, light, instance, IBL, and
-screen-space descriptor sets once, pushes the camera `view_proj`, then per batch binds its
-PSO and vertex streams; the bind count is constant in the batch count. The shared
-`record_batch_submeshes` helper issues one `cmd_draw_indexed` per submesh with the batch's
-instance count and the submesh-major `firstInstance` offset. In the scene pass it also
-applies each submesh's backface-cull mode (two-sided disables culling) through dynamic state.
+## Transparency
 
-`record_transparent_draw_list` replays the sorted translucent batches in the scene pass's
-trailing scope with the blend PSO: depth-test on, depth-write off, nearer surfaces
-compositing over farther ones. The depth, shadow, G-buffer, motion, and point-shadow passes
-are vertex-only variants of the same loop that bind only the instance set and push their own
-matrix. All of them replay `batches` only — translucent draws write no depth.
+Alpha-blended records sort on the GPU: a keys kernel collects `(key, record)` pairs, a
+stable LSD radix sort orders them, and a reorder kernel writes one full-length
+back-to-front command slice per live blend bucket — a pair belonging to another bucket
+masks to a zero draw, so each blend PSO replays the whole global order. The scene's
+translucent scope draws each slice with its bucket's blend PSO (depth-test on, depth-write
+off), counted by the transparent counter word.
+
+The sorted slices live in the same command arena as the binner's bucket slices, past them,
+and carry both executors' arguments at every slot exactly as the scatter writes them: the
+indexed command and the mesh-task dispatch covering the same draw. One arena and one
+`sliceBase` push therefore serve both scopes, so the translucent scope reaches the sorted cut
+through whichever stage the frame's [executor](../../frame-and-render-graph/hierarchical-visibility/)
+is — the alternative, a stream only one executor can consume, would make transparency the one
+raster family that silently changes shape with the device.
+
+The sort key is lexicographic over four words — cluster, page, instance slot, flipped
+view-space depth — run least significant first, four 8-bit radix passes each, with the keys
+kernel rewriting the pair's key word between levels. Depth alone is not a total order: an
+instance's records all carry its origin depth, and two instances can share one exactly.
+Ordering those ties by the record's own identity is what makes the emitted order a function
+of the record set instead of a function of the order the traversal's atomic append happened
+to produce, so a record entering or leaving the stream never reshuffles the rest and equal
+keys hold their relative order from frame to frame.
+
+## Deformation and displacement
+
+The scene driver's per-frame job is the frame's ray instances and one `DeformationWork` item
+per skinned, morphing, or displaced instance. Neither costs a scene walk. Every per-instance
+fact — world bounds, the opacity class its materials resolve to, the displacement they select
+— is derived by the [GPU-scene mirror](../../frame-and-render-graph/persistent-gpu-scene/)
+when the journal last touched that entity, and the mirror hands the driver its cached ray cut
+whole while nothing has moved and the reach window has not stepped. What is resolved live is
+what no journal covers: joint palettes and morph weights, whose ECS queries visit only the
+entities carrying them. The driver submits the work and the concatenated joint palette through
+`Renderer::submit_gpu_scene_deformations`, which wires the skin/morph compute dispatches; the
+deformed outputs are pulled by the executor vertex path.
+
+A displaced (`HeightMode::Displacement`) instance owns a row in the frame's amplification
+arena. The traversal emits one record naming that row instead of walking the instance's base
+hierarchy, and the binner turns it into a counted-indirect command from the row's draw seed —
+the same binned cut and the same draw call shape as every other representation (see
+[displacement](../../frame-and-render-graph/compute-displacement/)).
 
 ## Stats
 
-`submit_draw_list` tallies `RenderStats` while flattening: draw calls (one `cmd_draw_indexed`
-per submesh per batch), distinct batches, total instances, and triangles. The control plane
-exposes the counters, so instanced batching is checkable live — two cubes with different
-textures collapse to one batch:
+The frame's counters derive from the visibility readback: `drawCalls` is the emitted record
+count, `instances` the cull survivors, `triangles` the traversal's per-record index counts
+over three, `batches` the live bucket count. Two more report what preparation cost:
+`instanceUploadBytes` is the GPU-scene table bytes staged this frame, and
+`sceneGatherEntities` the instances the driver visited. Both read zero on a steady
+scene of any size, which is the measurable form of "preparation scales with changes":
 
 ```sh
 sa render-stats
-# { "drawCalls": 1, "batches": 1, "instances": 2, "triangles": 24, ... }
+# { "drawCalls": 12, "batches": 2, "instances": 2, "triangles": 24,
+#   "instanceUploadBytes": 0, "sceneGatherEntities": 0, ... }
 ```
 
 ## In the code
 
 | What | File | Symbols |
 |---|---|---|
-| Gather ECS → items | `assets/src/render_scene.rs` | `render_scene`, `gather_static_draw_list`, `gather_skinned_draw_list` |
-| Resolve materials | `assets/src/render_material.rs` | `resolve_entity_materials`, `ResolvedMaterials`, `build_submesh_material` |
-| Item + list types | `rendering/src/draw_list.rs` | `DrawItem`, `SubmeshMaterial`, `DrawBatch`, `SceneDrawList`, `RenderStats` |
-| Bucket + flatten + stats | `rendering/src/instancing.rs` | `Instancing::submit_draw_list`, `build_instance_rows`, `compute_stats` |
-| Per-instance row | `rendering/src/gpu_types.rs` | `InstanceData` |
-| Shaded + translucent replay | `rendering/src/scene_pass.rs` | `record_scene_draw_list`, `record_transparent_draw_list`, `record_batch_submeshes` |
-| Vertex-only replays | `rendering/src/scene_pass.rs`; `rendering/src/aa.rs` | `record_depth_prepass`, `record_shadow_depth`, `record_gbuffer`, `record_point_shadow`, `record_motion` |
+| Frame facts + deformation work | `assets/src/render_scene/{frame,gather}.rs` | `render_scene`, `gather_static_frame_facts`, `gather_skinned_frame_facts` |
+| Cached per-instance facts + ray cut | `assets/src/gpu_scene_mirror/{facts,resolve}.rs` | `InstanceFacts`, `ray_instances`, `mirrored_instance`, `displaced_static_entities` |
+| Buckets + visibility lists | `rendering/src/visibility.rs` | `build_executor_buckets`, `ExecutorBucket`, `SceneVisibilityView`, `ExecutorDrawInputs` |
+| Pass recorders | `rendering/src/scene_pass.rs` | `record_executor_buckets`, `record_executor_depth_family`, `record_executor_transparent_stream`, `bucket_index_buffer` |
+| Displacement arena | `rendering/src/tessellation.rs`; `rendering/src/renderer/tessellation_prep.rs` | `DisplacedFrameAddresses`, `DisplacedRow`, `access_displaced_arena` |
+| Deformation driver | `rendering/src/renderer.rs`; `rendering/src/instancing.rs` | `submit_gpu_scene_deformations`, `DeformationWork`, `gather_instance_deformation` |
+| Executor vertex path | `assets/shaders/mesh.slang` | `vertexMainExecutor` |
+| Binning + sort kernels | `assets/shaders/` | `scene_bin_count/seed/scatter.slang`, `scene_transparent_keys.slang`, `scene_transparent_reorder.slang` |
 
 > [!NOTE]
-> The shader and the unlit flag are per item (they follow `MaterialSet` slot 0), so one mesh
+> The shader and the unlit flag follow `MaterialSet` slot 0 for the whole mesh, so one mesh
 > cannot mix lit and unlit submeshes. Blend mode, textures, and every PBR factor vary freely
-> per submesh.
+> per submesh through the material table.
 
 ## Related
 
-- [Asset catalog](../asset-server-and-catalog/) — resolves each item's mesh + textures
-- [Bindless textures](../../materials-and-pipelines/bindless-textures/) — why textures never split a batch
-- [Materials & PSOs](../../materials-and-pipelines/material-and-pso-selection/) — the per-submesh PSO resolution
-- [Compute skinning](../../frame-and-render-graph/compute-skinning/) — how a deforming item is drawn
-- [Render graph](../../frame-and-render-graph/render-graph-overview/) — the passes that replay the list
-- [Render commands](../../tooling-and-control/render-commands/) — reading the batch/draw stats live
+- [Persistent GPU scene](../../frame-and-render-graph/persistent-gpu-scene/) — the tables the records resolve through
+- [Hierarchical visibility](../../frame-and-render-graph/hierarchical-visibility/) — the cull + traversal that emits the records
+- [Bindless textures](../../materials-and-pipelines/bindless-textures/) — why textures never split a bucket
+- [Materials & PSOs](../../materials-and-pipelines/material-and-pso-selection/) — the bucket → PSO resolution
+- [Compute skinning](../../frame-and-render-graph/compute-skinning/) — how a deforming instance is drawn
+- [Render graph](../../frame-and-render-graph/render-graph-overview/) — the passes that replay the commands
+- [Render commands](../../tooling-and-control/render-commands/) — reading the draw stats live

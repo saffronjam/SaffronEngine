@@ -3,11 +3,17 @@
 use schemars::JsonSchema;
 use serde_json::{Map, Value, json};
 
+/// A standalone JSON Schema document for wire type `T`, including its local definitions.
+#[must_use]
+pub fn standalone_schema_for<T: JsonSchema>() -> Value {
+    serde_json::to_value(schemars::schema_for!(T))
+        .expect("schemars schema serializes to a JSON value")
+}
+
 /// The wire field names of DTO `T` in declaration order.
 #[must_use]
 pub fn positional_field_order<T: JsonSchema>() -> Vec<String> {
-    let raw = serde_json::to_value(schemars::schema_for!(T))
-        .expect("schemars schema serializes to a JSON value");
+    let raw = standalone_schema_for::<T>();
     raw.get("properties")
         .and_then(Value::as_object)
         .map(|properties| properties.keys().cloned().collect())
@@ -17,8 +23,7 @@ pub fn positional_field_order<T: JsonSchema>() -> Vec<String> {
 /// The OpenRPC JSON Schema fragment for wire type `T`.
 #[must_use]
 pub fn fragment_for<T: JsonSchema>(type_name: &str) -> Value {
-    let raw = serde_json::to_value(schemars::schema_for!(T))
-        .expect("schemars schema serializes to a JSON value");
+    let raw = standalone_schema_for::<T>();
     let defs = raw.get("$defs").and_then(Value::as_object).cloned();
 
     if let Some(properties) = raw.get("properties").and_then(Value::as_object) {

@@ -106,12 +106,12 @@ GPU-runtime test dispatches a known light and compares its target cluster with t
 | What | File | Symbols |
 |---|---|---|
 | Cull kernel | `engine/assets/shaders/light_cull.slang` | `computeMain`, `screenToView`, `rayToZ` |
-| Grid + cap constants | `engine/crates/rendering/src/lighting.rs` | `CLUSTER_GRID_X`/`_Y`/`_Z`, `CLUSTER_COUNT`, `MAX_LIGHTS_PER_CLUSTER` |
-| CPU mirror of the cull | `engine/crates/rendering/src/lighting.rs` | `cluster_aabb`, `light_intersects_cluster`, `cull_clusters_cpu` |
-| Cluster params upload | `engine/crates/rendering/src/lighting.rs` | `Lighting::set_cluster_camera`, `ClusterParams`, `take_cluster_dispatch_pending` |
-| Pass scheduling | `engine/crates/rendering/src/renderer.rs` | `Renderer::record_scene_graph` — the `light-cull` `RgPass::compute` |
+| Grid + cap constants | `engine/crates/rendering/src/lighting/` | `CLUSTER_GRID_X`/`_Y`/`_Z`, `CLUSTER_COUNT`, `MAX_LIGHTS_PER_CLUSTER` |
+| CPU mirror of the cull | `engine/crates/rendering/src/lighting/` | `cluster_aabb`, `light_intersects_cluster`, `cull_clusters_cpu` |
+| Cluster params upload | `engine/crates/rendering/src/lighting/` | `Lighting::set_cluster_camera`, `ClusterParams`, `take_cluster_dispatch_pending` |
+| Pass scheduling | `engine/crates/rendering/src/renderer/` | `Renderer::record_scene_graph` — the `light-cull` `RgPass::compute` |
 | Fragment-side loop | `engine/assets/shaders/lighting.slang` | `evalLighting` — `clusterParams.screenSize.z` branch |
-| Runtime control | `engine/crates/control/src/commands_render.rs` | `set-clustered` |
+| Runtime control | `engine/crates/control/src/commands_render/` | `set-clustered` |
 
 > [!NOTE]
 > Grid dimensions and `MAX_LIGHTS_PER_CLUSTER` are duplicated across Rust and shader sources. The

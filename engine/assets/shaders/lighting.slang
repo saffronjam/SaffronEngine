@@ -1,39 +1,13 @@
 module lighting;
 
 import lighting_common;
+import global_gpu_data;
 import sdf;
 import giprobe;
+__exported import coverage;
+__exported import material_params;
 import sky_sh;
-
-// Instanced mesh shader. Vertex inputs come from an interleaved buffer
-// (position/normal/uv0); per-instance model + normal matrix + base color come from
-// a storage buffer (set 2) indexed by the absolute Vulkan InstanceIndex
-// (firstInstance + instance). SV_VulkanInstanceID is that builtin — plain
-// SV_InstanceID is base-relative (excludes firstInstance), which would break batching.
-// The push constant is the camera viewProj. Set 0 is albedo; set 1 is the lighting set:
-// directional UBO (0), punctual light list (1), per-cluster light lists (2), cluster
-// params UBO (3). Punctual lights are clustered-forward: the fragment loops only its
-// froxel cluster's lights (params.screenSize.z != 0), or every light otherwise.
-
-public struct VertexInput
-{
-    [[vk::location(0)]] public float3 position;
-    [[vk::location(1)]] public float3 normal;
-    [[vk::location(2)]] public float2 uv0;
-};
-
-// The skinned vertex layout: the base stream plus a second binding carrying the joint
-// indices + blend weights (the skinned PSO's vertexMainSkinned consumes it; the base
-// VertexInput and unskinned PSOs are untouched).
-public struct SkinnedVertexInput
-{
-    [[vk::location(0)]] public float3 position;
-    [[vk::location(1)]] public float3 normal;
-    [[vk::location(2)]] public float2 uv0;
-    // Location 3 (binding 0) is the base tangent; the skin stream (binding 1) picks up at 4/5.
-    [[vk::location(4)]] public uint4 joints;
-    [[vk::location(5)]] public float4 weights;
-};
+import thin_sheet;
 
 public struct VertexOutput
 {
@@ -41,23 +15,32 @@ public struct VertexOutput
     public float3 worldPos : POSITION0;
     public float3 worldNormal : NORMAL;
     public float2 uv0 : TEXCOORD0;
-    public nointerpolation uint materialIndex : TEXCOORD1;  // index into materialParams (set 2, binding 2)
+    public float3 coverageAnchor : TEXCOORD1;
+    public nointerpolation uint materialIndex : TEXCOORD2;
+    /// The record's representation-crossfade word (zero outside a transition).
+    public nointerpolation uint transition : TEXCOORD3;
+    /// The emitting draw record's index in the frame's semantic record stream. The selection
+    /// pass reads the record back through it; every other fragment entry ignores it.
+    public nointerpolation uint recordIndex : TEXCOORD4;
 };
 
 struct Camera
 {
     float4x4 viewProj;
+    /// The bucket's command-slice base, which the mesh executor's `SV_DrawIndex` is relative to.
+    uint sliceBase;
 };
 [[vk::push_constant]] Camera camera;
 
-// Bindless: one global albedo array (set 0) indexed per-instance. Partially bound +
-// update-after-bind on the C++ side; sampled with NonUniformResourceIndex. The size
-// matches MaxBindlessTextures in renderer.cppm (a bounded array, not a runtime one).
-[[vk::binding(0, 0)]] public Sampler2D albedoTextures[1024];
+/// The bucket's command-slice base for the mesh executor.
+public uint executorSliceBase()
+{
+    return camera.sliceBase;
+}
 
-// The bindless per-mesh SDF array (set 0, binding 1) is declared by the shared `sdf` module
-// (linked above); the specular reflection-occlusion cone trace below indexes it through that
-// module's `sdfReflectionOcclusion`.
+// Partially bound + update-after-bind; sampled with NonUniformResourceIndex. Bounded, not a
+// runtime array — the length matches the renderer's bindless texture capacity.
+[[vk::binding(0, 0)]] public Sampler2D albedoTextures[1024];
 
 [[vk::binding(0, 1)]] ConstantBuffer<LightGlobals> globals;
 
@@ -67,127 +50,75 @@ struct Camera
 
 [[vk::binding(3, 1)]] ConstantBuffer<ClusterParams> clusterParams;
 
-// Directional + spot shadow maps: depth textures sampled with a comparison (PCF) sampler.
-[[vk::binding(4, 1)]] Sampler2DShadow shadowMap;
-[[vk::binding(5, 1)]] Sampler2DShadow spotShadowMap;
-// Point shadow: two omnidirectional cubes of world distance-to-light (linear sampler) — a cached
-// STATIC cube (non-deformed casters) and a per-frame DYNAMIC cube (skinned / morph casters). The
-// nearest occluder is the min of the two, so a moving character composites over the cached
-// environment without re-rendering it.
-[[vk::binding(6, 1)]] SamplerCube pointShadowMap;
-[[vk::binding(7, 1)]] SamplerCube pointShadowMapDynamic;
-
-// The froxel volumetric-fog integration volume (binding 11): the integrated `(inScatter,
-// transmittance)` grid the fog composite writes. The forward transparent path samples it at the
-// fragment's `(screenUV, W)` — the same mapping `height_fog.slang` inverts — so translucent surfaces
-// receive the same volumetric fog the composite applies to opaque geometry. Bindings 8/9/10 are the
-// SDF-occluder list + GDF clipmap (declared by the `sdf` module).
+// The integrated `(inScatter, transmittance)` froxel grid, addressed by `(screenUV, W)` — the
+// same exponential-Z mapping `height_fog.slang` inverts. Bindings 8/9/10 are the SDF-occluder
+// list + GDF clipmap, declared by the `sdf` module.
 [[vk::binding(11, 1)]] Sampler3D<float4> froxelIntegration;
 [[vk::binding(12, 1)]] Sampler2DArray<float> cloudShadowMap;
+// The virtual-shadow physical page atlas (immutable compare sampler), reached through the page
+// table in the light UBO.
+[[vk::binding(13, 1)]] Sampler2DShadow vsmAtlas;
 
-// The shared `sdf` module (linked above) also declares the per-mesh SDF-occluder instance list
-// (set 1, binding 8) + the Global-SDF cascade clipmap (bindings 9/10). The fragment reaches only
-// the GDF tap (the reflection-occlusion cone, `gdfDistance`); the instance list is used solely by
-// the DDGI ray trace's near-field sphere-march, so it is dead-stripped from this fragment.
-
-public struct Instance
-{
-    public float4x4 model;
-    public float4x4 normalMatrix;
-    public float4x4 prevModel;  // last frame's world matrix (TAA object-motion reprojection)
-    public float4 baseColor;
-    public uint4 texture;    // x = bindless albedo index
-    public float4 pbr;       // x = metallic, y = roughness
-    public float4 emissive;  // rgb = emissive radiance (strength baked in)
-};
-[[vk::binding(0, 2)]] public StructuredBuffer<Instance> instances;
-// The frame's joint palette (worldBone * inverseBind per joint); a skinned instance
-// indexes it at texture.y + vertex joint index.
-[[vk::binding(1, 2)]] StructuredBuffer<float4x4> jointMatrices;
-
-// Set 2, binding 2: deduplicated per-material params, indexed by Instance.texture.w (the
-// material index). Many instances of one material share one entry; the fragment reads its
-// texture indices + factors from here. Layout mirrors MaterialParamsData (renderer_types.cppm).
-public struct MaterialParams
-{
-    public float4 baseColor;
-    public float4 pbr;       // x = metallic, y = roughness, z = normalStrength, w = alphaCutoff
-    public float4 emissive;  // rgb = radiance, w = heightScale
-    public float4 uv;        // tiling.xy, offset.xy
-    public uint4 tex0;       // albedo, orm/mr, normal, emissive (bindless indices)
-    public uint4 tex1;       // height, reserved, reserved, featureBits
-};
+// Deduplicated per-material params in the frame's global parameter arena, indexed by the
+// resident material record's `parameterIndex`.
 [[vk::binding(2, 2)]] public StructuredBuffer<MaterialParams> materialParams;
 
-// Set 3: image-based lighting — raw-radiance sky SH, prefiltered specular cube, and
-// the split-sum BRDF LUT. Sampled for the ambient term when globals.counts.z != 0.
+// Image-based lighting: raw-radiance sky SH, prefiltered specular cube, split-sum BRDF LUT.
+// Sampled for the ambient term when globals.counts.z != 0.
 [[vk::binding(0, 3)]] StructuredBuffer<float4> skyShCoefficients;
 [[vk::binding(1, 3)]] SamplerCube prefilteredMap;
 [[vk::binding(2, 3)]] Sampler2D brdfLut;
-static const float IblPrefilterMaxMip = 4.0;  // == IblPrefilterMips - 1 (renderer_detail.cppm)
+static const float IblPrefilterMaxMip = 4.0;
 
 // Perceptual roughness → prefiltered-cube mip (Filament `perceptualRoughnessToLod`). The `x*(2-x)`
 // curve matches the GGX lobe size per mip better than a linear `roughness*maxMip`, so near-mirror
-// surfaces stay on the sharp low mips and don't snap to a blurry level.
+// surfaces stay on the sharp low mips.
 float prefilterLod(float roughness)
 {
     return IblPrefilterMaxMip * roughness * (2.0 - roughness);
 }
 
-// Set 4: screen-space maps, all sampled by screen UV. AO (factor, 1 = open) modulates the
+// Screen-space maps, all sampled by screen UV. AO (factor, 1 = open) modulates the
 // indirect/ambient term (counts.w); contact shadows (factor, 1 = lit) darken the
 // directional direct term (screenFlags.x); SSGI (rgba16f radiance) adds one-bounce indirect
 // (screenFlags.y).
 [[vk::binding(0, 4)]] Texture2D<float4> aoMap;
 [[vk::binding(1, 4)]] Texture2D<float4> contactMap;
 [[vk::binding(2, 4)]] Texture2D<float4> ssgiMap;
-// Screen-space reflection map (rgb = reflected radiance, a = hit confidence), blended over
-// the prefiltered-env specular when extraFlags.x != 0.
+// Screen-space reflections: rgb = reflected radiance, a = hit confidence (extraFlags.x).
 [[vk::binding(3, 4)]] Texture2D<float4> ssrMap;
 // Previous frame's lit color, sampled by reprojecting an RT reflection hit (extraFlags.y).
 [[vk::binding(4, 4)]] Texture2D<float4> prevColorMesh;
 // Reduced-resolution, temporally-accumulated DFAO sky-visibility (r = [0,1] factor, 1 = open),
-// produced by the dfao → dfao-blur → dfao-accum prepass. Sampled to occlude the analytic sky
-// irradiance when sdfOcclusion.y != 0 (the diffuse half of the DFAO term; the per-fragment
-// 9-cone GDF march it replaces).
+// occluding the analytic sky irradiance when sdfOcclusion.y != 0.
 [[vk::binding(5, 4)]] Texture2D<float4> dfaoMap;
 // Reduced-resolution, temporally-accumulated specular reflection-occlusion (r = [0,1] factor,
-// 1 = open), produced by the specocc → specocc-blur → specocc-accum prepass. Sampled to occlude
-// the reflected skybox when sdfOcclusion.y != 0 (the specular half of the SDF occlusion term; the
-// per-fragment reflection cone-march it replaces).
+// 1 = open), occluding the reflected skybox when sdfOcclusion.y != 0.
 [[vk::binding(6, 4)]] Texture2D<float4> speoccMap;
-// The half-res screen-space indirect-diffuse resolve (DDGI cage + IBL diffuse × sky-visibility),
-// computed once per half-res pixel by the gi-resolve pass; sampled here (bilinear upsample) instead
-// of resolving the DDGI cage + IBL diffuse per full-res fragment.
+// The half-res indirect-diffuse resolve (DDGI cage + IBL diffuse × sky-visibility), sampled
+// with a bilinear upsample rather than resolved per full-res fragment.
 [[vk::binding(7, 4)]] Texture2D<float4> giIndirectMap;
 [[vk::binding(8, 4)]] SamplerState screenLinearSampler;
 
-// Set 5: DDGI probe atlases (octahedral irradiance + distance moments), passed to the shared
-// `giprobe::ddgiSampleIrradiance` (which declares no bindings of its own) for multi-bounce indirect
-// when screenFlags.z != 0.
+// DDGI probe atlases (octahedral irradiance + distance moments) for multi-bounce indirect when
+// screenFlags.z != 0.
 [[vk::binding(0, 5)]] Sampler2D ddgiIrradiance;
 [[vk::binding(1, 5)]] Sampler2D ddgiDistance;
 
-// Set 7: ReSTIR resolved direct-light radiance (screen UV). Replaces the punctual light
-// loop when screenFlags.w != 0 (multiplied by albedo/PI for the diffuse direct term).
+// ReSTIR resolved direct-light radiance (screen UV), replacing the punctual loop when
+// screenFlags.w != 0.
 //
 // ReSTIR rides the ray-tracing path, so this binding — and every ray-query binding below — is
-// compiled only into the RT variant (`SAFFRON_NO_RT` undefined). A device without ray tracing
-// (its PSO layout omits sets 6/7) loads the RT-off variant, where these declarations are absent
-// so the shader's declared interface matches the layout — MoltenVK requires that match, and the
-// RT branches are runtime-dead there anyway.
+// compiled only into the RT variant. A device without ray tracing loads the RT-off variant, whose
+// PSO layout omits sets 6/7: the declared shader interface must match the layout exactly, which
+// MoltenVK enforces.
 #ifndef SAFFRON_NO_RT
 [[vk::binding(0, 7)]] Sampler2D restirRadiance;
 #endif
 
-// Spatial reflection probes share the IBL set (set 3, bindings 3-5) so the mesh layout stays
-// within the maxBoundDescriptorSets budget. probeCubes[i] is probe i's prefiltered specular
-// cube, probeIrradiance[i] its diffuse irradiance cube; probeMeta carries each probe's
-// origin/radius/box/intensity. The fragment picks the nearest probe whose influence sphere
-// contains the surface and blends its specular over the global IBL by an edge-soft weight.
-// Iterated for the first ProbeMeta.count probes (globals.ambientColor.w); 0 = pure global
-// fallback (byte-identical to no-probe rendering). Every array slot is seeded with the global
-// IBL cubes, so unused slots harmlessly resolve to the global env.
+// Spatial reflection probes share the IBL set so the mesh layout stays within the
+// maxBoundDescriptorSets budget. Every array slot is seeded with the global IBL cubes, so an
+// unused slot resolves to the global environment.
 struct ProbeMeta
 {
     float4 originRadius;     // xyz = world origin, w = influence radius
@@ -199,8 +130,7 @@ struct ProbeMeta
 [[vk::binding(5, 3)]] StructuredBuffer<ProbeMeta> probeMeta;
 
 // Parallax-corrected cubemap: re-project the reflection ray R against the probe's influence
-// box (origin +- extent), returning a sample direction relative to the probe center. Used
-// only when boxProjection is on; the infinite-distance cube uses R directly.
+// box (origin +- extent), returning a sample direction relative to the probe center.
 float3 boxProject(float3 worldPos, float3 R, float3 origin, float3 extent)
 {
     float3 invR = 1.0 / R;
@@ -211,16 +141,12 @@ float3 boxProject(float3 worldPos, float3 R, float3 origin, float3 extent)
     return (worldPos + R * d) - origin;
 }
 
-// Set 6: the ray-tracing TLAS for inline ray-query shadows (pointShadowMeta.z gates it).
-// Present only when the device supports RT — the PSO layout omits set 6 otherwise (its
-// acceleration-structure descriptor needs the RT extension), so the RT-off variant excludes
-// this declaration and the ray-query helpers below.
+// The ray-tracing TLAS for inline ray-query shadows (pointShadowMeta.z gates it).
 #ifndef SAFFRON_NO_RT
 [[vk::binding(0, 6)]] RaytracingAccelerationStructure rtScene;
 
-// Trace one TerminateOnFirstHit shadow ray from worldPos toward `toLight` (a unit dir);
-// returns 1 = lit (no occluder within maxDist), 0 = shadowed. Resource-parameterized: the TLAS is
-// passed in so the mesh forward path and the fog inject pass share one copy.
+/// Traces one TerminateOnFirstHit shadow ray toward `toLight` (a unit dir); 1 = lit, 0 = shadowed.
+/// The TLAS is a parameter so the mesh forward path and the fog inject pass share one copy.
 public float rayQueryShadow(RaytracingAccelerationStructure tlas, float3 worldPos, float3 toLight, float maxDist)
 {
     RayDesc ray;
@@ -230,12 +156,24 @@ public float rayQueryShadow(RaytracingAccelerationStructure tlas, float3 worldPo
     ray.TMax = maxDist;
     RayQuery<RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH | RAY_FLAG_SKIP_PROCEDURAL_PRIMITIVES> q;
     q.TraceRayInline(tlas, RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH | RAY_FLAG_SKIP_PROCEDURAL_PRIMITIVES, 0xFF, ray);
-    q.Proceed();
+    while (q.Proceed())
+    {
+        if (q.CandidateType() == CANDIDATE_NON_OPAQUE_TRIANGLE
+            && gpuSceneRayCandidateCovered(
+                gpuSceneAddresses,
+                albedoTextures,
+                q.CandidateInstanceID(),
+                q.CandidateGeometryIndex(),
+                q.CandidatePrimitiveIndex(),
+                q.CandidateTriangleBarycentrics()))
+        {
+            q.CommitNonOpaqueTriangleHit();
+        }
+    }
     return q.CommittedStatus() == COMMITTED_TRIANGLE_HIT ? 0.0 : 1.0;
 }
 
-// Trace a reflection ray for the closest opaque hit; returns the hit distance (> 0) or -1 on
-// a miss. Used by RT reflections (extraFlags.y) to find the reflected surface even off-screen.
+// Traces a reflection ray for the closest opaque hit; the hit distance (> 0), or -1 on a miss.
 float rayQueryReflection(float3 worldPos, float3 dir, float maxDist)
 {
     RayDesc ray;
@@ -245,13 +183,27 @@ float rayQueryReflection(float3 worldPos, float3 dir, float maxDist)
     ray.TMax = maxDist;
     RayQuery<RAY_FLAG_SKIP_PROCEDURAL_PRIMITIVES> q;
     q.TraceRayInline(rtScene, RAY_FLAG_SKIP_PROCEDURAL_PRIMITIVES, 0xFF, ray);
-    while (q.Proceed()) {}  // opaque triangle candidates auto-commit; loop finds the closest
+    // Opaque candidates auto-commit; a non-opaque one commits only once the canonical classifier
+    // confirms its coverage, so cutout texels stay transparent to rays.
+    while (q.Proceed())
+    {
+        if (q.CandidateType() == CANDIDATE_NON_OPAQUE_TRIANGLE
+            && gpuSceneRayCandidateCovered(
+                gpuSceneAddresses,
+                albedoTextures,
+                q.CandidateInstanceID(),
+                q.CandidateGeometryIndex(),
+                q.CandidatePrimitiveIndex(),
+                q.CandidateTriangleBarycentrics()))
+        {
+            q.CommitNonOpaqueTriangleHit();
+        }
+    }
     return q.CommittedStatus() == COMMITTED_TRIANGLE_HIT ? q.CommittedRayT() : -1.0;
 }
 #endif
 
-/// Builds the shared [`giprobe::DdgiVolume`] from this frame's light globals (the mesh's view of the
-/// camera-centered probe clipmap) for `giprobe::ddgiSampleIrradiance`.
+/// The camera-centered DDGI probe clipmap, as this frame's light globals describe it.
 DdgiVolume ddgiVolumeFromGlobals()
 {
     DdgiVolume v;
@@ -268,51 +220,38 @@ float3 fresnelSchlickRoughness(float cosT, float3 F0, float roughness)
     return F0 + (max(float3(1.0 - roughness), F0) - F0) * pow(1.0 - cosT, 5.0);
 }
 
-// Displacement lives entirely in the `displace` compute pre-pass now: it bakes each displacement
-// material's height offset into the shared deformed vertex buffer, which every geometry pass (this
-// vertex shader included) reads as an ordinary static stream — so a displaced instance is already
-// displaced by the time it reaches here, consistently across the main view, depth, and every shadow
-// map, and the buffer can back an RT BLAS. The vertex shader therefore does no displacement itself.
-public VertexOutput transformVertex(VertexInput input, uint instanceIndex)
+// The executor vertex tail: the persistent-scene instance world transform (cofactor normals, so
+// non-uniform scale stays correct) plus the instance's stored wind sway.
+public VertexOutput transformExecutorVertex(
+    float3 local,
+    float3 localNormal,
+    float2 uv,
+    GpuSceneInstanceGpuRecord instance,
+    float3 windOffset,
+    uint parameterIndex,
+    uint transition)
 {
-    Instance inst = instances[instanceIndex];
+    float4 c0, c1, c2, c3;
+    gpuSceneInstanceColumns(instance, false, c0, c1, c2, c3);
+    float3 world = c0.xyz * local.x + c1.xyz * local.y + c2.xyz * local.z + c3.xyz
+        + windOffset;
+    float3 n0 = cross(c1.xyz, c2.xyz);
+    float3 n1 = cross(c2.xyz, c0.xyz);
+    float3 n2 = cross(c0.xyz, c1.xyz);
+    float3 worldNormal = n0 * localNormal.x + n1 * localNormal.y + n2 * localNormal.z;
+
     VertexOutput output;
-    float4 worldPos = mul(inst.model, float4(input.position, 1.0));
-    output.worldPos = worldPos.xyz;
-    output.position = mul(camera.viewProj, worldPos);
-    output.worldNormal = mul((float3x3)inst.normalMatrix, input.normal);
-    output.uv0 = input.uv0;
-    output.materialIndex = inst.texture.w;
+    output.worldPos = world;
+    output.position = mul(camera.viewProj, float4(world, 1.0));
+    output.worldNormal = worldNormal;
+    output.uv0 = uv;
+    output.coverageAnchor = local;
+    output.materialIndex = parameterIndex;
+    output.transition = transition;
+    output.recordIndex = 0u;
     return output;
 }
 
-// GPU skinning: blend the joint palette (worldBone * inverseBind, world-space) per
-// vertex, then apply inst.model — identity for skinned draws, since per glTF the
-// joints place the vertices entirely and the node transform is ignored.
-public VertexOutput transformVertexSkinned(SkinnedVertexInput input, uint instanceIndex)
-{
-    Instance inst = instances[instanceIndex];
-    uint base = inst.texture.y;  // this instance's offset into the frame's joint palette
-    float4x4 skinMatrix = input.weights.x * jointMatrices[base + input.joints.x]
-                        + input.weights.y * jointMatrices[base + input.joints.y]
-                        + input.weights.z * jointMatrices[base + input.joints.z]
-                        + input.weights.w * jointMatrices[base + input.joints.w];
-    float4 skinnedPos = mul(skinMatrix, float4(input.position, 1.0));
-    float3 skinnedNormal = mul((float3x3)skinMatrix, input.normal);
-
-    VertexOutput output;
-    float4 worldPos = mul(inst.model, skinnedPos);
-    output.worldPos = worldPos.xyz;
-    output.position = mul(camera.viewProj, worldPos);
-    output.worldNormal = normalize(mul((float3x3)inst.normalMatrix, skinnedNormal));
-    output.uv0 = input.uv0;
-    output.materialIndex = inst.texture.w;
-    return output;
-}
-
-// Cook-Torrance metallic/roughness BRDF (energy-conserving). `radiance` is the
-// incoming light's color * intensity * attenuation * cone; the cosine + diffuse/PI
-// are applied here. Shared by the directional and the punctual lights.
 static const float PI = 3.14159265;
 
 float3 fresnelSchlick(float cosT, float3 F0)
@@ -335,6 +274,8 @@ float visibilitySmithGGX(float ndotv, float ndotl, float a)  // height-correlate
     return 0.5 / max(v + l, 1e-5);
 }
 
+// Cook-Torrance metallic/roughness BRDF. `radiance` is the incoming light's
+// color * intensity * attenuation * cone; the cosine and diffuse/PI are applied here.
 float3 brdf(float3 n, float3 v, float3 l, float3 albedo, float metallic, float roughness, float3 radiance)
 {
     float3 h = normalize(v + l);
@@ -347,9 +288,8 @@ float3 brdf(float3 n, float3 v, float3 l, float3 albedo, float metallic, float r
     float D = distributionGGX(ndoth, a);
     float Vis = visibilitySmithGGX(ndotv, ndotl, a);
     float3 spec = D * Vis * F;
-    // Multi-scatter energy compensation (matches the IBL specular path): scale single-scatter GGX
-    // back toward unity using the single-scatter directional albedo Ess = ab.x + ab.y (≈1 at low
-    // roughness, so no boost on smooth metals; < 1 at high roughness).
+    // Multi-scatter energy compensation: scale single-scatter GGX back toward unity by the
+    // single-scatter directional albedo Ess = ab.x + ab.y (≈1 at low roughness, < 1 at high).
     float2 lutAb = brdfLut.SampleLevel(float2(ndotv, roughness), 0.0).rg;
     spec *= 1.0 + F0 * (1.0 / max(lutAb.x + lutAb.y, 1e-3) - 1.0);
     float3 kd = (1.0 - F) * (1.0 - metallic);
@@ -357,10 +297,76 @@ float3 brdf(float3 n, float3 v, float3 l, float3 albedo, float metallic, float r
     return (diff + spec) * radiance * ndotl;
 }
 
-// One punctual light's Cook-Torrance contribution at a world-space surface point.
-// `lightIndex` lets the shadowed spot light apply its shadow-map visibility.
+// The material seam: what `evalSurface` — the fixed glTF metallic-roughness body, or node-graph
+// codegen — hands the shared lighting below.
+public struct SurfaceData
+{
+    public float3 albedo;
+    public float metallic;
+    public float roughness;
+    public float3 normal;     // world-space, normalized
+    public float3 sheetNormal; // authored front-facing sheet normal
+    public float3 emissive;
+    public float occlusion;   // 1.0 = none; multiplies the ambient term
+    public float opacity;
+    public uint surfaceModel; // 0 standard, 1 thin sheet
+    public float frontFace;   // 1 front, 0 back
+    public float frontResponse;
+    public float backResponse;
+    public float thickness;
+    public float3 absorption;
+    public float3 transmission;
+    public float energyLimit;
+};
+
+ThinSheetEnergyPartition thinSheetPartition(SurfaceData surface, bool incidentFront, float cosine)
+{
+    float response = incidentFront ? surface.frontResponse : surface.backResponse;
+    return thinSheetEnergyPartition(
+        response,
+        surface.thickness,
+        surface.absorption,
+        surface.transmission,
+        surface.energyLimit,
+        cosine);
+}
+
+float3 surfaceDirect(
+    SurfaceData surface,
+    float3 n,
+    float3 v,
+    float3 l,
+    float3 radiance)
+{
+    if (surface.surfaceModel == 0u)
+    {
+        return brdf(n, v, l, surface.albedo, surface.metallic, surface.roughness, radiance);
+    }
+    float3 sheetNormal = normalize(surface.sheetNormal);
+    float viewCosine = dot(sheetNormal, v);
+    float lightCosine = dot(sheetNormal, l);
+    bool viewFront = viewCosine >= 0.0;
+    bool lightFront = lightCosine >= 0.0;
+    ThinSheetEnergyPartition partition =
+        thinSheetPartition(surface, lightFront, abs(lightCosine));
+    if (viewFront == lightFront)
+    {
+        return brdf(
+            n,
+            v,
+            l,
+            surface.albedo,
+            0.0,
+            surface.roughness,
+            radiance) * partition.reflection;
+    }
+    return partition.transmission * radiance * abs(lightCosine) / PI;
+}
+
+// One punctual light's contribution at a world-space surface point. `lightIndex` lets the
+// shadowed spot light apply its shadow-map visibility.
 float3 punctual(GpuLight lt, uint lightIndex, float3 worldPos, float3 n, float3 v,
-                float3 albedo, float metallic, float roughness)
+                SurfaceData surface)
 {
     float3 toLight = lt.positionRange.xyz - worldPos;
     float dist = length(toLight);
@@ -373,8 +379,8 @@ float3 punctual(GpuLight lt, uint lightIndex, float3 worldPos, float3 n, float3 
 
     float cone = 1.0;
     float shadow = 1.0;
-    // Ray-traced punctual shadow (one ray toward the light) when RT shadows are on — applies
-    // to every punctual light, vs the map paths that shadow only one spot + one point light.
+    // The ray-traced path shadows every punctual light; the map paths below shadow only the one
+    // spot and the one point light that own a shadow allocation.
 #ifndef SAFFRON_NO_RT
     if (globals.pointShadowMeta.z != 0)
     {
@@ -388,56 +394,26 @@ float3 punctual(GpuLight lt, uint lightIndex, float3 worldPos, float3 n, float3 
         cone = smoothstep(lt.spotCos.y, lt.spotCos.x, cosAngle);
         if (globals.pointShadowMeta.z == 0 && globals.spotShadow.y != 0 && lightIndex == globals.spotShadow.x)
         {
-            shadow = pcfShadow(spotShadowMap, globals.spotShadowViewProj, worldPos);
+            shadow = vsmSampleSpot(worldPos, globals, vsmAtlas);
         }
     }
     else if (globals.pointShadowMeta.z == 0 && globals.pointShadowMeta.y != 0 && lightIndex == globals.pointShadowMeta.x)
     {
-        shadow = pointShadow(pointShadowMap, pointShadowMapDynamic, globals.pointShadow.xyz, worldPos);
+        shadow = vsmSamplePoint(worldPos, globals, vsmAtlas);
     }
     float3 radiance = lt.colorIntensity.rgb * lt.colorIntensity.a * attenuation * cone * shadow;
-    return brdf(n, v, l, albedo, metallic, roughness, radiance);
+    return surfaceDirect(surface, n, v, l, radiance);
 }
-
-// The material seam: evalSurface turns interpolated vertex data + bound textures into the
-// surface inputs the lighting consumes. Its body is the fixed glTF metallic-roughness path,
-// or node-graph codegen; the lighting below it is shared across material variants.
-public struct SurfaceData
-{
-    public float3 albedo;
-    public float metallic;
-    public float roughness;
-    public float3 normal;     // world-space, normalized
-    public float3 emissive;
-    public float occlusion;   // 1.0 = none; multiplies the ambient term
-    public float opacity;
-};
 
 public struct MaterialInput
 {
     public float3 worldPos;
     public float3 worldNormal;
+    public float3 sheetNormal;
     public float3 viewDir;   // world-space, toward the eye (for parallax)
     public float2 uv0;
     public MaterialParams mat;
 };
-
-// Material feature bits (MaterialParams.tex1.w). Optional samples are taken only when set, so a
-// material without the map pays nothing (a uniform, wave-coherent branch).
-public static const uint FEATURE_NORMAL = 1u;
-public static const uint FEATURE_EMISSIVE_TEX = 2u;
-public static const uint FEATURE_OCCLUSION = 4u;
-public static const uint FEATURE_HEIGHT = 8u;
-public static const uint FEATURE_ALPHACLIP = 16u;
-// The height map drives real geometry displacement (a `displace` compute pre-pass bakes it into the
-// deformed vertex buffer — true silhouette, consistent across every pass, BLAS-able) rather than the
-// fragment parallax march. The fragment still reads it for a height-gradient shading normal. Mutually
-// exclusive with FEATURE_HEIGHT (the material sets exactly one height bit, or none).
-public static const uint FEATURE_DISPLACE = 32u;
-// The height map perturbs only the fragment shading normal (a height-to-normal bump) — no parallax
-// march, no geometry. The safe, flat-silhouette baseline; shares the gradient-normal fragment path
-// with FEATURE_DISPLACE (which additionally moves the vertices in the compute pre-pass).
-public static const uint FEATURE_HEIGHT_BUMP = 64u;
 
 // Per-fragment tangent frame from screen-space derivatives (no stored tangents needed). Schüler's
 // method: solve for the tangent/bitangent that map the UV gradients onto the world-position gradients.
@@ -455,23 +431,14 @@ public float3x3 cotangentFrame(float3 N, float3 p, float2 uv)
     return float3x3(T * invmax, B * invmax, N);
 }
 
-// Perturb the geometric normal N by a tangent-space normal-map sample (xyz in [-1, 1]).
-public float3 perturbNormal(float3 N, float3 worldPos, float2 uv, float3 mapN)
-{
-    float3x3 tbn = cotangentFrame(N, worldPos, uv);
-    return normalize(mul(mapN, tbn));
-}
-
 // Parallax occlusion mapping: march the tangent-space view ray through the height field and
 // return the offset UV. Height map: white = high; vt = tangent-space view dir (toward eye).
 //
-// Two robustness measures keep the surface from swimming at grazing angles (the artifact the naive
-// `vt.xy / vt.z` march produces as the view grazes the surface and vt.z → 0):
-//   * Offset limiting (Welsh 2003): march the *bounded* offset `v.xy * scale` — never divided by
-//     v.z — so the total UV travel stays ≤ scale regardless of angle. The trade is mild flattening
-//     at extreme grazing; a genuine silhouette is HeightMode::Displacement, not POM's job.
-//   * Dynamic sample count (Tatarchuk 2006): more layers at grazing (where the ray is longest),
-//     fewer head-on. N·V is v.z in the tangent frame.
+// Two measures keep the surface from swimming as the view grazes it and vt.z → 0:
+//   * Offset limiting (Welsh 2003): march the *bounded* offset `v.xy * scale`, never divided by
+//     v.z, so total UV travel stays ≤ scale at any angle. The trade is mild grazing flattening.
+//   * Dynamic sample count (Tatarchuk 2006): more layers at grazing, where the ray is longest.
+//     N·V is v.z in the tangent frame.
 public float2 parallaxUv(float2 uv, float3 vt, uint heightIndex, float scale)
 {
     float3 v = normalize(vt);
@@ -502,22 +469,21 @@ public float2 parallaxUv(float2 uv, float3 vt, uint heightIndex, float scale)
     return lerp(cur, prev, clamp(w, 0.0, 1.0));
 }
 
-
-// Builds the material seam input from interpolated vertex data + the per-material params.
 public MaterialInput makeMaterialInput(VertexOutput input)
 {
     MaterialParams mp = materialParams[input.materialIndex];
     MaterialInput mi;
     mi.worldPos = input.worldPos;
     mi.worldNormal = input.worldNormal;
+    mi.sheetNormal = input.worldNormal;
     mi.viewDir = normalize(globals.eyePosition.xyz - input.worldPos);
     mi.uv0 = input.uv0;
     mi.mat = mp;
     return mi;
 }
 
-// The debug render-output channel (pointShadowMeta.w); 0 = full shading. See `evalViewMode` for
-// the channel → view-mode mapping (matches ViewMode::debug_channel in renderer.rs).
+/// The debug render-output channel (pointShadowMeta.w); 0 = full shading. `evalViewMode` holds the
+/// channel → view-mode mapping, which mirrors `ViewMode::debug_channel`.
 public uint debugViewChannel()
 {
     return globals.pointShadowMeta.w;
@@ -533,66 +499,65 @@ float3 heatmap(float t)
     return float3(r, g, b);
 }
 
-// The shared lighting half: turns a SurfaceData into lit radiance (direct + punctual + IBL/GI).
-// Compiled once into this module; each material variant links it instead of recompiling it.
+// The shared lighting half: a SurfaceData into lit radiance (direct + punctual + IBL/GI).
 //
-// `translucent` (the blend permutation) gates off every screen-space term — contact shadows, the
-// screen-space GI resolve, GTAO, SSR, specular sky-occlusion, SSGI, and the ReSTIR direct sample —
-// because a blend fragment's screen UV addresses the OPAQUE geometry behind it, not the fragment.
-// It substitutes world-space indirect (analytic IBL irradiance + world-space DDGI), matching how
-// forward renderers (UE forward-shaded translucency, Unity/URP transparents) light blended surfaces.
+// `translucent` gates off every screen-space term — contact shadows, the screen-space GI resolve,
+// GTAO, SSR, specular sky-occlusion, SSGI, and the ReSTIR direct sample — because a blend
+// fragment's screen UV addresses the opaque geometry behind it, not the fragment. World-space
+// indirect (analytic IBL irradiance + world-space DDGI) stands in.
 public float4 evalLighting(VertexOutput input, SurfaceData surf, bool translucent)
 {
     float3 n = surf.normal;
     float3 albedo = surf.albedo;
 
     float metallic = surf.metallic;
-    float roughness = surf.roughness;  // clamp away from 0 (specular singularity)
+    float roughness = surf.roughness;
     float3 v = normalize(globals.eyePosition.xyz - input.worldPos);
 
-    // Screen UV for sampling the screen-space effect maps.
     float2 screenUv = input.position.xy / float2(clusterParams.screenSize.xy);
 
-    // Directional light, evaluated through the same BRDF as the punctual lights, then
-    // attenuated by the shadow map + screen-space contact shadows (directional only).
     float3 lDir = -normalize(globals.directionAmbient.xyz);
     float shadow = 1.0;
 #ifndef SAFFRON_NO_RT
     if (globals.pointShadowMeta.z != 0)
     {
-        // Ray-traced directional shadow (a long ray toward the sun) — A/B vs the map.
         shadow = rayQueryShadow(rtScene, input.worldPos, lDir, 1e4);
     }
     else if (globals.counts.y != 0)
     {
-        shadow = pcfShadow(shadowMap, globals.shadowViewProj, input.worldPos);
+        shadow = vsmSampleDirectional(input.worldPos, globals, vsmAtlas);
     }
 #else
     if (globals.counts.y != 0)
     {
-        shadow = pcfShadow(shadowMap, globals.shadowViewProj, input.worldPos);
+        shadow = vsmSampleDirectional(input.worldPos, globals, vsmAtlas);
     }
 #endif
     if (globals.screenFlags.x != 0 && !translucent)
     {
-        shadow *= contactMap.SampleLevel(screenLinearSampler, screenUv, 0.0).r;  // fine contact detail (opaque only)
+        shadow *= contactMap.SampleLevel(screenLinearSampler, screenUv, 0.0).r;
     }
     shadow *= cloudShadowVisibility(
         input.worldPos, cloudShadowMap, globals, globals.cloudShadowMeta.z);
-    float3 lo = brdf(n, v, lDir, albedo, metallic, roughness,
-                     globals.colorIntensity.rgb * globals.colorIntensity.a) * shadow;
+    float3 lo = surfaceDirect(
+        surf,
+        n,
+        v,
+        lDir,
+        globals.colorIntensity.rgb * globals.colorIntensity.a) * shadow;
     float3 moonDir = -normalize(globals.moonDirectionIntensity.xyz);
-    lo += brdf(n, v, moonDir, albedo, metallic, roughness,
-               globals.moonColor.rgb * globals.moonDirectionIntensity.w);
+    lo += surfaceDirect(
+        surf,
+        n,
+        v,
+        moonDir,
+        globals.moonColor.rgb * globals.moonDirectionIntensity.w);
 
-    // Punctual lights. ReSTIR (screenFlags.w) replaces the per-light loop with one resolved
-    // stochastic many-light direct radiance sample (diffuse term); otherwise loop the
-    // froxel cluster's lights (clustered) or every light (reference).
+    // Punctual lights: ReSTIR's one resolved stochastic many-light sample (screenFlags.w), else
+    // the froxel cluster's lights (clustered) or every light (reference).
 #ifndef SAFFRON_NO_RT
-    if (globals.screenFlags.w != 0 && !translucent)
+    if (globals.screenFlags.w != 0 && !translucent && surf.surfaceModel == SURFACE_STANDARD)
     {
-        // ReSTIR's resolved direct radiance is a screen-space buffer keyed to the opaque G-buffer, so
-        // a translucent fragment falls through to the real clustered/reference punctual loop instead.
         float3 restir = restirRadiance.SampleLevel(screenUv, 0.0).rgb;
         lo += restir * albedo / PI;  // resolved radiance already includes geometry * vis * W
     }
@@ -607,14 +572,14 @@ public float4 evalLighting(VertexOutput input, SurfaceData surf, bool translucen
         for (uint i = 0; i < count; i = i + 1)
         {
             uint li = clusters[clusterIndex].indices[i];
-            lo += punctual(lights[li], li, input.worldPos, n, v, albedo, metallic, roughness);
+            lo += punctual(lights[li], li, input.worldPos, n, v, surf);
         }
     }
     else
     {
         for (uint i = 0; i < globals.counts.x; i = i + 1)
         {
-            lo += punctual(lights[i], i, input.worldPos, n, v, albedo, metallic, roughness);
+            lo += punctual(lights[i], i, input.worldPos, n, v, surf);
         }
     }
 
@@ -627,17 +592,15 @@ public float4 evalLighting(VertexOutput input, SurfaceData surf, bool translucen
         float ndotv = max(dot(n, v), 1e-4);
         float3 F = fresnelSchlickRoughness(ndotv, F0, roughness);
         float3 kd = (1.0 - F) * (1.0 - metallic);
-        // Analytic IBL sky irradiance along the shading normal. It is the residual indirect
-        // diffuse where the DDGI cage does not cover the surface; the DDGI replace below overrides
-        // it wherever coverage exists (DDGI carries the sky occlusion intrinsically, via ray-miss).
+        // Analytic IBL sky irradiance along the shading normal: the residual indirect diffuse
+        // wherever the DDGI cage below has no coverage.
         float3 irradiance = skyShIrradiance(n, skyShCoefficients);
         float3 R = reflect(-v, n);
         float3 prefiltered = prefilteredMap.SampleLevel(R, prefilterLod(roughness)).rgb;
 
-        // Reflection probes: find the nearest covering probe and blend its prefiltered specular +
-        // irradiance over the global IBL by an edge-soft weight (1 at center, 0 at the boundary).
-        // ambientColor.w bit-packs the probe count (CPU bit_casts the u32, so read it back the
-        // same way); 0 leaves both terms exactly at the global value.
+        // Reflection probes: the nearest covering probe blends its prefiltered specular +
+        // irradiance over the global IBL by an edge-soft weight (1 at centre, 0 at the boundary).
+        // ambientColor.w bit-packs the probe count, so read it back as a u32.
         uint probeCount = asuint(globals.ambientColor.w);
         int best = -1;
         float bestDist = 1e30;
@@ -663,11 +626,10 @@ public float4 evalLighting(VertexOutput input, SurfaceData surf, bool translucen
             irradiance = lerp(irradiance, probeIrr, w);
         }
 
-        // Screen-space reflections replace the prefiltered-env radiance where they hit, so
-        // a smooth metal mirrors the actual neighbouring geometry (the cube only holds the
-        // environment). Weighted by hit confidence × a smoothness gate (full at roughness 0,
-        // zero past ~0.4) so rough surfaces keep the cube fallback. Applied at the radiance
-        // level so the BRDF + multi-scatter + horizon + specular-AO below treat it uniformly.
+        // Screen-space reflections replace the prefiltered-env radiance where they hit, weighted
+        // by hit confidence × a smoothness gate so rough surfaces keep the cube fallback. Applied
+        // at the radiance level, so the BRDF, multi-scatter, horizon, and specular-AO below all
+        // treat it uniformly.
         if (globals.extraFlags.x != 0 && !translucent)
         {
             float4 ssr = ssrMap.SampleLevel(screenLinearSampler, screenUv, 0.0);
@@ -675,11 +637,9 @@ public float4 evalLighting(VertexOutput input, SurfaceData surf, bool translucen
             prefiltered = lerp(prefiltered, ssr.rgb, ssr.a * gate);
         }
 
-        // Ray-traced reflections: trace the reflection ray against the TLAS (finds geometry
-        // off-screen, where SSR fails) and reproject the world-space hit through last frame's
-        // view-proj into prev_color for its reflected radiance. Gated to smooth surfaces; an
-        // off-screen reprojection or a missed ray falls back to the (SSR-or-env) radiance. RT
-        // only — the RT-off variant keeps the SSR/env reflection it already computed.
+        // Ray-traced reflections reach geometry off-screen, where SSR fails: trace against the
+        // TLAS, then reproject the world-space hit through last frame's view-proj into prev_color
+        // for its radiance. An off-screen reprojection or a miss falls back to the SSR/env value.
 #ifndef SAFFRON_NO_RT
         if (globals.extraFlags.y != 0 && !translucent)
         {
@@ -705,58 +665,48 @@ public float4 evalLighting(VertexOutput input, SurfaceData surf, bool translucen
         }
 #endif
 
-        // Specular sky occlusion: a cone along the reflection vector R (widened by roughness)
-        // sphere-marched against the Global Distance Field — the reflected skybox is occluded only
-        // where the reflection direction is blocked, NOT by the diffuse AO scalar (which would
-        // wrongly dim a chrome surface facing open sky). The march runs in the reduced-resolution
-        // specocc prepass (denoised + temporally accumulated); the mesh samples the resolved map.
-        // Off (1.0) unless enabled this frame.
+        // Specular sky occlusion: the reflected skybox is occluded only where the reflection
+        // direction is blocked, never by the diffuse AO scalar — that would wrongly dim a chrome
+        // surface facing open sky. The roughness-widened cone march runs in the specocc prepass;
+        // this samples its resolved map. 1.0 when the pass is off this frame.
         float specSkyVis = (globals.sdfOcclusion.y != 0 && !translucent) ? speoccMap.SampleLevel(screenLinearSampler, screenUv, 0.0).r : 1.0;
 
         float2 ab = brdfLut.SampleLevel(float2(ndotv, roughness), 0.0).rg;
         float3 specularIBL = prefiltered * (F0 * ab.x + ab.y);
         // Multi-scatter energy compensation (Fdez-Aguera / Filament 4.7.2): single-scatter GGX
         // loses energy as roughness rises (a rough metal darkens up to ~60% at roughness 1). `Ess`
-        // is the single-scatter directional albedo (the white-F0 reflectance = ab.x + ab.y), which is
-        // ~1 at low roughness (→ no boost on smooth mirrors) and < 1 at high roughness (→ scaled back
-        // toward unity). Using ab.y alone would explode as ab.y→0 on smooth metals — the bug that
-        // blew them out.
+        // is the single-scatter directional albedo, the white-F0 reflectance ab.x + ab.y — ~1 at
+        // low roughness, < 1 at high. `ab.y` alone explodes as it approaches 0 on smooth metals.
         float Ess = ab.x + ab.y;
         float3 energyComp = 1.0 + F0 * (1.0 / max(Ess, 1e-3) - 1.0);
         specularIBL *= energyComp;
-        // Horizon occlusion: a reflection ray pointing below the geometric surface can't see the
-        // environment, so fade it out — otherwise a curved/normal-mapped metal leaks reflections
-        // from under itself at grazing angles. Uses the GEOMETRIC vertex normal, not the shading n.
+        // Horizon occlusion: a reflection ray pointing below the geometric surface cannot see the
+        // environment, or a curved/normal-mapped metal leaks reflections from under itself at
+        // grazing angles. Uses the GEOMETRIC vertex normal, not the shading n.
         float horizon = min(1.0 + dot(R, normalize(input.worldNormal)), 1.0);
         specularIBL *= horizon * horizon;
-        // Occlusion band split: large-range occlusion of indirect DIFFUSE is the DDGI ray-miss
-        // replace below (the sky reaches the surface only on a ray that escapes), so the diffuse
-        // term here carries only the material occlusion texture + contact-scale GTAO. GTAO is the
-        // contact term: this `ao` (material × GTAO, small radius) drives the roughness-aware
-        // specular-AO (Lagarde, → 1 on smooth metals so a chrome sphere keeps its reflection in
-        // creases), the contact darkening of the indirect diffuse, and the SSGI bounce below.
+        // Occlusion band split: large-range occlusion of indirect diffuse rides the DDGI ray-miss
+        // below, so `ao` here is the contact-scale term only — material occlusion × small-radius
+        // GTAO. It drives the roughness-aware specular-AO (Lagarde, → 1 on smooth metals so a
+        // chrome sphere keeps its reflection in creases), the diffuse darkening, and SSGI.
         float ao = surf.occlusion;  // material occlusion (1.0 = none)
         if (globals.counts.w != 0 && !translucent)
         {
-            ao *= aoMap.SampleLevel(screenLinearSampler, screenUv, 0.0).r;  // screen-space GTAO (contact scale, opaque only)
+            ao *= aoMap.SampleLevel(screenLinearSampler, screenUv, 0.0).r;
         }
         float specAO = saturate(pow(ndotv + ao, exp2(-16.0 * roughness - 1.0)) - 1.0 + ao);
         specularIBL *= specAO * specSkyVis;  // reflection-cone occludes the reflected skybox
         reflectionSpec = specularIBL;
 
-        // Indirect diffuse irradiance (the DDGI cage replacing the analytic IBL diffuse by coverage,
-        // both occluded by the DFAO sky-visibility) is resolved once per HALF-res pixel in the
-        // gi-resolve pass (view-independent), not per full-res fragment — the fragment samples the
-        // bilinearly-upsampled result here and applies the per-pixel kd·albedo tail. This is why the
-        // 8-probe DDGI cage + IBL diffuse cube are no longer sampled in this fragment. See
-        // `gi_resolve.slang`.
+        // Indirect diffuse irradiance — the DDGI cage replacing the analytic IBL diffuse by
+        // coverage, both occluded by the DFAO sky-visibility — is view-independent, so
+        // `gi_resolve.slang` resolves it once per half-res pixel. This samples the bilinearly
+        // upsampled result and applies the per-pixel kd·albedo tail.
         float3 indirectIrr;
         if (translucent)
         {
-            // Translucent surfaces can't read the screen-space GI resolve (it's keyed to the opaque
-            // G-buffer behind them), so take indirect diffuse from world-space sources: the analytic
-            // IBL sky irradiance (already reflection-probe-blended above), overlaid by the world-space
-            // DDGI cage where it has coverage — the same terms the fallback path uses.
+            // The GI resolve is keyed to the opaque G-buffer behind a translucent fragment, so
+            // take its indirect diffuse from world-space sources instead.
             indirectIrr = irradiance;
             if (globals.screenFlags.z != 0)
             {
@@ -770,13 +720,12 @@ public float4 evalLighting(VertexOutput input, SurfaceData surf, bool translucen
             indirectIrr = giIndirectMap.SampleLevel(screenLinearSampler, screenUv, 0.0).rgb;
         }
         float3 indirect = kd * indirectIrr * albedo;
-        // Indirect diffuse occlusion: the large-range term is the DDGI ray-miss already folded into
-        // indirectIrr (the sky enters only on a ray that escapes), so the only further occlusion is
-        // contact-scale — the material texture × small-radius GTAO (`ao`) — filling in the contact
-        // detail the coarse probe grid cannot resolve, with no large-range double-count.
+        // The large-range diffuse occlusion is already folded into indirectIrr by the DDGI
+        // ray-miss, so `ao` adds only the contact detail the coarse probe grid cannot resolve —
+        // no large-range double-count.
         ambient = (indirect * ao + specularIBL) * globals.iblTint.rgb;
-        // SSGI adds one-bounce screen-space indirect on top (it is a bounce, not the sky term),
-        // modulated by AO so occluded creases don't over-bounce. Screen-space, so opaque only.
+        // SSGI is a bounce, not the sky term, so it adds on top — modulated by AO so occluded
+        // creases do not over-bounce.
         if (globals.screenFlags.y != 0 && !translucent)
         {
             float3 gi = ssgiMap.SampleLevel(screenLinearSampler, screenUv, 0.0).rgb;
@@ -787,14 +736,13 @@ public float4 evalLighting(VertexOutput input, SurfaceData surf, bool translucen
     {
         float ao = (globals.counts.w != 0 && !translucent) ? aoMap.SampleLevel(screenLinearSampler, screenUv, 0.0).r : 1.0;
         ambient = albedo * (1.0 - metallic) * globals.ambientColor.rgb * surf.occlusion * ao;
-        // SSGI bounce on the non-IBL fallback path (additive, AO-modulated). Screen-space, opaque only.
         if (globals.screenFlags.y != 0 && !translucent)
         {
             float3 gi = ssgiMap.SampleLevel(screenLinearSampler, screenUv, 0.0).rgb;
             ambient += gi * albedo * (1.0 - metallic) * ao;
         }
-        // DDGI on the fallback path: no analytic IBL diffuse to replace, so add the cage
-        // irradiance directly (weighted by coverage to avoid a hard edge at the cage boundary).
+        // No analytic IBL diffuse to replace on this path, so the DDGI cage irradiance adds
+        // directly, weighted by coverage to avoid a hard edge at the cage boundary.
         if (globals.screenFlags.z != 0)
         {
             float4 ddgi = ddgiSampleIrradiance(
@@ -802,6 +750,37 @@ public float4 evalLighting(VertexOutput input, SurfaceData surf, bool translucen
             ambient += ddgi.rgb * ddgi.w * albedo * (1.0 - metallic);
         }
     }
+    if (surf.surfaceModel == SURFACE_THIN_SHEET)
+    {
+        bool viewFront = dot(normalize(surf.sheetNormal), v) >= 0.0;
+        ThinSheetEnergyPartition reflectionPartition =
+            thinSheetPartition(surf, viewFront, 1.0);
+        ThinSheetEnergyPartition transmissionPartition =
+            thinSheetPartition(surf, !viewFront, 1.0);
+        float3 oppositeIrradiance;
+        if (globals.counts.z != 0)
+        {
+            oppositeIrradiance = skyShIrradiance(-n, skyShCoefficients);
+            if (globals.screenFlags.z != 0)
+            {
+                float4 oppositeDdgi = ddgiSampleIrradiance(
+                    ddgiVolumeFromGlobals(),
+                    ddgiIrradiance,
+                    ddgiDistance,
+                    input.worldPos,
+                    -n);
+                oppositeIrradiance = lerp(oppositeIrradiance, oppositeDdgi.rgb, oppositeDdgi.w);
+            }
+        }
+        else
+        {
+            oppositeIrradiance = globals.ambientColor.rgb;
+        }
+        ambient = ambient * reflectionPartition.reflection
+            + oppositeIrradiance * transmissionPartition.transmission / PI;
+        reflectionSpec *= reflectionPartition.reflection;
+    }
+
     // Two view modes peel a single term off the composed result.
     uint channel = debugViewChannel();
     if (channel == 9u)  // Reflections: IBL specular only
@@ -816,17 +795,10 @@ public float4 evalLighting(VertexOutput input, SurfaceData surf, bool translucen
     return float4(color, surf.opacity);
 }
 
-// Resolves the active view mode (debugViewChannel) to a final color. Channel 0 is full shading;
-// `kUnlit` (the per-material unlit PSO permutation) also forces the unlit output. Pure surface and
-// screen-space channels return here; material-override modes recolour the surface and fall through
-// to evalLighting (which itself peels off the Reflections/GI terms by channel). `Wireframe`,
-// `LitWireframe`, and `MotionVectors` are channel 0 here — produced by dedicated passes.
-// The forward transparent path's froxel volumetric fog: sample the integrated `(inScatter,
-// transmittance)` volume at the fragment's screen UV + exponential-Z W (the inverse of the inject
-// pass's distance mapping, matching `height_fog.slang`) and apply the shared `color*T + inScatter`
-// operator. Transparents are not in the depth prepass, so the depth-based composite fogs them at the
-// opaque depth behind them; sampling here fogs them at their own fragment distance instead. Gated on
-// `froxelFog.x` — a no-op unless volumetric fog is authored this frame.
+// Froxel volumetric fog for the forward transparent path: sample the integrated `(inScatter,
+// transmittance)` volume at the fragment's screen UV + exponential-Z W, then apply
+// `color*T + inScatter`. Transparents are not in the depth prepass, so the depth-based composite
+// would fog them at the opaque depth behind them; this fogs them at their own distance.
 float3 applyFroxelFog(float3 worldPos, float2 pixel, float3 color)
 {
     if (globals.froxelFog.x < 0.5)
@@ -843,6 +815,10 @@ float3 applyFroxelFog(float3 worldPos, float2 pixel, float3 color)
     return color * vol.a + vol.rgb;
 }
 
+// Resolves the active view mode to a final color. Channel 0 is full shading, as is `kUnlit` (the
+// per-material unlit PSO permutation) apart from its unlit output. Pure surface and screen-space
+// channels return here; material-override modes recolour the surface and fall through to
+// evalLighting, which peels off the Reflections/GI terms itself.
 public float4 evalViewMode(VertexOutput input, SurfaceData surf, bool kUnlit, bool translucent)
 {
     uint channel = debugViewChannel();
@@ -873,9 +849,8 @@ public float4 evalViewMode(VertexOutput input, SurfaceData surf, bool kUnlit, bo
         return float4(ao.xxx, 1.0);
     }
 
-    // Punctual-light complexity as a heatmap: the number of point/spot lights reaching this
-    // pixel (directional lights are not clustered, so they never count). 0 reads as near-black;
-    // the ramp saturates to red around 8 overlapping lights.
+    // Punctual-light complexity as a heatmap: 0 reads near-black, the ramp saturating to red
+    // around 8 overlapping lights. Directional lights are not clustered, so they never count.
     if (channel == 13u)
     {
         uint count;
@@ -887,8 +862,7 @@ public float4 evalViewMode(VertexOutput input, SurfaceData surf, bool kUnlit, bo
         }
         else
         {
-            // Brute force: count punctual lights whose range reaches this pixel, matching the
-            // reference lighting loop (so the mode is meaningful with clustering off).
+            // Matches the reference lighting loop, so the mode stays meaningful with clustering off.
             count = 0u;
             for (uint i = 0u; i < globals.counts.x; i = i + 1u)
             {
@@ -904,6 +878,48 @@ public float4 evalViewMode(VertexOutput input, SurfaceData surf, bool kUnlit, bo
             return float4(float3(0.02), 1.0);
         }
         return float4(heatmap(saturate(float(count) / 8.0)), 1.0);
+    }
+
+    // Virtual-shadow pages: the directional sampler's resolved (level, page) as a stable colour,
+    // dimmed where no level holds a resident page.
+    if (channel == 14u)
+    {
+        if (globals.vsmPageTable == 0 || globals.vsmParams.z == 0.0)
+        {
+            return float4(0.05, 0.05, 0.05, 1.0);
+        }
+        float3 lightPos = mul(globals.vsmBasis, float4(input.worldPos, 1.0)).xyz;
+        for (uint level = 0u; level < 8u; ++level)
+        {
+            float4 window = globals.vsmLevels[level];
+            if (window.z <= 0.0)
+            {
+                continue;
+            }
+            float2 local = (lightPos.xy - window.xy) / window.z;
+            if (local.x < 0.0 || local.y < 0.0 || local.x >= 1.0 || local.y >= 1.0)
+            {
+                continue;
+            }
+            uint2 page = uint2(local * 32.0);
+            uint entry = *(uint*)(
+                globals.vsmPageTable
+                + (uint64_t(level) * 1024u + page.y * 32u + page.x) * 4u);
+            if ((entry & VSM_TABLE_RESIDENT) == 0u)
+            {
+                continue;
+            }
+            uint hash = (level * 1024u + page.y * 32u + page.x) * 0x9e3779b9u;
+            float3 colour = float3(
+                float((hash >> 16u) & 0xffu) / 255.0,
+                float((hash >> 8u) & 0xffu) / 255.0,
+                float(hash & 0xffu) / 255.0);
+            // Level tint: fine levels warm, coarse levels cool.
+            float tint = float(level) / 7.0;
+            colour = lerp(colour * float3(1.0, 0.8, 0.6), colour * float3(0.6, 0.8, 1.0), tint);
+            return float4(colour * 0.85 + 0.15, 1.0);
+        }
+        return float4(0.05, 0.05, 0.05, 1.0);
     }
 
     // Material-override modes reuse the full lighting path on a recoloured surface.
@@ -928,9 +944,7 @@ public float4 evalViewMode(VertexOutput input, SurfaceData surf, bool kUnlit, bo
     }
 
     float4 lit = evalLighting(input, surf, translucent);
-    // Translucent surfaces self-apply the froxel volumetric fog at their own fragment distance (the
-    // depth-based composite only reaches the opaque depth behind them). Only in full-shading mode —
-    // the debug channels above are already display-referred and must not be fogged.
+    // Full shading only: the debug channels above are already display-referred and must not fog.
     if (translucent && channel == 0u)
     {
         lit.rgb = applyFroxelFog(input.worldPos, input.position.xy, lit.rgb);

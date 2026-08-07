@@ -31,6 +31,9 @@ static const uint kGdfCascades = 3u;
 // (wrap-modulo) addressing reads spatially-adjacent texels across the storage wrap (a recenter
 // scrolls in only the leading slab, the rest of the volume keeps its physical location).
 [[vk::binding(9, 1)]] Sampler3D gdfCascades[kGdfCascades];
+// The per-cascade porous-occupancy volumes (binding 14): aggregate density the marches
+// accumulate extinction through instead of hitting.
+[[vk::binding(14, 1)]] Sampler3D gdfOccupancy[kGdfCascades];
 
 // One cascade's world placement + encode scale (matches `global_sdf.rs::GdfCascadeUbo`).
 public struct GdfCascade
@@ -47,6 +50,16 @@ public struct GdfParams
 };
 [[vk::binding(10, 1)]] ConstantBuffer<GdfParams> gdfParams;
 
+// The occluder scatter's meta words for this frame slot (binding 15): [0] instances
+// written, [1] culled against the reach window, [2] dropped to capacity. The count is
+// GPU-produced, so no push constant can carry it.
+[[vk::binding(15, 1)]] StructuredBuffer<uint> sdfInstanceMeta;
+
+public uint sdfInstanceCount()
+{
+    return sdfInstanceMeta[0];
+}
+
 // Probes every per-mesh SDF occluder at a world sample given the cone-footprint radius
 // (`footprint`, world units). The global minimum signed distance over instances is kept;
 // `openness` is the min over instances so the cone can early-out only where every nearby block
@@ -56,25 +69,39 @@ public SdfSample sdfSample(float3 wp, uint count, float footprint)
     SdfSample s;
     s.distance = 1e30;
     s.openness = 1.0;
+    s.occupancy = 0.0;
     for (uint i = 0; i < count; i = i + 1)
     {
         SdfSample inst = sampleMdfBrick(sdfInstances[i], wp, footprint);
+        float instanceOccupancy = sdfInstances[i].localMax.w;
+        if (instanceOccupancy < 1.0)
+        {
+            // Porous matter never hardens the near field; where its brick surface
+            // passes the sample it contributes density instead.
+            if (inst.distance < max(footprint, 0.25))
+            {
+                s.occupancy = max(s.occupancy, instanceOccupancy);
+            }
+            continue;
+        }
         s.distance = min(s.distance, inst.distance);
         s.openness = min(s.openness, inst.openness);
     }
     return s;
 }
 
-// One trilinear tap of the Global Distance Field at a world sample: selects the finest cascade
-// whose bounds contain `wp` (minus a wrap-seam margin), converts world → that cascade's toroidal
-// `[0,1]³` UVW (`wp / worldExtent`, the repeat sampler wraps), and denormalizes the `R16_SNORM`
-// by the cascade's max-encode distance. Near the cascade's outer edge it blends into the next
-// coarser cascade over an overlap band so the cascade boundary shows no shell. `valid` is false
-// (and the return undefined) when `wp` lies beyond the coarsest cascade — the caller then falls
-// back to the per-mesh near field / treats it as open sky.
-public float gdfDistance(float3 wp, out bool valid)
+// One cascade walk serving every consumer: a trilinear Global Distance Field tap plus the
+// porous-occupancy density from the same cascade, so a march pays one cascade select for both.
+// Selects the finest cascade whose bounds contain `wp` (minus a wrap-seam margin), converts world
+// → that cascade's toroidal `[0,1]³` UVW (`wp / worldExtent`, the repeat sampler wraps), and
+// denormalizes the `R16_SNORM` by the cascade's max-encode distance. Near the cascade's outer edge
+// it blends into the next coarser cascade over an overlap band, so the boundary shows no shell.
+// `valid` is false (and the return undefined) when `wp` lies beyond the coarsest cascade — the
+// caller then falls back to the per-mesh near field, or treats it as open sky.
+public float gdfDistanceOccupancy(float3 wp, out bool valid, out float occupancy)
 {
     valid = false;
+    occupancy = 0.0;
     uint count = min(uint(gdfParams.control.y), kGdfCascades);
     float bandFrac = gdfParams.control.w;
     for (uint c = 0; c < count; c = c + 1)
@@ -90,6 +117,7 @@ public float gdfDistance(float3 wp, out bool valid)
         float worldExtent = cas.voxelEncode.z;
         float3 uvw = wp / worldExtent;  // toroidal: the repeat sampler wraps modulo the extent
         float d = gdfCascades[c].SampleLevel(uvw, 0.0).r * cas.voxelEncode.y;
+        occupancy = gdfOccupancy[c].SampleLevel(uvw, 0.0).r;
 
         // Overlap band: near this cascade's outer face, blend with the next coarser cascade so
         // the handoff is seamless (and the seam-margin band is covered entirely by the coarser).
@@ -123,19 +151,35 @@ public float gdfFinestWorldExtent()
     return gdfParams.cascades[0].voxelEncode.z;
 }
 
-// The unified near/far field sample for the cone march: the per-mesh MDF for the near field
-// (full resolution where leaks matter — the README's leak mitigation) and a single Global-SDF
-// tap beyond the handoff radius, so far-field cost decouples from instance count. Falls back to
-// the per-mesh field when the GDF is off or the sample lies beyond the coarsest cascade. Public so
-// the DDGI ray trace (`ddgi_trace.slang`) sphere-marches the same near/far handoff the per-pixel
-// cone trace does.
+// The porous-occupancy density at `wp` alone (the fused walk's occupancy output).
+public float gdfOccupancyAt(float3 wp)
+{
+    bool valid;
+    float occupancy;
+    gdfDistanceOccupancy(wp, valid, occupancy);
+    return occupancy;
+}
+
+// The shared Beer-Lambert extinction step every march applies through porous matter:
+// full density transmits ~5% per metre, scaling linearly with the occupancy density.
+public float sdfExtinctionStep(float occupancy, float stepLength)
+{
+    return exp(
+        -AGGREGATE_EXTINCTION_PER_METER * max(occupancy, 0.0) * max(stepLength, 0.0));
+}
+
+// The unified near/far field sample for a march: the full-resolution per-mesh MDF for the near
+// field, where leaks matter, and a single Global-SDF tap beyond the handoff radius, so far-field
+// cost decouples from instance count. Falls back to the per-mesh field when the GDF is off or the
+// sample lies beyond the coarsest cascade.
 public SdfSample sampleField(float3 wp, uint count, float footprint, float t)
 {
     bool useGdf = (uint(gdfParams.control.x) != 0u) && (t >= gdfParams.control.z);
     if (useGdf)
     {
         bool valid;
-        float d = gdfDistance(wp, valid);
+        float occupancy;
+        float d = gdfDistanceOccupancy(wp, valid, occupancy);
         if (valid)
         {
             SdfSample s;
@@ -143,6 +187,7 @@ public SdfSample sampleField(float3 wp, uint count, float footprint, float t)
             // Openness for the early-out + the leap: open ahead when the field distance exceeds
             // the cone footprint here, blocked as it approaches a surface.
             s.openness = saturate(d / max(footprint, 1e-4));
+            s.occupancy = occupancy;
             return s;
         }
     }
@@ -168,24 +213,31 @@ public float sdfReflectionOcclusion(float3 worldPos, float3 R, float roughness)
     const float kMaxDist = 12.0;
     const int kSteps = 12;
     float occ = 1.0;
+    float transmittance = 1.0;
     float t = kStart;
     for (int s = 0; s < kSteps; s = s + 1)
     {
         float footprint = coneHalfAngle * t;
         bool valid;
-        float d = gdfDistance(worldPos + R * t, valid);
+        float occupancy;
+        float3 wp = worldPos + R * t;
+        float d = gdfDistanceOccupancy(wp, valid, occupancy);
         // The reflection left the cascade coverage: nothing more to occlude with, so stop and keep
         // the open fraction accumulated so far.
         if (!valid) { break; }
         // Penumbra: the nearest surface subtends `d / (coneHalfAngle * t)` of the cone; the
         // smallest such ratio along the cone is its open fraction.
         occ = min(occ, saturate(d / max(footprint, 1e-4)));
+        float step = clamp(d, kStepFloor, kMaxDist);
+        // Porous matter dims the reflection by its accumulated extinction rather than
+        // blocking the cone.
+        transmittance *= sdfExtinctionStep(occupancy, step);
         // Already fully open and far from any surface — the rest of the march can only stay open.
-        if (occ > 0.99 && d > footprint * 4.0) { break; }
-        t += clamp(d, kStepFloor, kMaxDist);
+        if (occ > 0.99 && transmittance > 0.99 && d > footprint * 4.0) { break; }
+        t += step;
         if (t > kMaxDist) { break; }
     }
-    return occ;
+    return occ * transmittance;
 }
 
 /// Diffuse sky-visibility on the Global Distance Field (DFAO — Wright, "Dynamic Occlusion
@@ -252,11 +304,14 @@ public float sdfSkyVisibility(float3 worldPos, float3 N, float azimuthJitter)
         float w = max(dot(dir, N), 0.0);
         if (w <= 0.0) { continue; }
         float minVis = 1.0;
+        float transmittance = 1.0;
         float t = kStart;
         for (int i = 0; i < kSteps; i = i + 1)
         {
             bool valid;
-            float d = gdfDistance(origin + dir * t, valid);
+            float occupancy;
+            float3 wp = origin + dir * t;
+            float d = gdfDistanceOccupancy(wp, valid, occupancy);
             // Left the cascade coverage: open sky beyond, so this cone keeps its accumulated
             // openness and stops marching.
             if (!valid) { break; }
@@ -265,10 +320,13 @@ public float sdfSkyVisibility(float3 worldPos, float3 N, float azimuthJitter)
             // brightening; the smallest ratio along the cone is its open fraction.
             minVis = min(minVis, saturate(d / max(coneRadius, 1e-4)));
             if (minVis <= 0.0) { break; }
-            t += clamp(d, kStepFloor, kMaxLeap);
+            float step = clamp(d, kStepFloor, kMaxLeap);
+            // A canopy dims the sky by its density instead of sealing the cone.
+            transmittance *= sdfExtinctionStep(occupancy, step);
+            t += step;
             if (t > kMaxDist) { break; }
         }
-        visSum += w * minVis;
+        visSum += w * minVis * transmittance;
         weightSum += w;
     }
     return weightSum > 0.0 ? saturate(visSum / weightSum) : 1.0;

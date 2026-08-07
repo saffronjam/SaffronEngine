@@ -6,6 +6,7 @@
 // Relationship write relinks server-side).
 //
 import { afterAll, afterEach, beforeAll, expect, test } from "bun:test";
+import type { EntityRef, PickResult, Vec3 } from "@saffron/protocol";
 import { Engine } from "./harness.ts";
 import { bootEngine, Cleaner, prepareScene, trackEntity } from "./test-utils.ts";
 
@@ -29,28 +30,8 @@ afterEach(async () => {
   await caseCleaner.cleanup();
 });
 
-interface Ref {
-  id: string;
-  name: string;
-}
-interface PickResult {
-  hit: boolean;
-  id?: string;
-  name?: string;
-  kind?: string;
-}
-interface Vec3 {
-  x: number;
-  y: number;
-  z: number;
-}
-
-async function makeCube(name: string, translation: Vec3): Promise<Ref> {
-  const ref = trackEntity(
-    caseCleaner,
-    engine,
-    await engine.call<Ref>("add-entity", { args: ["cube"] }),
-  );
+async function makeCube(name: string, translation: Vec3): Promise<EntityRef> {
+  const ref = trackEntity(caseCleaner, engine, await engine.call("add-entity", { args: ["cube"] }));
   await engine.call("rename-entity", { entity: ref.id, name });
   await engine.call("set-transform", { entity: ref.id, translation });
   return ref;
@@ -67,7 +48,7 @@ async function parentTo(child: string, parent: string): Promise<void> {
 async function focusPick(entity: string): Promise<PickResult> {
   await engine.call("focus", { entity });
   await engine.settle();
-  return engine.call<PickResult>("pick", {});
+  return engine.call("pick", {});
 }
 
 async function findWorldXHandle(): Promise<{ x: number; y: number }> {
@@ -77,7 +58,7 @@ async function findWorldXHandle(): Promise<{ x: number; y: number }> {
     const rows = offset === 0 ? [0] : [offset, -offset];
     for (const y of rows) {
       for (const x of [0.06, 0.1, 0.14, 0.18, 0.22]) {
-        const result = await engine.call<{ hovered: string }>("gizmo-pointer", {
+        const result = await engine.call("gizmo-pointer", {
           phase: "hover",
           x,
           y,
@@ -113,7 +94,7 @@ test("a parented child picks at its world position, not its local origin", async
   const probe = trackEntity(
     caseCleaner,
     engine,
-    await engine.call<Ref>("create-entity", { args: ["h-probe"] }),
+    await engine.call("create-entity", { args: ["h-probe"] }),
   );
   await engine.call("set-transform", { entity: probe.id, translation: { x: 0, y: 2, z: 0 } });
   const atLocal = await focusPick(probe.id);
@@ -125,7 +106,7 @@ test("a parented light's billboard picks and focuses at its world position", asy
   const light = trackEntity(
     caseCleaner,
     engine,
-    await engine.call<Ref>("add-entity", { args: ["point-light"] }),
+    await engine.call("add-entity", { args: ["point-light"] }),
   );
   await engine.call("set-transform", { entity: light.id, translation: { x: 0, y: 3, z: 0 } });
   await parentTo(light.id, anchor.id);
@@ -147,7 +128,7 @@ test("gizmo drag on a parented child moves it in world space and rebases the loc
   await engine.settle();
 
   const handle = await findWorldXHandle();
-  const begin = await engine.call<{ dragging: boolean }>("gizmo-pointer", {
+  const begin = await engine.call("gizmo-pointer", {
     phase: "begin",
     x: handle.x,
     y: handle.y,
@@ -157,10 +138,10 @@ test("gizmo drag on a parented child moves it in world space and rebases the loc
   await engine.call("gizmo-pointer", { phase: "end", x: handle.x + 0.2, y: handle.y });
 
   // A world +X drag rebased into the parent frame: local x moved, y/z untouched.
-  const info = await engine.call<{ components: { Transform: { translation: Vec3 } } }>("inspect", {
+  const info = await engine.call("inspect", {
     entity: child.id,
   });
-  const t = info.components.Transform.translation;
+  const t = info.components.Transform!.translation;
   expect(t.x).toBeGreaterThan(0.05);
   expect(t.y).toBeCloseTo(2, 3);
   expect(t.z).toBeCloseTo(0, 3);
@@ -170,13 +151,8 @@ test("gizmo drag on a parented child moves it in world space and rebases the loc
   await engine.call("save-scene", { path });
   await engine.call("load-scene", { path });
   await engine.settle();
-  const reloaded = await engine.call<{ components: { Transform: { translation: Vec3 } } }>(
-    "inspect",
-    {
-      entity: "g-child",
-    },
-  );
-  const rt = reloaded.components.Transform.translation;
+  const reloaded = await engine.call("inspect", { entity: "g-child" });
+  const rt = reloaded.components.Transform!.translation;
   expect(rt.x).toBeCloseTo(t.x, 4);
   expect(rt.y).toBeCloseTo(t.y, 4);
   expect(rt.z).toBeCloseTo(t.z, 4);
@@ -191,44 +167,31 @@ test("set-parent preserves world position, keeps the selection, and detaches cle
   const parent = await makeCube("sp-parent", { x: 4, y: 1, z: -2 });
   const child = await makeCube("sp-child", { x: -1, y: 0.5, z: 3 });
   await engine.call("select", { entity: child.id });
-  const before = await engine.call<{ sceneVersion: number }>("get-selection");
+  const before = await engine.call("get-selection");
 
   await engine.call("set-parent", { entity: child.id, parent: parent.id });
-  const info = await engine.call<{
-    components: { Transform: { translation: Vec3 }; Relationship: { parent: string } };
-  }>("inspect", { entity: child.id });
-  expect(info.components.Relationship.parent).toBe(parent.id);
+  const info = await engine.call("inspect", { entity: child.id });
+  expect(info.components.Relationship!.parent).toBe(parent.id);
   // keepWorld rebased the local translation so the world position is unchanged.
-  expect(info.components.Transform.translation.x).toBeCloseTo(-5, 4);
-  expect(info.components.Transform.translation.y).toBeCloseTo(-0.5, 4);
-  expect(info.components.Transform.translation.z).toBeCloseTo(5, 4);
+  expect(info.components.Transform!.translation.x).toBeCloseTo(-5, 4);
+  expect(info.components.Transform!.translation.y).toBeCloseTo(-0.5, 4);
+  expect(info.components.Transform!.translation.z).toBeCloseTo(5, 4);
 
   // The reparent bumped sceneVersion and left the selection intact.
-  const after = await engine.call<{ sceneVersion: number; entity?: { id: string } }>(
-    "get-selection",
-  );
+  const after = await engine.call("get-selection");
   expect(after.sceneVersion).toBeGreaterThan(before.sceneVersion);
   expect(after.entity?.id).toBe(child.id);
 
-  const list = await engine.call<{ entities: { id: string; parentId?: string }[] }>(
-    "list-entities",
-  );
+  const list = await engine.call("list-entities");
   expect(list.entities.find((e) => e.id === child.id)?.parentId).toBe(parent.id);
 
   // Detach restores the original local translation (world preserved both ways).
   await engine.call("set-parent", { entity: child.id, parent: "0" });
-  const detached = await engine.call<{ components: { Transform: { translation: Vec3 } } }>(
-    "inspect",
-    {
-      entity: child.id,
-    },
-  );
-  expect(detached.components.Transform.translation.x).toBeCloseTo(-1, 4);
-  expect(detached.components.Transform.translation.y).toBeCloseTo(0.5, 4);
-  expect(detached.components.Transform.translation.z).toBeCloseTo(3, 4);
-  const relisted = await engine.call<{ entities: { id: string; parentId?: string }[] }>(
-    "list-entities",
-  );
+  const detached = await engine.call("inspect", { entity: child.id });
+  expect(detached.components.Transform!.translation.x).toBeCloseTo(-1, 4);
+  expect(detached.components.Transform!.translation.y).toBeCloseTo(0.5, 4);
+  expect(detached.components.Transform!.translation.z).toBeCloseTo(3, 4);
+  const relisted = await engine.call("list-entities");
   expect(relisted.entities.find((e) => e.id === child.id)?.parentId).toBeUndefined();
 });
 
@@ -236,7 +199,7 @@ test("preserve-children: set-transform on a parent rebases the child to hold its
   const parent = await makeCube("pc-parent", { x: 5, y: 0, z: 0 });
   const child = await makeCube("pc-child", { x: 2, y: 1, z: 0 });
   await parentTo(child.id, parent.id);
-  const gizmo = await engine.call<{ preserveChildren: boolean }>("set-gizmo", {
+  const gizmo = await engine.call("set-gizmo", {
     preserveChildren: true,
   });
   expect(gizmo.preserveChildren).toBe(true);
@@ -248,14 +211,12 @@ test("preserve-children: set-transform on a parent rebases the child to hold its
     translation: { x: 9, y: 0, z: 0 },
     scale: { x: 4, y: 1, z: 2 },
   });
-  const info = await engine.call<{
-    components: { Transform: { translation: Vec3; scale: Vec3 } };
-  }>("inspect", { entity: child.id });
-  const t = info.components.Transform.translation;
+  const info = await engine.call("inspect", { entity: child.id });
+  const t = info.components.Transform!.translation;
   expect(t.x).toBeCloseTo(-0.5, 4);
   expect(t.y).toBeCloseTo(1, 4);
   expect(t.z).toBeCloseTo(0, 4);
-  const s = info.components.Transform.scale;
+  const s = info.components.Transform!.scale;
   expect(s.x).toBeCloseTo(0.25, 4);
   expect(s.y).toBeCloseTo(1, 4);
   expect(s.z).toBeCloseTo(0.5, 4);
@@ -280,15 +241,15 @@ test("preserve-children: a gizmo drag on the parent leaves the child's world pos
   // The parent moved along world +X; the child's local compensated so its drag-begin
   // world position (parent 10 + local 0, y 2) is unchanged: parent.x + child.x == 10.
   const parentT = (
-    await engine.call<{ components: { Transform: { translation: Vec3 } } }>("inspect", {
+    await engine.call("inspect", {
       entity: parent.id,
     })
-  ).components.Transform.translation;
+  ).components.Transform!.translation;
   const childT = (
-    await engine.call<{ components: { Transform: { translation: Vec3 } } }>("inspect", {
+    await engine.call("inspect", {
       entity: child.id,
     })
-  ).components.Transform.translation;
+  ).components.Transform!.translation;
   expect(parentT.x).toBeGreaterThan(10.05);
   expect(parentT.x + childT.x).toBeCloseTo(10, 3);
   expect(childT.y).toBeCloseTo(2, 3);

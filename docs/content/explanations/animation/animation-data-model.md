@@ -150,7 +150,7 @@ its midpoint to $0.75$ where a lerp would give $0.5$.
 | Pose types | `engine/crates/animation/src/pose.rs` | `JointPose`, `PoseBuffer`, `PoseDelta` |
 | Pose algebra | `engine/crates/animation/src/algebra.rs` | `blend_joint`, `pose_diff`, `apply_delta`, `smoothstep01`, `quintic_decay` |
 | Track samplers | `engine/crates/animation/src/sample.rs` | `sample_track`, `sample_weights`, `locate_keys` |
-| Clip-level sampling | `engine/crates/animation/src/runtime.rs` | `sample_clip_resolved`, `sample_into` |
+| Clip-level sampling | `engine/crates/animation/src/runtime/` | `sample_clip_resolved`, `sample_into` |
 | `.sanim` byte format | `engine/crates/geometry/src/sanim.rs` | `save_animation_to_buffer`, `load_animation_from_bytes` |
 | Pose-override component | `engine/crates/scene/src/component.rs` | `PoseOverride` |
 

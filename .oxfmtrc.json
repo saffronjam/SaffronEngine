@@ -1,0 +1,12 @@
+{
+  "printWidth": 100,
+  "ignorePatterns": [
+    "**/node_modules/**",
+    "**/dist/**",
+    "**/target/**",
+    "editor/src/protocol/sa-types.ts",
+    "engine/crates/protocol/bindings/**",
+    "third_party/**",
+    "docs/themes/**"
+  ]
+}

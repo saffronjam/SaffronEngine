@@ -1,39 +1,39 @@
-// The amplifying displacement kernel (Phase 4). One workgroup per base triangle (dispatched per
-// instance, `tri_count` workgroups): dices the triangle into a barycentric micro-grid at its Phase-3
-// dice level `L`, evaluates a Phong-smoothed base position at each sample, displaces it (scalar along
-// the normal or tangent-space vector), re-derives a normal + tangent from the full displaced-surface
-// Jacobian, welds shared-edge micro-vertices onto the edge's shared per-edge factor (watertight by
-// construction), and writes the micro-vertices + a generated index stream into the Phase-3
-// worst-case-reserved transient VB/IB at the offsets the scan predicted.
+// The amplifying displacement kernel. One workgroup per base triangle (dispatched per instance,
+// `tri_count` workgroups): dices the triangle into a barycentric micro-grid at the scan's dice level
+// `L`, evaluates a Phong-smoothed base position at each sample, displaces it (scalar along the normal
+// or tangent-space vector), re-derives a normal + tangent from the full displaced-surface Jacobian,
+// welds shared-edge micro-vertices onto the edge's shared per-edge factor, and writes the
+// micro-vertices + a generated index stream into the worst-case-reserved transient VB/IB at the
+// offsets the scan predicted.
 //
-// Temporal prev-stream (Phase 5): the kernel additionally writes each micro-vertex's PREVIOUS-frame position
-// into `outPrevVertices`, evaluated on the SAME cur-`L` grid but with the previous frame's per-edge factors
-// (`prevFactors`) driving the boundary snap + interior geomorph. Static height ⇒ the only cross-frame change
-// is the camera-driven factor, so the cur→prev delta is exactly the geomorph slide the motion prepass needs
-// for watertight TAA reprojection. The prev boundary snap reuses the shared per-edge `prevFactors`, so the
-// previous silhouette is welded as watertight as the current one.
+// The temporal prev-stream: each micro-vertex's PREVIOUS-frame position also goes to
+// `outPrevVertices`, evaluated on the SAME cur-`L` grid but with the previous frame's per-edge factors
+// (`prevFactors`) driving the boundary snap + interior geomorph. With static height the only
+// cross-frame change is the camera-driven factor, so the cur→prev delta is exactly the geomorph slide
+// the motion prepass needs for watertight TAA reprojection. The prev boundary snap reuses the shared
+// `prevFactors`, so the previous silhouette welds as watertight as the current one.
 //
-// The dice contract (Phase 3 defines it, this kernel must emit exactly it): the scan resolves the driving
-// factor into `4^levels` barycentric SUBPATCHES (the SPLIT pass — removes the manual-cap ceiling for
-// extreme near-field triangles: `perTri.z = leafLevel`, `perTri.w = levels`), each diced at
+// The dice contract `tess_scan.slang` defines and this kernel must emit exactly: the scan resolves the
+// driving factor into `4^levels` barycentric SUBPATCHES (the SPLIT pass, which lifts the manual-cap
+// ceiling for extreme near-field triangles: `perTri.z = leafLevel`, `perTri.w = levels`), each diced at
 // `leafLevel <= TESS_MAX_DICE_FACTOR` into `(L+1)(L+2)/2` verts + `L²` tris. This kernel enumerates the
-// subpatches (`subpatchCorners`), dices each leaf in the parent frame, and packs them contiguously so each
-// leaf is a CLAS-sized cluster. WATERTIGHT by construction: (a) sibling subpatches share their interior
-// split edges — the parent-relative corners are exact dyadic midpoints, identical on both, so the plain
-// leaf grid places matching boundary verts; (b) the parent's OUTER edges weld with the neighbouring base
-// triangle because every boundary micro-vertex is snapped onto that edge's SHARED per-edge factor's segment
-// grid (`snapEdgeParam`, geomorphed floor→ceil), a pure function of the two endpoints regardless of either
-// side's split depth (extra grid points collapse onto shared segment points — degenerate slivers, no gap).
+// subpatches (`subpatchCorners`), dices each leaf in the parent frame, and packs them contiguously so
+// each leaf is a CLAS-sized cluster. Watertight by construction: (a) sibling subpatches share their
+// interior split edges — the parent-relative corners are exact dyadic midpoints, identical on both, so
+// the plain leaf grid places matching boundary verts; (b) the parent's OUTER edges weld with the
+// neighbouring base triangle because every boundary micro-vertex is snapped onto that edge's SHARED
+// per-edge factor's segment grid (`snapEdgeParam`, geomorphed floor→ceil), a pure function of the two
+// endpoints regardless of either side's split depth — extra grid points collapse onto shared segment
+// points as degenerate slivers, never a gap.
 //
-// Output is mesh-LOCAL (no instance model): every graphics pass applies
-// `inst.model` and the RT BLAS places the instance at its node matrix. `sa::Vertex` is 48 B
-// (position@0, normal@12, uv0@24, tangent@32), read/written through ByteAddressBuffer so std430 packing
-// matches the engine `#[repr(C)]` layout.
+// Output is mesh-LOCAL: every graphics pass applies `inst.model` and the RT BLAS places the instance at
+// its node matrix. `sa::Vertex` is 48 B (position@0, normal@12, uv0@24, tangent@32), read and written
+// through ByteAddressBuffer so std430 packing matches the engine `#[repr(C)]` layout.
 
 // Bindless albedo/height array (shared set 0, matches the übershader), sampled by index.
 [[vk::binding(0, 0)]] Sampler2D albedoTextures[1024];
 
-// Set 1 — the emit buffers.
+// The emit buffers.
 [[vk::binding(0, 1)]] ByteAddressBuffer baseVertices;   // base stream in (48 B): static VB or skinned ring
 [[vk::binding(1, 1)]] ByteAddressBuffer baseIndices;    // base index stream (u32) — the triangle corners
 [[vk::binding(2, 1)]] StructuredBuffer<uint4> perTri;   // (vertOffset, indexOffset, L, pad) per base triangle
@@ -41,8 +41,8 @@
 [[vk::binding(4, 1)]] StructuredBuffer<float> factors;  // per-edge fractional factors (instance slice, current frame)
 [[vk::binding(5, 1)]] RWByteAddressBuffer outVertices;  // amplified micro-vertices (48 B stride)
 [[vk::binding(6, 1)]] RWByteAddressBuffer outIndices;   // generated index stream (u32)
-// Phase-5 temporal prev-stream: the SAME per-edge factor slice as `factors` but from the PREVIOUS frame
-// (double-buffered on the CPU; identical to `factors` on frame 0 or a layout change ⇒ zero geomorph delta).
+// The SAME per-edge factor slice as `factors` but from the PREVIOUS frame (double-buffered on the CPU;
+// identical to `factors` on frame 0 or a layout change, giving zero geomorph delta).
 [[vk::binding(7, 1)]] StructuredBuffer<float> prevFactors; // per-edge factors, previous frame (instance slice)
 // The previous-frame micro-vertex positions: each slot placed with `prevFactors` on the SAME cur-`L` grid,
 // so it maps 1:1 onto `outVertices`/`outIndices`. The motion prepass binds this as its prev-position stream,
@@ -62,7 +62,7 @@ struct Push
     uint indexBase;    // this instance's reserved index slice base (the draw's firstIndex)
     uint heightIndex;  // bindless index of the height map
     float heightScale; // LOCAL-space displacement amplitude — scales with the instance like its geometry
-    float factorCap;   // hard dice cap (matches Phase 3)
+    float factorCap;   // hard dice cap (matches the scan's)
     uint vectorIndex;  // bindless index of the vector-displacement map (0 = scalar)
     uint pad3;
     float4 uvTransform; // tiling.xy, offset.xy
@@ -92,9 +92,9 @@ Corner loadCorner(uint vertexIndex)
     return c;
 }
 
-// Mip-aware height sampling (Phase 10): sample at a LOD matched to the micro-edge texel density so a
-// coarse micro-grid prefilters the height field instead of point-sampling full resolution below Nyquist
-// (the aliasing that reads as "spiky"). `lod` is computed once per base triangle in `computeMain`.
+// Mip-aware height sampling: a LOD matched to the micro-edge texel density, so a coarse micro-grid
+// prefilters the height field instead of point-sampling full resolution below Nyquist (the aliasing
+// that reads as "spiky"). `lod` is computed once per base triangle in `computeMain`.
 float sampleHeight(float2 uv, float lod)
 {
     return albedoTextures[NonUniformResourceIndex(push.heightIndex)].SampleLevel(uv, lod).r;
@@ -185,9 +185,9 @@ float smoothstep01(float t)
     return c * c * (3.0 - 2.0 * c);
 }
 
-// Geomorph a boundary parameter `p in [0,1]` along an edge onto its shared per-edge segment grid
-// (Phase 5). Instead of snapping to a single integer segment count (which pops when the factor crosses
-// an integer), blend between the floor and ceil segment counts by a smoothstep of the fractional factor:
+// Geomorph a boundary parameter `p in [0,1]` along an edge onto its shared per-edge segment grid.
+// Snapping to a single integer segment count pops when the factor crosses an integer, so blend
+// between the floor and ceil segment counts by a smoothstep of the fractional factor:
 // as `factor` sweeps N → N+1, the boundary point slides continuously from the N-segment placement to the
 // (N+1)-segment one. Both incident triangles read the SAME shared per-edge `factor`, so they compute the
 // bit-identical blended position — watertight through the transition, not just at rest.
@@ -210,7 +210,7 @@ float3 gridBary(float gi, float gj, float levelF)
     return float3(1.0 - a - b, a, b);
 }
 
-// The PARENT-relative barycentric corners of subpatch `s` (SPLIT pass, Phase 10). A base triangle whose
+// The PARENT-relative barycentric corners of subpatch `s` in the SPLIT pass. A base triangle whose
 // driving factor exceeds `TESS_MAX_DICE_FACTOR` is subdivided `levels` times (4 sub-triangles via edge
 // midpoints per level) into `4^levels` subpatches; this returns subpatch `s`'s three corners as
 // barycentric coords WITHIN the parent (parent identity = corners (1,0,0),(0,1,0),(0,0,1)). Each level's
@@ -244,7 +244,7 @@ float3 localToParent(float la, float lb, float3 SA, float3 SB, float3 SC)
     return (1.0 - la - lb) * SA + la * SB + lb * SC;
 }
 
-// The COARSE-PARENT displaced position for a subpatch-local point `(la, lb)` (INTERIOR geomorph, Phase 10):
+// The COARSE-PARENT displaced position for a subpatch-local point `(la, lb)` (the interior geomorph):
 // the position the previous integer LEAF level `coarseLevel = leafLevel-1` places at the same point — the
 // linear interpolation across the `coarseLevel` micro-triangle (in SUBPATCH-local coords) that contains it,
 // its three local corners mapped to the parent frame and displaced (sampled at `coarseLod`, the prefilter
@@ -318,9 +318,9 @@ float3 geomorphLocal(Corner c0, Corner c1, Corner c2, float la, float lb, float3
 
 // Dice ONE subpatch (a leaf of the split, or the whole base triangle when un-split) into its barycentric
 // micro-grid at leaf level `L`, evaluated in the parent frame through the subpatch corners `SA/SB/SC`.
-// Parallel form: `emitLeafVertex` places ONE micro-vertex and `emitLeafTriangle` writes ONE micro-triangle;
+// `emitLeafVertex` places ONE micro-vertex and `emitLeafTriangle` writes ONE micro-triangle;
 // `computeMain`'s 64 lanes stride the flattened (subpatch × local) index space, so a heavily split
-// triangle no longer serializes onto a single thread (the pre-parallel kernel device-lost at high caps).
+// triangle never serializes onto a single thread — that device-loses at high caps.
 // WATERTIGHT: a micro-vertex on a PARENT outer edge (detected exactly via integer weights + the dyadic
 // subpatch corners) is snapped onto that edge's SHARED per-edge factor's segment grid AND samples the
 // height at that edge's SHARED LOD (`edgeLodFor` — a pure function of the two shared endpoints + the
@@ -577,7 +577,7 @@ void computeMain(uint3 gtid: SV_GroupThreadID, uint3 gid: SV_GroupID)
     const float pf12 = prevFactors[push.factorBase + e1];
     const float pf20 = prevFactors[push.factorBase + e2];
 
-    // Interior geomorph (Phase 10), per-LEAF: each INTERIOR micro-vertex blends from the coarser `L-1` leaf
+    // Interior geomorph, per-LEAF: each INTERIOR micro-vertex blends from the coarser `L-1` leaf
     // grid (frac → 0) to the fine `L` displaced surface (frac → 1) by `smoothstep01(frac)` of the LEAF
     // factor's fractional part; boundary verts keep their `snapEdgeParam` weld. `frac` is measured against
     // `L-1` so an exact-integer / cap-saturated leaf resolves to full fine detail.
@@ -602,8 +602,9 @@ void computeMain(uint3 gtid: SV_GroupThreadID, uint3 gid: SV_GroupID)
     const float edgeLod20 = edgeLodFor(c2.uv, c0.uv, f20);
 
     // Per-subpatch reserved sub-slices (contiguous within the base triangle's packed slice), so each
-    // subpatch is a self-contained CLAS-sized cluster the Phase-8 backend can point at directly. The lanes
-    // stride the flattened vertex work, then the flattened index work (independent writes, no barrier).
+    // subpatch is a self-contained CLAS-sized cluster a cluster-acceleration backend can point at
+    // directly. The lanes stride the flattened vertex work, then the flattened index work — independent
+    // writes, no barrier.
     const uint vertsPerLeaf = (L + 1u) * (L + 2u) / 2u;
     const uint trisPerLeaf = L * L;
     const uint subpatchCount = 1u << (2u * levels);

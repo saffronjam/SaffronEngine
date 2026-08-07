@@ -157,15 +157,15 @@ fn run(
 }
 
 /// Loads an existing project's doc off-thread: read + parse + version-gate (`Manifest`), then the
-/// catalog reconcile (`Catalog`). Mirrors the ordered doc-half of the former synchronous
-/// `AssetServer::load_project`, minus the GPU idle + cache clear + `scene_from_json` (all main
-/// thread).
+/// catalog reconcile (`Catalog`). The GPU idle, cache clear, and `scene_from_json` stay on the main
+/// thread.
 fn load_open(
     selection: &str,
     sa_lua_defs: &str,
     progress: &Arc<Mutex<DocProgress>>,
 ) -> Result<LoadedDoc> {
     set_progress(progress, DocStage::Manifest, 0, 0, "");
+    let manifest_started = std::time::Instant::now();
     let path = project_json_path(selection);
     let text = std::fs::read_to_string(&path)
         .map_err(|err| Error::Io(format!("cannot open '{}': {err}", path.display())))?;
@@ -194,11 +194,18 @@ fn load_open(
     catalog_from_json(&mut seed, doc.get("assets").unwrap_or(&empty_array));
     catalog_folders_from_json(&mut seed, doc.get("assetFolders").unwrap_or(&empty_array));
 
+    let manifest_ms = manifest_started.elapsed().as_millis();
+    let catalog_started = std::time::Instant::now();
     let asset_root = root.join("assets");
     let (catalog, _delta) =
         resolve_catalog_from_disk(&asset_root, &seed, &mut |done, total, item| {
             set_progress(progress, DocStage::Catalog, done, total, item);
         });
+    tracing::info!(
+        "project doc ready — manifest {manifest_ms} ms, catalog {} ms ({} assets)",
+        catalog_started.elapsed().as_millis(),
+        catalog.entries.len()
+    );
 
     let sidecar = ProjectSidecar {
         editor_camera: doc.get("editorCamera").cloned().unwrap_or(Value::Null),

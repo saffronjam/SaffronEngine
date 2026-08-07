@@ -3,8 +3,8 @@
 // Z planes) and appends every intersecting punctual light to the cluster's light list.
 // The fragment shader (mesh.slang) then loops only its cluster's lights.
 //
-// Grid + cap must match renderer.cppm (ClusterGridX/Y/Z, MaxLightsPerCluster) and
-// mesh.slang. Cluster index encoding: x + y*gridX + z*gridX*gridY.
+// The grid dimensions and per-cluster cap must match the renderer's and `mesh.slang`'s.
+// Cluster index encoding: x + y*gridX + z*gridX*gridY.
 
 static const uint MAX_LIGHTS_PER_CLUSTER = 64;
 

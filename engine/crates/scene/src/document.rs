@@ -1,30 +1,13 @@
-//! The whole-scene document serde and the v1→v4 version migrations.
+//! The whole-scene document serde and the v1→v4 version migrations. Every key spelling and every
+//! migration branch is load-bearing.
 //!
-//! This sits on top of the per-component serde (`serde.rs`) and the component registry
-//! (`registry.rs`) and assembles the byte-compatible scene document:
-//! `{version, environment, entities:[{id, components, componentOrder}]}`. The frozen
-//! `project.json` scene block and the control-plane scene payloads must stay
-//! byte-identical, so every key spelling and the migration behavior are load-bearing.
+//! [`Scene::scene_from_json`] is the single reader and carries every migration: v1 has no
+//! `environment` block, pre-v3 no per-entity `Relationship`, pre-v4 no `componentOrder`. An unknown
+//! component name warns and is skipped; a version outside `1..=SCENE_VERSION` is an error.
 //!
-//! The single reader [`Scene::scene_from_json`] carries every migration branch in one code
-//! path, the migration is part of the one reader, not a per-version reader zoo:
-//!
-//! - **v1** has no `environment` block → defaulted via `environment_from_json({})`.
-//! - **pre-v3** has no per-entity `Relationship` → every entity loads as a root (the
-//!   relink defaults a root `Relationship` onto any entity missing one).
-//! - **pre-v4** has no per-entity `componentOrder` → the canonical order is derived
-//!   (`sort_component_order`).
-//! - an **unknown component name** warns and is skipped (forward-compat read).
-//! - a version `< 1` or `> SceneVersion` is an error.
-//!
-//! Entities are created *preserving* their uuids ([`Scene::spawn_with_id`], not
-//! [`Scene::create_entity`] which would mint fresh ids), and cross-entity references
-//! (parent uuids, skin joint uuids) resolve in the post-loop [`Scene::relink_hierarchy`]
-//! pass — so a child entry may precede its parent in the array.
-//!
-//! The play duplicate (`enter_play`, a later phase) round-trips the scene through
-//! [`Scene::scene_to_json`] → [`Scene::scene_from_json`], so round-trip fidelity here is
-//! exactly what makes play mode correct.
+//! Entities are created preserving their uuids and cross-entity references resolve in the post-loop
+//! [`Scene::relink_hierarchy`] pass, so a child entry may precede its parent. `enter_play` round-trips
+//! through this serde, so round-trip fidelity here is what makes play mode correct.
 
 use std::fs;
 use std::path::Path;
@@ -65,8 +48,7 @@ impl Scene {
 
         let mut entities: Vec<Value> = Vec::with_capacity(ids.len());
         for (uuid, entity) in ids {
-            // Asset-placement preview ghosts live in the authored scene only to render; they
-            // are never persisted.
+            // Preview ghosts only render; they are never persisted.
             if self.has_component::<crate::PreviewGhost>(entity) {
                 continue;
             }
@@ -136,10 +118,10 @@ impl Scene {
             }
             let entity = self.spawn_with_id(Uuid(uuid));
 
-            if let Some(components) = entry.as_object().and_then(|m| m.get("components")) {
-                if components.is_object() {
-                    reg.deserialize_entity(self, entity, components)?;
-                }
+            if let Some(components) = entry.as_object().and_then(|m| m.get("components"))
+                && components.is_object()
+            {
+                reg.deserialize_entity(self, entity, components)?;
             }
 
             let order = entry.as_object().and_then(|m| m.get("componentOrder"));
@@ -157,10 +139,8 @@ impl Scene {
             let _ = reg.component_order(self, entity);
         }
 
-        // Resolve cross-entity references (uuid → live handle) after the whole loop, since
-        // a parent uuid may point at an entity created later in the array. The relink also
-        // defaults a root Relationship onto pre-v3 entities and downgrades dangling parents
-        // to root with a warning.
+        // Resolve uuid → live handle after the whole loop, since a parent uuid may point at an
+        // entity created later in the array.
         self.relink_hierarchy();
         Ok(())
     }
@@ -278,7 +258,6 @@ mod tests {
         assert!(subtree.contains(&child));
         assert!(subtree.contains(&grandchild));
 
-        // A leaf's subtree is just itself.
         assert_eq!(scene.subtree_entities(grandchild), vec![grandchild]);
     }
 
@@ -373,7 +352,6 @@ mod tests {
         .unwrap();
 
         let doc = tree.scene_to_json(&reg);
-        // The document carries the per-entity component order.
         let entities = doc.get("entities").and_then(Value::as_array).unwrap();
         assert!(
             entities
@@ -553,10 +531,9 @@ mod tests {
                     .get_mut("components")
                     .and_then(|c| c.get_mut("Relationship"))
                     .and_then(Value::as_object_mut)
+                    && rel.get("parent").and_then(Value::as_str) != Some("0")
                 {
-                    if rel.get("parent").and_then(Value::as_str) != Some("0") {
-                        rel.insert("parent".to_string(), Value::String("424242".to_string()));
-                    }
+                    rel.insert("parent".to_string(), Value::String("424242".to_string()));
                 }
             }
         }
@@ -577,30 +554,25 @@ mod tests {
         let reg = registry();
         let mut scene = Scene::new();
 
-        // version 0 (< 1).
         let doc = serde_json::json!({ "version": 0, "entities": [] });
         assert!(matches!(
             scene.scene_from_json(&reg, &doc),
             Err(crate::Error::UnsupportedVersion(0))
         ));
-        // version above SCENE_VERSION.
         let doc = serde_json::json!({ "version": SCENE_VERSION + 1, "entities": [] });
         assert!(matches!(
             scene.scene_from_json(&reg, &doc),
             Err(crate::Error::UnsupportedVersion(_))
         ));
-        // missing entities array.
         let doc = serde_json::json!({ "version": SCENE_VERSION });
         assert!(matches!(
             scene.scene_from_json(&reg, &doc),
             Err(crate::Error::Document(_))
         ));
-        // root not an object.
         assert!(matches!(
             scene.scene_from_json(&reg, &serde_json::json!([1, 2, 3])),
             Err(crate::Error::Document(_))
         ));
-        // an entity missing its id.
         let doc = serde_json::json!({
             "version": SCENE_VERSION,
             "entities": [{ "components": {} }],
@@ -663,8 +635,7 @@ mod tests {
     fn document_bytes_match_captured_block() {
         let reg = registry();
         let mut scene = Scene::new();
-        // A single deterministic entity: id 1024, default Name + Transform + root
-        // Relationship + default component order ["Name","Transform"].
+        // One deterministic entity: id 1024, default Name + Transform + root Relationship.
         let e = scene.spawn_with_id(Uuid(1024));
         scene
             .add_component(
@@ -678,9 +649,7 @@ mod tests {
         scene.add_component(e, Relationship::default()).unwrap();
         reg.sort_component_order(&mut scene, e);
 
-        // The expected document: alphabetical keys (no preserve_order), decimal-string id,
-        // default environment, default Name/Transform/Relationship components, and the
-        // canonical component order.
+        // Alphabetical keys, decimal-string id, default environment and components.
         const EXPECT: &str = concat!(
             r#"{"entities":[{"componentOrder":["Name","Transform"],"components":{"#,
             r#""Name":{"name":"Cube"},"#,
@@ -701,7 +670,7 @@ mod tests {
             r#""fog":{"aerialIntensity":1.0,"aerialPerspective":false,"albedo":{"x":0.5,"y":0.6000000238418579,"z":0.699999988079071},"baseDensity":0.019999999552965164,"density":0.019999999552965164,"directionalColor":{"x":1.0,"y":0.8999999761581421,"z":0.699999988079071},"directionalExponent":8.0,"emissive":{"x":0.0,"y":0.0,"z":0.0},"enabled":false,"height":0.0,"heightFalloff":0.20000000298023224,"historyBlend":0.05000000074505806,"layer2Density":0.0,"layer2Falloff":0.5,"layer2Height":0.0,"lightClamp":0.0,"maxOpacity":1.0,"mode":"analytic","neighborhoodClamp":false,"phaseG":0.6000000238418579,"quality":"medium","scatterAlbedo":0.8999999761581421,"startDistance":0.0},"#,
             r#""skyIntensity":1.0,"skyMode":"procedural","skyRotation":0.0,"skyTexture":"0","#,
             r#""timeOfDay":{"cloudTypeCurve":[],"coverageCurve":[],"day":21,"dayLengthSeconds":600.0,"enabled":false,"exposureCurve":[],"latitude":0.0,"longitude":0.0,"manualOverride":false,"month":6,"timeOfDay":0.5,"tintCurve":{"blue":[],"green":[],"master":[],"red":[]},"year":2025},"#,
-            r#""useSkyForAmbient":true,"visible":true,"wind":{"gust":0.25,"orientation":0.0,"speed":10.0}},"#,
+            r#""useSkyForAmbient":true,"visible":true,"wind":{"gust":0.25,"gustFrequency":0.15000000596046448,"heightExponent":0.20000000298023224,"orientation":0.0,"referenceHeight":10.0,"seed":0,"speed":10.0,"turbulenceOctaves":3,"turbulenceRoughness":0.550000011920929}},"#,
             r#""version":4}"#
         );
 

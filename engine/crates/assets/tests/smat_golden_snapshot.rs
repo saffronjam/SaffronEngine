@@ -1,15 +1,8 @@
-//! The `.smat` byte-exact golden snapshot.
-//!
-//! `MaterialParamsData` (the GPU side) is hashed by raw bytes for per-frame dedup, and the
-//! `.smat` (the CPU side) is the editor's on-disk contract — both fail silently on a byte
-//! shift (a mis-deduped material; a `.smat` the editor parses wrong without erroring). The
-//! detector is a byte compare against a fixture in `fixtures/golden/gen/`, which carries
-//! f64-promoted float formatting and sorted keys — the exact bytes
-//! `material_asset_to_json` + `dump_json_sorted` must reproduce.
-//!
-//! This test rebuilds a populated material and matches the serialized bytes. A
-//! float-format or key-order drift surfaces as a hexdump mismatch.
-//! Reseed with `UPDATE_GOLDEN=1` only on an intentional format change.
+//! The `.smat` byte-exact golden snapshot: a byte compare against a fixture in
+//! `fixtures/golden/gen/`, which carries the f64-promoted float formatting and sorted keys
+//! `material_asset_to_json` + `dump_json_sorted` must reproduce. A `.smat` byte shift is otherwise
+//! silent — the editor parses the file wrong without erroring. Reseed with `UPDATE_GOLDEN=1` only on
+//! an intentional format change.
 
 use saffron_assets::{MaterialAsset, material_asset_to_text};
 use saffron_core::{HeightMode, Uuid};
@@ -17,8 +10,8 @@ use saffron_geometry::glam::{Vec2, Vec3, Vec4};
 use saffron_test_support::assert_bytes_match_golden;
 use saffron_vegetation::MaterialSurface;
 
-/// The populated material the golden fixture covers, field-for-field. `graph`/`overrides`
-/// are `Null` so `material_asset_to_json` emits `{}`.
+/// The populated material the golden fixture covers, field-for-field. `graph`/`overrides` are
+/// `Null` so `material_asset_to_json` emits `{}`.
 fn populated_material() -> MaterialAsset {
     MaterialAsset {
         surface: MaterialSurface::Standard,
@@ -52,9 +45,7 @@ fn populated_material() -> MaterialAsset {
 }
 
 #[test]
-fn populated_smat_bytes_match_cpp_golden() {
-    // The `.smat` write path serializes with sorted keys + two-space indent — the exact
-    // `dump_json_sorted(..., 2)` `save_material_asset` writes to disk.
+fn populated_smat_bytes_match_golden() {
     let text = material_asset_to_text(&populated_material(), 2);
     assert_bytes_match_golden("material.smat", text.as_bytes());
 }

@@ -1,18 +1,12 @@
-//! The shm-ABI header golden snapshot: the *static* half of the shm-ABI gate, paired with the
-//! live byte-exact reader-oracle gate in `shm_abi_gate.rs`.
+//! The static half of the shm-ABI gate, paired with the live reader-oracle gate in
+//! `shm_abi_gate.rs`.
 //!
-//! The frame transport's 32-byte header is `[magic, width, height, seq, ringSlots,
-//! slotCapacity, generationLo, generationHi]` (eight native-endian `u32` words), written at
-//! segment creation with width/height/seq = 0 and the capacity floored at 4K RGBA. A change to any of those
-//! words — a magic, a ring depth, a header size — is an ABI break the editor reader cannot
-//! tolerate, and it never throws. The detector is a golden header layout in
-//! `fixtures/golden/gen/`.
-//!
-//! This test rebuilds the header from the Rust constants, renders the same
-//! `word N <field> <value>` / `hexdump:` text the generator emits, matches it byte-for-byte
-//! against `shm_header.layout`, and additionally asserts the *live* `ViewportShmPublisher`
-//! segment carries those exact header bytes at startup — the static contract and the real
-//! producer agreeing on the same bytes.
+//! The transport's 32-byte header is `[magic, width, height, seq, ringSlots, slotCapacity,
+//! generationLo, generationHi]` as native-endian `u32` words, written at segment creation with
+//! width/height/seq zero and the capacity floored at 4K RGBA. A change to any word is an ABI break
+//! the editor reader cannot tolerate and never throws on, so the detector is a golden layout under
+//! `fixtures/golden/gen/`. The test matches the header rebuilt from the Rust constants against that
+//! golden, then asserts the live publisher's segment carries the same bytes.
 
 use saffron_host::{ShmView, ShmViewConfig, ViewportShmPublisher};
 use saffron_rendering::{MIN_SHM_SLOT_CAPACITY, SHM_HEADER_BYTES, SHM_MAGIC, SHM_RING_SLOTS};

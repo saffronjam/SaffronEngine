@@ -1,17 +1,15 @@
-//! The scoped session guard: the scene and registry are lent to a scripted call only
-//! while it is on the stack.
+//! The scoped session guard: the scene and registry are lent to a scripted call only while it is on
+//! the stack.
 //!
 //! A `&mut Scene` lifetime cannot live inside the `'static` userdata an
-//! [`crate::entity::EntityHandle`] becomes, so the borrow is re-supplied per call by a
-//! **scoped guard** instead of cached in the handle. An entity handle kept past its
-//! session degrades to a logged no-op, never a dangling deref.
+//! [`crate::entity::EntityHandle`] becomes, so the borrow is re-supplied per call rather than cached
+//! in the handle. The VM is single-threaded and `!Send`, so the scene is *moved into* a thread-local
+//! slot for the call's duration and moved back out on scope exit. Nothing escapes into the VM, so
+//! this needs no `unsafe`, and a handle kept past its session degrades to a logged no-op rather than
+//! a dangling deref.
 //!
-//! Because the VM is single-threaded and `!Send`, the guard is a thread-local slot that
-//! the scene is *moved into* for the duration of a scripted call and *moved back out of*
-//! on scope exit (`mem::take` + restore). The borrow never escapes into the VM, so the
-//! borrow checker is satisfied with no `unsafe`: the handle's accessors reach the live
-//! scene only through [`with_scene`] / [`with_scene_mut`], which see the moved-in value,
-//! and resolve to the documented no-op default whenever no session is open.
+//! Every accessor here returns `None` when no session is open; each caller resolves that to its
+//! documented default.
 
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -25,91 +23,59 @@ use saffron_scene::{ComponentRegistry, Scene, ScriptInputState};
 use crate::bridge::ScriptHostBridge;
 
 thread_local! {
-    /// The scene lent for the active scripted call, or `None` between calls.
-    ///
-    /// `RefCell<Option<Scene>>` (single-thread shared-mutable): the VM is `!Send`, so no
-    /// `Mutex` is needed. `Some` exactly while a [`ScopedSession`] is alive.
+    /// `Some` exactly while a [`ScopedSession`] is alive. Moved in and out, so the caller cannot
+    /// touch the scene for the call's duration.
     static SESSION: RefCell<Option<Scene>> = const { RefCell::new(None) };
 
-    /// The component registry lent alongside the scene, or `None` between calls.
-    ///
-    /// The registry drives the type-erased component bridge
-    /// (`get/set/add/remove/has_component`). It is read-only during a session, so it
-    /// crosses as a shared `Arc` clone rather than a moved value — there is nothing to
-    /// move back out.
+    /// Read-only during a session, so it crosses as a shared `Arc` clone with nothing to move back
+    /// out.
     static REGISTRY: RefCell<Option<Arc<ComponentRegistry>>> = const { RefCell::new(None) };
 
-    /// The deferred structural ops accumulated during the active call's instance loop.
-    ///
-    /// `entity:destroy()` queues a uuid here and the handle stays valid for the rest
-    /// of the handler; the runtime drains it with [`take_deferred`] after the loop and
-    /// runs `destroy_entity` + one `relink_hierarchy` if dirty — never mid-loop. The slot
-    /// is reset on each [`enter_session`] and lives for the call's duration.
+    /// `entity:destroy()` queues a uuid here and the handle stays valid for the rest of the handler;
+    /// the runtime drains it after the instance loop, never mid-loop, because the loop iterates the
+    /// instance vector by reference.
     static DEFERRED: RefCell<DeferredOps> = const { RefCell::new(DeferredOps::new()) };
 
-    /// The gameplay-input snapshot lent for the active call, or `None` when the call
-    /// runs without input (a `None` input → every input binding returns its default).
-    ///
-    /// Read-only during a session (the edges are derived by the host *before* the
-    /// tick), so the bindings only ever read it; it crosses by move like the scene
-    /// (the host owns it between ticks) so there is no per-tick clone.
+    /// The host derives the input edges *before* the tick, so a session only reads this. It crosses
+    /// by move like the scene, so there is no per-tick clone.
     static INPUT: RefCell<Option<ScriptInputState>> = const { RefCell::new(None) };
 
-    /// The uuid of the instance whose handler is currently running, so a queued
-    /// message records its sender. `Uuid(0)` (no sender) outside an instance handler —
-    /// set per instance, cleared after the loop.
+    /// The instance whose handler is running, so a queued message records its sender. `Uuid(0)`
+    /// outside an instance handler.
     static SENDER: RefCell<Uuid> = const { RefCell::new(Uuid(0)) };
 
-    /// The inter-script messages queued during the active call's instance loop, drained
-    /// by the runtime after the loop.
-    ///
-    /// `entity:send` queues a targeted message; `sa.broadcast` queues with `target =
-    /// Uuid(0)` (every instance). The payload is a registry ref so it survives the
-    /// queue and is released after dispatch — never carried mid-loop (the instance
-    /// vector is iterated by reference).
+    /// Drained by the runtime after the instance loop. The payload rides as a registry ref so it
+    /// survives the queue, and is released after dispatch.
     static MESSAGES: RefCell<Vec<ScriptMessage>> = const { RefCell::new(Vec::new()) };
 
-    /// The host-callback bridge lent for the active call, or `None` between calls.
-    ///
-    /// The physics-reaching bindings (`sa.raycast`/`apply_impulse`/ragdoll/`sa.log`'s
-    /// sink) reach it through [`with_bridge`]; the runtime clones the host's
-    /// `Rc<dyn ScriptHostBridge>` into this slot when it opens a session and clears it on
-    /// scope exit. `None` (no bridge lent) means the documented no-op path. Read-only
-    /// during a session, so it crosses as a shared `Rc` clone.
+    /// Read-only during a session, so it crosses as a shared `Rc` clone.
     static BRIDGE: RefCell<Option<Rc<dyn ScriptHostBridge>>> = const { RefCell::new(None) };
 }
 
 /// One queued inter-script message, dispatched after the instance loop.
-///
-/// `entity:send(handler, payload)` queues `target = <that entity's uuid>`;
-/// `sa.broadcast(handler, payload)` queues `target = Uuid(0)` (every instance). The
-/// payload rides as an [`mlua::RegistryKey`], released after the message is dispatched.
 pub struct ScriptMessage {
-    /// The uuid of the target instance, or `Uuid(0)` for a broadcast to every instance.
+    /// The target instance, or `Uuid(0)` for a broadcast to every instance.
     pub target: Uuid,
-    /// The uuid of the sending instance (`Uuid(0)` when sent outside a handler).
+    /// The sending instance (`Uuid(0)` when sent outside a handler).
     pub sender: Uuid,
-    /// The handler method name invoked as `self:<handler>(sender, payload)`.
+    /// Invoked as `self:<handler>(sender, payload)`.
     pub handler: String,
-    /// The registry ref to the payload table, or `None` when the payload was `nil`.
+    /// `None` when the payload was `nil`.
     pub payload: Option<RegistryKey>,
 }
 
-/// The structural ops a scripted call defers to its post-loop flush.
-///
-/// Only `destroy` is queued; `set_parent`/`spawn` run inline (they touch components,
-/// not the instance vector). Reset per [`enter_session`].
+/// The structural ops a scripted call defers to its post-loop flush. Only `destroy` is queued;
+/// `set_parent` and `spawn` run inline, because they touch components rather than the instance
+/// vector.
 #[derive(Default)]
 pub struct DeferredOps {
-    /// The uuids queued by `entity:destroy()`, drained after the instance loop.
     pub pending_destroy: Vec<Uuid>,
-    /// Set whenever a queued structural op changes the hierarchy, so the flush runs
-    /// `relink_hierarchy` exactly once.
+    /// Set whenever a queued op changes the hierarchy, so the flush runs `relink_hierarchy` exactly
+    /// once.
     pub hierarchy_dirty: bool,
 }
 
 impl DeferredOps {
-    /// An empty op set — the between-calls state.
     const fn new() -> Self {
         Self {
             pending_destroy: Vec::new(),
@@ -117,15 +83,13 @@ impl DeferredOps {
         }
     }
 
-    /// Whether anything is queued (a fast skip for the flush).
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.pending_destroy.is_empty() && !self.hierarchy_dirty
     }
 }
 
-/// Queues `uuid` for deferred destruction and marks the hierarchy dirty. A no-op when
-/// no session is open — the deferred slot is only meaningful within a call.
+/// Queues `uuid` for deferred destruction and marks the hierarchy dirty.
 pub fn defer_destroy(uuid: Uuid) {
     if !session_active() {
         return;
@@ -137,34 +101,30 @@ pub fn defer_destroy(uuid: Uuid) {
     });
 }
 
-/// Takes and clears the deferred ops accumulated during the call, for the runtime's
-/// post-loop flush. Returns the empty set when no session is open.
+/// Takes and clears the deferred ops, for the runtime's post-loop flush.
 pub fn take_deferred() -> DeferredOps {
     DEFERRED.with(|slot| std::mem::take(&mut *slot.borrow_mut()))
 }
 
-/// Runs `f` against the lent input snapshot, or returns `None` when no input is lent
-/// (the input bindings' no-input path → the documented default).
+/// Runs `f` against the lent input snapshot.
 pub fn with_input<R>(f: impl FnOnce(&ScriptInputState) -> R) -> Option<R> {
     INPUT.with(|slot| slot.borrow().as_ref().map(f))
 }
 
-/// Sets the uuid of the instance whose handler is about to run, so a message queued
-/// from it records the right sender. Cleared to `Uuid(0)` after the loop.
+/// Sets the instance whose handler is about to run, so a message queued from it records the right
+/// sender. Cleared to `Uuid(0)` after the loop.
 pub fn set_sender(uuid: Uuid) {
     SENDER.with(|slot| *slot.borrow_mut() = uuid);
 }
 
-/// The uuid of the instance whose handler is currently running (`Uuid(0)` outside a
-/// handler), for the message sender and the host log-sink tag.
+/// The instance whose handler is running (`Uuid(0)` outside a handler), for the message sender and
+/// the host log-sink tag.
 #[must_use]
 pub fn current_sender() -> Uuid {
     SENDER.with(|slot| *slot.borrow())
 }
 
 /// Queues an inter-script message, drained by the runtime after the instance loop.
-/// A no-op when no session is open — a message outside a call has no loop to dispatch
-/// into.
 pub fn queue_message(message: ScriptMessage) {
     if !session_active() {
         return;
@@ -172,24 +132,19 @@ pub fn queue_message(message: ScriptMessage) {
     MESSAGES.with(|slot| slot.borrow_mut().push(message));
 }
 
-/// Takes and clears the queued messages, for the runtime's post-loop dispatch. Returns
-/// the empty queue when no session is open.
+/// Takes and clears the queued messages, for the runtime's post-loop dispatch.
 pub fn take_messages() -> Vec<ScriptMessage> {
     MESSAGES.with(|slot| std::mem::take(&mut *slot.borrow_mut()))
 }
 
-/// Whether a scripted call is currently on the stack (a session is open).
-///
-/// The first check every accessor runs.
+/// Whether a scripted call is currently on the stack.
 #[must_use]
 pub fn session_active() -> bool {
     SESSION.with(|slot| slot.borrow().is_some())
 }
 
-/// Lends `bridge` to the active call so the physics-reaching bindings reach the host's
-/// callbacks. The runtime sets it right after [`enter_session`] (cloning the host's
-/// `Rc<dyn ScriptHostBridge>`); [`ScopedSession`]'s drop clears it. A no-op outside a
-/// session — a bridge call has no live world to reach.
+/// Lends `bridge` to the active call so the physics-reaching bindings reach the host's callbacks.
+/// The runtime sets it right after [`enter_session`]; [`ScopedSession`]'s drop clears it.
 pub fn set_bridge(bridge: Rc<dyn ScriptHostBridge>) {
     if !session_active() {
         return;
@@ -197,31 +152,18 @@ pub fn set_bridge(bridge: Rc<dyn ScriptHostBridge>) {
     BRIDGE.with(|slot| *slot.borrow_mut() = Some(bridge));
 }
 
-/// Runs `f` against the lent host-callback bridge, or returns `None` when no bridge is
-/// lent (no session open, or the host installed none) — the documented no-op path for the
-/// physics-reaching bindings.
+/// Runs `f` against the lent host-callback bridge. `None` also when the host installed none.
 pub fn with_bridge<R>(f: impl FnOnce(&dyn ScriptHostBridge) -> R) -> Option<R> {
     BRIDGE.with(|slot| slot.borrow().as_ref().map(|b| f(b.as_ref())))
 }
 
-/// Opens a session, lending `scene` and `registry` to the thread-local slots, and
-/// returns a guard.
+/// Opens a session, lending `scene` and `registry` to the thread-local slots.
 ///
-/// While the returned [`ScopedSession`] is alive, [`session_active`] is `true`,
-/// [`with_scene`] / [`with_scene_mut`] see `scene`'s contents, and [`with_registry`]
-/// sees `registry`; dropping the guard moves the scene back into `*scene` and clears
-/// the registry. The guard borrows `scene` for its whole lifetime, so the caller
-/// cannot touch `scene` until the session ends — the compiler enforces the "scene is
-/// lent, not aliased" contract via `mem::take`/restore around the instance loop.
+/// The guard borrows `scene` for its whole lifetime, so the compiler enforces that the scene is lent
+/// rather than aliased. Pass `input = None` for a call that runs without gameplay input
+/// (`on_create`/`on_destroy`, the schema probe, the tests).
 ///
-/// `input` is the gameplay-input snapshot lent for the call (the host's snapshot,
-/// moved in and restored on drop like the scene); pass `None` for a call that runs
-/// without input (`on_create`/`on_destroy`, the schema probe, the tests), so the
-/// input bindings read their documented default.
-///
-/// A re-entrant call (a session already open on this thread) is a programming error —
-/// the invariant is single-call-on-the-stack — so it panics rather than silently
-/// aliasing.
+/// Panics on a re-entrant call rather than silently aliasing: the invariant is one call on the stack.
 pub fn enter_session<'a>(
     scene: &'a mut Scene,
     registry: Arc<ComponentRegistry>,
@@ -238,7 +180,6 @@ pub fn enter_session<'a>(
     REGISTRY.with(|slot| {
         *slot.borrow_mut() = Some(registry);
     });
-    // Move the caller's input into the slot (no clone), restored on drop like the scene.
     INPUT.with(|slot| {
         *slot.borrow_mut() = input.as_deref_mut().map(std::mem::take);
     });
@@ -253,9 +194,7 @@ pub fn enter_session<'a>(
     ScopedSession { scene, input }
 }
 
-/// The live session: a guard that holds the caller's `&mut Scene` (and optional `&mut
-/// ScriptInputState`) and restores them on drop. The lent contents live in the
-/// thread-local slots while this is alive.
+/// Holds the caller's `&mut Scene` (and optional `&mut ScriptInputState`) and restores them on drop.
 #[must_use = "the session ends when the guard is dropped; hold it for the call's duration"]
 pub struct ScopedSession<'a> {
     scene: &'a mut Scene,
@@ -289,25 +228,17 @@ impl Drop for ScopedSession<'_> {
     }
 }
 
-/// Runs `f` with a shared reference to the lent scene, or returns `None` when no
-/// session is open (the "outside a script callback" path).
-///
-/// The handle accessors call this for reads (`get_position`, `name`, `uuid`, …):
-/// `None` means session-inactive → the caller logs and returns the documented
-/// default.
+/// Runs `f` with a shared reference to the lent scene.
 pub fn with_scene<R>(f: impl FnOnce(&Scene) -> R) -> Option<R> {
     SESSION.with(|slot| slot.borrow().as_ref().map(f))
 }
 
-/// Runs `f` with a mutable reference to the lent scene, or returns `None` when no
-/// session is open. The write counterpart of [`with_scene`] (`set_position`, …).
+/// The write counterpart of [`with_scene`].
 pub fn with_scene_mut<R>(f: impl FnOnce(&mut Scene) -> R) -> Option<R> {
     SESSION.with(|slot| slot.borrow_mut().as_mut().map(f))
 }
 
-/// Runs `f` with the lent component registry, or returns `None` when no session is
-/// open. The registry drives the type-erased component bridge (`get/set/add/remove/
-/// has_component`).
+/// Runs `f` with the lent component registry, which drives the type-erased component bridge.
 pub fn with_registry<R>(f: impl FnOnce(&ComponentRegistry) -> R) -> Option<R> {
     REGISTRY.with(|slot| slot.borrow().as_ref().map(|r| f(r)))
 }

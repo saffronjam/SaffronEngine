@@ -73,9 +73,9 @@ page.
 | What | File | Symbols |
 |---|---|---|
 | Traits as interfaces | `engine/crates/app/src/lib.rs` | `Layer`, `FrameHost`, `attach_layer` |
-| The deferred-work closure seam | `engine/crates/rendering/src/renderer.rs` | `Renderer::submit` |
+| The deferred-work closure seam | `engine/crates/rendering/src/renderer/` | `Renderer::submit` |
 | The hand-built itable | `engine/crates/scene/src/registry.rs` | `ComponentTraits`, `ComponentRegistry` |
-| Plain-data GPU wrappers | `engine/crates/rendering/src/resources.rs` | `Buffer`, `Image`, `GpuMesh`, `GpuTexture`, `Pipeline` |
+| Plain-data GPU wrappers | `engine/crates/rendering/src/resources/` | `Buffer`, `Image`, `GpuMesh`, `GpuTexture`, `Pipeline` |
 | The sharing alias | `engine/crates/core/src/lib.rs` | `Ref` |
 
 ## Related

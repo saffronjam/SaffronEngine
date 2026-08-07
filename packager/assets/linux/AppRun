@@ -1,9 +1,6 @@
 #!/usr/bin/env bash
-# AppImage entrypoint. Wires the bundled layout to the three runtime knobs the engine reads:
-# CEF resolves libcef.so + its resource packs beside the shell binary (usr/bin), the host is
-# spawned from SAFFRON_ANIMA_BIN, and the engine data roots come from SAFFRON_ASSET_DIR (the dir
-# that directly holds models/fonts/icons/shaders — the engine joins e.g. models/editor-camera.glb
-# onto it, mirroring the dev target/<profile>/ layout) and SAFFRON_SHADER_DIR (compiled SPIR-V).
+# AppImage entrypoint. SAFFRON_ASSET_DIR must be the dir that *directly* holds
+# models/fonts/icons/shaders — the engine joins relative paths (models/editor-camera.glb) onto it.
 set -euo pipefail
 HERE="$(dirname "$(readlink -f "${0}")")"
 
@@ -11,8 +8,6 @@ export LD_LIBRARY_PATH="${HERE}/usr/bin:${LD_LIBRARY_PATH:-}"
 export SAFFRON_ANIMA_BIN="${HERE}/usr/bin/saffron-host"
 export SAFFRON_ASSET_DIR="${HERE}/usr/share/saffron-anima/assets"
 export SAFFRON_SHADER_DIR="${SAFFRON_ASSET_DIR}/shaders"
-# The shell serves this bundled React UI over the saffron-app:// scheme (no dev server in a package).
-# Point SAFFRON_DEV_URL at a running Vite server instead to test the UI against this bundle.
 export SAFFRON_UI_DIR="${HERE}/usr/share/saffron-anima/ui"
 
 exec "${HERE}/usr/bin/saffron-editor-shell" "$@"

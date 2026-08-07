@@ -12,7 +12,8 @@ one layer algebra, and one mutation reducer. Rendering and Jolt remain downstrea
 ## Crate and dependency boundary
 
 - [x] Add `engine/crates/vegetation/` depending on `saffron-core`, `saffron-json`,
-  `saffron-geometry`, and `saffron-spatial` only.
+  `saffron-material`, `saffron-geometry`, and `saffron-spatial`. Surface and coverage vocabulary comes
+  from `saffron-material` re-exported through the crate root rather than restated.
 - [x] Keep asset-server I/O, GPU resources, Jolt, scene ECS, control, and host concerns out of the
   crate. `saffron-assets`/`saffron-runtime` integrate its pure formats and reducers later.
 - [x] Add typed `Error` variants for format, identity, schema, mutation, manifest, and numeric

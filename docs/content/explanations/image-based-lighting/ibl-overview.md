@@ -57,12 +57,12 @@ The master IBL switch is enabled by default. `sa set-ibl 0` selects the authored
 
 | What | File | Symbols |
 |---|---|---|
-| Resources and capture lifetime | `engine/crates/rendering/src/ibl.rs` | `Ibl`, `LiveCapture`, `Ibl::request_env_bake` |
-| Capture dimensions | `engine/crates/rendering/src/ibl.rs` | `IBL_ENV_SIZE`, `SKY_SH_COEFFICIENTS`, `IBL_PREFILTER_SIZE`, `IBL_PREFILTER_MIPS`, `IBL_LUT_SIZE` |
-| IBL descriptor layout | `engine/crates/rendering/src/descriptors.rs` | `create_ibl_layout` |
+| Resources and capture lifetime | `engine/crates/rendering/src/ibl/` | `Ibl`, `LiveCapture`, `Ibl::request_env_bake` |
+| Capture dimensions | `engine/crates/rendering/src/ibl/` | `IBL_ENV_SIZE`, `SKY_SH_COEFFICIENTS`, `IBL_PREFILTER_SIZE`, `IBL_PREFILTER_MIPS`, `IBL_LUT_SIZE` |
+| IBL descriptor layout | `engine/crates/rendering/src/descriptors/` | `create_ibl_layout` |
 | Opaque diffuse resolve | `engine/assets/shaders/gi_resolve.slang` | `computeMain`, `skyShIrradiance` |
 | Specular and transparent diffuse | `engine/assets/shaders/lighting.slang` | `evalLighting`, `prefilterLod`, `skyShIrradiance` |
-| Runtime toggle | `engine/crates/control/src/commands_render.rs` | `set-ibl` |
+| Runtime toggle | `engine/crates/control/src/commands_render/` | `set-ibl` |
 
 ## Related
 

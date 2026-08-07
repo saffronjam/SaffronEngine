@@ -4,28 +4,45 @@ use std::sync::Arc;
 
 use ash::vk;
 
-use crate::shader_artifact::{ShaderArtifactIdentity, load_shader_artifact};
+use crate::shader_artifact::{
+    ShaderArtifactContract, ShaderArtifactIdentity, load_shader_artifact,
+};
 use crate::{Buffer, Device, Pipeline};
 
 const FENCE_POLL_NANOSECONDS: u64 = 2_000_000;
 
+/// Cooperative reason for stopping a submitted compute workload.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum ComputeDispatchAbort {
+pub enum ComputeDispatchAbort {
+    /// The caller cancelled the workload.
     Cancelled,
+    /// The caller's execution deadline elapsed.
     DeadlineExceeded,
 }
 
-pub(crate) enum ComputeDispatchOutcome {
+/// Completed readback buffers or a safely drained cooperative abort.
+pub enum ComputeDispatchOutcome {
+    /// Output buffers in descriptor-binding order.
     Complete(Vec<Vec<u8>>),
+    /// Abort observed before submission or after the submitted work drained.
     Aborted(ComputeDispatchAbort),
 }
 
-pub(crate) struct ComputeBuffer {
-    pub(crate) bytes: Vec<u8>,
+/// Owned bytes uploaded to one storage-buffer binding.
+pub struct ComputeBuffer {
+    bytes: Vec<u8>,
 }
 
 impl ComputeBuffer {
-    pub(crate) fn zeroed(size: usize) -> Self {
+    /// Creates a buffer initialized from exact host bytes.
+    #[must_use]
+    pub fn from_bytes(bytes: Vec<u8>) -> Self {
+        Self { bytes }
+    }
+
+    /// Creates a zero-initialized buffer of the requested size.
+    #[must_use]
+    pub fn zeroed(size: usize) -> Self {
         Self {
             bytes: vec![0; size],
         }
@@ -68,7 +85,8 @@ impl Drop for Cleanup<'_> {
     }
 }
 
-pub(crate) struct ComputeDispatch {
+/// Reusable owned Vulkan compute dispatcher for one verified shader artifact.
+pub struct ComputeDispatch {
     device: Arc<Device>,
     binding_count: usize,
     shader_artifact_identity: ShaderArtifactIdentity,
@@ -81,11 +99,7 @@ pub(crate) struct ComputeDispatch {
 }
 
 impl ComputeDispatch {
-    pub(crate) fn new(
-        device: Arc<Device>,
-        shader: &str,
-        binding_count: usize,
-    ) -> crate::Result<Self> {
+    fn new(device: Arc<Device>, shader: &str, binding_count: usize) -> crate::Result<Self> {
         if binding_count == 0 {
             return Err(crate::Error::ShaderLoad(
                 "compute dispatch requires at least one buffer binding".to_owned(),
@@ -205,7 +219,20 @@ impl ComputeDispatch {
         })
     }
 
-    pub(crate) fn shader_artifact_identity(&self) -> &ShaderArtifactIdentity {
+    /// Creates a dispatcher only when the loaded artifact matches the consumer's exact contract.
+    pub fn new_verified(
+        device: Arc<Device>,
+        contract: ShaderArtifactContract,
+        binding_count: usize,
+    ) -> crate::Result<Self> {
+        let dispatcher = Self::new(device, contract.shader(), binding_count)?;
+        contract.verify(dispatcher.shader_artifact_identity())?;
+        Ok(dispatcher)
+    }
+
+    /// Exact compiler, source-closure, and SPIR-V identity loaded by this dispatcher.
+    #[must_use]
+    pub fn shader_artifact_identity(&self) -> &ShaderArtifactIdentity {
         &self.shader_artifact_identity
     }
 
@@ -223,7 +250,8 @@ impl ComputeDispatch {
         }
     }
 
-    pub(crate) fn run_interruptible(
+    /// Dispatches one buffer set and polls the caller's cooperative abort source.
+    pub fn run_interruptible(
         &mut self,
         buffers: Vec<ComputeBuffer>,
         dispatch: [u32; 3],
@@ -398,6 +426,29 @@ impl ComputeDispatch {
             );
         }
         Ok(ComputeDispatchOutcome::Complete(result))
+    }
+}
+
+/// Vulkan storage and workgroup bounds relevant to generic compute adapters.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ComputeDispatchLimits {
+    /// Maximum bytes in one storage-buffer binding.
+    pub max_storage_buffer_range: u64,
+    /// Maximum workgroup count along the X dimension.
+    pub max_work_group_count_x: u32,
+}
+
+/// Reads the selected physical device's generic compute-dispatch limits.
+#[must_use]
+pub fn compute_dispatch_limits(device: &Device) -> ComputeDispatchLimits {
+    let properties = unsafe {
+        device
+            .instance()
+            .get_physical_device_properties(device.physical_device())
+    };
+    ComputeDispatchLimits {
+        max_storage_buffer_range: u64::from(properties.limits.max_storage_buffer_range),
+        max_work_group_count_x: properties.limits.max_compute_work_group_count[0],
     }
 }
 

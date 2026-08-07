@@ -1,0 +1,116 @@
+{
+  "schemaVersion": 1,
+  "profile": {
+    "name": "NVIDIA GeForce RTX 3070 Ti",
+    "deviceType": "discrete-gpu",
+    "vendorId": 4318,
+    "deviceId": 9346,
+    "driverVersion": 2559230144,
+    "apiVersion": 4211029,
+    "driverId": 4,
+    "deviceUuid": "449c5964c6cad0624ab4f5bf0cb7858d",
+    "driverUuid": "08d21a137e9852738a860d4c7ef8f6ea",
+    "moltenVk": false
+  },
+  "spatialNumeric": {
+    "shaderArtifact": {
+      "shader": "spatial_numeric_test",
+      "source": "spatial_numeric_test.slang",
+      "artifact": "spatial_numeric_test.spv",
+      "sourceFiles": [
+        "spatial_numeric.slang",
+        "spatial_numeric_test.slang"
+      ],
+      "compilerIdentity": "2026.10",
+      "compilerIdentitySha256": "4cf5a4e22ff7b707cb9db312fb6b7a8668929dc74b4c05c0ee527c36aaa24c41",
+      "spirvFlags": [
+        "-profile",
+        "glsl_450",
+        "-target",
+        "spirv",
+        "-emit-spirv-directly",
+        "-fvk-use-entrypoint-name",
+        "-matrix-layout-column-major",
+        "-capability",
+        "SPV_KHR_non_semantic_info+SPV_GOOGLE_user_type+spvSparseResidency+spvMinLod+spvFragmentFullyCoveredEXT+spvShaderNonUniformEXT+spvRayQueryKHR+spvMeshShadingEXT+spvGroupNonUniform+spvGroupNonUniformBallot"
+      ],
+      "defines": [],
+      "compileInputSha256": "489acb9efcd70afd2a6647498d80505b3a818400330ab4d1df6839305c5cf484",
+      "spirvSha256": "c0fbaf3caeee061648962ab0b62b43cc7733a42a8e70b48079f4bcafa3b41bad",
+      "recordSha256": "23f6244ac5f6ad7db5f8c85979364908b233d7438ff1a198efaba998e46df292"
+    },
+    "goldenWordCount": 32,
+    "rustReferenceSha256": "9cd45b0f7e7fa8782771377091f57aea1d40a66b3468a075104f8ca53944b6b1",
+    "slangSha256": "9cd45b0f7e7fa8782771377091f57aea1d40a66b3468a075104f8ca53944b6b1"
+  },
+  "graphProgram": {
+    "abiVersion": 1,
+    "abiSha256": "83677153a77a50cf9eb39cef25d311a8e9df432beb1bdde1231ef88e322071b7",
+    "corpusProgramCount": 7,
+    "corpusInvocationCount": 30,
+    "corpusSha256": "e72393bf7725a265a5a2cc377b04c9c0e0ca2e368bf1e4b0092cfc5f1e9a5b30",
+    "rustReferenceSha256": "89ae9f1af68cd8040823f2a5cddb79887e717643c68423fb1ebddc14bd7843fc",
+    "slangSha256": "89ae9f1af68cd8040823f2a5cddb79887e717643c68423fb1ebddc14bd7843fc",
+    "shaderArtifact": {
+      "shader": "vegetation_graph",
+      "source": "vegetation_graph.slang",
+      "artifact": "vegetation_graph.spv",
+      "sourceFiles": [
+        "spatial_numeric.slang",
+        "vegetation_graph.slang"
+      ],
+      "compilerIdentity": "2026.10",
+      "compilerIdentitySha256": "4cf5a4e22ff7b707cb9db312fb6b7a8668929dc74b4c05c0ee527c36aaa24c41",
+      "spirvFlags": [
+        "-profile",
+        "glsl_450",
+        "-target",
+        "spirv",
+        "-emit-spirv-directly",
+        "-fvk-use-entrypoint-name",
+        "-matrix-layout-column-major",
+        "-capability",
+        "SPV_KHR_non_semantic_info+SPV_GOOGLE_user_type+spvSparseResidency+spvMinLod+spvFragmentFullyCoveredEXT+spvShaderNonUniformEXT+spvRayQueryKHR+spvMeshShadingEXT+spvGroupNonUniform+spvGroupNonUniformBallot"
+      ],
+      "defines": [],
+      "compileInputSha256": "ab8cf52c7d86f6a637eab711ec1b8a7a587473e401a103243e61d3f49a26db63",
+      "spirvSha256": "173094b0fdb35d286dd9d7721fe8a4c7e2bdbca71877050e2a93e27e50173f85",
+      "recordSha256": "a24eceedd729734790c3e09a516e338c768f453e67d7464949c2e3593120d95e"
+    },
+    "qualifiedOperators": [
+      {
+        "operator": "noise",
+        "semanticVersion": 1
+      },
+      {
+        "operator": "gradient",
+        "semanticVersion": 1
+      },
+      {
+        "operator": "curve",
+        "semanticVersion": 1
+      },
+      {
+        "operator": "remap",
+        "semanticVersion": 1
+      },
+      {
+        "operator": "combine",
+        "semanticVersion": 1
+      },
+      {
+        "operator": "clamp",
+        "semanticVersion": 1
+      },
+      {
+        "operator": "field-importance",
+        "semanticVersion": 1
+      }
+    ]
+  },
+  "validation": {
+    "before": 0,
+    "after": 0,
+    "newIssues": 0
+  }
+}

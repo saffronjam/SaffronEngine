@@ -1,25 +1,19 @@
-//! The material height-map technique — how a grayscale height map is realized, shared by
-//! the asset model, the resolve, and the renderer so there is one vocabulary for it.
+//! The material height-map technique, shared by the asset model, the resolve, and the renderer.
 
 /// How a material's height map is rendered.
 ///
-/// One grayscale Height Map slot; the *mode* selects the technique (the shape the major
-/// engines converge on — Unity HDRP's `Displacement Mode`, Godot's Height feature, Blender's
-/// Bump/Displacement modes). The wire form (scene JSON, `.smat`) is the lowercase string
-/// [`HeightMode::as_wire`] returns; [`HeightMode::from_wire`] parses it (unknown →
-/// [`HeightMode::Bump`], the artifact-free baseline).
+/// The wire form (scene JSON, `.smat`) is the lowercase string [`HeightMode::as_wire`] returns;
+/// [`HeightMode::from_wire`] parses it, mapping anything unknown to [`HeightMode::Bump`].
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub enum HeightMode {
-    /// Height → shading-normal bump only: no parallax, no geometry. The safe, artifact-free
-    /// baseline (Blender `Bump Only`); the far-field / low-poly degrade for the other modes.
+    /// Height feeds the shading normal only: no parallax, no geometry, no artifacts. The
+    /// far-field and low-poly degrade for the other modes.
     #[default]
     Bump,
-    /// Parallax occlusion mapping: a fragment UV march fakes depth. Flat silhouette; the
-    /// right tool for genuine height/parallax maps on near-perpendicular surfaces.
+    /// Parallax occlusion mapping: a fragment UV march fakes depth, leaving a flat silhouette.
     Parallax,
-    /// Real per-vertex displacement (the `displace` compute pre-pass moves geometry into the
-    /// shared deformed buffer — true silhouette, consistent across every pass, BLAS-able).
-    /// Needs a densely-tessellated mesh to show its silhouette.
+    /// Per-vertex displacement through the `displace` compute pre-pass into the shared deformed
+    /// buffer — a true silhouette across every pass, BLAS-able, on a densely tessellated mesh.
     Displacement,
 }
 
@@ -59,7 +53,6 @@ mod tests {
         ] {
             assert_eq!(HeightMode::from_wire(mode.as_wire()), mode);
         }
-        // Unknown tokens are bump; the default is bump.
         assert_eq!(HeightMode::from_wire("nonsense"), HeightMode::Bump);
         assert_eq!(HeightMode::default(), HeightMode::Bump);
     }

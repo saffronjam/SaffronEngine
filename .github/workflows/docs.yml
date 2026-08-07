@@ -1,12 +1,6 @@
-# Docs site → GitHub Pages.
-#
-# Unlike ci.yml, this needs NO toolbox: Hugo has none of the engine's
-# dependencies (Clang/Vulkan/SDL3/slang), so it builds on a stock hosted
-# runner. Pins hugo-extended to match the toolbox (0.162.1) — the hugo-book
-# theme requires >= 0.158.0 and compiles SCSS, so the extended build is
-# mandatory. The theme is a git submodule, hence submodules: recursive.
-#
-# One-time setup (cannot be done from here): repo Settings -> Pages ->
+# Docs site → GitHub Pages. The hugo-book theme compiles SCSS, so the build needs
+# hugo-extended (>= 0.158.0, pinned here to the toolbox's version), and the theme is a
+# git submodule. Publishing also needs a one-time repo setting: Settings -> Pages ->
 # Build and deployment -> Source: GitHub Actions.
 
 name: docs
@@ -19,13 +13,11 @@ on:
       - .github/workflows/docs.yml
   workflow_dispatch:
 
-# Allow the deploy job to publish to Pages via OIDC.
 permissions:
   contents: read
   pages: write
   id-token: write
 
-# One in-flight Pages deploy at a time; don't cancel a publish midway.
 concurrency:
   group: pages
   cancel-in-progress: false
@@ -55,8 +47,8 @@ jobs:
 
       - name: Build site
         working-directory: docs
-        # baseURL comes from configure-pages so the build is correct even if the
-        # repo/owner is renamed; hugo.toml's baseURL stays right for local preview.
+        # baseURL comes from configure-pages so a renamed repo/owner still resolves;
+        # hugo.toml's baseURL serves local preview.
         run: hugo --minify --baseURL "${{ steps.pages.outputs.base_url }}/"
 
       - name: Upload Pages artifact

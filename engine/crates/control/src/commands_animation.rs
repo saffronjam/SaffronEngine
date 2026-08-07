@@ -1,20 +1,10 @@
-//! The 16 animation-domain control commands: playback state (get/play/set-playing/seek/
-//! set-loop/stop-preview), clip listing, the skeleton overlay (get/set/highlight + joint
-//! pick), the viewport debug overlays (get/set), the asset-preview options (show-floor), and
-//! foot-IK (get/set).
+//! The animation-domain control commands: playback state, clip listing, the skeleton overlay and
+//! joint pick, the viewport debug overlays, the asset-preview options, and foot IK.
 //!
-//! `get/set-debug-overlays` sit in this block per the frozen manifest order (between
-//! `set-skeleton-overlay` and `set-skeleton-highlight`), interleaved with the
-//! skeleton-overlay group. `set-asset-preview-options` likewise sits here per the
-//! manifest order (between `pick-skeleton-joint` and `get-foot-ik`); it reuses the
-//! preview-floor helpers from `commands_asset`.
-//!
-//! The handlers drive the per-rig [`AnimationPlayer`] and the overlay render state — a thin
-//! command surface over the animation-player runtime. A model's player / foot-IK / state may
-//! live on the container root or a rig descendant while the selection is any entity in the
-//! forest (e.g. a `Morph` mesh child), so every transport command resolves to the model's
-//! single authority via [`Scene::model_player`] first — never a leaf that would spawn a rival
-//! player.
+//! A model's player, foot-IK, and state may live on the container root or a rig descendant while
+//! the selection is any entity in the forest, so every transport command resolves the model's
+//! single authority through [`Scene::model_player`] rather than a leaf that would spawn a rival
+//! player. Command order within the block is the frozen manifest order.
 
 use saffron_geometry::{AnimClip, AnimPath, AnimTarget, AnimTrack};
 use saffron_protocol::{
@@ -69,7 +59,7 @@ fn asset_selector_parts(selector: &AssetSelector) -> (u64, String) {
 /// entry id.
 fn resolve_clip(ctx: &EngineContext<'_>, selector: &AssetSelector) -> Result<saffron_core::Uuid> {
     let (by_id, name) = asset_selector_parts(selector);
-    for entry in &ctx.assets.catalog.entries {
+    for entry in &ctx.assets.catalog().entries {
         if entry.asset_type == AssetType::Animation && (entry.id.0 == by_id || entry.name == name) {
             return Ok(entry.id);
         }
@@ -85,7 +75,7 @@ fn resolve_container(
     selector: &AssetSelector,
 ) -> Result<saffron_core::Uuid> {
     let (by_id, name) = asset_selector_parts(selector);
-    for entry in &ctx.assets.catalog.entries {
+    for entry in &ctx.assets.catalog().entries {
         if entry.id.0 == by_id || entry.name == name {
             if entry.asset_type == AssetType::Model {
                 return Ok(entry.id);
@@ -120,7 +110,7 @@ fn state_of(
 ) -> AnimationStateResult {
     let (clip_name, duration) = ctx
         .assets
-        .catalog
+        .catalog()
         .find(player.clip)
         .map(|entry| (entry.name.clone(), entry.duration))
         .unwrap_or_default();
@@ -261,6 +251,12 @@ fn debug_overlays_state(opts: &DebugOverlayOptions) -> DebugOverlaysResult {
         light_volumes: opts.light_volumes,
         grid: opts.grid,
         colliders: opts.colliders,
+        vegetation_cells: opts.vegetation_cells,
+        vegetation_bounds: opts.vegetation_bounds,
+        vegetation_rejections: opts.vegetation_rejections,
+        vegetation_heatmap: opts.vegetation_heatmap,
+        vegetation_navigation: opts.vegetation_navigation,
+        wind_vectors: opts.wind_vectors,
     }
 }
 
@@ -324,7 +320,7 @@ pub fn register_animation_commands(reg: &mut CommandRegistry) {
             // forest here, so labels are the raw glTF target names.
             let rows: Vec<(saffron_core::Uuid, String, f32)> = ctx
                 .assets
-                .catalog
+                .catalog()
                 .entries
                 .iter()
                 .filter(|entry| entry.asset_type == AssetType::Animation)
@@ -487,7 +483,7 @@ pub fn register_animation_commands(reg: &mut CommandRegistry) {
 
     reg.register::<DebugOverlaysParams, DebugOverlaysResult>(
         "set-debug-overlays",
-        "set-debug-overlays {bounds?, sceneAabb?, lightVolumes?, grid?, colliders?} — toggle viewport debug overlays",
+        "set-debug-overlays {bounds?, sceneAabb?, lightVolumes?, grid?, colliders?, vegetationCells?, vegetationBounds?} — toggle viewport debug overlays",
         |ctx, params| {
             let opts = &mut ctx.scene_edit.debug_overlays;
             if let Some(bounds) = params.bounds {
@@ -504,6 +500,24 @@ pub fn register_animation_commands(reg: &mut CommandRegistry) {
             }
             if let Some(colliders) = params.colliders {
                 opts.colliders = colliders;
+            }
+            if let Some(vegetation_cells) = params.vegetation_cells {
+                opts.vegetation_cells = vegetation_cells;
+            }
+            if let Some(vegetation_bounds) = params.vegetation_bounds {
+                opts.vegetation_bounds = vegetation_bounds;
+            }
+            if let Some(vegetation_rejections) = params.vegetation_rejections {
+                opts.vegetation_rejections = vegetation_rejections;
+            }
+            if let Some(vegetation_heatmap) = params.vegetation_heatmap {
+                opts.vegetation_heatmap = vegetation_heatmap;
+            }
+            if let Some(vegetation_navigation) = params.vegetation_navigation {
+                opts.vegetation_navigation = vegetation_navigation;
+            }
+            if let Some(wind_vectors) = params.wind_vectors {
+                opts.wind_vectors = wind_vectors;
             }
             Ok(debug_overlays_state(opts))
         },
@@ -578,10 +592,30 @@ pub fn register_animation_commands(reg: &mut CommandRegistry) {
 
     reg.register::<SetAssetPreviewOptionsParams, AssetPreviewOptionsResult>(
         "set-asset-preview-options",
-        "set-asset-preview-options {floor?} — preview-scene settings (show floor)",
+        "set-asset-preview-options {floor?, variation?, phenotype?} — preview-scene settings",
         |ctx, params| {
             if !ctx.scene_edit.previewing() {
                 return Err(Error::command("not in an asset preview"));
+            }
+            if params.variation.is_some() || params.phenotype.is_some() {
+                let root = ctx.scene_edit.preview_root_entity;
+                let scene = ctx.scene_edit.preview_scene.as_mut().expect("previewing");
+                let current = scene
+                    .component::<saffron_scene::PlantVariant>(root)
+                    .unwrap_or_default();
+                let variant = saffron_scene::PlantVariant {
+                    variation: params.variation.unwrap_or(current.variation),
+                    phenotype: params.phenotype.unwrap_or(current.phenotype),
+                };
+                if scene.has_component::<saffron_scene::PlantVariant>(root) {
+                    let _ =
+                        scene.with_component_mut::<saffron_scene::PlantVariant, _>(root, |value| {
+                            *value = variant;
+                        });
+                } else {
+                    let _ = scene.add_component(root, variant);
+                }
+                ctx.scene_edit.scene_version += 1;
             }
             if let Some(floor) = params.floor
                 && floor != ctx.scene_edit.preview_show_floor
@@ -801,7 +835,7 @@ mod tests {
         with_stub(&mut renderer, |ctx| {
             // Seed a clip into the catalog so resolve_clip + find() both resolve it.
             let clip_id = saffron_core::Uuid(4242);
-            ctx.assets.catalog.put(AssetEntry {
+            ctx.assets.register_imported_asset(AssetEntry {
                 id: clip_id,
                 name: "walk".to_owned(),
                 asset_type: AssetType::Animation,
@@ -840,7 +874,7 @@ mod tests {
         let reg = registry();
         let mut renderer = StubRenderer::default();
         with_stub(&mut renderer, |ctx| {
-            ctx.assets.catalog.put(AssetEntry {
+            ctx.assets.register_imported_asset(AssetEntry {
                 id: saffron_core::Uuid(10),
                 name: "run".to_owned(),
                 asset_type: AssetType::Animation,
@@ -848,7 +882,7 @@ mod tests {
                 tracks: 3,
                 ..AssetEntry::default()
             });
-            ctx.assets.catalog.put(AssetEntry {
+            ctx.assets.register_imported_asset(AssetEntry {
                 id: saffron_core::Uuid(11),
                 name: "box".to_owned(),
                 asset_type: AssetType::Mesh,

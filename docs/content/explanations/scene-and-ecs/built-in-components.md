@@ -34,6 +34,7 @@ The built-in registry contains these component rows:
 | Lighting | `DirectionalLight`, `PointLight`, `SpotLight`, `ReflectionProbe`, `FogVolume` | Direct lights, local reflection capture, and bounded participating media |
 | Animation | `AnimationPlayer`, `SkinnedMesh`, `Morph`, `Bone`, `FootIk`, `BonePhysics`, `KinematicBones` | Clip playback, deformation, skeleton metadata, IK, and bone/physics coupling |
 | Physics | `Rigidbody`, `Collider`, `CharacterController` | Motion, collision shape and material, and virtual-character state |
+| Environment | `WindSource`, `VegetationField` | Placeable local wind influence and the map-to-world vegetation binding |
 | Scripting | `Script` | Ordered `.lua` attachments and per-entity field overrides |
 
 The canonical registry order and names live in `BUILTIN_COMPONENT_NAMES`. This list is also a completeness check: every listed name must resolve to one registry row, and every row must appear in the list.

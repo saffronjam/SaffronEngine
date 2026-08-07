@@ -30,7 +30,8 @@ all = "warn"
 just lint
 # cd engine && cargo fmt --check
 # cd engine && cargo clippy --workspace -- -D warnings
-# cd editor && bun run lint      (oxlint over the editor TypeScript)
+# bun run format:check           (oxfmt over every .ts/.tsx in the tree)
+# bun run lint                   (oxlint --deny-warnings over the same set)
 ```
 
 ## Unsafe is opt-in, one crate per FFI seam

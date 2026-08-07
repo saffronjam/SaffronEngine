@@ -62,7 +62,9 @@ Raw writes to `Relationship` trigger a hierarchy relink. `set-parent` remains th
 
 `select`, `deselect`, and `get-selection` manage editor selection. The selection result also carries scene, selection, play, and animation versions, making it the editor's lightweight reconciliation poll.
 
-`pick` tests meshless light and camera billboards before mesh surfaces. Static meshes use cached BVHs; skinned meshes use the current deformed pose. A mesh hit inside a `ModelInstance` selects the model root, while a miss clears selection. See [Picking](../../scene-and-ecs/picking/) for the geometric path.
+`pick` tests meshless light and camera billboards before mesh surfaces. Static meshes use cached BVHs; skinned meshes use the current deformed pose. A mesh hit inside a `ModelInstance` selects the model root, while a miss clears selection; a mesh hit also carries the world position and geometric normal. See [Picking](../../scene-and-ecs/picking/) for the geometric path.
+
+`query-surface-ray` casts one explicit world ray (origin in metres, a direction that normalizes, an optional range) against the scene's surface providers and returns the nearest hit's position and normal without touching selection. The vegetation brush's straight-down projection re-lands stroke samples through it.
 
 `focus` frames the selected entity's full renderable subtree. It uses the model bounds center and field of view to choose a distance, falling back to the entity's world translation when no mesh bounds resolve.
 
@@ -121,13 +123,13 @@ The editor compares these values before issuing heavier list and inspection requ
 
 | What | File | Symbols |
 |---|---|---|
-| Scene-domain registrations | `engine/crates/control/src/commands_scene.rs` | `register_scene_commands` |
+| Scene-domain registrations | `engine/crates/control/src/commands_scene/` | `register_scene_commands` |
 | Entity selectors and DTO conversion | `engine/crates/control/src/selector.rs` | `resolve_entity`, `entity_ref_dto` |
 | Active-scene and version state | `engine/crates/sceneedit/src/context.rs` | `SceneEditContext::active_scene`, `SceneEditContext::set_selection` |
 | Registry-backed component behavior | `engine/crates/scene/src/registry.rs` | `ComponentRegistry`, `ComponentTraits` |
 | Hierarchy-safe structural edits | `engine/crates/scene/src/hierarchy.rs` | `Scene::set_parent`, `Scene::relink_hierarchy` |
-| Surface picking and framing bounds | `engine/crates/assets/src/render_scene.rs` | `pick_entity`, `model_render_aabb` |
-| Protocol shapes | `engine/crates/protocol/src/dto.rs` | `EntitySelector`, `SetTransformParams`, `SelectionResult` |
+| Surface queries and framing bounds | `engine/crates/assets/src/render_scene/` | `query_scene_surface_ray`, `model_render_aabb` |
+| Protocol shapes | `engine/crates/protocol/src/dto/` | `EntitySelector`, `SetTransformParams`, `SelectionResult` |
 | Environment profiles | `engine/crates/assets/src/environment_profile.rs` | `builtin_environment_profiles`, `save_environment_profile`, `load_environment_profile` |
 
 ## Related

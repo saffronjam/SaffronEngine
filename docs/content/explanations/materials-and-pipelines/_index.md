@@ -14,7 +14,7 @@ The shared `mesh.slang` shader covers fixed PBR materials. Specialization consta
 
 | Page | Covers | Code |
 |---|---|---|
-| [Materials & PSOs](material-and-pso-selection/) | Material flags, typed PSO keys, lazy construction, and cache reuse | `pipelines.rs` · `request_mesh_pipeline`, `PsoKey` |
+| [Materials & PSOs](material-and-pso-selection/) | Material flags, typed PSO keys, lazy construction, and cache reuse | `pipelines.rs` · `request_executor_mesh_pipeline`, `PsoKey` |
 | [Übershader](ubershader-and-specialization/) | Shared mesh shader and its specialized pipeline permutations | `pipelines.rs` · `build_mesh_pipeline`; `mesh.slang` · `kUnlit`, `kAlphaToCoverage` |
 | [Descriptor sets](descriptor-sets/) | Mesh resource layout across bindless, lighting, material, and feature sets | `lighting.slang` · `vk::binding`; `pipelines.rs` · `Pipelines::new` |
 | [Bindless textures](bindless-textures/) | Descriptor indexing, slot allocation, reclamation, and per-material texture indices | `descriptors.rs` · `claim_slot`, `write_texture`; `upload.rs` · `upload_texture` |

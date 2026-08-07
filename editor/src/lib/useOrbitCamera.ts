@@ -1,12 +1,9 @@
-/// The orbit camera shared by every preview pane that drives the `assetPreview` view — the
-/// asset editor (model / texture / HDRI subjects) and the material-graph editor's live sphere.
-/// Input moves an orbit target (pivot / distance / yaw / pitch); each change streams that pose to
-/// the engine, and the engine eases pivot / distance / angles toward it every rendered frame at
-/// tau=0.025 (the same ease the fly-cam look and gizmo drag use), sweeping the eye along the arc —
-/// so motion stays smooth at the engine's render FPS, not the ~60 Hz control rate, and a fast drag
-/// follows the circle instead of cutting a chord across it. One coalesced `set-camera` is in flight
-/// at a time (never one call per pointer sample). `exit-asset-preview` restores the engine-stashed
-/// camera, so orbiting never dirties the saved `editorCamera`.
+/// The orbit camera shared by every preview pane driving the `assetPreview` view. Input moves an
+/// orbit target and streams that pose to the engine, which eases pivot / distance / angles toward it
+/// every rendered frame and sweeps the eye along the arc — so motion stays smooth at the engine's
+/// render FPS rather than the control rate, and a fast drag follows the circle instead of cutting a
+/// chord across it. One coalesced `set-camera` is in flight at a time. `exit-asset-preview` restores
+/// the engine-stashed camera, so orbiting never dirties the saved `editorCamera`.
 import { useCallback, useEffect, useMemo, useRef } from "react";
 import type { PointerEvent as ReactPointerEvent, WheelEvent as ReactWheelEvent } from "react";
 import { client } from "../control/client";

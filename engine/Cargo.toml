@@ -4,18 +4,14 @@ members = ["crates/*", "xtask"]
 
 [workspace.package]
 edition = "2024"
-rust-version = "1.85"
+rust-version = "1.96"
 version = "0.1.0"
 license = "MIT"
 authors = ["Saffron Anima"]
 
-# Third-party version pins live here once (the PP-2 dependency-adoption pin list).
-# Member crates pull each dep via `dep.workspace = true`, so versions never drift across
-# crates — the Cargo replacement for the C++ `FetchContent` single-place pin. Each pin is
-# discharged by the area phase that owns the subsystem; the stub crates of phase 1 consume
-# none of these yet (only the inter-crate edges are wired).
+# Member crates pull each dep via `dep.workspace = true`, so versions never drift.
 [workspace.dependencies]
-# Vulkan (saffron-rendering) — pinned exactly to 0.38 per the version-churn risk register.
+# Vulkan (saffron-rendering).
 ash = "=0.38"
 ash-window = "0.13"
 raw-window-handle = "0.6"
@@ -24,8 +20,7 @@ vk-mem = "0.4"
 # Window (saffron-window).
 winit = "0.30"
 
-# ECS behind saffron-scene — the PP-4 default, locked by the 03-ecs-and-scene benchmark gate.
-# Wrapped, never named outside saffron-scene, so escalating to bevy_ecs stays a one-crate change.
+# ECS behind saffron-scene — wrapped, never named outside that crate.
 hecs = "0.11"
 
 # Math (saffron-geometry and most).
@@ -36,14 +31,11 @@ mlua = { version = "0.11", features = ["luau", "vendored"] }
 
 # Serde stack — JSON, wire, schema, errors.
 serde = { version = "1.0", features = ["derive"] }
-# `preserve_order` makes `serde_json::Map` insertion-ordered (the `nlohmann::ordered_json`
-# behavior the editor's typed client assumes): result objects emit keys in DTO field order,
-# and the OpenRPC `components.schemas` block emits in registration order, so the codegen
-# reproduces the committed `gen.ts` artifacts byte-for-byte.
+# `preserve_order` makes `serde_json::Map` insertion-ordered: results emit keys in DTO field
+# order and OpenRPC schemas in registration order, so codegen is byte-reproducible.
 serde_json = { version = "1.0", features = ["preserve_order"] }
 # `schemars_1` so the serde_with adapters carry their `Schema` impls into the schemars 1
-# (draft 2020-12) the control DTOs declare; protocol's `Uuid` newtype pairs the
-# PickFirst<(DisplayFromStr,_)> adapter with a string schema.
+# (draft 2020-12) the control DTOs declare.
 serde_with = { version = "3", features = ["schemars_1"] }
 schemars = "1"
 ts-rs = "10"
@@ -59,14 +51,15 @@ image = "0.25"
 resvg = "0.44"
 usvg = "0.44"
 tiny-skia = "0.11"
+optimesh = "1.1.0"
+zstd = { version = "=0.13.3", default-features = false }
 
 # Syscalls & CLI.
 rustix = "0.38"
 clap = { version = "4", features = ["derive"] }
-# Shell-completion generation for the `sa` CLI, sourced from the same clap `Command`.
 clap_complete = "4"
 
-# Filesystem walk for the asset catalog scan (saffron-assets) — deterministic when sorted.
+# Filesystem walk for the asset catalog scan — order is only deterministic once sorted.
 walkdir = "2.5"
 atomic-write-file = "0.3"
 sha2 = "0.10"
@@ -81,9 +74,8 @@ base64 = "0.22"
 anyhow = "1"
 thiserror = "2"
 
-# Logging (saffron-log) — tracing is the event/span API every crate emits through; the
-# subscriber stack, the time formatter, and the ANSI palette are the saffron-log internals
-# that render the compact line and host future sinks (file, editor channel).
+# Logging — `tracing` is the event/span API every crate emits through; the rest is the
+# saffron-log subscriber stack.
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", default-features = false, features = [
     "registry",
@@ -97,7 +89,7 @@ nu-ansi-term = "0.50"
 # Astronomical time-of-day driver (full NREL Solar Position Algorithm).
 solar-positioning = { version = "0.5.2", default-features = false, features = ["std"] }
 
-# Benchmark harness (dev-only; the ECS go/no-go gate in 03-ecs-and-scene phase 2).
+# Benchmark harness (dev-only).
 criterion = "0.7"
 
 [workspace.lints.rust]
@@ -106,23 +98,20 @@ unsafe_code = "deny"
 [workspace.lints.clippy]
 all = "warn"
 
-# Profile knobs (PP-12 / 01-build-and-toolchain phase 2). These replace the two CMake
-# build types; the old compiler/stdlib/linker pins have no Cargo analogue (the toolchain
-# is the toolbox's rustc) and carry over as nothing — only genuine Cargo knobs remain.
 [profile.dev]
 opt-level = 0
 debug = true
 overflow-checks = true
+incremental = false
 
-# Optimize dependencies even in a debug engine build — the idiomatic Rust expression of
-# CMake's implicit "third-party code (glam, Jolt via saffron-physics-sys, ash inlining)
-# is always optimized enough to run". Pinned to 3 so the debug build stays usable.
+[profile.test]
+incremental = false
+
+# Dependencies are optimized even in a debug engine build, so it stays fast enough to run.
 [profile.dev.package."*"]
 opt-level = 3
 
-# panic = "unwind" (the default) is kept deliberately: the FFI/shm seams must unwind
-# cleanly across the Rust/C++ boundary and the test suite uses #[should_panic]; abort
-# would defeat both. Recorded so it is not silently flipped for a size win.
+# `panic = "unwind"` is required: the FFI/shm seams unwind across the Rust/C++ boundary.
 [profile.release]
 opt-level = 3
 debug = true

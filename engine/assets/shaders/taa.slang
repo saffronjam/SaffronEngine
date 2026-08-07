@@ -41,7 +41,7 @@ struct Push
     float2 prevJitter;   // last frame's NDC jitter
     float2 screenSize;   // input render extent, px
     float2 gammaValid;   // x = variance-clip gamma, y = 1 if history valid this frame
-    float2 rejectSharp;  // x = velocity rejection, y = sharpness (Phase 4)
+    float2 rejectSharp;  // x = velocity rejection, y = sharpness
     float2 upscale;      // x = ratio n = displayW/inputW, y = accumulation target (sampleTarget)
     float2 lockReactive; // x = lock initial lifetime (frames), y = reactive scale
     float2 disoccl;      // x = disocclusion threshold (relative), y = lock-break luma fraction
@@ -119,7 +119,7 @@ float3 YCoCg_to_RGB(float3 c)
 // Optimized Catmull-Rom history reconstruction: a 4x4 bicubic footprint gathered with 9
 // bilinear taps (Pettineo/TheRealMJP). The negative Catmull-Rom lobes preserve the sharpness a
 // single bilinear tap would low-pass away when fed back through history every frame. `texSize`
-// is the history extent in pixels (== the current extent today; the upsampling set diverges it).
+// is the history extent in pixels; under temporal upsampling it differs from the input extent.
 float3 SampleHistoryCatmullRom(Sampler2D tex, float2 uv, float2 texSize)
 {
     float2 samplePos = uv * texSize;

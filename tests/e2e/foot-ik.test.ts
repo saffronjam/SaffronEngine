@@ -1,4 +1,4 @@
-// Foot IK as a blend-layer producer (Phase 13): a two-bone analytic solver writes into the
+// Foot IK as a blend-layer producer: a two-bone analytic solver writes into the
 // PoseBuffer override_/weight layer so an animated rig's foot plants on a ground plane instead
 // of clipping/floating. The leg.gltf fixture is a 3-joint hip→knee→ankle chain whose KneeBend
 // clip drops the ankle; with the ground raised, foot IK lifts the ankle back up to track it.
@@ -15,12 +15,8 @@ let rigId = "";
 let ankleId = "";
 const FIXTURE = join(REPO, "tests", "e2e", "fixtures", "leg.gltf");
 
-interface Inspect {
-  components: { SkinnedMesh?: { bones: string[] } };
-}
-
 const worldY = async (entity: string): Promise<number> =>
-  (await engine.call<{ translation: { y: number } }>("get-world-transform", { entity })).translation.y;
+  (await engine.call("get-world-transform", { entity })).translation.y;
 
 beforeAll(async () => {
   engine = await Engine.boot({ SAFFRON_SCRATCH_PROJECT: "1" });
@@ -30,10 +26,10 @@ beforeAll(async () => {
   // SkinnedMesh/AnimationPlayer/FootIk components live on a mesh descendant. Find that descendant
   // and read its bone list — the generic set-component[-field] commands operate on the exact entity,
   // so they must target the rig descendant, not the root.
-  const list = (await engine.call<{ entities: { id: string }[] }>("list-entities")).entities;
+  const list = (await engine.call("list-entities")).entities;
   let bones: string[] = [];
   for (const e of list) {
-    const skin = (await engine.call<Inspect>("inspect", { entity: e.id })).components.SkinnedMesh;
+    const skin = (await engine.call("inspect", { entity: e.id })).components.SkinnedMesh;
     if (skin) {
       rigId = e.id;
       bones = skin.bones;
@@ -45,7 +41,11 @@ beforeAll(async () => {
   await engine.call("set-component", {
     entity: rigId,
     component: "FootIk",
-    json: { enabled: false, groundHeight: 0, chains: [{ upper: 0, mid: 1, end: 2, poleVector: { x: -1, y: 0, z: 0 } }] },
+    json: {
+      enabled: false,
+      groundHeight: 0,
+      chains: [{ upper: 0, mid: 1, end: 2, poleVector: { x: -1, y: 0, z: 0 } }],
+    },
   });
   // Enter Play and bend the knee, then freeze (playing=false) at a bent pose: the ankle is now
   // below full reach, so it has slack for the IK to lift, and the readings compare one pose.
@@ -79,7 +79,11 @@ test("raising the ground lifts the ankle's world Y to track the ground target", 
 });
 
 test("disabling foot IK reverts the ankle to its animated position", async () => {
-  await engine.call("set-foot-ik", { entity: rigId, enabled: true, groundHeight: (await worldY(ankleId)) + 0.08 });
+  await engine.call("set-foot-ik", {
+    entity: rigId,
+    enabled: true,
+    groundHeight: (await worldY(ankleId)) + 0.08,
+  });
   await engine.settle(300);
   const lifted = await worldY(ankleId);
   await engine.call("set-foot-ik", { entity: rigId, enabled: false });

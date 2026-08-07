@@ -18,8 +18,8 @@ use std::sync::Arc;
 
 use saffron_core::Uuid;
 use saffron_geometry::{
-    ChunkKind, ContainerReader, MeshCounts, SModelHeader, mesh_counts_from_bytes, mesh_file_counts,
-    read_container, read_container_header,
+    ChunkKind, ContainerReader, ImportedNode, MeshCounts, SModelHeader, glam::Mat4,
+    mesh_counts_from_bytes, mesh_file_counts, read_container, read_container_header,
 };
 use saffron_json::{
     Value, dump_json_sorted, json_f32_or, json_string_or, json_u64_or, parse_json, uuid_to_json,
@@ -29,6 +29,48 @@ use saffron_scene::{AssetEntry, AssetType};
 use crate::AssetServer;
 use crate::error::{Error, Result};
 use crate::names::{asset_type_from_name, asset_type_name};
+
+/// Composes one validated imported node forest into source-root transforms.
+pub(crate) fn imported_node_world_transforms(nodes: &[ImportedNode]) -> Result<Vec<Mat4>> {
+    let locals = nodes
+        .iter()
+        .map(|node| {
+            let transform =
+                Mat4::from_scale_rotation_translation(node.scale, node.rotation, node.translation);
+            if transform.is_finite() {
+                Ok(transform)
+            } else {
+                Err(Error::Io("model node transform is non-finite".to_owned()))
+            }
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let mut world = Vec::with_capacity(nodes.len());
+    for index in 0..nodes.len() {
+        let mut transform = locals[index];
+        let mut parent = nodes[index].parent;
+        let mut active = std::collections::BTreeSet::new();
+        active.insert(index);
+        while parent >= 0 {
+            let parent_index = usize::try_from(parent)
+                .map_err(|_| Error::Io("model node parent is invalid".to_owned()))?;
+            let parent_transform = locals
+                .get(parent_index)
+                .ok_or_else(|| Error::Io("model node parent is out of range".to_owned()))?;
+            if !active.insert(parent_index) {
+                return Err(Error::Io(
+                    "model node hierarchy contains a cycle".to_owned(),
+                ));
+            }
+            transform = *parent_transform * transform;
+            parent = nodes[parent_index].parent;
+        }
+        if parent != -1 {
+            return Err(Error::Io("model node parent is invalid".to_owned()));
+        }
+        world.push(transform);
+    }
+    Ok(world)
+}
 
 /// The metadata-chunk schema version this build writes and accepts. Forward
 /// compatible: a reader ignores unknown keys, so a v1 reader survives a later schema
@@ -438,17 +480,16 @@ impl AssetServer {
         opened
     }
 
-    /// Reads + validates the container at `container_id`'s catalog row, or returns `None`
-    /// (with a warn) on any failure. The caller caches the outcome.
-    ///
-    /// A container parent is a `.smodel` **Model** (mesh/material/texture chunks) or a
-    /// texture-embedding **Material** (its own `.smat` chunk + one texture chunk per map);
-    /// both open identically. Any other asset type is not a container.
+    /// Reads + validates the container at `container_id`'s catalog row, or returns `None` (with a
+    /// warn) on any failure; the caller caches the outcome. A container parent is a `.smodel`
+    /// **Model** or a texture-embedding **Material** — both open identically, and no other asset
+    /// type is a container.
     fn open_container(&self, container_id: Uuid) -> Option<Arc<ModelAsset>> {
         let entry = self.catalog.find(container_id)?;
         if !matches!(entry.asset_type, AssetType::Model | AssetType::Material) {
             return None;
         }
+        let opened = std::time::Instant::now();
         let full_path = format!("{}/{}", self.root.display(), entry.path);
         let meta = match read_container_metadata(&full_path) {
             Ok(meta) => meta,
@@ -464,6 +505,12 @@ impl AssetServer {
                 return None;
             }
         };
+        tracing::debug!(
+            "container {} opened — '{}' in {} ms",
+            container_id.value(),
+            entry.path,
+            opened.elapsed().as_millis()
+        );
         Some(Arc::new(ModelAsset { meta, reader }))
     }
 
@@ -480,21 +527,21 @@ impl AssetServer {
         sub_id: Uuid,
     ) -> ByteSource {
         let key = sub_id.value().to_string();
-        if let Some(remap) = model.meta.remap.as_object().and_then(|m| m.get(&key)) {
-            if let Some(external) = remap.get("external").and_then(Value::as_str) {
-                let external_path = format!("{}/{}", self.root.display(), external);
-                if Path::new(&external_path).exists() {
-                    return ByteSource {
-                        path: external_path,
-                        ..ByteSource::default()
-                    };
-                }
-                tracing::warn!(
-                    "model {}: remap target '{external}' for sub-asset {} is missing; using the embedded chunk",
-                    model.meta.model_id.value(),
-                    sub_id.value()
-                );
+        if let Some(remap) = model.meta.remap.as_object().and_then(|m| m.get(&key))
+            && let Some(external) = remap.get("external").and_then(Value::as_str)
+        {
+            let external_path = format!("{}/{}", self.root.display(), external);
+            if Path::new(&external_path).exists() {
+                return ByteSource {
+                    path: external_path,
+                    ..ByteSource::default()
+                };
             }
+            tracing::warn!(
+                "model {}: remap target '{external}' for sub-asset {} is missing; using the embedded chunk",
+                model.meta.model_id.value(),
+                sub_id.value()
+            );
         }
         match model.reader.find(kind, sub_id.value()) {
             Some(entry) => ByteSource {
@@ -669,7 +716,6 @@ mod tests {
         let dir = scratch("roundtrip");
         let meta = sample_metadata();
         let meta_bytes = encode_container_metadata(&meta);
-        // A large payload chunk proves the prefix read never touches payloads.
         let payload = vec![0x5Au8; 8192];
         let chunks = [
             ContainerChunk {
@@ -699,7 +745,6 @@ mod tests {
         assert_eq!(read.nodes, meta.nodes);
         assert_eq!(read.skin, meta.skin);
         assert_eq!(read.remap, meta.remap);
-        // The whole struct compares equal.
         assert_eq!(read, meta);
 
         let _ = std::fs::remove_dir_all(&dir);
@@ -707,22 +752,18 @@ mod tests {
 
     #[test]
     fn animation_extras_only_serialize_for_animation_subassets() {
-        // A mesh sub-asset omits duration/tracks; an animation carries them.
         let meta = sample_metadata();
         let bytes = encode_container_metadata(&meta);
         let text = std::str::from_utf8(&bytes).unwrap();
         let doc = parse_json(text).unwrap();
         let subs = doc.get("subAssets").and_then(Value::as_array).unwrap();
-        // sub[0] is the mesh: no duration/tracks keys.
         assert!(subs[0].get("duration").is_none());
         assert!(subs[0].get("tracks").is_none());
-        // sub[1] is the texture: a colorspace key, no duration/tracks.
         assert_eq!(
             subs[1].get("colorspace").and_then(Value::as_str),
             Some("srgb")
         );
         assert!(subs[1].get("duration").is_none());
-        // sub[3] is the animation: duration + tracks present.
         assert!(subs[3].get("duration").is_some());
         assert_eq!(subs[3].get("tracks").and_then(Value::as_i64), Some(7));
     }
@@ -762,11 +803,9 @@ mod tests {
 
     #[test]
     fn golden_meta_bytes_are_frozen() {
-        // A minimal, fully-determined metadata pins the exact byte string the encoder
-        // produces. A drift here means the source hash (and the contract test) would
-        // see a different container for identical input — the silent-failure this golden
-        // guards against. Sub-id `12` is a texture (carries `colorspace`); `13` is a
-        // mesh (no colorspace / duration / tracks).
+        // A drift in these bytes means the source hash sees a different container for identical
+        // input. Sub-id `12` is a texture (carries `colorspace`); `13` is a mesh (no colorspace /
+        // duration / tracks).
         let mut meta = ContainerMetadata {
             schema: 1,
             model_id: Uuid(7),
@@ -818,7 +857,6 @@ mod tests {
 
     #[test]
     fn meta_encoding_is_compact_not_pretty() {
-        // The META encoding is compact (indent = -1): no newlines.
         let bytes = encode_container_metadata(&sample_metadata());
         let text = std::str::from_utf8(&bytes).unwrap();
         assert!(!text.contains('\n'), "META encoding must be compact");
@@ -849,7 +887,6 @@ mod tests {
 
     #[test]
     fn missing_meta_chunk_is_rejected() {
-        // A container with no META chunk surfaces an error, not a panic.
         let dir = scratch("nometa");
         let mesh_bytes = sample_mesh_bytes();
         let chunks = [ContainerChunk {
@@ -866,8 +903,7 @@ mod tests {
 
     #[test]
     fn oversized_meta_length_is_rejected_not_crashed() {
-        // A header claiming a META span larger than the file is rejected by the bounds
-        // check (and `read_container_header`'s total-length check).
+        // A header claiming a META span larger than the file is rejected by the bounds check.
         let dir = scratch("badlen");
         let meta_bytes = encode_container_metadata(&sample_metadata());
         let chunks = [ContainerChunk {
@@ -937,8 +973,7 @@ mod tests {
         assert_eq!(first.meta.sub_assets.len(), 4);
         assert!(assets.model_by_uuid.contains_key(&id.value()));
 
-        // Delete the file: a re-read would now fail. The cached open must survive, and
-        // both handles point at the same cached `Arc`.
+        // Delete the file: a re-read would now fail, so a surviving handle proves the cache hit.
         let full = format!("{}/models/town.smodel", assets.root.display());
         std::fs::remove_file(&full).unwrap();
         let second = assets.load_model_asset(id).expect("served from cache");
@@ -955,7 +990,6 @@ mod tests {
         let dir = scratch("missing");
         let root = dir.join("assets");
         let mut assets = AssetServer::new(&root);
-        // A Model catalog row pointing at a file that does not exist.
         let id = Uuid(7000);
         assets.catalog.put(AssetEntry {
             id,
@@ -966,9 +1000,7 @@ mod tests {
             ..AssetEntry::default()
         });
         assert!(assets.load_model_asset(id).is_none());
-        // The negative marker is present (a None value, not an absent key).
         assert!(matches!(assets.model_by_uuid.get(&id.value()), Some(None)));
-        // A second call is a negative-cache hit, not a retry.
         assert!(assets.load_model_asset(id).is_none());
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -981,7 +1013,6 @@ mod tests {
         let id = Uuid(7100);
         let rel = "models/corrupt.smodel";
         let full = format!("{}/{rel}", assets.root.display());
-        // Garbage bytes: not a valid `.smodel` header.
         std::fs::write(&full, b"not a container at all").unwrap();
         assets.catalog.put(AssetEntry {
             id,
@@ -1001,7 +1032,6 @@ mod tests {
         let dir = scratch("nonmodel");
         let root = dir.join("assets");
         let mut assets = AssetServer::new(&root);
-        // A catalog row for the id, but of the wrong type (a texture).
         let id = Uuid(7200);
         assets.catalog.put(AssetEntry {
             id,
@@ -1022,7 +1052,6 @@ mod tests {
         let dir = scratch("embedded");
         let root = dir.join("assets");
         let mut assets = AssetServer::new(&root);
-        // No remap on the mesh sub-id, so the embedded chunk wins.
         let mut meta = sample_metadata();
         meta.remap = Value::Object(serde_json::Map::new());
         let id = write_model_fixture(&mut assets, &meta, "town");
@@ -1033,7 +1062,6 @@ mod tests {
         assert!(source.path.ends_with("town.smodel"));
         assert_ne!(source.offset, 0, "an embedded chunk has a non-zero offset");
         assert_ne!(source.length, 0);
-        // The slice reads back exactly the mesh bytes.
         let sliced = source.read().unwrap();
         assert_eq!(sliced, sample_mesh_bytes());
 
@@ -1055,7 +1083,6 @@ mod tests {
         meta.remap = Value::Object(remap);
         let id = write_model_fixture(&mut assets, &meta, "town");
 
-        // Materialize the external file under the root.
         std::fs::create_dir_all(root.join("meshes")).unwrap();
         let external = root.join("meshes").join("town_extracted.smesh");
         std::fs::write(&external, sample_mesh_bytes()).unwrap();
@@ -1103,7 +1130,6 @@ mod tests {
         let id = write_model_fixture(&mut assets, &sample_metadata(), "town");
         let model = assets.load_model_asset(id).unwrap();
 
-        // sub-id 9999 has no mesh chunk.
         let source = assets.chunk_source_for(&model, ChunkKind::Mesh, Uuid(9999));
         assert!(source.is_empty());
         assert_eq!(source, ByteSource::default());
@@ -1117,7 +1143,6 @@ mod tests {
         let mut assets = AssetServer::new(&root);
         let id = write_model_fixture(&mut assets, &sample_metadata(), "town");
 
-        // The mesh sub-asset's catalog row points at the container.
         let entry = AssetEntry {
             id: Uuid(11),
             name: "town_mesh".to_owned(),

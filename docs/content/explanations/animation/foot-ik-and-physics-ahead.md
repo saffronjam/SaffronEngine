@@ -130,10 +130,10 @@ world Y rises to meet it, and asserts the ankle reverts when IK is disabled.
 | What | File | Symbols |
 |---|---|---|
 | Two-bone solver + unit tests | `engine/crates/animation/src/ik.rs` | `solve_two_bone_ik`, `rotation_between`, `TwoBoneIkResult` |
-| Foot-IK producer (FK resolve → solve → local conversion) | `engine/crates/animation/src/runtime.rs` | `apply_foot_ik`, `tick_skinned_rig` |
-| Post-IK pose snapshot | `engine/crates/animation/src/runtime.rs` | `AnimationRuntime` (`last_pose`, `last_poses`) |
+| Foot-IK producer (FK resolve → solve → local conversion) | `engine/crates/animation/src/runtime/` | `apply_foot_ik`, `tick_skinned_rig` |
+| Post-IK pose snapshot | `engine/crates/animation/src/runtime/` | `AnimationRuntime` (`last_pose`, `last_poses`) |
 | Chain + ground config, override layer | `engine/crates/scene/src/component.rs` | `FootIk`, `FootChain`, `PoseOverride` |
-| Ragdoll producers on the same layer | `engine/crates/physics/src/world.rs` | `drive_ragdolls_to_pose`, `write_ragdoll_poses` |
+| Ragdoll producers on the same layer | `engine/crates/physics/src/world/` | `drive_ragdolls_to_pose`, `write_ragdoll_poses` |
 | Play-tick handoff | `engine/crates/runtime/src/session.rs` | `RuntimeSession::step`, `PoseTarget` |
 | Control commands | `engine/crates/control/src/commands_animation.rs` | `set-foot-ik`, `get-foot-ik`, `foot_ik_entity` |
 

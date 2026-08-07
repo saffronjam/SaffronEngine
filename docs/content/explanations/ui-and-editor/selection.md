@@ -32,9 +32,9 @@ sequenceDiagram
 
 A left press in the viewport always begins the [gizmo](../gizmo/) gesture. If the pointer stays within three CSS pixels before release, the editor calls `pick` at the original press coordinate. A larger movement is treated as a gizmo drag and does not run the pick.
 
-The command maps viewport UV into the camera ray used for the rendered view. It checks meshless point-light, spot-light, and camera billboards first because their screen glyphs have no mesh surface. A billboard uses a 13-pixel half-size hit region and the nearest matching glyph wins.
+The command checks meshless point-light, spot-light, and camera billboards first, because a glyph is overlay art with no draw record behind it. A billboard uses a 13-pixel half-size hit region and the nearest matching glyph wins.
 
-Mesh picking has two stages. Static meshes reject misses with a world AABB, then traverse a cached mesh-local BVH for the nearest triangle. Skinned meshes reject against a joint-union box, CPU-skin the vertices with the current joint palette, and test the deformed triangles. Preview-placement ghosts are excluded.
+Everything else answers from the [GPU selection-ID readback](../../scene-and-ecs/picking/): the frame's own binned cut is replayed into a one-texel identity target at the clicked pixel, and the record found there resolves to an entity, a plant, or a cosmetic micro blade. Deformed and procedurally generated geometry therefore picks exactly where it was drawn.
 
 A hit on a mesh inside a model instance resolves through `model_root_of`, so the model container becomes selected rather than an internal mesh or bone entity. A miss sets the engine selection to `Entity::NULL` and returns `hit: false`.
 
@@ -66,8 +66,8 @@ Opening an asset preview stashes the authored selection and selects the preview 
 | What | File | Symbols |
 |---|---|---|
 | Selection state and signal | `engine/crates/sceneedit/src/context.rs` | `SceneEditContext::selected`, `SceneEditContext::set_selection`, `on_selection_changed` |
-| Selection and pick commands | `engine/crates/control/src/commands_scene.rs` | `select`, `get-selection`, `deselect`, `pick`, `pick_billboard` |
-| Exact mesh picking | `engine/crates/assets/src/render_scene.rs` | `pick_entity`, `pick_scene_surface` |
+| Selection and pick commands | `engine/crates/control/src/commands_scene/` | `select`, `get-selection`, `deselect`, `pick`, `pick_billboard` |
+| Selection replay and readback | `engine/crates/rendering/src/renderer/selection_pick.rs` | `Renderer::pick_selection_id` |
 | Model-container resolution | `engine/crates/scene/src/hierarchy.rs` | `Scene::model_root_of` |
 | Store mirror and reconcile | `editor/src/state/store.ts` | `selectedId`, `selectEntity`, `startReconcile`, `selectionVersion` |
 | Hierarchy selection | `editor/src/panels/HierarchyPanel.tsx` | `HierarchyPanel`, `onSelect` |
@@ -76,7 +76,7 @@ Opening an asset preview stashes the authored selection and selects the preview 
 
 ## Related
 
-- [Picking](../../scene-and-ecs/picking/) — viewport-ray construction and mesh intersection
+- [Picking](../../scene-and-ecs/picking/) — the selection replay and how a record becomes an identity
 - [Hierarchy panel](../hierarchy-panel/) — optimistic row selection and empty-space deselect
 - [Gizmo](../gizmo/) — click-versus-drag arbitration
 - [Inspector](../inspector/) — component snapshot refreshed for the selection

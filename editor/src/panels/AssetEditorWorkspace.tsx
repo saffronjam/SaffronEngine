@@ -1,19 +1,12 @@
-/// The asset editor: a full work-area main tab (see App.tsx / openAssetEditorTab) that previews ANY
-/// model — rigged or static — outside the authored scene. The engine spawns the model into an isolated
-/// preview scene and publishes it through the one viewport subsurface (glued into the center pane here).
-/// The side panels appear by capability: the skeleton tree (left) only for a rigged model, the clip list
-/// + details (right) and the bottom timeline only when the model has clips. A static model is just the
-/// framed viewport (orbit, materials, floor) — no rig chrome.
+/// The asset editor: a full work-area main tab that previews any model, rigged or static, in an
+/// isolated preview scene published through the viewport subsurface. Side panels appear by
+/// capability — the skeleton tree for a rigged model, the clip list and timeline only when the model
+/// has clips.
 ///
-/// Orbit is eased: input moves a target, a rAF loop drains current→target with the engine's tau (refs
-/// only, no React re-render), so a slight lag reads as smooth motion. Loading is masked: the panels +
-/// subsurface mount only once the model's capabilities are known (so the first frame already has the
-/// right panels at the final width), behind a "Preparing…" spinner that lifts after the viewport settles.
-///
-/// Lifecycle is keyed to the mount: App renders this with key={assetId}, so switching to a different
-/// model remounts (cleanup exits model A, mount enters model B) — an activeKind-only effect would keep
-/// previewing A under B's panels. enter-asset-preview / exit-asset-preview stash + restore the camera
-/// engine-side, so orbiting never dirties the saved editorCamera.
+/// Orbit is eased through refs and a rAF loop rather than React state, so a slight lag reads as
+/// smooth motion. The lifecycle is keyed to the mount (App renders this with `key={assetId}`), so
+/// switching models remounts and the cleanup exits model A before mount enters model B; an
+/// activeKind-only effect would keep previewing A under B's panels.
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Axis3d, Bone, Box, Grid2x2, Wrench } from "lucide-react";
 import { client } from "../control/client";
@@ -21,6 +14,13 @@ import { useSubsurfaceBounds } from "../lib/useSubsurfaceBounds";
 import { useOrbitCamera, type OrbitState } from "../lib/useOrbitCamera";
 import { errorText, notifyError } from "../lib/flash";
 import { Button } from "@/components/ui/button";
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select";
 import { Slider } from "@/components/ui/slider";
 import {
   DropdownMenu,
@@ -57,6 +57,10 @@ export function AssetEditorWorkspace({ assetId, active }: { assetId: string; act
   // Overlay toggles default on (the engine forces show=on while previewing); local mirror for the chips.
   const [showBones, setShowBones] = useState(true);
   const [showAxes, setShowAxes] = useState(false);
+  // A plant subject's authored (variation, phenotype) combinations — the scrub domain
+  // reported by enter-asset-preview; empty for every other subject.
+  const [combinations, setCombinations] = useState<{ variation: number; phenotype: number }[]>([]);
+  const [combinationIndex, setCombinationIndex] = useState(0);
   // The bone the tree has highlighted (a get-asset-model node index); local view state, not selection.
   const [highlightJoint, setHighlightJoint] = useState(-1);
 
@@ -71,6 +75,14 @@ export function AssetEditorWorkspace({ assetId, active }: { assetId: string; act
   // A material subject gets the Material editor pinned to it in the right dock (no selector). For a
   // self-container material the catalog id IS the material id, so `assetId` is what the panel edits.
   const isMaterial = asset?.type === "material";
+  // Vegetation subjects: a plant previews its compiled renderable form like any model;
+  // biome/map have no 3D subject — no enter-asset-preview, no subsurface, the summary
+  // panel carries the workspace.
+  const vegetationType =
+    asset?.type === "plant" || asset?.type === "biome" || asset?.type === "vegetation-map"
+      ? asset.type
+      : null;
+  const summaryOnly = vegetationType === "biome" || vegetationType === "vegetation-map";
   const isHdr = asset?.role === "hdri" || asset?.colorspace === "hdr";
   const panOnly = isTexture && !isHdr;
   // The HDRI preview's exposure sweep (EV, exp2). Restored engine-side on exit-asset-preview, so it
@@ -90,7 +102,9 @@ export function AssetEditorWorkspace({ assetId, active }: { assetId: string; act
 
   // Drive this pane's OWN "assetPreview" viewport surface (permanently sized to the pane). Gated on
   // `active && ready` so a parked/loading pane emits nothing; App.tsx parks the surface when inactive.
-  useSubsurfaceBounds(hostRef, "assetPreview", { enabled: active && ready });
+  useSubsurfaceBounds(hostRef, "assetPreview", {
+    enabled: active && ready && !summaryOnly,
+  });
 
   // Highlight a bone in the live overlay (a get-asset-model node index) — view state, not selection.
   const onBoneSelect = useCallback((joint: number) => {
@@ -126,11 +140,19 @@ export function AssetEditorWorkspace({ assetId, active }: { assetId: string; act
     let cancelled = false;
     void (async () => {
       try {
+        if (summaryOnly) {
+          // No 3D subject: the summary panel is the workspace.
+          setModel(null);
+          setStatus("ready");
+          return;
+        }
         const entered = await client.enterAssetPreview(assetId);
         if (cancelled) {
           return;
         }
         setRootEntity(entered.rootEntity);
+        setCombinations(entered.plantCombinations ?? []);
+        setCombinationIndex(0);
         const cam = await client.getCamera();
         if (cancelled) {
           return;
@@ -167,7 +189,7 @@ export function AssetEditorWorkspace({ assetId, active }: { assetId: string; act
       cancelled = true;
       void client.exitAssetPreview().catch(() => {});
     };
-  }, [assetId, orbit]);
+  }, [assetId, orbit, summaryOnly]);
 
   // This pane owns its OWN viewport surface (the "assetPreview" view), permanently sized to the pane.
   // App.tsx drives set-active-view + per-view park on a tab switch — switching is instant (the surface
@@ -210,7 +232,38 @@ export function AssetEditorWorkspace({ assetId, active }: { assetId: string; act
     } else {
       closePanel("materialEdit");
     }
-  }, [ready, hasRig, hasClips, isMaterial]);
+    if (vegetationType !== null) {
+      openPanel("vegSummary");
+    } else {
+      closePanel("vegSummary");
+    }
+    if (vegetationType === "biome") {
+      openPanel("biomeGraph");
+    } else {
+      closePanel("biomeGraph");
+    }
+    // A plant's structure panel. It homes to the same dock leaf as `skeleton`, which the rig branch
+    // above closes for a rigless subject — and a plant grown from a botanical graph is rigless, so
+    // this must open AFTER that close or the leaf collapses with the panel in it.
+    if (vegetationType === "plant") {
+      openPanel("plantGraph");
+      // The wind and interaction surface. It shares the same leaf for the same reason, and it opens
+      // only for a plant because only a plant answers a field: pushing wind at a biome or a
+      // vegetation map moves nothing an author can see.
+      openPanel("plantWind");
+      openPanel("plantAtlas");
+      openPanel("plantHierarchy");
+      openPanel("plantSeason");
+      openPanel("plantProxies");
+    } else {
+      closePanel("plantGraph");
+      closePanel("plantWind");
+      closePanel("plantAtlas");
+      closePanel("plantHierarchy");
+      closePanel("plantSeason");
+      closePanel("plantProxies");
+    }
+  }, [ready, hasRig, hasClips, isMaterial, vegetationType]);
 
   // Space = play/pause while THIS tab is active (the workspace stays mounted-but-hidden when parked, so
   // the window listener must no-op unless active) and no text field is focused.
@@ -242,6 +295,24 @@ export function AssetEditorWorkspace({ assetId, active }: { assetId: string; act
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
   }, [active, rootEntity]);
+
+  // Scrubs the plant subject to another authored combination (variation + phenotype).
+  const onCombination = useCallback(
+    (index: number) => {
+      setCombinationIndex(index);
+      const combination = combinations[index];
+      if (!combination) {
+        return;
+      }
+      void client
+        .setAssetPreviewOptions({
+          variation: combination.variation,
+          phenotype: combination.phenotype,
+        })
+        .catch((err: unknown) => notifyError(errorText(err)));
+    },
+    [combinations],
+  );
 
   const toggleFloor = useCallback(() => {
     setFloor((prev) => {
@@ -291,8 +362,21 @@ export function AssetEditorWorkspace({ assetId, active }: { assetId: string; act
       active,
       ready,
       materialSubject: isMaterial ? assetId : null,
+      assetId,
+      vegetationType,
     }),
-    [model, rootEntity, highlightJoint, onBoneSelect, orbit, active, ready, isMaterial, assetId],
+    [
+      model,
+      rootEntity,
+      highlightJoint,
+      onBoneSelect,
+      orbit,
+      active,
+      ready,
+      isMaterial,
+      assetId,
+      vegetationType,
+    ],
   );
 
   if (status === "error") {
@@ -363,6 +447,31 @@ export function AssetEditorWorkspace({ assetId, active }: { assetId: string; act
                   <Axis3d className="size-4" />
                 </Button>
               </>
+            ) : null}
+            {combinations.length > 1 ? (
+              <Select
+                value={String(combinationIndex)}
+                onValueChange={(value) => onCombination(Number(value))}
+              >
+                <SelectTrigger
+                  size="sm"
+                  className="h-7 w-40 text-[11px]"
+                  aria-label="Plant combination"
+                >
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  {combinations.map((combination, index) => (
+                    <SelectItem
+                      key={`${combination.variation}-${combination.phenotype}`}
+                      value={String(index)}
+                      className="text-[11px]"
+                    >
+                      Variation {combination.variation} · Phenotype {combination.phenotype}
+                    </SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
             ) : null}
             <Button
               variant={floor ? "secondary" : "ghost"}

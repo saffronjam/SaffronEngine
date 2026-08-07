@@ -27,8 +27,10 @@ just package                # interactive: clack prompts for the target
 cd packager && bun run index.ts linux   # inside the toolbox, for iterating on the packager itself
 ```
 
-`bun run index.ts <target>` runs directly (no build/transpile step). Deps are pinned in `package.json`
-+ `bun.lock`; `node_modules/` is gitignored. Output lands under the gitignored `build/`.
+`bun run index.ts <target>` runs directly (no build/transpile step). This is a member of the repo-root
+Bun workspace: deps are declared in `package.json` and resolved through the root `bun.lock`, so
+`bun install` runs at the root. Output lands under the gitignored `build/`. Format, lint, and
+typecheck come from the root too (`just format` / `just lint` / `just typecheck`).
 
 ## Rules that are easy to break
 
@@ -61,10 +63,9 @@ cd packager && bun run index.ts linux   # inside the toolbox, for iterating on t
 - **A new OS target is `targets/<os>.ts` + a branch in `index.ts`.** Add the target to the `TARGETS` tuple
   and dispatch to it; put its static files under `assets/<os>/`. Keep the not-yet-implemented branches
   printing a clack warning, not a silent no-op.
-- **Keep the justfile recipe a thin caller.** Packaging logic belongs here in TypeScript, never back in a
-  bash recipe. Do not resurrect a top-level `packaging/` folder — it was replaced by this one.
+- **Keep the justfile recipe a thin caller.** Packaging logic belongs here in TypeScript, never in a
+  bash recipe.
 
 ## Open gaps
 
 - `targets/windows.ts` / `targets/macos.ts` are unbuilt (macOS also needs helper apps + MoltenVK).
-- Not yet wired into `just lint` / `just format` (those cover the editor).

@@ -1,10 +1,8 @@
-/// The mouse-button command dispatcher. Mouse commands (tab back/forward, close hovered
-/// tab) live in the keybinding registry as `mouse:<name>` bindings, so this routes a
-/// pressed button to whichever command is bound to it. Two input paths feed it:
-/// - The side buttons (GDK 8/9): WebKitGTK never hands them to the page, so the native
-///   bridge intercepts them and re-emits a `mouse-button` event.
-/// - The middle button: it reaches the DOM, so we catch it on `pointerdown` and suppress
-///   the platform autoscroll/paste only when it actually triggers a command.
+/// The mouse-button command dispatcher: mouse commands live in the keybinding registry as
+/// `mouse:<name>` bindings, and this routes a pressed button to whichever command is bound to it.
+/// The side buttons never reach the page, so the native bridge re-emits them as a `mouse-button`
+/// event; the middle button does reach the DOM, so its platform autoscroll is suppressed only when
+/// it actually triggers a command.
 import { listen, type UnlistenFn } from "../shell";
 import { useEffect } from "react";
 import { mouseCommandFor, mouseToken, type MouseButtonName } from "../lib/keybindings";

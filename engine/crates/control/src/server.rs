@@ -128,7 +128,6 @@ pub fn start_control_server(path: String) -> Result<ControlServer> {
     .map_err(|e| Error::Socket(format!("socket: {e}")))?;
     configure_socket(listen_fd.as_fd());
 
-    // Remove any stale socket before binding.
     let _ = unlink(path.as_str());
 
     let addr = SocketAddrUnix::new(path.as_str()).map_err(|_| Error::PathTooLong(path.clone()))?;
@@ -147,28 +146,24 @@ pub fn start_control_server(path: String) -> Result<ControlServer> {
 }
 
 impl ControlServer {
-    /// Accepts pending clients, drains their readable bytes, splits the buffered
-    /// input on `\n`, and for each complete line calls `handle(line) -> reply`,
-    /// flushing the reply (plus a trailing `\n`) back with the short-write loop.
-    /// Closed clients are dropped at the end.
+    /// Accepts pending clients, drains their readable bytes, splits the buffered input on `\n`, and
+    /// for each complete line calls `handle(line) -> reply`, flushing the reply plus a trailing
+    /// `\n` back through the short-write loop. Closed clients are dropped at the end.
     ///
-    /// `handle` is the request→reply seam: the per-frame caller wires it to parse
-    /// the line and dispatch through the registry against the live
-    /// `EngineContext`. Threading the dispatch through a closure keeps the socket
-    /// machinery decoupled from the un-headless-constructible subsystems, so the
-    /// framing and flush are unit-testable on their own.
+    /// Every complete line runs, including lines that arrived ahead of the peer's EOF: a
+    /// fire-and-forget client may write its final request and close without reading the reply,
+    /// and that request must still execute. The reply flush no-ops for a dead peer.
+    ///
+    /// `handle` is the request-to-reply seam. Threading dispatch through a closure keeps the socket
+    /// machinery independent of the subsystems, so the framing and flush are unit-testable alone.
     pub fn drain(&mut self, mut handle: impl FnMut(&str) -> String) {
         self.accept_pending();
 
         for client in &mut self.clients {
             read_into(client);
 
-            while !client.dead {
-                let Some(newline) = client.inbuf.iter().position(|&b| b == b'\n') else {
-                    break;
-                };
+            while let Some(newline) = client.inbuf.iter().position(|&b| b == b'\n') {
                 let line: Vec<u8> = client.inbuf.drain(..=newline).collect();
-                // The slice up to (not incl.) the trailing '\n' is the request.
                 let request = String::from_utf8_lossy(&line[..line.len() - 1]);
 
                 let mut reply = handle(&request);
@@ -219,12 +214,11 @@ fn read_into(client: &mut Client) {
 
 /// Sends `out` in full, looping over short writes.
 ///
-/// The client socket is non-blocking, so a single `send` short-writes any reply
-/// larger than the socket buffer and silently drops the tail — the client then
-/// never sees the `\n` and hangs. This loops until the whole reply is flushed,
-/// `poll`-waiting (1000 ms) on `POLLOUT` when the buffer fills, ignoring `EINTR`,
-/// and marking the client dead on any other fatal error (`MSG_NOSIGNAL` keeps a
-/// vanished peer from raising `SIGPIPE`).
+/// The client socket is non-blocking, so one `send` short-writes any reply larger than the socket
+/// buffer and drops the tail, leaving the client waiting for a `\n` that never comes. This loops
+/// until the whole reply is flushed, `poll`-waiting 1000 ms on `POLLOUT` when the buffer fills,
+/// ignoring `EINTR`, and marking the client dead on any other error. `MSG_NOSIGNAL` keeps a
+/// vanished peer from raising `SIGPIPE`.
 fn flush_reply(client: &mut Client, out: &[u8]) {
     let mut sent = 0;
     while sent < out.len() && !client.dead {
@@ -244,21 +238,39 @@ fn flush_reply(client: &mut Client, out: &[u8]) {
 
 #[cfg(test)]
 mod tests {
-    use super::resolve_socket_path;
+    use super::{resolve_socket_path, start_control_server};
+
+    #[test]
+    fn drain_runs_requests_written_before_the_peer_closed() {
+        let path = format!(
+            "{}/saffron-eof-test-{}.sock",
+            std::env::temp_dir().display(),
+            std::process::id()
+        );
+        let mut server = start_control_server(path.clone()).unwrap();
+        let mut client = std::os::unix::net::UnixStream::connect(&path).unwrap();
+        std::io::Write::write_all(&mut client, b"final-request\n").unwrap();
+        // Fire-and-forget: the peer closes before any drain ran; the request must still execute.
+        drop(client);
+
+        let mut seen = Vec::new();
+        server.drain(|request| {
+            seen.push(request.to_owned());
+            String::from("ok")
+        });
+        assert_eq!(seen, vec!["final-request".to_string()]);
+    }
 
     #[test]
     fn path_resolution_honors_override_then_runtime_then_tmp() {
-        // The override wins outright.
         assert_eq!(
             resolve_socket_path(Some("/run/custom.sock"), Some("/run/user/1000"), 1000),
             "/run/custom.sock"
         );
-        // Else the runtime dir.
         assert_eq!(
             resolve_socket_path(None, Some("/run/user/1000"), 1000),
             "/run/user/1000/saffron-control.sock"
         );
-        // Else the per-uid tmp fallback.
         assert_eq!(
             resolve_socket_path(None, None, 1000),
             "/tmp/saffron-control-1000.sock"

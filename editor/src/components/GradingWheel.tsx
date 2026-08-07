@@ -1,13 +1,11 @@
-/// A Resolve-style color trackball: a circular hue/saturation pad with a draggable puck for the
-/// chroma push, plus a vertical luma-trim bar beside it. It encodes an RGB triplet as a uniform
-/// **luma** level (the vertical bar) plus a zero-sum **chroma** offset (the disc), so the disc
-/// centred + the bar at neutral is the identity correction. The chroma lives in the plane orthogonal
-/// to grey, spanned by two orthonormal RGB basis vectors, so the disc↔triplet map is exact and
-/// invertible — an external value round-trips to the same puck position.
+/// A Resolve-style color trackball: a hue/saturation pad with a draggable chroma puck plus a
+/// vertical luma-trim bar. It encodes an RGB triplet as a uniform luma level plus a zero-sum chroma
+/// offset, so centred + neutral is the identity correction. The chroma lives in the plane orthogonal
+/// to grey spanned by two orthonormal RGB basis vectors, making the disc↔triplet map exact and
+/// invertible, so an external value round-trips to the same puck position.
 ///
-/// The widget owns drag-local rendering through `useScrubValue` (the puck tracks the pointer without
-/// waiting on the wire) and brackets a gesture with `onDragStart`/`onDragEnd` so the panel records
-/// one undo entry and gates the reconcile poll; the panel owns the coalesced emit.
+/// Owns drag-local rendering and brackets a gesture with `onDragStart`/`onDragEnd`; the panel owns
+/// the coalesced emit.
 import { useMemo, useRef } from "react";
 import { useScrubValue } from "@/lib/useScrubValue";
 

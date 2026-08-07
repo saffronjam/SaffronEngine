@@ -1,42 +1,13 @@
-//! Pure CPU pose math: the pose types, the track/clip samplers, and the
-//! pose-algebra helpers the player runtime and IK build on.
+//! Pure CPU pose math: the pose types, the track/clip samplers, and the pose-algebra helpers the
+//! player runtime and IK build on. Zero FFI, no GPU concept.
 //!
-//! This crate has zero FFI and no GPU concept. It consumes the clip types
-//! (`AnimClip`/`AnimTrack`) from `saffron-geometry` and reads and writes
-//! `saffron-scene` components; its only output toward rendering is the
-//! per-bone pose override scene composes into world matrices.
+//! A sampled rotation is a [`glam::Vec4`] whose four lanes are already the quaternion in `xyzw`
+//! order, so `Quat::from_vec4` reads it with no reorder.
 //!
-//! A sampled rotation is a [`glam::Vec4`] whose four lanes are already the quaternion in
-//! `xyzw` order, so `Quat::from_vec4` reads it with no reorder.
-//!
-//! # The skinning-prepass seam (the contract toward rendering)
-//!
-//! This crate produces **no GPU data**. Its only output toward rendering is the
-//! [`saffron_scene::PoseOverride`] [`tick_animation`] writes onto each driven bone — a
-//! per-frame, per-bone local TRS override that is *non-destructive*: a bone's authored
-//! [`saffron_scene::Transform`] (the rest pose) is never touched, so Edit preview can scrub
-//! the timeline without dirtying the saved project. The seam to rendering is one-directional
-//! and entirely mediated by scene components:
-//!
-//! 1. [`tick_animation`] writes a [`saffron_scene::PoseOverride`] onto each driven bone.
-//! 2. `saffron-scene`'s `local_matrix`/`world_matrix` prefer that override over the bone's
-//!    [`saffron_scene::Transform`], so `update_world_transforms` composes the animated pose
-//!    into the cached world matrices.
-//! 3. `saffron-scene`'s `joint_matrices(skin) -> Vec<Mat4>` builds `world(bone) ·
-//!    inverse_bind` per joint — the joint palette.
-//! 4. `saffron-assets`' scene-render path appends that palette per skinned rig into a
-//!    per-frame joint buffer and tags the draw item with the joint offset/count;
-//!    `saffron-rendering`'s compute-skinning prepass blends it, feeds motion vectors, and
-//!    refits the skinned BLAS.
-//!
-//! So the rendering and scene phases may rely on exactly this: the override flows into world
-//! composition and therefore into the palette they consume. The
-//! `skinning_seam_palette_reflects_animation` test asserts that flow through the real scene
-//! helpers (no mock, no GPU); the palette builder belongs to `saffron-scene` and the GPU
-//! prepass to `saffron-rendering`.
-//! This crate carries no rendering-code dependency — only the frozen seam contract above.
-//!
-//! Depends on `saffron-core`, `saffron-geometry`, `saffron-scene`.
+//! The only output toward rendering is the [`saffron_scene::PoseOverride`] [`tick_animation`] writes
+//! onto each driven bone — a per-frame local TRS override that leaves the bone's authored
+//! [`saffron_scene::Transform`] untouched, so Edit preview can scrub the timeline without dirtying
+//! the saved project. Nothing flows back.
 
 #![deny(unsafe_code)]
 

@@ -8,15 +8,9 @@ use ts_rs::TS;
 
 /// A stable 64-bit identity as it crosses the control wire.
 ///
-/// Every id serializes to JSON as a **decimal string**, not a number, because ids span the
-/// full `u64` range past JavaScript's `2^53` safe-integer limit; a bare `u64` would emit a
-/// JSON number and silently corrupt the id on a JS client. On read the wire accepts a string
-/// *or* a number (`PickFirst` tries the string form first, then the raw `u64`).
-///
-/// This wraps the same `u64` as [`saffron_core::Uuid`]; conversions to and from the core type
-/// are free (`From`), so engine handlers move between the minting newtype and the wire newtype
-/// without restringing. The wire derives live here (the single place the encoding is decided),
-/// keeping `saffron-core` serde-free.
+/// Serializes as a decimal *string*: ids span the full `u64` range past JavaScript's `2^53`
+/// safe-integer limit, so a JSON number would silently corrupt them on a JS client. Reads accept
+/// a string or a number.
 #[serde_as]
 #[derive(
     Debug, Clone, Copy, PartialEq, Eq, Hash, Default, serde::Serialize, serde::Deserialize, TS,
@@ -51,9 +45,7 @@ impl From<u64> for Uuid {
     }
 }
 
-/// The wire schema is a JSON **string**, not an integer — the `serde_as` attribute emits a
-/// decimal string, so the schema must say so or the contract test's schema oracle would reject
-/// every id.
+/// The wire schema is a JSON string, matching the decimal-string encoding `serde_as` emits.
 impl JsonSchema for Uuid {
     fn schema_name() -> Cow<'static, str> {
         Cow::Borrowed("Uuid")
@@ -78,23 +70,18 @@ mod tests {
 
     #[test]
     fn emits_quoted_decimal_string_not_number() {
-        // The single most silent-failure-prone seam: a `Uuid` must serialize to a *quoted
-        // decimal string*, never a bare JSON number.
         assert_eq!(serde_json::to_string(&Uuid(42)).unwrap(), "\"42\"");
         assert_ne!(serde_json::to_string(&Uuid(42)).unwrap(), "42");
     }
 
     #[test]
     fn accepts_string_or_number_on_read() {
-        // Read leniency: a string *or* a number both decode to the same id.
         assert_eq!(serde_json::from_str::<Uuid>("\"42\"").unwrap(), Uuid(42));
         assert_eq!(serde_json::from_str::<Uuid>("42").unwrap(), Uuid(42));
     }
 
     #[test]
     fn round_trips_past_2_53() {
-        // The whole reason ids cross as strings: a value past JavaScript's 2^53 must survive
-        // the full u64 round-trip exactly.
         let big = Uuid(18_446_744_073_709_551_615);
         let text = serde_json::to_string(&big).unwrap();
         assert_eq!(text, "\"18446744073709551615\"");
@@ -103,18 +90,16 @@ mod tests {
 
     #[test]
     fn cross_encoder_identity_with_saffron_json() {
-        // PP-7/PP-13 contract: the DTO derive and the imperative `saffron-json` helpers must
-        // emit byte-identical output for the same value, and each must parse the other's emit.
+        // The DTO derive and the imperative `saffron-json` helpers must emit byte-identical
+        // output for a value, and each must parse the other's emit.
         for raw in [0_u64, 1023, 1024, 42, u64::MAX] {
             let derive_emit = serde_json::to_value(Uuid(raw)).unwrap();
             let imperative_emit = saffron_json::uuid_to_json(raw);
             assert_eq!(derive_emit, imperative_emit, "emit must be byte-identical");
 
-            // `json_u64` parses the derive emit back to the full u64.
             let object = serde_json::json!({ "id": derive_emit });
             assert_eq!(saffron_json::json_u64(&object, "id").unwrap(), raw);
 
-            // The derive parses the imperative emit back to the same id.
             assert_eq!(
                 serde_json::from_value::<Uuid>(imperative_emit).unwrap(),
                 Uuid(raw)
@@ -140,8 +125,6 @@ mod tests {
 
     #[test]
     fn ts_binding_is_string_alias() {
-        // `#[ts(type = "string")]` declares `Uuid` as a `string` alias, so the editor's
-        // `WireUuid = string` alias matches and every `Uuid`-typed field resolves to a `string`.
         assert_eq!(<Uuid as TS>::inline(), "string");
         assert_eq!(<Uuid as TS>::decl(), "type Uuid = string;");
     }

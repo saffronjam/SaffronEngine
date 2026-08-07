@@ -19,13 +19,14 @@ asset load and upload it once.
 ```rust
 pub struct AssetServer {
     pub root: PathBuf,                               // the project's assets/ dir
-    pub catalog: AssetCatalog,                       // id -> {name, type, path, ...}
-    pub mesh_by_uuid: AssetCache<GpuMesh>,           // uploaded meshes
-    pub mesh_bvh_by_uuid: AssetCache<MeshBvh>,       // lazily built ray-pick BVHs
-    pub texture_by_uuid: AssetCache<GpuTexture>,     // uploaded textures
-    pub model_by_uuid: AssetCache<ModelAsset>,       // opened .smodel containers
-    pub material_by_uuid: AssetCache<MaterialAsset>, // parent-resolved .smat state
-    // + the codegen-shader memo, the preview-render queue, the thumbnail cache root
+    catalog: AssetCatalog,                           // read through catalog()
+    mesh_by_uuid: AssetCache<GpuMesh>,               // uploaded meshes
+    mesh_bvh_by_uuid: AssetCache<MeshBvh>,           // lazily built ray-pick BVHs
+    texture_by_uuid: AssetCache<GpuTexture>,         // uploaded textures
+    model_by_uuid: AssetCache<ModelAsset>,           // opened .smodel containers
+    material_by_uuid: AssetCache<MaterialAsset>,     // parent-resolved .smat state
+    asset_journal: VecDeque<AssetMutation>,          // ordered derived-state invalidations
+    // + the codegen-shader memo, the preview render queue, the thumbnail cache root
 }
 ```
 
@@ -34,6 +35,10 @@ The catalog is the source of truth; every map is a cache over it. The catalog re
 `Arc<GpuMesh>`. `AssetServer::new` seeds the root's model, texture, material, environment, and
 vegetation subdirectories. [Loading a project](../project-serialization/) populates the catalog
 from a disk scan.
+
+The catalog and caches are private. Typed mutation methods update them and publish an
+[asset mutation](../asset-mutation-journal/) together. Read-only callers borrow `catalog()`; derived
+consumers retain a journal cursor or rebuild from `asset_catalog_snapshot`.
 
 A project switch drops every cache through `clear_asset_caches`, and its caller idles the GPU
 first: an in-flight frame may still reference a cached `Arc<GpuTexture>`, so the last `Arc` must
@@ -178,9 +183,9 @@ state, so editing a parent reflows every instance's tile without touching the ch
 
 `request_thumbnail` checks the cache before loading anything. A mesh, texture, model, or vegetation
 asset reads its `content_hash` from the in-memory catalog, so a hit never opens the source file.
-Plant, biome, and vegetation-map misses rasterize their type icon immediately. Rendered asset misses
-enqueue a `PreviewRenderJob`; the host renders the tile through the main forward+ graph and writes the
-PNG for the editor's next poll.
+Biome and vegetation-map misses rasterize their type icon immediately. Rendered asset misses — a
+mesh, texture, model, material, or plant family — enqueue a `PreviewRenderJob`; the host renders the
+tile through the main forward+ graph and writes the PNG for the editor's next poll.
 
 A row whose stored hash is `0` derives one from the gathered bytes, backfills the catalog, and
 persists the catalog cache. The next request uses the cheap path.
@@ -195,6 +200,7 @@ The shared cache is bounded to 1 GiB: a write that pushes past the cap deletes t
 | The server | `assets/src/lib.rs` | `AssetServer`, `AssetServer::new`, `clear_asset_caches` |
 | Catalog types | `scene/src/environment.rs` | `AssetCatalog`, `AssetEntry`, `AssetType`, `Colorspace`, `TextureRole` |
 | Catalog ops | `scene/src/environment.rs` | `AssetCatalog::put`, `find`, `rename`, `unique_name` |
+| Mutation stream | `assets/src/journal.rs`, `assets/src/lib.rs` | `AssetMutation`, `read_asset_journal`, `asset_catalog_snapshot` |
 | Cache shape | `assets/src/cache.rs` | `AssetCache`, `resolve_cached` |
 | Resolve + cache | `assets/src/load.rs` | `load_mesh_asset`, `load_texture_asset`, `resolve_mesh`, `resolve_texture` |
 | Scan, sidecar, catalog cache | `assets/src/scan.rs` | `reconcile_catalog_from_disk`, `load_catalog`, `apply_sidecar_overrides`, `write_asset_sidecar`, `asset_signature` |
@@ -205,9 +211,10 @@ The shared cache is bounded to 1 GiB: a write that pushes past the cap deletes t
 
 - [The .smodel container](../smodel-container/) — the scanned, self-describing model file
 - [Import pipeline](../import-pipeline/) — how entries get into the catalog
+- [Asset mutation journal](../asset-mutation-journal/) — how derived consumers track changes
 - [Project files](../project-serialization/) — how the catalog persists
 - [Built-in primitives](../built-in-primitives/) — the reserved ids that bypass the catalog
-- [Draw list](../draw-list/) — the per-frame consumer of resolved meshes
+- [Executor draws](../draw-list/) — how resolved meshes are drawn
 - [Asset catalog in the scene](../../scene-and-ecs/asset-catalog-in-scene/) — why the type lives in `saffron-scene`
 - [Asset commands](../../tooling-and-control/asset-commands/) — driving the catalog from the CLI
 - [Assets panel and thumbnails](../../ui-and-editor/assets-panel-and-thumbnails/) — the editor surface over the catalog

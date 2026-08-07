@@ -1,32 +1,31 @@
-// Per-unique-edge tessellation-factor kernel (Phase 3a / Phase 10). One compute thread per unique base
-// edge of a displaced instance. Writes ONE fractional factor per edge into the instance's slice of the
-// factor buffer, so both triangles sharing an edge index the SAME slot and read a bit-identical value —
-// the structural (not floating-point) guarantee that a shared edge cannot crack.
+// Per-unique-edge tessellation-factor kernel. One compute thread per unique base edge of a displaced
+// instance. Writes ONE fractional factor per edge into the instance's slice of the factor buffer, so
+// both triangles sharing an edge index the SAME slot and read a bit-identical value — the structural
+// (not floating-point) guarantee that a shared edge cannot crack.
 //
-// The factor is a pure function of (endpoint A, endpoint B, camera, the shared min/max pyramid): the two
-// welded endpoint positions + UVs (from the Phase-2 conditioning `welded` buffer, indexed by the edge's
-// welded ids) and the pushed camera. An angular arc metric (rotation-stable) drives the base pixel
-// budget; a world/local-space fallback keeps it finite and range-clamped when the arc degenerates (an
-// endpoint clipped behind the near plane), so the value is never NaN and always in [minFactor, factorCap].
+// The factor is a pure function of (endpoint A, endpoint B, camera, the shared min/max pyramid): the
+// two welded endpoint positions + UVs and the pushed camera. An angular arc metric (rotation-stable)
+// drives the base pixel budget; a world/local-space fallback keeps it finite and range-clamped when the
+// arc degenerates at an endpoint clipped behind the near plane, so the value is never NaN and always in
+// [minFactor, factorCap].
 //
-// Per-region displacement adaptivity (Phase 10): the displaced surface spans the base edge PLUS the LOCAL
-// height range over the edge's UV span, so a surface refines where the height field is *busy*, not just
-// where it is globally tall. The local range is sampled from the per-height min/max pyramid (bindless
-// binding 4, R32G32_SFLOAT: min in R, max in G) at a mip covering the edge's UV span, point-filtered so
-// the conservative bound survives. Because it reads only the two shared endpoint UVs (one agreed
-// representative per welded vertex) + the shared pyramid, a shared edge stays bit-identical → crack-free.
+// Per-region displacement adaptivity: the displaced surface spans the base edge PLUS the LOCAL height
+// range over the edge's UV span, so a surface refines where the height field is *busy*, not just where
+// it is globally tall. The local range is sampled from the per-height min/max pyramid (bindless binding
+// 4, R32G32_SFLOAT: min in R, max in G) at a mip covering the edge's UV span, point-filtered so the
+// conservative bound survives. It reads only the two shared endpoint UVs (one agreed representative per
+// welded vertex) and the shared pyramid, so a shared edge stays bit-identical and crack-free.
 //
 // The metric is computed in the instance's LOCAL space (endpoints are local; `camPosLocal` is the world
-// camera transformed by the inverse model on the CPU). This is exact for uniform scale; non-uniform
-// scale mildly distorts the angle — an accepted v1 compromise, documented in the plan. The full
-// fractional value is stored (integer part drives the dice grid; the remainder feeds Phase-5 geomorph).
+// camera transformed by the inverse model on the CPU). Exact for uniform scale; non-uniform scale mildly
+// distorts the angle. The full fractional value is stored: the integer part drives the dice grid and the
+// remainder feeds the geomorph.
 
-// Set 0 — the shared bindless table (matches the übershader). The factor kernel reads only the per-height
-// min/max pyramid array (binding 4), indexed by the height map's bindless slot (`heightIndex`), point-
-// sampled with explicit LOD.
+// The shared bindless table. This kernel reads only the per-height min/max pyramid array, indexed by
+// the height map's bindless slot (`heightIndex`), point-sampled with explicit LOD.
 [[vk::binding(4, 0)]] Sampler2D heightMinMaxTextures[1024];
 
-// Set 1 — the per-instance edge buffers.
+// The per-instance edge buffers.
 // WeldedVertex: 64 B — position@0 (float4, xyz), direction@16 (float4), tangent@32 (float4), uv@48
 // (float4, xy). Read as raw bytes so the std430 packing matches the engine `#[repr(C)]` layout exactly.
 [[vk::binding(0, 1)]] ByteAddressBuffer welded;    // WeldedVertex[] (64 B stride)
@@ -133,12 +132,11 @@ void computeMain(uint3 tid: SV_DispatchThreadID)
         pixels = arc / max(push.tanHalfFovY, 1e-4) * push.viewport.y * 0.5;
     }
 
-    // Displacement-aware term (Phase 10, per-region): the displaced surface spans the base edge PLUS the
-    // LOCAL height range over this edge's UV span, so a flat base under a *busy* (not just tall) height
-    // field refines automatically while a genuinely smooth region stays coarse. The local range scales
-    // the full local amplitude (`dispAmpLocal`); project it at the midpoint distance (small-angle form)
-    // and drive the factor by whichever extent is larger. A pure function of the shared endpoints (UVs +
-    // positions) + the shared pyramid, so a shared edge stays bit-identical — still crack-free.
+    // Per-region displacement term: the displaced surface spans the base edge PLUS the LOCAL height
+    // range over this edge's UV span, so a flat base under a *busy* (not just tall) height field
+    // refines automatically while a genuinely smooth region stays coarse. The local range scales the
+    // full local amplitude, projected at the midpoint distance (small-angle form); the larger extent
+    // drives the factor. Still a pure function of the shared endpoints and pyramid, so crack-free.
     const float localRange = localHeightRange(weldedUv(v0), weldedUv(v1));
     const float dispAmp = localRange * push.dispAmpLocal;
     const float dispPixels = (dispAmp / dist) / max(push.tanHalfFovY, 1e-4) * push.viewport.y * 0.5;

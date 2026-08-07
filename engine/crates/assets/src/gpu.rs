@@ -1,19 +1,15 @@
 //! The GPU-upload seam the resolve/load paths reach through.
 //!
-//! Rendering owns the upload calls (README §1); this crate reaches them through the
-//! [`GpuUploader`] trait so the loaders are one code path over either the live renderer
-//! or a test stub — the upload is genuinely performed by rendering's ash seam, not
-//! stubbed in the engine.
+//! Rendering owns the upload calls; this crate reaches them through the [`GpuUploader`] trait so
+//! the loaders are one code path over either the live renderer or a test stub.
 //!
-//! The trait carries exactly the three upload entry points the loaders need plus the
-//! `skinning_enabled` gate `render_scene` reads (the skinned draw path is byte-identical
-//! to a build without it when off). Errors surface as [`saffron_rendering::Error`]; the
-//! loaders turn a failure into a logged warn plus a negative-cache `None`, never an `Err`.
+//! Errors surface as [`saffron_rendering::Error`]; the loaders turn a failure into a logged warn
+//! plus a negative-cache `None`, never an `Err`.
 
 use std::sync::Arc;
 
-use saffron_geometry::{Mesh, MorphData, VertexSkin};
-use saffron_rendering::{Descriptors, GpuMesh, GpuTexture, SdfBake, Uploader};
+use saffron_geometry::{Mesh, MorphData, PortableVirtualHierarchy, VertexSkin};
+use saffron_rendering::{Descriptors, GpuMesh, GpuTexture, SdfSource, TextureMipLevel, Uploader};
 
 /// The GPU-facing operations the resolve/load paths drive.
 ///
@@ -21,8 +17,8 @@ use saffron_rendering::{Descriptors, GpuMesh, GpuTexture, SdfBake, Uploader};
 /// loaders depend only on this trait, so the get-or-negative-cache logic is exercised
 /// without a Vulkan device while the production path still performs the real upload.
 pub trait GpuUploader {
-    /// Uploads a mesh (with its optional parallel [`VertexSkin`] stream) into device-local
-    /// buffers, returning the shared [`GpuMesh`].
+    /// Uploads a mesh and its canonical portable hierarchy (plus an optional parallel
+    /// [`VertexSkin`] stream) into device-local buffers, returning the shared [`GpuMesh`].
     ///
     /// When `sdf_bake` is present the per-mesh signed distance field is GPU jump-flood baked
     /// (or read from the sidecar cache) from the mesh geometry, uploaded into the bindless
@@ -36,9 +32,10 @@ pub trait GpuUploader {
     fn upload_mesh(
         &self,
         mesh: &Mesh,
+        hierarchy: &PortableVirtualHierarchy,
         skin: &[VertexSkin],
         morph: Option<&MorphData>,
-        sdf_bake: Option<&SdfBake>,
+        sdf: SdfSource<'_>,
     ) -> saffron_rendering::Result<Arc<GpuMesh>>;
 
     /// Uploads tightly packed RGBA8 (already decoded by the caller) as an sRGB or unorm
@@ -55,6 +52,21 @@ pub trait GpuUploader {
         height: u32,
         srgb: bool,
     ) -> saffron_rendering::Result<Arc<GpuTexture>>;
+
+    /// Uploads a complete prefiltered RGBA8 mip chain.
+    ///
+    /// The default uploads level zero through [`Self::upload_texture`], which keeps
+    /// non-GPU test doubles small. Live renderers override it and preserve every level.
+    fn upload_texture_mips(
+        &self,
+        mips: &[TextureMipLevel<'_>],
+        srgb: bool,
+    ) -> saffron_rendering::Result<Arc<GpuTexture>> {
+        let Some(base) = mips.first() else {
+            return Err(saffron_rendering::Error::ZeroSizedImage);
+        };
+        self.upload_texture(base.rgba, base.width, base.height, srgb)
+    }
 
     /// Uploads tightly packed linear-float RGBA as an `R16G16B16A16_SFLOAT` sampled
     /// texture (HDR panoramas / env sources).
@@ -91,7 +103,8 @@ pub trait GpuUploader {
     }
 
     /// Uploads a creative look-up table — `size³` red-fastest `[r, g, b]` triples — as an
-    /// `R16G16B16A16_SFLOAT` `TYPE_3D` sampled image, returning the [`GpuLut`] the tonemap pass binds.
+    /// `R16G16B16A16_SFLOAT` `TYPE_3D` sampled image, returning the
+    /// [`GpuLut`](saffron_rendering::GpuLut) the tonemap pass binds.
     ///
     /// The default errors ([`saffron_rendering::Error::ZeroSizedImage`]) — a non-GPU test stub never
     /// imports a LUT. The live uploaders override it with the real 3D upload.
@@ -144,12 +157,13 @@ impl GpuUploader for RendererUploader<'_> {
     fn upload_mesh(
         &self,
         mesh: &Mesh,
+        hierarchy: &PortableVirtualHierarchy,
         skin: &[VertexSkin],
         morph: Option<&MorphData>,
-        sdf_bake: Option<&SdfBake>,
+        sdf: SdfSource<'_>,
     ) -> saffron_rendering::Result<Arc<GpuMesh>> {
         self.uploader
-            .upload_mesh(self.descriptors, mesh, skin, morph, sdf_bake)
+            .upload_mesh(self.descriptors, mesh, hierarchy, skin, morph, sdf)
     }
 
     fn upload_texture(
@@ -171,6 +185,15 @@ impl GpuUploader for RendererUploader<'_> {
     ) -> saffron_rendering::Result<Arc<GpuTexture>> {
         self.uploader
             .upload_texture_float(self.descriptors, rgba, width, height)
+    }
+
+    fn upload_texture_mips(
+        &self,
+        mips: &[TextureMipLevel<'_>],
+        srgb: bool,
+    ) -> saffron_rendering::Result<Arc<GpuTexture>> {
+        self.uploader
+            .upload_texture_mips(self.descriptors, mips, srgb)
     }
 
     fn upload_height_texture(

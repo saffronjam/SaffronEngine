@@ -70,8 +70,8 @@ the CPU mirror used by fog-grid tests.
 | Pixel + view-Z → flat index | `engine/assets/shaders/lighting.slang` | `clusterIndexFor` |
 | View-Z transform + the loop | `engine/assets/shaders/lighting.slang` | `evalLighting` — `clusterParams.view`, `clusters[...]` |
 | Matching forward slicing | `engine/assets/shaders/light_cull.slang` | `computeMain` — `tileNear`/`tileFar` `pow` |
-| Grid dims + z planes upload | `engine/crates/rendering/src/lighting.rs` | `Lighting::set_cluster_camera` — `ClusterParams::grid_size`, `ClusterParams::z_planes` |
-| Fog CPU mirror | `engine/crates/rendering/src/froxel_fog.rs` | `froxel_to_cluster` |
+| Grid dims + z planes upload | `engine/crates/rendering/src/lighting/` | `Lighting::set_cluster_camera` — `ClusterParams::grid_size`, `ClusterParams::z_planes` |
+| Fog CPU mirror | `engine/crates/rendering/src/froxel_fog/` | `froxel_to_cluster` |
 | ReSTIR mirror | `engine/assets/shaders/restir_initial.slang` | `clusterIndexFor` |
 
 > [!TIP]

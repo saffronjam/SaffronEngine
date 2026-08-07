@@ -1,20 +1,12 @@
-//! The Roblox-task-style coroutine scheduler: verbatim Luau installed onto the `sa`
-//! table after the bindings are bound.
+//! The Roblox-task-style coroutine scheduler: verbatim Luau installed onto the `sa` table after the
+//! bindings are bound. `_sa_advance(dt)` resumes ready coroutines timed off accumulated `dt`, so
+//! scheduling is deterministic and never reads a wall clock.
 //!
-//! The scheduler is pure Luau over the enabled coroutine library: `sa.spawn_task` creates
-//! and resumes a coroutine, `sa.wait` yields it (a no-op outside a coroutine, never a
-//! tick error), `sa.delay` is wait + call, and the global `_sa_advance(dt)` resumes
-//! ready coroutines timed off accumulated `dt` — deterministic, never `os.clock` (the
-//! sandbox omits `os` anyway). The runtime calls `_sa_advance(dt)` once per tick (after
-//! the message dispatch) through [`crate::ScriptHost`]; a faulting coroutine logs via
-//! `sa.log` and never crashes the VM.
-//!
-//! `sa.wait`'s "am I inside a scheduler task?" guard accounts for mlua's Luau backend
-//! running every `Function::call` (including a script's `on_update`) on an auxiliary Lua
-//! thread, so `coroutine.running()`'s `ismain` reads `false` even in a bare `on_update`.
-//! The prelude tracks the scheduler coroutine it is currently resuming (`_sa_active`) and
-//! yields only from *that* coroutine; a bare-`on_update` `sa.wait` falls through to the
-//! documented ignored no-op, never the "yield across a C-call boundary" error.
+//! `sa.wait`'s "am I inside a scheduler task?" guard cannot use `coroutine.running()`: mlua's Luau
+//! backend runs every `Function::call` — a script's `on_update` included — on an auxiliary Lua
+//! thread, so `ismain` reads `false` even outside a task. The prelude instead tracks the coroutine it
+//! is currently resuming in `_sa_active` and yields only from that one, so a bare-`on_update`
+//! `sa.wait` becomes the documented no-op rather than a "yield across a C-call boundary" error.
 
 use mlua::Lua;
 

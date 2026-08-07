@@ -36,6 +36,8 @@ saffron-assets = { path = "../assets" }
 saffron-signal = { path = "../signal" }
 saffron-protocol = { path = "../protocol" }
 saffron-spatial = { path = "../spatial" }
+saffron-wind = { path = "../wind" }
+saffron-vegetation-gpu = { path = "../vegetation-gpu" }
 glam.workspace = true
 serde_json.workspace = true
 rustix = { workspace = true, features = ["process"] }

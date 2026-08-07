@@ -62,6 +62,15 @@ pub enum Error {
     /// The payload is the cook's own message.
     #[error("mesh cook failed: {0}")]
     CookFailed(String),
+
+    /// A per-entity body was requested for an entity that carries no `Collider`, or one whose
+    /// capsule belongs to a `CharacterVirtual` instead of a world body.
+    #[error("entity has no world-body collider")]
+    MissingCollider,
+
+    /// Jolt rejected the body: a degenerate shape, or the world's body limit.
+    #[error("body create failed")]
+    BodyCreate,
 }
 
 /// The crate `Result` alias bound to [`Error`].

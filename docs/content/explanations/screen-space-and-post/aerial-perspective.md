@@ -81,12 +81,12 @@ Environment panel's Fog section.
 |---|---|---|
 | AP fill shader | `engine/assets/shaders/aerial_perspective.slang` | `computeMain`, `froxelCenterWorld`, `sampleTransmittance`, `sampleMultiScatter`, `hgPhase` |
 | Shared-ledger composite | `engine/assets/shaders/height_fog.slang` | `computeMain`; `T = fogT*apT`, `aerialVolume` (binding 5) |
-| AP volume + params + fill set | `engine/crates/rendering/src/froxel_fog.rs` | `AerialPerspective`, `AerialParamsUbo`, `AP_GRID`, `AP_FAR_M`, `ap_slice_view_z` |
-| Atmosphere LUT accessors | `engine/crates/rendering/src/ibl.rs` | `transmittance_view`, `multi_scatter_view`, `baked_atmosphere`, `baked_sun` |
-| Fill pass + composite fold | `engine/crates/rendering/src/renderer.rs` | `add_aerial_perspective_pass`, `add_fog_pass`, `FogParams` (`aerial`, `fog_enabled`) |
-| Per-view AP binding | `engine/crates/rendering/src/view_target.rs` | `write_fog_aerial` (fog-set binding 5) |
+| AP volume + params + fill set | `engine/crates/rendering/src/froxel_fog/` | `AerialPerspective`, `AerialParamsUbo`, `AP_GRID`, `AP_FAR_M`, `ap_slice_view_z` |
+| Atmosphere LUT accessors | `engine/crates/rendering/src/ibl/` | `transmittance_view`, `multi_scatter_view`, `baked_atmosphere`, `baked_sun` |
+| Fill pass + composite fold | `engine/crates/rendering/src/renderer/` | `add_aerial_perspective_pass`, `add_fog_pass`, `FogParams` (`aerial`, `fog_enabled`) |
+| Per-view AP binding | `engine/crates/rendering/src/view_target/` | `write_fog_aerial` (fog-set binding 5) |
 | Scene state + serde | `engine/crates/scene/src/environment.rs`, `serde.rs` | `FogSettings` (`aerial_perspective`, `aerial_intensity`), `fog_to_json`/`fog_from_json` |
-| Wire DTO + command | `engine/crates/protocol/src/dto.rs`, `engine/crates/control/src/commands_scene.rs` | `SetFogParams` (`aerialPerspective`/`aerialIntensity`), the `set-fog` merge (`aerialIntensity >= 0`) |
+| Wire DTO + command | `engine/crates/protocol/src/dto/`, `engine/crates/control/src/commands_scene/` | `SetFogParams` (`aerialPerspective`/`aerialIntensity`), the `set-fog` merge (`aerialIntensity >= 0`) |
 
 ## Related
 

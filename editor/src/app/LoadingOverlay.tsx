@@ -1,12 +1,7 @@
-/// Overlay shown over the viewport region while the renderer is not ready. The
-/// reparented X11 child always paints on top of its rect once mapped, so this
-/// overlay is only meaningful while the native window is NOT yet mapped (before
-/// the first successful attach) or after a crash (window gone) — exactly the
-/// phases where phase !== 'ready'. On 'error' it offers Retry and Restart.
-///
-/// It MUST stay an absolutely-positioned sibling layer over the viewport region
-/// (NOT a Radix Dialog/portal): the engine maps the native window only after
-/// attach, so this must paint inline within the viewport panel.
+/// Shown over the viewport region while the renderer is not ready — the phases where the native
+/// surface is not yet mapped, or is gone after a crash. It MUST stay an absolutely-positioned
+/// sibling layer rather than a Radix Dialog/portal, because it has to paint inline within the
+/// viewport panel.
 import { useState } from "react";
 import { Loader2 } from "lucide-react";
 import { client } from "../control/client";
@@ -23,16 +18,23 @@ export function LoadingOverlay() {
     return null;
   }
 
-  // Retry: re-run start → attach from idle. The ViewportPanel attach effect picks
-  // up once phase advances past 'starting'; here we kick the engine off again.
+  // The session boot intent for a recovery start: reopen the current project when one is
+  // loaded, else let the host resolve the environment (an env/scratch boot that died).
+  const recoveryIntent = () => {
+    const path = useEditorStore.getState().project?.path;
+    return path ? { path } : {};
+  };
+
+  // Retry: start a fresh session from idle/error. The phase flips to `attaching` only once the
+  // child exists — before that the crash watchdog must stay quiet — and the ViewportPanel attach
+  // probe takes it from there.
   const retry = async (): Promise<void> => {
     if (busy) {
       return;
     }
     setBusy(true);
     try {
-      setPhase("starting");
-      await client.startEngine();
+      await client.sessionStart(recoveryIntent());
       setPhase("attaching");
     } catch (err) {
       setPhase("error", String(err));
@@ -41,16 +43,15 @@ export function LoadingOverlay() {
     }
   };
 
-  // Restart: tear the current engine down first, then start fresh.
+  // Restart: tear the current session down first, then start fresh.
   const restart = async (): Promise<void> => {
     if (busy) {
       return;
     }
     setBusy(true);
     try {
-      setPhase("starting");
-      await client.quitEngine().catch(() => {});
-      await client.startEngine();
+      await client.sessionStop().catch(() => {});
+      await client.sessionStart(recoveryIntent());
       setPhase("attaching");
     } catch (err) {
       setPhase("error", String(err));

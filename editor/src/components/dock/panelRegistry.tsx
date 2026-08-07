@@ -12,9 +12,12 @@ import {
   AssetPreviewPanel,
   AssetSkeletonPanel,
   AssetTimelinePanel,
+  VegetationSummaryPanel,
 } from "../../panels/assetEditorPanels";
+import { BiomeGraphPanel } from "../../panels/BiomeGraphPanel";
 import { InspectorPanel } from "../../panels/InspectorPanel";
 import { EnvironmentPanel } from "../../panels/EnvironmentPanel";
+import { WindDebugPanel } from "../../panels/WindDebugPanel";
 import { RenderPanel } from "../../panels/RenderPanel";
 import { PostProcessPanel } from "../../panels/PostProcessPanel";
 import { RenderStatsPanel } from "../../panels/RenderStatsPanel";
@@ -22,6 +25,15 @@ import { ProfilerPanel } from "../../panels/ProfilerPanel";
 import { PhysicsPanel } from "../../panels/PhysicsPanel";
 import { ScriptLogsPanel } from "../../panels/ScriptLogsPanel";
 import { MaterialEditorPanel } from "../../panels/MaterialEditorPanel";
+import { PlantAtlasPanel } from "../../panels/PlantAtlasPanel";
+import { PlantHierarchyPanel } from "../../panels/PlantHierarchyPanel";
+import { PlantProxiesPanel } from "../../panels/PlantProxiesPanel";
+import { PlantSeasonPanel } from "../../panels/PlantSeasonPanel";
+import { PlantWindPanel } from "../../panels/PlantWindPanel";
+import { VegetationPanel } from "../../panels/VegetationPanel";
+import { VegetationTelemetryPanel } from "../../panels/VegetationTelemetryPanel";
+import { EcologyTimelinePanel } from "../../panels/EcologyTimelinePanel";
+import { PlantGraphPanel } from "../../panels/PlantGraphPanel";
 import { TimelinePanel } from "../../panels/TimelinePanel";
 import { HierarchyPanel } from "../../panels/HierarchyPanel";
 import { AssetsPanel } from "../../panels/AssetsPanel";
@@ -59,6 +71,13 @@ export const SCENE_PANEL_REGISTRY: Record<SceneDockPanelId, DockPanelDef> = {
     closable: false,
     renderer: "onlyWhenVisible",
     component: EnvironmentPanel,
+  },
+  windDebug: {
+    id: "windDebug",
+    title: "Wind Debug",
+    closable: true,
+    renderer: "onlyWhenVisible",
+    component: WindDebugPanel,
   },
   render: {
     id: "render",
@@ -113,6 +132,30 @@ export const SCENE_PANEL_REGISTRY: Record<SceneDockPanelId, DockPanelDef> = {
     group: "editing",
     renderer: "always",
     component: MaterialEditorPanel,
+  },
+  vegetation: {
+    id: "vegetation",
+    title: "Vegetation",
+    closable: true,
+    group: "editing",
+    renderer: "onlyWhenVisible",
+    component: VegetationPanel,
+  },
+  vegetationTelemetry: {
+    id: "vegetationTelemetry",
+    title: "Vegetation Telemetry",
+    closable: true,
+    group: "diagnostics",
+    renderer: "onlyWhenVisible",
+    component: VegetationTelemetryPanel,
+  },
+  ecologyTimeline: {
+    id: "ecologyTimeline",
+    title: "Ecology Timeline",
+    closable: true,
+    group: "diagnostics",
+    renderer: "onlyWhenVisible",
+    component: EcologyTimelinePanel,
   },
   timeline: {
     id: "timeline",
@@ -194,6 +237,62 @@ export const ASSET_EDITOR_PANEL_REGISTRY: Record<AssetEditorDockPanelId, DockPan
     closable: true,
     renderer: "onlyWhenVisible",
     component: RenderStatsPanel,
+  },
+  vegSummary: {
+    id: "vegSummary",
+    title: "Vegetation",
+    closable: true,
+    renderer: "onlyWhenVisible",
+    component: VegetationSummaryPanel,
+  },
+  plantGraph: {
+    id: "plantGraph",
+    title: "Plant Graph",
+    closable: true,
+    renderer: "onlyWhenVisible",
+    component: PlantGraphPanel,
+  },
+  plantWind: {
+    id: "plantWind",
+    title: "Wind Preview",
+    closable: true,
+    renderer: "onlyWhenVisible",
+    component: PlantWindPanel,
+  },
+  plantAtlas: {
+    id: "plantAtlas",
+    title: "Atlas",
+    closable: true,
+    renderer: "onlyWhenVisible",
+    component: PlantAtlasPanel,
+  },
+  plantHierarchy: {
+    id: "plantHierarchy",
+    title: "Hierarchy",
+    closable: true,
+    renderer: "onlyWhenVisible",
+    component: PlantHierarchyPanel,
+  },
+  plantSeason: {
+    id: "plantSeason",
+    title: "Season",
+    closable: true,
+    renderer: "onlyWhenVisible",
+    component: PlantSeasonPanel,
+  },
+  plantProxies: {
+    id: "plantProxies",
+    title: "Proxies",
+    closable: true,
+    renderer: "onlyWhenVisible",
+    component: PlantProxiesPanel,
+  },
+  biomeGraph: {
+    id: "biomeGraph",
+    title: "Biome Graph",
+    closable: true,
+    renderer: "onlyWhenVisible",
+    component: BiomeGraphPanel,
   },
 };
 

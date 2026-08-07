@@ -1,8 +1,5 @@
-# Pin the Rust toolchain for reproducibility. The saffron-build toolbox ships rustc/cargo 1.96.0 as
-# Fedora packages (no rustup), so this file is honored when a developer drives the workspace through a
-# rustup-managed toolchain and is a harmless, documented intent otherwise — cargo falls back to
-# the toolbox's system 1.96.0, which is what this pins. rustfmt + clippy are required components
-# (the `just lint` / `just format` recipes call them); both ship in the toolbox already.
+# The saffron-build toolbox ships rustc/cargo 1.96.0 as Fedora packages (no rustup), so this pin
+# takes effect only under a rustup-managed toolchain. rustfmt + clippy back `just lint` / `just format`.
 [toolchain]
 channel = "1.96.0"
 components = ["rustfmt", "clippy"]

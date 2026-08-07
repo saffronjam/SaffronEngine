@@ -1,9 +1,6 @@
-/// The Script Logs diagnostics panel: sa.log output drained from the open-AND-playing poll in store.ts,
-/// shown as `<time> [<entity>] <message>` rows. Search is a VS Code-style find widget: hidden until Ctrl+F
-/// (while the panel is active) reveals it as a top-right overlay, Esc or its X closes it. The bar is
-/// AnimaSearchbar with an `Entity:` chip (typed-verb autocomplete over the scene's entities) plus free-text
-/// message filtering. The list is windowed (only visible rows mount, each memoized) and auto-scrolls to
-/// newest unless the user has scrolled up to read history.
+/// The Script Logs panel: sa.log output drained by the open-and-playing poll, shown as
+/// `<time> [<entity>] <message>` rows. Ctrl+F reveals the find overlay. The list is windowed and
+/// auto-scrolls to newest unless the user has scrolled up to read history.
 import * as React from "react";
 import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { TriangleAlert, X } from "lucide-react";

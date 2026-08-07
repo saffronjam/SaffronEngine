@@ -224,9 +224,10 @@ fn read_view(view: View, shm_name: &str, shared: &Arc<ViewportShared>, ready: &A
             break mapping;
         }
         attempts += 1;
+        // No session may exist yet (the launcher is up); waiting here is the presenter's
+        // normal idle state, ended by a session publishing the segment.
         if attempts.is_multiple_of(50) {
-            let errno = std::io::Error::last_os_error();
-            tracing::warn!(target: "shell", "viewport: still waiting for shm '{shm_name}': {errno}");
+            tracing::trace!(target: "shell", "viewport: waiting for a session to publish '{shm_name}'");
         }
         thread::sleep(Duration::from_millis(100));
     };

@@ -22,7 +22,7 @@ to a stored asset:
 let graph = translate_model(path)?;                          // parse glTF/OBJ → ImportedModel
 let bake = self.bake_model(&graph, options, path, Uuid(0))?; // write one .smodel (0 mints a fresh id)
 for row in &bake.rows {
-    self.catalog.put(row.clone());                           // the container + its sub-assets
+    self.register_imported_asset(row.clone());               // catalog + mutation journal
 }
 ```
 
@@ -123,6 +123,7 @@ where entities referencing the same sub-id share one upload through the cache.
 | Parse dispatch | `geometry/src/translate.rs` | `translate_model` |
 | Bake + import a model | `assets/src/import.rs` | `bake_model`, `import_model`, `ImportOptions` |
 | Rows a container contributes | `assets/src/import.rs` | `catalog_rows_for_container` |
+| Catalog publication | `assets/src/lib.rs` | `register_imported_asset`, `register_reimported_asset` |
 | Content hashes | `assets/src/import.rs` | `hash_file_fnv`, `hash_bytes_fnv` |
 | Reimport (content-hash skip) | `assets/src/manage.rs` | `reimport_model`, `ReimportDelta` |
 | Texture import | `assets/src/scan.rs` | `import_texture`, `register_texture_bytes`, `register_hdr_texture_bytes` |
@@ -137,4 +138,5 @@ where entities referencing the same sub-id share one upload through the cache.
 - [.smesh format](../smesh-format/) — the mesh chunk format
 - [Image decoding](../image-decoding/) — the texture decode
 - [Asset catalog](../asset-server-and-catalog/) — the read side
+- [Asset mutation journal](../asset-mutation-journal/) — publication and derived-state invalidation
 - [Project files](../project-serialization/) — persisting the catalog the import filled

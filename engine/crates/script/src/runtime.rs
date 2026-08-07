@@ -1,17 +1,8 @@
-//! The play-session runtime: one VM, a class-table cache, and an ordered instance
-//! vector driven through start / tick / stop.
+//! The play-session runtime: one VM, a class-table cache, and an ordered instance vector driven
+//! through start / tick / stop.
 //!
-//! `start_scripts` creates the VM, registers the bindings, instantiates every
-//! `ScriptComponent` slot in `for_each` order, and runs `on_create`; `tick_scripts`
-//! runs every instance's `on_update(dt)` in order with pause-on-error; `stop_scripts`
-//! runs `on_destroy` with no scene bound, then drops everything and the VM. The class
-//! cache, the instance build with field injection, and the deferred destroy + relink are
-//! all here.
-//!
-//! The coroutine scheduler (`advance_scheduler` after each loop), inter-script messages
-//! (`dispatch_messages` draining the queue with payload-ref release), the input edges
-//! (lent through the session guard), the hierarchy/query bindings, the physics bridges,
-//! and `dispatch_contact` are wired here.
+//! Instances are created in scene `for_each` order and ticked in that order with pause-on-error;
+//! `stop_scripts` runs `on_destroy` with no scene bound before dropping the VM.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -37,17 +28,10 @@ use crate::vm::ScriptVm;
 /// registry ref to its `self` table. Within an entity, instances keep slot order; the
 /// vector order across entities is load-bearing (instances run top-to-bottom).
 struct ScriptInstance {
-    /// The owning entity (handle into the play scene). Carried metadata — the runtime
-    /// matches instances by uuid.
-    #[allow(dead_code)]
-    entity: Entity,
     /// The entity's uuid, cached so a contact/message dispatch can match by id.
     entity_uuid: Uuid,
-    /// The slot's script path relative to the project `src/` (for error reporting).
+    /// The slot's script path relative to the project `src/`, for error reporting.
     script_path: String,
-    /// The slot index within the entity's `Script` component (deterministic order).
-    #[allow(dead_code)]
-    slot_index: usize,
     /// The registry ref to the instance's `self` table.
     self_ref: RegistryKey,
 }
@@ -59,12 +43,21 @@ struct ScriptInstance {
 /// world-space contact manifold. The host fills it from a drained `saffron-physics`
 /// `ContactEvent` — `saffron-script` carries no physics edge, so this is the plain shape
 /// the binding sees.
+/// The `other` argument a contact handler receives: the touching entity's handle, or
+/// a macro plant's canonical hex identity.
+enum ContactOther {
+    /// The other body's scene entity (the null handle when unowned).
+    Entity(Entity),
+    /// The other body's plant identity as canonical hex.
+    Plant(String),
+}
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct ContactInfo {
-    /// One body's owner-entity uuid (`Uuid(0)` when the body had no owning entity).
-    pub entity_a: Uuid,
-    /// The other body's owner-entity uuid (`Uuid(0)` when none).
-    pub entity_b: Uuid,
+    /// One body's tagged owner (`None` when the body has no owner).
+    pub target_a: Option<crate::bridge::ScriptHitTarget>,
+    /// The other body's tagged owner (`None` when none).
+    pub target_b: Option<crate::bridge::ScriptHitTarget>,
     /// Whether the contact began (`true`) or ended (`false`).
     pub begin: bool,
     /// Whether either body is a sensor — a trigger overlap, not a solid touch.
@@ -73,6 +66,45 @@ pub struct ContactInfo {
     pub point: glam::Vec3,
     /// The world-space contact normal (`entity_a` → `entity_b`; zero for an `End` event).
     pub normal: glam::Vec3,
+}
+
+/// One committed vegetation transition surfaced to scripts, the POD input to
+/// [`ScriptHost::dispatch_vegetation_event`].
+///
+/// The kind and the value names are the same text the control plane reports, so a script and an
+/// `sa vegetation-drain-events` call describe one transition identically. The host fills it from a
+/// drained `saffron-vegetation` transition — `saffron-script` carries no vegetation edge, so this
+/// is the plain shape the handler sees.
+#[derive(Clone, Debug, PartialEq)]
+pub struct VegetationEventInfo {
+    /// Monotonic sequence number within the bound world.
+    pub seq: u64,
+    /// The transition kind (`damaged`, `harvested`, `burned`, `removed`, `planted`, `regrew`,
+    /// `lifecycle-changed`, `ignited`, `extinguished`, `wetted`, `state-replaced`, `moved`,
+    /// `disturbed`).
+    pub kind: &'static str,
+    /// The plant the transition names as canonical hex, absent for a cell-wide change.
+    pub plant: Option<String>,
+    /// The cell whose persistent state changed, and its hierarchy level.
+    pub cell: [i64; 3],
+    /// The cell's hierarchy level (`0` is the base level).
+    pub cell_level: u8,
+    /// The lifecycle the transition settled at, when it names one.
+    pub lifecycle: Option<&'static str>,
+    /// The prior lifecycle a transition declared as its precondition, when it declared one.
+    pub previous_lifecycle: Option<&'static str>,
+    /// The species phenotype the transition settled at, when it names one.
+    pub phenotype: Option<u32>,
+    /// The damage the transition applied, in 0..1.
+    pub amount: Option<f32>,
+    /// The health it settled at, in 0..1.
+    pub health: Option<f32>,
+    /// The persistent moisture it settled at, in 0..1.
+    pub moisture: Option<f32>,
+    /// The combustible fuel it settled at, in 0..1.
+    pub fuel: Option<f32>,
+    /// Disturbance class bits for a `disturbed` transition.
+    pub categories: Option<u32>,
 }
 
 /// A contained per-instance failure from a start/tick call, traceback included.
@@ -262,18 +294,15 @@ impl ScriptHost {
     ///
     /// A sensor Begin invokes `on_trigger_enter(self, other)`, a sensor End
     /// `on_trigger_exit(self, other)`, a solid Begin `on_contact(self, other, point,
-    /// normal)` (world space, passed as `sa.Vec3`); a solid End has no handler (v1 emits
-    /// it but routes nothing). The transition is dispatched in both directions
-    /// (A-then-B); a missing handler is a silent skip; the first failing handler halts
-    /// the dispatch and is returned (pause-on-error, like [`ScriptHost::tick_scripts`]).
-    /// `None` (no error) when there is no VM, no instance, or no handler for the
-    /// transition.
+    /// normal)` in world space as `sa.Vec3`. A solid End is emitted but routes to no handler.
     ///
-    /// The contact ring's events are seq-stamped POD (`entity_a`/`entity_b` uuids, the
-    /// `Begin`/`End` flag, `sensor`, `point`/`normal`); the host drains the ring before
-    /// `on_update` each tick and drives this per event. After the dispatch the
-    /// deferred structural ops flush and the queued messages dispatch (a contact handler
-    /// may `destroy`/`send`), exactly as a tick does.
+    /// The transition dispatches in both directions, A then B; a missing handler is a silent skip;
+    /// the first failing handler halts the dispatch and is returned, matching
+    /// [`ScriptHost::tick_scripts`]. `None` when there is no VM, no instance, or no handler.
+    ///
+    /// The host drains the contact ring before `on_update` each tick and drives this per event. After
+    /// the dispatch the deferred structural ops flush and the queued messages dispatch, exactly as a
+    /// tick does, because a contact handler may `destroy` or `send`.
     pub fn dispatch_contact(
         &mut self,
         scene: &mut Scene,
@@ -283,7 +312,7 @@ impl ScriptHost {
         if self.vm.is_none() || self.instances.is_empty() {
             return None;
         }
-        // v1 emits sensor enter/exit + solid Begin; a solid End has no handler.
+        // Sensor enter/exit and solid Begin route to a handler; a solid End does not.
         let (handler, with_manifold) = if contact.sensor {
             (
                 if contact.begin {
@@ -304,8 +333,8 @@ impl ScriptHost {
         let mut failure = self.dispatch_contact_one(
             handler,
             with_manifold,
-            contact.entity_a,
-            contact.entity_b,
+            contact.target_a,
+            contact.target_b,
             contact.point,
             contact.normal,
         );
@@ -313,8 +342,8 @@ impl ScriptHost {
             failure = self.dispatch_contact_one(
                 handler,
                 with_manifold,
-                contact.entity_b,
-                contact.entity_a,
+                contact.target_b,
+                contact.target_a,
                 contact.point,
                 contact.normal,
             );
@@ -326,6 +355,77 @@ impl ScriptHost {
         failure
     }
 
+    /// Dispatches one committed vegetation transition to every instance declaring
+    /// `on_vegetation_event(self, event)`.
+    ///
+    /// A vegetation transition names a plant, not an entity, so it broadcasts: a plant is world
+    /// state that any script may be watching, and the reducer commit is the one place a change
+    /// becomes observable. The event arrives as a table shaped by
+    /// [`VegetationEventInfo`]; the first failing handler halts the dispatch and is returned,
+    /// matching [`ScriptHost::tick_scripts`]. `None` when there is no VM, no instance, or no
+    /// handler.
+    ///
+    /// The host drains the transition ring before `on_update` each tick and drives this per event.
+    /// Structural ops flush and queued messages dispatch afterwards, exactly as a tick does.
+    pub fn dispatch_vegetation_event(
+        &mut self,
+        scene: &mut Scene,
+        registry: Arc<ComponentRegistry>,
+        event: &VegetationEventInfo,
+    ) -> Option<ScriptRunError> {
+        if self.vm.is_none() || self.instances.is_empty() {
+            return None;
+        }
+        let guard = session::enter_session(scene, registry, None);
+        session::set_bridge(Rc::clone(&self.bridge));
+        let mut failure = None;
+        for index in 0..self.instances.len() {
+            let instance = &self.instances[index];
+            session::set_sender(instance.entity_uuid);
+            if let Err(err) = self.call_vegetation_handler(&instance.self_ref, event) {
+                failure = Some(ScriptRunError {
+                    entity_uuid: instance.entity_uuid,
+                    script: instance.script_path.clone(),
+                    message: err.to_string(),
+                });
+                break;
+            }
+        }
+        session::set_sender(Uuid(0));
+        flush_structural_ops();
+        self.dispatch_messages();
+        drop(guard);
+        failure
+    }
+
+    /// Invokes `self:on_vegetation_event(event)` for one instance, resetting the per-call budget
+    /// first. An absent handler is a successful no-op.
+    fn call_vegetation_handler(
+        &self,
+        self_ref: &RegistryKey,
+        event: &VegetationEventInfo,
+    ) -> Result<()> {
+        let vm = self
+            .vm
+            .as_ref()
+            .expect("a VM is bound during vegetation dispatch");
+        let lua = vm.lua();
+        let self_table: Table = lua
+            .registry_value(self_ref)
+            .map_err(|e| Error::Runtime(e.to_string()))?;
+        let method: LuaValue = self_table
+            .get("on_vegetation_event")
+            .map_err(|e| vm.classify_run_error(&e))?;
+        let LuaValue::Function(method) = method else {
+            return Ok(());
+        };
+        vm.reset_budget();
+        let table = crate::bindings::vegetation_event_table(lua, event)
+            .map_err(|e| Error::Runtime(e.to_string()))?;
+        let result: mlua::Result<()> = method.call((self_table, table));
+        result.map_err(|e| vm.classify_run_error(&e))
+    }
+
     /// Dispatches one direction of a contact transition: every instance whose
     /// `entity_uuid` matches `self_uuid` runs `self:<handler>(other[, point, normal])`,
     /// halting on the first error. `self_uuid == Uuid(0)`
@@ -335,17 +435,27 @@ impl ScriptHost {
         &self,
         handler: &str,
         with_manifold: bool,
-        self_uuid: Uuid,
-        other_uuid: Uuid,
+        self_target: Option<crate::bridge::ScriptHitTarget>,
+        other_target: Option<crate::bridge::ScriptHitTarget>,
         point: glam::Vec3,
         normal: glam::Vec3,
     ) -> Option<ScriptRunError> {
-        if self_uuid == Uuid(0) {
+        // Handlers run on scene entities; a plant (or an unowned body) has no script
+        // instance until promotion turns it into one.
+        let Some(crate::bridge::ScriptHitTarget::SceneEntity(self_uuid)) = self_target else {
             return None;
-        }
-        let other = session::with_scene(|scene| scene.find_entity_by_uuid(other_uuid))
-            .flatten()
-            .unwrap_or(Entity::NULL);
+        };
+        let other = match other_target {
+            Some(crate::bridge::ScriptHitTarget::SceneEntity(uuid)) => ContactOther::Entity(
+                session::with_scene(|scene| scene.find_entity_by_uuid(uuid))
+                    .flatten()
+                    .unwrap_or(Entity::NULL),
+            ),
+            Some(crate::bridge::ScriptHitTarget::Vegetation(plant)) => {
+                ContactOther::Plant(plant.canonical_hex())
+            }
+            None => ContactOther::Entity(Entity::NULL),
+        };
         for instance in &self.instances {
             if instance.entity_uuid != self_uuid {
                 continue;
@@ -354,7 +464,7 @@ impl ScriptHost {
             if let Err(err) = self.call_contact_handler(
                 &instance.self_ref,
                 handler,
-                other,
+                &other,
                 with_manifold,
                 point,
                 normal,
@@ -380,7 +490,7 @@ impl ScriptHost {
         &self,
         self_ref: &RegistryKey,
         name: &str,
-        other: Entity,
+        other: &ContactOther,
         with_manifold: bool,
         point: glam::Vec3,
         normal: glam::Vec3,
@@ -402,11 +512,20 @@ impl ScriptHost {
         };
 
         vm.reset_budget();
-        let other_handle = EntityHandle::new(other);
+        let other_value = match other {
+            ContactOther::Entity(entity) => LuaValue::UserData(
+                lua.create_userdata(EntityHandle::new(*entity))
+                    .map_err(|e| Error::Runtime(e.to_string()))?,
+            ),
+            ContactOther::Plant(hex) => LuaValue::String(
+                lua.create_string(hex)
+                    .map_err(|e| Error::Runtime(e.to_string()))?,
+            ),
+        };
         let result: mlua::Result<()> = if with_manifold {
-            method.call((self_table, other_handle, SaVec3(point), SaVec3(normal)))
+            method.call((self_table, other_value, SaVec3(point), SaVec3(normal)))
         } else {
-            method.call((self_table, other_handle))
+            method.call((self_table, other_value))
         };
         result.map_err(|e| vm.classify_run_error(&e))
     }
@@ -516,10 +635,8 @@ impl ScriptHost {
             .create_registry_value(self_table)
             .map_err(|e| Error::Runtime(e.to_string()))?;
         Ok(ScriptInstance {
-            entity: slot.entity,
             entity_uuid: slot.entity_uuid,
             script_path: slot.script_path.clone(),
-            slot_index: slot.slot_index,
             self_ref,
         })
     }
@@ -693,12 +810,10 @@ fn flush_structural_ops() {
     });
 }
 
-/// One slot collected from the scene before the session opens: the entity, its uuid,
-/// the slot index, the relative script path, the resolved full path, and the overrides.
+/// One slot collected from the scene before the session opens.
 struct CollectedSlot {
     entity: Entity,
     entity_uuid: Uuid,
-    slot_index: usize,
     script_path: String,
     full_path: PathBuf,
     overrides: JsonValue,
@@ -710,14 +825,13 @@ fn collect_slots(scene: &mut Scene, src_dir: &Path) -> Vec<CollectedSlot> {
     let mut slots = Vec::new();
     scene.for_each::<(&Script, Option<&IdComponent>), _>(|entity, (script, id)| {
         let entity_uuid = id.map_or(Uuid(0), |id| id.id);
-        for (slot_index, slot) in script.scripts.iter().enumerate() {
+        for slot in &script.scripts {
             if slot.script_path.is_empty() {
                 continue;
             }
             slots.push(CollectedSlot {
                 entity,
                 entity_uuid,
-                slot_index,
                 script_path: slot.script_path.clone(),
                 full_path: src_dir.join(&slot.script_path),
                 overrides: slot.overrides.clone(),

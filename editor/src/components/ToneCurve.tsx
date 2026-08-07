@@ -1,9 +1,8 @@
-/// An SVG tone-curve editor: a `[0,1]×[0,1]` display-space spline with draggable control points for a
-/// master + per-channel (R/G/B) curve. Click empty space to add a point, drag to move, right-click an
-/// interior point to remove; the two endpoints keep their x and move only in y. The curve is a
-/// monotone cubic (Fritsch–Carlson) through the points, so a tone curve never overshoots into a
-/// contrast reversal. The widget owns drag-local rendering (`useScrubValue`) and brackets a gesture
-/// with `onDragStart`/`onDragEnd`; the panel bakes the sampled curve into the creative-LUT slot.
+/// An SVG tone-curve editor over a `[0,1]×[0,1]` display-space spline, with a master and per-channel
+/// curve. The two endpoints keep their x and move only in y. The curve is a monotone cubic
+/// (Fritsch–Carlson) through the points, so it never overshoots into a contrast reversal. Owns
+/// drag-local rendering and brackets a gesture; the panel bakes the sampled curve into the
+/// creative-LUT slot.
 import { useRef, useState } from "react";
 import { useScrubValue } from "@/lib/useScrubValue";
 import { cn } from "@/lib/utils";

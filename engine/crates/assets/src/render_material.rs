@@ -1,25 +1,16 @@
 //! The resolution from a loaded [`MaterialAsset`] (or a scene material component) to a
 //! render-ready [`SubmeshMaterial`] with bindless GPU texture handles.
 //!
-//! Three entry points, narrowing in scope:
-//!
-//! - [`build_submesh_material`] maps one resolved [`MaterialAsset`] to a
-//!   [`SubmeshMaterial`], resolving each texture slot through a borrowed loader closure.
-//!   The main draw path passes [`AssetServer::load_texture_asset`]; the thumbnail worker
-//!   passes its own uploader — one mapping, one call site, the loader a
-//!   `&dyn Fn(Uuid) -> Option<Arc<…>>`.
-//! - [`AssetServer::resolve_material_asset`] instantiates a [`MaterialAsset`] on the main
-//!   thread, wiring [`build_submesh_material`]'s loader to [`AssetServer::load_texture_asset`].
-//! - [`AssetServer::resolve_entity_materials`] resolves a single renderable's whole
-//!   submesh-material table, applying the per-entity component precedence and producing
-//!   the [`ResolvedMaterials`] result the draw loop reads.
+//! Texture slots resolve through a borrowed loader closure, so the main draw path and the thumbnail
+//! worker share one mapping with their own uploader.
 //!
 //! # The packed ORM/ARM map feeds two slots
 //!
 //! A material's single ORM texture (`orm_texture`) drives **both** the
 //! metallic-roughness slot (roughness in G, metalness in B) and the occlusion slot (AO
 //! in R), so one map covers all three. [`SubmeshMaterial::blend_mode`] is parsed from the
-//! `.smat` `blend` string via [`BlendMode::from_wire`].
+//! `.smat` `blend` string via [`BlendMode::from_wire`] for standard surfaces. Thin-sheet
+//! foliage derives it from the canonical coverage classification.
 //!
 //! # Component precedence
 //!
@@ -38,8 +29,14 @@ use saffron_core::Uuid;
 use saffron_geometry::Submesh;
 use saffron_geometry::glam::Vec3;
 use saffron_json::Value;
-use saffron_rendering::{GpuTexture, SubmeshMaterial};
+use saffron_rendering::{
+    AggregateMaterialMoments, CoverageSourceKind, GpuTexture, SubmeshMaterial, ThinSheetMaterial,
+    ThinSheetNormalMode,
+};
 use saffron_scene::{Entity, MaterialSet, Scene};
+use saffron_vegetation::{
+    AlphaClassification, CoverageSource, MaterialSurface, ThinSheetNormalBehavior,
+};
 
 use crate::gpu::GpuUploader;
 use crate::graph::lower_graph_to_params;
@@ -55,8 +52,8 @@ const DEFAULT_MESH_SHADER: &str = "shaders/mesh.spv";
 /// (which selects the PSO) and a proxy albedo for the DDGI voxel box.
 ///
 /// Built by [`AssetServer::resolve_entity_materials`] from the entity's
-/// [`MaterialAsset`]/[`MaterialSet`]/[`Material`] component (precedence in that order),
-/// else engine defaults.
+/// [`MaterialAsset`]/[`MaterialSet`](saffron_scene::MaterialSet) component (precedence in that
+/// order), else engine defaults.
 #[derive(Clone)]
 pub struct ResolvedMaterials {
     /// One [`SubmeshMaterial`] per mesh submesh; a single entry applies to every
@@ -66,9 +63,41 @@ pub struct ResolvedMaterials {
     pub unlit: bool,
     /// The resolved base color's rgb, captured for the DDGI voxel-box proxy albedo.
     pub proxy_albedo: Vec3,
+    /// Aggregate occupancy the SDF/GDF path splats for this entity's matter:
+    /// `1.0` solid; below one, the densest thin-sheet submesh's aggregate
+    /// occupancy (porous matter never hardens the distance field).
+    pub occupancy: f32,
     /// The übershader the scene PSO selects. A codegen material points this at its
     /// compiled `_mesh.spv` variant; everything else keeps the shared übershader.
     pub shader: String,
+}
+
+/// The aggregate occupancy that reproduces `transmission_mean` across `thickness_m`.
+///
+/// The extinction coefficient is achromatic, so one density has to stand for three channels;
+/// the channel mean is the reduction that preserves total transmitted energy rather than
+/// favouring a perceptual weighting the injection path does not use.
+pub(crate) fn derive_parity_occupancy(transmission_mean: [f32; 3], thickness_m: f32) -> f32 {
+    let mean = (transmission_mean[0] + transmission_mean[1] + transmission_mean[2]) / 3.0;
+    saffron_material::parity_occupancy(mean, thickness_m)
+}
+
+/// The entity-level aggregate occupancy: an entity whose submeshes are all thin
+/// sheets occupies its bounds only fractionally, and the densest sheet's aggregate
+/// occupancy stands in for the whole; any solid submesh (or no submeshes) keeps the
+/// entity solid at `1.0`.
+fn derive_entity_occupancy(submeshes: &[SubmeshMaterial]) -> f32 {
+    if submeshes.is_empty() {
+        return 1.0;
+    }
+    let mut occupancy = 0.0_f32;
+    for submesh in submeshes {
+        match &submesh.thin_sheet {
+            Some(sheet) => occupancy = occupancy.max(sheet.aggregate.occupancy),
+            None => return 1.0,
+        }
+    }
+    occupancy.clamp(0.0, 1.0)
 }
 
 impl Default for ResolvedMaterials {
@@ -77,6 +106,7 @@ impl Default for ResolvedMaterials {
             submeshes: Vec::new(),
             unlit: false,
             proxy_albedo: Vec3::ONE,
+            occupancy: 1.0,
             shader: DEFAULT_MESH_SHADER.to_owned(),
         }
     }
@@ -89,16 +119,14 @@ impl Default for ResolvedMaterials {
 /// thumbnail worker passes its own uploader. A zero texture id leaves that handle unset —
 /// the draw path's default-white substitution is a renderer concern, not done here. The
 /// packed `orm_texture` feeds **both** the metallic-roughness and the occlusion slot, and
-/// `blend_mode` parses the `.smat` `blend` string.
+/// `blend_mode` parses the `.smat` `blend` string for standard surfaces and follows the
+/// canonical coverage classification for thin sheets.
 ///
-/// The loader is `FnMut(id, as_height)`: the main path's closure fills the texture cache as it
-/// resolves, so a borrowed mutable closure is the allocation-free shape — no trait object for a single
-/// call site. The `as_height` flag (set only for a [`HeightMode::Displacement`] material's height slot)
-/// routes that texture through the pyramid-building height loader; one closure keeps a single `&mut
-/// self` borrow (two self-capturing closures would conflict).
+/// The loader receives a `TextureLoadRole` so height and coverage pyramids use their canonical
+/// builders while one closure retains the single mutable server borrow.
 pub fn build_submesh_material(
     material: &MaterialAsset,
-    load_tex: &mut dyn FnMut(saffron_core::Uuid, bool) -> Option<Arc<GpuTexture>>,
+    load_tex: &mut dyn FnMut(saffron_core::Uuid, TextureLoadRole) -> Option<Arc<GpuTexture>>,
 ) -> SubmeshMaterial {
     let mut sm = SubmeshMaterial {
         base_color: material.base_color,
@@ -117,28 +145,119 @@ pub fn build_submesh_material(
         ..SubmeshMaterial::defaults()
     };
     if material.albedo_texture.value() != 0 {
-        sm.albedo_texture = load_tex(material.albedo_texture, false);
+        sm.albedo_texture = load_tex(material.albedo_texture, TextureLoadRole::Plain);
     }
     if material.orm_texture.value() != 0 {
-        sm.metallic_roughness_texture = load_tex(material.orm_texture, false);
-        sm.occlusion_texture = load_tex(material.orm_texture, false);
+        sm.metallic_roughness_texture = load_tex(material.orm_texture, TextureLoadRole::Plain);
+        sm.occlusion_texture = load_tex(material.orm_texture, TextureLoadRole::Plain);
     }
     if material.normal_texture.value() != 0 {
-        sm.normal_texture = load_tex(material.normal_texture, false);
+        sm.normal_texture = load_tex(material.normal_texture, TextureLoadRole::Plain);
     }
     if material.emissive_texture.value() != 0 {
-        sm.emissive_texture = load_tex(material.emissive_texture, false);
+        sm.emissive_texture = load_tex(material.emissive_texture, TextureLoadRole::Plain);
     }
     if material.height_texture.value() != 0 {
         // A displacement material's height map carries the min/max pyramid (built by the height loader)
         // that the tessellation factor kernel samples for per-region LOD; bump/parallax need no pyramid.
-        let as_height = material.height_mode == HeightMode::Displacement;
-        sm.height_texture = load_tex(material.height_texture, as_height);
+        let role = if material.height_mode == HeightMode::Displacement {
+            TextureLoadRole::Height
+        } else {
+            TextureLoadRole::Plain
+        };
+        sm.height_texture = load_tex(material.height_texture, role);
     }
     if material.vector_displacement_texture.value() != 0 {
-        sm.vector_displacement_texture = load_tex(material.vector_displacement_texture, false);
+        sm.vector_displacement_texture =
+            load_tex(material.vector_displacement_texture, TextureLoadRole::Plain);
+    }
+    if let MaterialSurface::ThinSheetFoliage(parameters) = &material.surface {
+        let coverage_id = match parameters.coverage_source {
+            CoverageSource::AlbedoAlpha => material.albedo_texture,
+            CoverageSource::Texture(texture) => texture,
+            CoverageSource::ModeledGeometry => Uuid(0),
+        };
+        if coverage_id.value() != 0 {
+            sm.coverage_texture = load_tex(
+                coverage_id,
+                TextureLoadRole::Coverage {
+                    cutoff_bits: parameters.coverage.reference_cutoff.bits(),
+                },
+            );
+        }
+        sm.blend_mode = match parameters.coverage.classification {
+            AlphaClassification::Opaque => BlendMode::Opaque,
+            AlphaClassification::Masked => BlendMode::Masked,
+            AlphaClassification::Transmissive => BlendMode::Blend,
+        };
+        sm.thin_sheet = Some(thin_sheet_material(parameters));
+        sm.double_sided = true;
     }
     sm
+}
+
+/// Texture upload role selected while resolving a material.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TextureLoadRole {
+    /// Ordinary color/data texture with the standard filtered mip chain.
+    Plain,
+    /// Displacement texture with a min/max height pyramid.
+    Height,
+    /// Linear coverage texture with cutoff-preserving alpha mips.
+    Coverage {
+        /// Canonical normalized cutoff bits.
+        cutoff_bits: u16,
+    },
+}
+
+fn thin_sheet_material(
+    parameters: &saffron_vegetation::ThinSheetFoliageParameters,
+) -> ThinSheetMaterial {
+    let scalar = |value: saffron_spatial::DecisionScalar| value.to_f64() as f32;
+    let unit = |value: saffron_spatial::UnitInterval| value.to_f64() as f32;
+    let vec3 = |values: [saffron_spatial::DecisionScalar; 3]| {
+        Vec3::new(scalar(values[0]), scalar(values[1]), scalar(values[2]))
+    };
+    let moments = parameters.voxel_moments;
+    ThinSheetMaterial {
+        front_albedo_response: unit(parameters.front_albedo_response),
+        back_albedo_response: unit(parameters.back_albedo_response),
+        thickness: scalar(parameters.thickness),
+        absorption: vec3(parameters.absorption_color),
+        transmission: vec3(parameters.transmission_color),
+        roughness: unit(parameters.roughness),
+        normal_mode: match parameters.normal_behavior {
+            ThinSheetNormalBehavior::Preserve => ThinSheetNormalMode::Preserve,
+            ThinSheetNormalBehavior::FaceForwardBack => ThinSheetNormalMode::FaceForwardBack,
+            ThinSheetNormalBehavior::Symmetric => ThinSheetNormalMode::Symmetric,
+        },
+        coverage_source: match parameters.coverage_source {
+            CoverageSource::AlbedoAlpha => CoverageSourceKind::AlbedoAlpha,
+            CoverageSource::Texture(_) => CoverageSourceKind::Texture,
+            CoverageSource::ModeledGeometry => CoverageSourceKind::ModeledGeometry,
+        },
+        coverage_classification: parameters.coverage.classification,
+        coverage_hash_salt: parameters.coverage.spatial_hash_salt,
+        coverage_source_extent: parameters.coverage.source_extent,
+        energy_limit: unit(parameters.energy_limit),
+        aggregate: AggregateMaterialMoments {
+            // Occupancy is DERIVED, not authored: it is the density at which marching through
+            // the sheet's own mean thickness transmits the sheet's own mean transmission. The
+            // aggregate voxel and the triangles it replaces then describe one optical depth,
+            // so a plant crossing that transition does not change how much light it lets
+            // through — which is what an authored occupancy sitting beside an authored
+            // transmission cannot guarantee.
+            occupancy: derive_parity_occupancy(
+                moments.transmission_mean.map(scalar),
+                scalar(moments.thickness_mean),
+            ),
+            albedo_mean: vec3(moments.albedo_mean),
+            roughness_mean: unit(moments.roughness_mean),
+            transmission_mean: vec3(moments.transmission_mean),
+            thickness_mean: scalar(moments.thickness_mean),
+            normal_second_moments: moments.normal_second_moments.map(scalar),
+        },
+    }
 }
 
 impl AssetServer {
@@ -153,11 +272,11 @@ impl AssetServer {
         gpu: &dyn GpuUploader,
         material: &MaterialAsset,
     ) -> SubmeshMaterial {
-        build_submesh_material(material, &mut |id, as_height| {
-            if as_height {
-                self.load_height_texture_asset(gpu, id)
-            } else {
-                self.load_texture_asset(gpu, id)
+        build_submesh_material(material, &mut |id, role| match role {
+            TextureLoadRole::Plain => self.load_texture_asset(gpu, id),
+            TextureLoadRole::Height => self.load_height_texture_asset(gpu, id),
+            TextureLoadRole::Coverage { cutoff_bits } => {
+                self.load_coverage_texture_asset(gpu, id, cutoff_bits)
             }
         })
     }
@@ -183,50 +302,77 @@ impl AssetServer {
     ) -> ResolvedMaterials {
         let mut out = ResolvedMaterials::default();
 
-        let slots = scene
-            .with_component::<MaterialSet, _>(entity, |set| set.slots.clone())
-            .unwrap_or_default();
+        let slots = self.resolve_entity_material_slots(scene, entity);
         if slots.is_empty() {
             return out;
         }
 
-        // Resolve each slot's referenced material (parent chain) with its sparse overrides
-        // once, so a submesh reusing a slot does not re-load it.
-        let resolved: Vec<MaterialAsset> = slots
-            .iter()
-            .map(|slot| self.resolve_slot_material(slot.material, &slot.overrides))
-            .collect();
-
-        // The whole-mesh flags + codegen shader follow slot 0.
-        out.unlit = resolved[0].unlit;
-        out.proxy_albedo = resolved[0].base_color.truncate();
-        if let Some(shader) = self.codegen_shader_for(slots[0].material) {
+        out.unlit = slots[0].1.unlit;
+        out.proxy_albedo = slots[0].1.base_color.truncate();
+        if let Some(shader) = self.codegen_shader_for(slots[0].0) {
             out.shader = shader;
         }
 
         out.submeshes.reserve(submeshes.len());
         for submesh in submeshes {
-            let index = (submesh.material_slot as usize).min(resolved.len() - 1);
+            let index = (submesh.material_slot as usize).min(slots.len() - 1);
             out.submeshes
-                .push(self.resolve_material_asset(gpu, &resolved[index]));
+                .push(self.resolve_material_asset(gpu, &slots[index].1));
         }
+        out.occupancy = derive_entity_occupancy(&out.submeshes);
         out
+    }
+
+    /// Resolves the exact material asset used by every submesh for CPU coverage classification.
+    pub(crate) fn resolve_entity_material_assets(
+        &mut self,
+        scene: &Scene,
+        entity: Entity,
+        submeshes: &[Submesh],
+    ) -> Vec<MaterialAsset> {
+        let slots = self.resolve_entity_material_slots(scene, entity);
+        if slots.is_empty() {
+            return vec![default_material_asset(); submeshes.len()];
+        }
+        submeshes
+            .iter()
+            .map(|submesh| {
+                slots[(submesh.material_slot as usize).min(slots.len() - 1)]
+                    .1
+                    .clone()
+            })
+            .collect()
+    }
+
+    fn resolve_entity_material_slots(
+        &mut self,
+        scene: &Scene,
+        entity: Entity,
+    ) -> Vec<(Uuid, MaterialAsset)> {
+        scene
+            .with_component::<MaterialSet, _>(entity, |set| set.slots.clone())
+            .unwrap_or_default()
+            .into_iter()
+            .map(|slot| {
+                let material = self.resolve_slot_material(slot.material, &slot.overrides);
+                (slot.material, material)
+            })
+            .collect()
     }
 
     /// Resolves one slot: loads its referenced `.smat` (parent chain resolved) and layers the
     /// slot's sparse overrides on top. A `0` reference is the built-in default (the common
-    /// case — no warning); a non-zero id that fails to load warns and falls back to default.
-    fn resolve_slot_material(&mut self, material_id: Uuid, overrides: &Value) -> MaterialAsset {
+    /// case); a non-zero id that fails to load falls back to default (the loader warns once
+    /// when it caches the miss).
+    pub(crate) fn resolve_slot_material(
+        &mut self,
+        material_id: Uuid,
+        overrides: &Value,
+    ) -> MaterialAsset {
         let mut material = if material_id.value() == 0 {
             default_material_asset()
         } else {
-            load_material_asset(self, material_id).unwrap_or_else(|| {
-                tracing::warn!(
-                    "slot material asset {} missing; using default",
-                    material_id.value()
-                );
-                default_material_asset()
-            })
+            load_material_asset(self, material_id).unwrap_or_else(default_material_asset)
         };
         apply_overrides(&mut material, overrides);
         material
@@ -241,7 +387,7 @@ impl AssetServer {
     /// frame); the result only changes through the invalidation seams. A container-embedded id
     /// short-circuits to `None` without touching disk — imported materials never carry a graph,
     /// and reading the whole binary `.smodel` as a UTF-8 string was pure per-frame waste.
-    fn codegen_shader_for(&mut self, material_id: Uuid) -> Option<String> {
+    pub(crate) fn codegen_shader_for(&mut self, material_id: Uuid) -> Option<String> {
         if let Some(cached) = self.material_shader_by_uuid.get(&material_id.value()) {
             return cached.as_ref().map(|s| (**s).clone());
         }
@@ -285,14 +431,23 @@ fn load_material_asset(assets: &mut AssetServer, id: saffron_core::Uuid) -> Opti
     if id == DEFAULT_MATERIAL_ID {
         return Some(default_material_asset());
     }
-    // Cached parent-resolved material (before the per-slot overrides the caller layers on the
-    // returned clone). A present key — including a negative-cached `None` — skips the disk read;
-    // only a true miss reads + parses the `.smat` (and, for a container material, slices the
-    // `.smodel` chunk). Cleared wholesale on any material mutation.
+    if id == crate::EDITOR_CAMERA_MATERIAL_ID {
+        return Some(crate::load::editor_camera_material_asset());
+    }
+    // A present key — including a negative-cached `None` — skips the disk read; only a true miss
+    // reads + parses the `.smat` (and, for a container material, slices the `.smodel` chunk).
     if let Some(cached) = assets.material_by_uuid.get(&id.value()) {
         return cached.as_ref().map(|material| (**material).clone());
     }
     let loaded = crate::material::load_catalog_material_asset(assets, id).ok();
+    if loaded.is_none() {
+        // Once per negative-cache fill, not per resolve: the miss repeats from the
+        // cache silently until a material mutation clears it.
+        tracing::warn!(
+            "material asset {} missing; slots fall back to default",
+            id.value()
+        );
+    }
     assets
         .material_by_uuid
         .insert(id.value(), loaded.clone().map(Arc::new));
@@ -357,13 +512,13 @@ mod tests {
         // A loader that records which ids it was asked for, returning `None` (no GPU);
         // the test asserts on the *requests*, not the handles.
         let mut requests = Vec::<u64>::new();
-        let mut load = |id: saffron_core::Uuid, _as_height: bool| -> Option<Arc<GpuTexture>> {
-            requests.push(id.value());
-            None
-        };
+        let mut load =
+            |id: saffron_core::Uuid, _role: TextureLoadRole| -> Option<Arc<GpuTexture>> {
+                requests.push(id.value());
+                None
+            };
         let sm = build_submesh_material(&material, &mut load);
 
-        // The factors copy across verbatim.
         assert_eq!(sm.base_color, Vec4::new(0.2, 0.4, 0.6, 1.0));
         assert_eq!(sm.metallic, 0.7);
         assert_eq!(sm.roughness, 0.3);
@@ -374,12 +529,9 @@ mod tests {
         assert_eq!(sm.uv_offset, Vec2::new(0.1, 0.2));
         assert_eq!(sm.height_scale, 0.1);
         assert_eq!(sm.alpha_cutoff, 0.25);
-        // `blend == "masked"` lowers to the masked blend mode.
         assert_eq!(sm.blend_mode, BlendMode::Masked);
 
-        // The packed ORM id is requested for *both* the metallic-roughness and the
-        // occlusion slot. `load`'s mutable borrow of `requests` ends at the call above
-        // (it is never used again), so the vector reads back here.
+        // The packed ORM id is requested for *both* the metallic-roughness and the occlusion slot.
         let orm_count = requests.iter().filter(|&&id| id == 200).count();
         assert_eq!(orm_count, 2, "the ORM id feeds both mr and occlusion");
         assert!(requests.contains(&100));
@@ -390,11 +542,8 @@ mod tests {
 
     #[test]
     fn build_submesh_material_populates_both_handles_from_one_orm_id() {
-        // A loader that hands a distinct (dummy) handle per id — but we cannot construct a
-        // real `GpuTexture` off-GPU, so this asserts the *handle presence* contract via the
-        // request count instead: an ORM id present yields two requests, mr + occlusion,
-        // and the slots are set from the same id (proved by the request-count test above).
-        // Here we assert the blend-mode derivation across the three glTF alpha modes.
+        // A real `GpuTexture` cannot be constructed off-GPU, so this asserts the blend-mode
+        // derivation across the three glTF alpha modes.
         for (blend, expect) in [
             ("opaque", BlendMode::Opaque),
             ("masked", BlendMode::Masked),
@@ -410,11 +559,72 @@ mod tests {
     }
 
     #[test]
+    fn thin_sheet_surface_is_the_authority_for_coverage_and_optics() {
+        use saffron_spatial::{DecisionScalar, UnitInterval};
+
+        let thin = saffron_vegetation::ThinSheetFoliageParameters {
+            front_albedo_response: UnitInterval::from_bits(20_000),
+            back_albedo_response: UnitInterval::from_bits(10_000),
+            thickness: DecisionScalar::from_bits(131),
+            absorption_color: [
+                DecisionScalar::from_bits(1_000),
+                DecisionScalar::from_bits(2_000),
+                DecisionScalar::from_bits(3_000),
+            ],
+            transmission_color: [
+                DecisionScalar::from_bits(4_000),
+                DecisionScalar::from_bits(5_000),
+                DecisionScalar::from_bits(6_000),
+            ],
+            coverage_source: CoverageSource::Texture(Uuid(707)),
+            coverage: saffron_vegetation::CoverageMipMetadata {
+                classification: AlphaClassification::Masked,
+                reference_cutoff: UnitInterval::from_bits(22_000),
+                source_extent: [512, 256],
+                spatial_hash_salt: 0x1122_3344_5566_7788,
+                mip_hashes: Vec::new(),
+            },
+            ..saffron_vegetation::ThinSheetFoliageParameters::default()
+        };
+        let material = MaterialAsset {
+            blend: "opaque".to_owned(),
+            double_sided: false,
+            surface: MaterialSurface::ThinSheetFoliage(thin.clone()),
+            ..MaterialAsset::default()
+        };
+        let mut requests = Vec::new();
+        let resolved = build_submesh_material(&material, &mut |id, role| {
+            requests.push((id, role));
+            None
+        });
+
+        assert_eq!(resolved.blend_mode, BlendMode::Masked);
+        assert!(resolved.double_sided);
+        assert_eq!(
+            requests,
+            [(
+                Uuid(707),
+                TextureLoadRole::Coverage {
+                    cutoff_bits: 22_000
+                }
+            )]
+        );
+        let gpu = resolved.thin_sheet.expect("thin-sheet GPU contract");
+        assert_eq!(gpu.coverage_source, CoverageSourceKind::Texture);
+        assert_eq!(gpu.coverage_classification, AlphaClassification::Masked);
+        assert_eq!(gpu.coverage_source_extent, [512, 256]);
+        assert_eq!(gpu.coverage_hash_salt, 0x1122_3344_5566_7788);
+        assert_eq!(gpu.front_albedo_response, 20_000.0 / 65_535.0);
+        assert_eq!(gpu.back_albedo_response, 10_000.0 / 65_535.0);
+        assert_eq!(gpu.thickness, 131.0 / 65_536.0);
+    }
+
+    #[test]
     fn displacement_material_requests_its_height_slot_as_a_height_map() {
         use saffron_geometry::glam::Vec4;
         // Two materials sharing a height texture id: one Displacement (pyramid), one Bump (plain). The
         // loader records the `as_height` flag it was asked for per id.
-        let mut asks: Vec<(u64, bool)> = Vec::new();
+        let mut asks: Vec<(u64, TextureLoadRole)> = Vec::new();
         for mode in [HeightMode::Displacement, HeightMode::Bump] {
             let material = MaterialAsset {
                 base_color: Vec4::ONE,
@@ -422,23 +632,25 @@ mod tests {
                 height_mode: mode,
                 ..MaterialAsset::default()
             };
-            let _ = build_submesh_material(&material, &mut |id, as_height| {
-                asks.push((id.value(), as_height));
+            let _ = build_submesh_material(&material, &mut |id, role| {
+                asks.push((id.value(), role));
                 None
             });
         }
         // The height slot is requested `as_height = true` only for the Displacement material; every
         // non-height slot is always plain.
         assert!(
-            asks.contains(&(777, true)),
+            asks.contains(&(777, TextureLoadRole::Height)),
             "displacement height → pyramid load"
         );
-        assert!(asks.contains(&(777, false)), "bump height → plain load");
+        assert!(
+            asks.contains(&(777, TextureLoadRole::Plain)),
+            "bump height → plain load"
+        );
     }
 
     #[test]
     fn build_submesh_material_leaves_zero_ids_unset() {
-        // The default material has every texture id at zero.
         let material = MaterialAsset::default();
         let mut asked = 0u32;
         let sm = build_submesh_material(&material, &mut |_, _| {
@@ -463,9 +675,10 @@ mod tests {
         fn upload_mesh(
             &self,
             _mesh: &saffron_geometry::Mesh,
+            _hierarchy: &saffron_geometry::PortableVirtualHierarchy,
             _skin: &[saffron_geometry::VertexSkin],
             _morph: Option<&saffron_geometry::MorphData>,
-            _sdf_bake: Option<&saffron_rendering::SdfBake>,
+            _sdf: saffron_rendering::SdfSource<'_>,
         ) -> saffron_rendering::Result<Arc<saffron_rendering::GpuMesh>> {
             unreachable!("the precedence tests use zero texture ids; no upload happens")
         }
@@ -522,14 +735,12 @@ mod tests {
         let meshes = [submesh(0), submesh(0), submesh(0)];
         let resolved = assets.resolve_entity_materials(&NoGpu, &scene, entity, &meshes);
 
-        // The slot's `.smat`: its base color, its unlit flag, one entry per submesh.
         assert_eq!(resolved.submeshes.len(), 3);
         assert!(resolved.unlit);
         assert_eq!(resolved.proxy_albedo, Vec3::new(0.11, 0.22, 0.33));
         for sm in &resolved.submeshes {
             assert_eq!(sm.base_color, Vec4::new(0.11, 0.22, 0.33, 1.0));
         }
-        // A no-graph material keeps the shared übershader.
         assert_eq!(resolved.shader, DEFAULT_MESH_SHADER);
 
         let _ = std::fs::remove_dir_all(&tmp);
@@ -554,7 +765,6 @@ mod tests {
         let meshes = [submesh(0)];
         let resolved = assets.resolve_entity_materials(&NoGpu, &scene, entity, &meshes);
         assert_eq!(resolved.submeshes.len(), 1);
-        // Base color rides through from the `.smat`; metallic comes from the override.
         assert_eq!(
             resolved.submeshes[0].base_color,
             Vec4::new(0.4, 0.5, 0.6, 1.0)
@@ -605,7 +815,6 @@ mod tests {
         let resolved = assets.resolve_entity_materials(&NoGpu, &scene, entity, &meshes);
 
         assert_eq!(resolved.submeshes.len(), 3);
-        // Slot 0 drives the whole-mesh `unlit` + proxy albedo.
         assert!(resolved.unlit);
         assert_eq!(resolved.proxy_albedo, Vec3::new(1.0, 0.0, 0.0));
         assert_eq!(
@@ -616,13 +825,88 @@ mod tests {
             resolved.submeshes[1].base_color,
             Vec4::new(0.0, 1.0, 0.0, 1.0)
         );
-        // The out-of-range slot clamps to the last slot.
         assert_eq!(
             resolved.submeshes[2].base_color,
             Vec4::new(0.0, 1.0, 0.0, 1.0)
         );
 
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// A thin sheet transmitting `transmission` through `thickness_m` of mean thickness.
+    fn parity_sheet(transmission: f32, thickness_m: f32) -> SubmeshMaterial {
+        let mut params = saffron_vegetation::ThinSheetFoliageParameters::default();
+        let scalar = |value: f32| {
+            saffron_spatial::DecisionScalar::from_f64(f64::from(value)).expect("in-range scalar")
+        };
+        params.voxel_moments.transmission_mean = [scalar(transmission); 3];
+        params.voxel_moments.thickness_mean = scalar(thickness_m);
+        SubmeshMaterial {
+            thin_sheet: Some(thin_sheet_material(&params)),
+            ..SubmeshMaterial::default()
+        }
+    }
+
+    #[test]
+    fn occupancy_follows_the_densest_sheet_and_solid_wins() {
+        assert_eq!(derive_entity_occupancy(&[]), 1.0);
+        // A sheet that transmits less is denser, so it wins the entity-level max.
+        let dense = parity_sheet(0.05, 0.2);
+        let sparse = parity_sheet(0.8, 0.2);
+        let both = [sparse.clone(), dense.clone()];
+        let dense_occupancy = dense
+            .thin_sheet
+            .as_ref()
+            .expect("sheet")
+            .aggregate
+            .occupancy;
+        assert!((derive_entity_occupancy(&both) - dense_occupancy).abs() < 1e-4);
+        assert!(
+            dense_occupancy
+                > sparse
+                    .thin_sheet
+                    .as_ref()
+                    .expect("sheet")
+                    .aggregate
+                    .occupancy,
+            "the less transmissive sheet must be the denser one"
+        );
+        // A solid submesh keeps the entity solid regardless of sheets.
+        let mixed = [sparse, SubmeshMaterial::default()];
+        assert_eq!(derive_entity_occupancy(&mixed), 1.0);
+    }
+
+    #[test]
+    fn aggregate_occupancy_transmits_what_the_triangles_it_replaces_did() {
+        // The parity contract: marching the derived occupancy across the sheet's own thickness
+        // must return the sheet's own transmission. Without it the plant changes brightness at
+        // the triangle-to-voxel transition, which is the artifact the derivation exists to stop.
+        for (transmission, thickness) in [(0.5_f32, 0.25_f32), (0.2, 1.0), (0.9, 0.05)] {
+            let sheet = parity_sheet(transmission, thickness);
+            let aggregate = sheet.thin_sheet.as_ref().expect("sheet").aggregate;
+            let marched = saffron_material::aggregate_transmittance(aggregate.occupancy, thickness);
+            assert!(
+                (marched - transmission).abs() < 1e-3,
+                "transmission {transmission} through {thickness}m marched back as {marched}"
+            );
+        }
+        // Opaque matter is solid, and so is a sheet with no thickness to absorb across.
+        assert_eq!(
+            parity_sheet(0.0, 0.5)
+                .thin_sheet
+                .expect("sheet")
+                .aggregate
+                .occupancy,
+            1.0
+        );
+        assert_eq!(
+            parity_sheet(0.5, 0.0)
+                .thin_sheet
+                .expect("sheet")
+                .aggregate
+                .occupancy,
+            1.0
+        );
     }
 
     #[test]

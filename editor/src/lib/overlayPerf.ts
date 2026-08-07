@@ -1,13 +1,8 @@
-/// Dev-mode overlay open→paint timer. A shared overlay primitive (Select, DropdownMenu, …)
-/// given a `perfLabel` calls `measureOverlayOpen(label)` on its opening edge; this stamps the
-/// time and logs the elapsed milliseconds on the second animation frame (a first-paint proxy):
-///
-///   [overlay-perf] resolution open→paint 312.0ms
-///
-/// Reads the store via getState() so it never subscribes (must add no re-render of its own), and
-/// is a no-op while dev mode is off (the titlebar chip / VITE_SAFFRON_DEV_MODE). Two rAFs: the
-/// first fires after the open commit is scheduled, the second after the browser has laid out and
-/// is about to paint — so the delta captures style-recalc + layout, the cost this measures.
+/// Dev-mode overlay open→paint timer: a shared overlay primitive given a `perfLabel` stamps its
+/// opening edge and logs the elapsed milliseconds on the second animation frame. Two rAFs, because
+/// the first fires after the open commit is scheduled and the second after layout, just before
+/// paint — so the delta captures the style-recalc and layout this is meant to measure. Reads the
+/// store through `getState()` so it never subscribes, and is a no-op while dev mode is off.
 import { useEditorStore } from "../state/store";
 
 export function measureOverlayOpen(label: string): void {

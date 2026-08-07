@@ -58,10 +58,12 @@ and random-access sample counter depend on them.
 ## Surfaces and fields
 
 `SurfaceField` is the query contract for geometry and environmental data. Every provider publishes a
-stable provider ID, revision, exact bounds, primitive count, and capabilities before work is
-dispatched. Ray, directional projection, and nearest queries return an exact world position,
-geometric tangent frame, UV or projection coordinates, weighted tags, revision, and a stable
-primitive attachment with canonical barycentrics when the provider can preserve it.
+stable provider ID, revision, exact bounds, primitive count, maximum weighted tags per hit, and
+capabilities before work is dispatched. The query boundary rejects a hit that exceeds the declared
+tag maximum.
+Ray, directional projection, and nearest queries return an exact world position, geometric tangent
+frame, UV or projection coordinates, weighted tags, revision, and a stable primitive attachment with
+canonical barycentrics when the provider can preserve it.
 
 The initial static-mesh provider uses the mesh's cached BVH for arbitrary-direction queries. It
 handles non-uniform affine scale in world metric and reports authoritative attachments. A skinned
@@ -83,6 +85,15 @@ navigation, and network facets. Its exact position, velocity prediction, per-lev
 radii, priority, and stable ID determine claims. Cleanup radii cannot be smaller than load radii,
 which gives each source explicit hysteresis. Multiple sources add references to the same facet-cell
 pair instead of taking ownership away from one another.
+
+The velocity is measured, not declared. A viewpoint carries no rigidbody to read one from, so
+`SourceMotion` differences successive observed positions over the frame interval and reports a
+smoothed estimate; the claim cube then centres on the position the source will occupy at the end of
+its prediction horizon rather than the one it occupies now. Both the editor viewport and the
+player's view camera feed it, so a source travelling at speed loads what is ahead of it instead of
+faulting on arrival. The estimate is exponentially smoothed, because one long frame would otherwise
+double the apparent speed and drag the claim centre a cell ahead and back, and a jump too large to
+be travel restarts it at rest rather than reporting a teleport as speed.
 
 Async work carries `GenerationToken { cell, source_revision, generation }`. Beginning or cancelling a
 generation invalidates older tickets. `GenerationSlot` publishes one complete `Arc` under a lock, so
@@ -114,7 +125,7 @@ JSON useful in tests and diagnostic diffs.
 | Residency and publication | `engine/crates/spatial/src/residency.rs` | `SpatialSource`, `ResidencyManager`, `GenerationSlot` |
 | Static mesh provider and scene queries | `engine/crates/assets/src/mesh_surface.rs`, `render_scene.rs` | `StaticMeshSurfaceProvider`, `query_scene_surface_ray` |
 | GPU numeric goldens | `engine/assets/shaders/spatial_numeric.slang`, `spatial_numeric_test.slang` | `spatialRandomSample`, `computeMain` |
-| Control diagnostics | `engine/crates/control/src/commands_scene.rs` | `register_scene_commands`, `spatial-cell`, `spatial-sample` |
+| Control diagnostics | `engine/crates/control/src/commands_scene/` | `register_scene_commands`, `spatial-cell`, `spatial-sample` |
 
 ## Related
 

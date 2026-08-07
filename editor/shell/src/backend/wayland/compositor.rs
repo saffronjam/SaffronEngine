@@ -228,9 +228,8 @@ pub struct UiCompositor {
     /// with the theme background, so the editor's transparent regions resolve against it (not the
     /// desktop). The engine viewport subsurfaces sit between this and the toplevel.
     backdrop_surface: WlSurface,
-    #[allow(dead_code)]
-    // held so the subsurface relationship persists for the compositor's lifetime
-    backdrop_subsurface: WlSubsurface,
+    /// Held so the subsurface relationship outlives every frame; never read after setup.
+    _backdrop_subsurface: WlSubsurface,
     backdrop_fd: Option<OwnedFd>,
     backdrop_base: *mut u8,
     backdrop_mapped: usize,
@@ -336,7 +335,7 @@ impl UiCompositor {
             frame: 0,
             first_commit: true,
             backdrop_surface,
-            backdrop_subsurface,
+            _backdrop_subsurface: backdrop_subsurface,
             backdrop_fd: None,
             backdrop_base: std::ptr::null_mut(),
             backdrop_mapped: 0,
@@ -556,11 +555,35 @@ impl UiCompositor {
         Ok(())
     }
 
-    /// Flush pending requests, dispatch queued Wayland events, and drain the file-drag steps produced
-    /// this tick. Called once per main-loop iteration so OS-drag feedback stays responsive independent
-    /// of CEF's paint cadence (the queue is otherwise only advanced inside `paint`).
+    /// Flush pending requests, read the shared connection, dispatch queued Wayland events, and
+    /// drain the file-drag steps produced this tick. Called once per main-loop iteration.
+    ///
+    /// The socket read is load-bearing: this connection is shared with winit, and a read
+    /// demultiplexes arrived events into every queue on it — winit's input queue included. Without
+    /// it, an event arriving while the socket sits unpolled (a sparse key edge during a
+    /// pointer-locked fly with the mouse still) strands unread until the next input burst; the
+    /// per-iteration read bounds that delay to one UI frame.
     pub fn pump_dnd(&mut self) -> Vec<DndEvent> {
         let _ = self.conn.flush();
+        let _ = self.queue.dispatch_pending(&mut self.state);
+        if let Some(guard) = self.conn.prepare_read() {
+            // Complete the read only when the socket has data. `read` joins libwayland's
+            // shared-connection read protocol and waits for every other prepared reader on this
+            // display, so an unconditional read on a quiet socket parks the main loop on a
+            // condvar until an event arrives — and at startup none ever does, because events
+            // only start flowing once this loop paints. Dropping the guard cancels the read.
+            let mut pfd = libc::pollfd {
+                fd: guard.connection_fd().as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            // SAFETY: `pfd` is one valid pollfd over the guard's connection fd.
+            let readable =
+                unsafe { libc::poll(&mut pfd, 1, 0) } > 0 && (pfd.revents & libc::POLLIN) != 0;
+            if readable {
+                let _ = guard.read();
+            }
+        }
         let _ = self.queue.dispatch_pending(&mut self.state);
         std::mem::take(&mut self.state.dnd_queue)
     }

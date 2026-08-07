@@ -1,11 +1,9 @@
-/// The portal panel host: dockview's state-preservation technique, hand-rolled. Every open
-/// panel renders exactly once, flat at app root, portaled into a per-panel host div that the
-/// module map owns for the panel's open lifetime. A leaf body claims the hosts of the tabs
-/// it owns with `appendChild` and toggles `display`, so a panel's React tree shape never
-/// changes when it moves between docks — component state, refs, and DOM survive the move.
-///
-/// The map is keyed by `DockPanelId` (unique across both island kinds), so one map serves
-/// every dockspace; each `DockPanelsHost` instance manages only its own kind's panels.
+/// The portal panel host: every open panel renders exactly once, flat at app root, portaled into a
+/// per-panel host div the module map owns for the panel's open lifetime. A leaf body claims the
+/// hosts of the tabs it owns with `appendChild` and toggles `display`, so a panel's React tree shape
+/// never changes when it moves between docks — component state, refs, and DOM survive the move.
+/// The map is keyed by `DockPanelId`, which is unique across both islands, so one map serves every
+/// dockspace.
 import { createPortal } from "react-dom";
 import { useEffect, useLayoutEffect, useRef } from "react";
 import { useEditorStore } from "../../state/store";

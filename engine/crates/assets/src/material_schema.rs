@@ -6,8 +6,8 @@
 //! A graph-authored material exposes the same set: the graph adds a surface program, not a
 //! different override vocabulary, so `baseColor` / `metallic` / … stay the tweakable
 //! parameters. This single list is the source of truth for [`apply_overrides`] coverage
-//! (see the drift test), override validation ([`ExposedParamKind::accepts`]), and — from
-//! phase 5 — the inspector's override editor.
+//! (see the drift test), override validation ([`ExposedParamKind::accepts`]), and the inspector's
+//! override editor.
 //!
 //! [`apply_overrides`]: crate::apply_overrides
 

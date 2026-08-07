@@ -1,12 +1,8 @@
-/// A tiny synchronous event bus that the resizable dock `Layout` pings whenever a
-/// PanelGroup's layout settles (`onLayoutChanged`), so the `ViewportPanel` can fire
-/// an exact resize-end commit for the reparented native window. This is decoupled
-/// from the Zustand store on purpose: a panel-split layout change is a transient UI
-/// signal, not editor state, so it should not churn the store or trigger renders.
-///
-/// The ViewportPanel's ResizeObserver already catches host-div geometry changes
-/// during a drag. This bus covers non-resize layout events, including tab switches
-/// that can disturb the native child window without changing the measured rect.
+/// A synchronous event bus the dock `Layout` pings whenever a PanelGroup's layout settles, so the
+/// `ViewportPanel` can fire an exact resize-end commit for the native surface. Deliberately outside
+/// the store: a layout change is a transient signal, not editor state. The ViewportPanel's
+/// ResizeObserver already catches geometry changes during a drag; this bus covers the rest,
+/// including tab switches that disturb the surface without changing the measured rect.
 export interface LayoutSettledEvent {
   force?: boolean;
 }

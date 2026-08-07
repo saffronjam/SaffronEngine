@@ -13,10 +13,10 @@
 //     renders validation-clean on an entity.
 
 import { afterAll, afterEach, beforeAll, expect, test } from "bun:test";
+import type { EntityRef } from "@saffron/protocol";
 import { existsSync } from "node:fs";
 import { isAbsolute, join } from "node:path";
 import { Engine, REPO } from "./harness.ts";
-import type { EntityRef, InspectResult } from "@saffron/protocol";
 import { bootEngine, captureViewport, Cleaner, prepareScene, trackEntity } from "./test-utils.ts";
 
 let engine: Engine;
@@ -46,27 +46,27 @@ async function screenshot(tag: string): Promise<Buffer> {
   return captureViewport(engine, caseCleaner, `matrender-${tag}`);
 }
 
-/// mapped-material.glb is imported once (the bake is expensive); each call instantiates a fresh entity
-/// from the cached asset and registers it for per-test cleanup.
+// mapped-material.glb is imported once (the bake is expensive); each call instantiates a fresh entity
+// from the cached asset and registers it for per-test cleanup.
 async function mintMappedEntity(): Promise<EntityRef> {
-  mappedAsset ??= (await engine.call<{ id: string }>("import-model", { path: MAPPED })).id;
+  mappedAsset ??= (await engine.call("import-model", { path: MAPPED })).id;
   return trackEntity(
     caseCleaner,
     engine,
-    await engine.call<EntityRef>("instantiate-model", { asset: mappedAsset }),
+    await engine.call("instantiate-model", { asset: mappedAsset }),
   );
 }
 
-/// The albedo + packed-ORM texture ids on the mapped entity's referenced `.smat`, plus the slot
-/// material and count — read from the entity's MaterialSet. The override/normal cases assign these
-/// real imported textures; keeping the read here dedupes it across cases.
+// The albedo + packed-ORM texture ids on the mapped entity's referenced `.smat`, plus the slot
+// material and count — read from the entity's MaterialSet. The override/normal cases assign these
+// real imported textures; keeping the read here dedupes it across cases.
 async function mintTextureId(
   entity: string,
 ): Promise<{ material: string; slots: number; albedo: string; orm: string }> {
-  const info = await engine.call<InspectResult>("inspect", { entity });
-  const slots = (info.components.MaterialSet as { slots?: { material: string }[] }).slots ?? [];
+  const info = await engine.call("inspect", { entity });
+  const slots = info.components.MaterialSet?.slots ?? [];
   const material = slots[0]?.material;
-  const smat = await engine.call<{ ormTexture: string; albedoTexture: string }>("material-get", {
+  const smat = await engine.call("material-get", {
     material,
   });
   return { material, slots: slots.length, albedo: smat.albedoTexture, orm: smat.ormTexture };
@@ -79,7 +79,7 @@ test("a created .smat material assigned to an entity drives the render", async (
 
   // Create a fresh default material (white, no textures) and assign it; it takes precedence over
   // the entity's inline glTF material, so the textured surface becomes the flat default.
-  const created = await engine.call<{ id: string }>("material-create", { name: "TestMat" });
+  const created = await engine.call("material-create", { name: "TestMat" });
   expect(created.id).toBeDefined();
   expect(created.id).not.toBe("0");
 
@@ -122,14 +122,14 @@ test("an ORM texture override changes the shaded pixels", async () => {
 });
 
 test("a codegen material compiles a übershader variant and renders on an entity", async () => {
-  const project = await engine.call<{ root: string }>("get-project");
+  const project = await engine.call("get-project");
   const root = isAbsolute(project.root) ? project.root : join(REPO, project.root);
 
   const e = await mintMappedEntity();
   await engine.settle(300);
   const before = await screenshot("cg-before");
 
-  const m = await engine.call<{ id: string }>("material-create", { name: "SceneCodegen" });
+  const m = await engine.call("material-create", { name: "SceneCodegen" });
   const graph = {
     nodes: [
       { id: "c1", type: "constant", props: { value: [0, 1, 0, 1] } },
@@ -143,7 +143,7 @@ test("a codegen material compiles a übershader variant and renders on an entity
       { from: ["mul", "rgba"], to: ["out", "baseColor"] },
     ],
   };
-  const set = await engine.call<{ foldable: boolean }>("material-set-graph", {
+  const set = await engine.call("material-set-graph", {
     material: m.id,
     graph,
   });

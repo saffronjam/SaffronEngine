@@ -83,9 +83,6 @@ start_engine() {
 
 stop_engine() {
   SAFFRON_CONTROL_SOCK="$SOCK" "$SA" quit >/dev/null
-  # The control assertions above already prove the engine ran and answered; the device-teardown
-  # exit is tolerated (and bounded by reap_engine) because llvmpipe trips a known VMA
-  # "allocations not freed" assertion at exit.
   reap_engine
 }
 

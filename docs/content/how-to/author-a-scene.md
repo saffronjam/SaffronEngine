@@ -10,7 +10,7 @@ Build a small lit scene from native primitives, assign a material, and verify th
 
 ## Prerequisites
 
-- Create a fresh project in the editor startup dialog and wait for the viewport to appear.
+- Create a fresh project in the launcher (New, enter a name, Create Project) and wait for the viewport to appear.
 - Run the commands from a shell with `sa` and `jq` available.
 - Stay in Edit mode for the whole procedure.
 

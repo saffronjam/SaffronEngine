@@ -52,21 +52,21 @@ export function useProjectLoadPoll(): void {
       store.setProject(project);
       store.resetSceneState();
       await rememberProject(project);
-      store.setProjectModalOpen(false);
+      store.setLauncherOpen(false);
       store.setProjectLoad({ phase: "idle", version: lastVersion.current, finalizing: false });
     };
 
     /// The user cancelled: drop the (possibly already-`ready`) load without adopting it. Return to
-    /// the picker when there is no project yet (the startup case), else just close the modal (a
-    /// menu-initiated reload/switch — the prior project stays). `cancelledVersion` blocks the poll
-    /// from re-completing this same `ready` version on the next tick.
+    /// the picker when there is no project yet (the startup case), else the launcher dissolves back
+    /// to the editor (a menu-initiated reload/switch — the prior project stays). `cancelledVersion`
+    /// blocks the poll from re-completing this same `ready` version on the next tick.
     const abortToPicker = (version: number): void => {
       const store = useEditorStore.getState();
       lastVersion.current = version;
       cancelledVersion.current = version;
       store.setProjectLoadCancelling(false);
       store.setProjectLoad({ phase: "idle", version, finalizing: false });
-      store.setProjectModalOpen(store.project === null);
+      store.setLauncherOpen(store.project === null);
     };
 
     const tick = async (): Promise<void> => {
@@ -148,7 +148,7 @@ export function useProjectLoadPoll(): void {
                 store2.setProjectLoadCancelling(false);
                 store2.setProjectLoad({ phase: "idle", version: dto.version });
                 if (store2.project === null) {
-                  store2.setProjectModalOpen(true);
+                  store2.setLauncherOpen(true);
                 }
               }
             }

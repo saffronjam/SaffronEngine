@@ -92,12 +92,12 @@ partial pose weights use the active-ragdoll controls.
 
 | What | File | Symbols |
 |---|---|---|
-| Ragdoll creation, pose write-back, and removal | `engine/crates/physics/src/world.rs` | `World::enable_ragdoll`, `World::write_ragdoll_poses`, `World::disable_ragdoll`, `joint_raw` |
+| Ragdoll creation, pose write-back, and removal | `engine/crates/physics/src/world/` | `World::enable_ragdoll`, `World::write_ragdoll_poses`, `World::disable_ragdoll`, `joint_raw` |
 | Jolt settings and constraints | `engine/crates/physics-sys/src/lib.rs`, `shim/jolt_bridge.cpp` | `add_ragdoll`, `BonePart`, `build_joint_constraint`, `ragdoll_part_transform` |
 | Bone physics schema | `engine/crates/scene/src/component.rs` | `BonePhysics`, `BonePhysicsComponent`, `Joint` |
 | Import fitting | `engine/crates/assets/src/spawn.rs` | `autofit_bone_physics` |
 | Runtime tick order | `engine/crates/runtime/src/session.rs` | `RuntimeSession::step` |
-| Control protocol | `engine/crates/control/src/commands_physics.rs`, `engine/crates/protocol/src/dto.rs` | `register_physics_commands`, `EnableRagdollParams`, `RagdollResult` |
+| Control protocol | `engine/crates/control/src/commands_physics.rs`, `engine/crates/protocol/src/dto/` | `register_physics_commands`, `EnableRagdollParams`, `RagdollResult` |
 
 ## Related
 

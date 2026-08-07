@@ -77,9 +77,10 @@ The display-extent lock images ping-pong with colour history. A stable, high-con
 short lock that widens its variance box and raises its history floor. Locks preserve thin features
 while the Halton cycle covers their display pixels.
 
-A separate reactive-coverage pass clears an input-extent `r8` image and draws visible translucent
-batches into it. Reactive pixels reduce history feedback because their motion and opaque depth do not
-fully describe the blended surface.
+A separate reactive-coverage pass clears an input-extent `r8` image and replays the blend buckets'
+GPU-binned indirect commands into it, depth-tested read-only against the scene depth. Reactive pixels
+reduce history feedback because their motion and opaque depth do not fully describe the blended
+surface.
 
 The optional contrast-adaptive sharpen reads reconstructed neighbours on the display grid. It writes
 only `outColor`; `outHistory` stores the unsharpened resolve so sharpening does not accumulate from one
@@ -143,7 +144,7 @@ so exposure and display encoding do not enter the accumulated history.
 | Jittered scene projection | `render_scene.rs` | `render_scene`, `Mat4::from_translation` |
 | Resolve shader | `taa.slang` | `LinearizeDepth`, `ReconstructCurrent`, `SampleHistoryCatmullRom`, `clip_aabb`, `DilatedMotion`, `computeMain` |
 | Motion, reactive, and TAA passes | `renderer.rs` | `scene_view_proj_unjittered`, `add_motion_pass`, `add_reactive_coverage_pass`, `add_taa_pass`, `apply_render_extent` |
-| Reactive draw | `scene_pass.rs` | `record_reactive_coverage` |
+| Reactive draw | `scene_pass.rs` | `record_executor_depth_family` |
 | Per-view history and extents | `view_target.rs` | `history`, `lock`, `reactive`, `scaled_render_extent`, `published_extent`, `build_aa_targets_preserving_temporal`, `advance_jitter` |
 | Control-plane surfaces | `commands_render.rs`, `dto.rs` | `get-taa-params`, `set-taa-params`, `TaaParamsDto`, `get-upscale`, `set-upscale`, `UpscaleDto` |
 

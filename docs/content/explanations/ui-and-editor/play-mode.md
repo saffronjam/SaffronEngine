@@ -69,8 +69,8 @@ The React store updates optimistically when a playback button or shortcut is use
 | State machine, duplicate, camera, and tick gate | `engine/crates/sceneedit/src/play.rs` | `PlayState`, `enter_play`, `play_step_dt`, `render_camera_view`, `stop_play` |
 | Active-scene routing | `engine/crates/sceneedit/src/context.rs` | `active_scene`, `registry_and_active_scene`, `play_scene_and_input` |
 | Shared simulation session | `engine/crates/runtime/src/session.rs` | `RuntimeSession::start`, `RuntimeSession::step`, `RuntimeSession::stop` |
-| Host edge and update ordering | `engine/crates/host/src/layer.rs` | `HostLayer::reconcile_play_edge`, `HostLayer::update_session`, `HostLayer::drain_runtime_sinks` |
-| Playback control commands | `engine/crates/control/src/commands_scene.rs` | `play`, `pause`, `step`, `stop`, `get-play-state` |
+| Host edge and update ordering | `engine/crates/host/src/layer/` | `HostLayer::reconcile_play_edge`, `HostLayer::update_session`, `HostLayer::drain_runtime_sinks` |
+| Playback control commands | `engine/crates/control/src/commands_scene/` | `play`, `pause`, `step`, `stop`, `get-play-state` |
 | Optimistic playback controls | `editor/src/panels/Topbar.tsx` | `onPlayPause`, `onStop`, `onStep` |
 | Reconciliation and shortcuts | `editor/src/state/store.ts` · `editor/src/app/useGizmoShortcuts.ts` | `playState`, `playVersion`, `startReconcile` |
 

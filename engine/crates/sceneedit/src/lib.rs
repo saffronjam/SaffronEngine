@@ -2,36 +2,9 @@
 //! selection, the version stamps, the gizmo op/space source of truth, the overlay options,
 //! the smoothing queues, play state, and the asset-preview block.
 //!
-//! This is the backend-neutral editor core. It depends only on `saffron-core`,
-//! `saffron-signal`, `saffron-scene`, and `saffron-json` — no Rendering, no SDL: input
-//! arrives as plain structs the host fills. The gizmo *geometry* (`build_native_gizmo`)
-//! lives in the host; only the hit-test / projection / drag *math* lives here.
-//!
-//! Delivered so far: the container and its invariants — [`SceneEditContext`], the version
-//! stamps, [`SceneEditContext::set_selection`], the
-//! [`active_scene`](SceneEditContext::active_scene) / [`previewing`](SceneEditContext::previewing)
-//! accessors, [`register_builtin_components`], the [`ScriptInputState`] +
-//! [`derive_script_input_edges`], and the fly-camera math + serde
-//! ([`SceneEditCamera::forward`] / [`view`](SceneEditCamera::view) /
-//! [`to_json`](SceneEditCamera::to_json) / [`from_json`](SceneEditCamera::from_json),
-//! [`update_scene_edit_camera`]), and the play state machine — the
-//! [`enter_play`](SceneEditContext::enter_play) /
-//! [`pause_play`](SceneEditContext::pause_play) /
-//! [`resume_play`](SceneEditContext::resume_play) / [`step_play`](SceneEditContext::step_play)
-//! / [`stop_play`](SceneEditContext::stop_play) transitions, the
-//! [`play_step_dt`](SceneEditContext::play_step_dt) gate (the consumer steps its own
-//! simulation with the returned `dt`),
-//! [`render_camera_view`](SceneEditContext::render_camera_view), and the script error/log
-//! rings — and the gizmo math: the projection / hit-test ([`viewport_project`],
-//! [`pixel_to_ndc`], [`camera_position`], [`ring_basis`], [`gizmo_axes`], [`handle_axis`],
-//! [`gizmo_plane_corners`], [`axis_color`], [`SceneEditContext::hit_native_gizmo`]), the
-//! translate/rotate/scale drag with `preserve_children` rebasing
-//! ([`SceneEditContext::snapshot_native_gizmo_start`] /
-//! [`apply_native_gizmo_drag`](SceneEditContext::apply_native_gizmo_drag)), the `tau = 0.025`
-//! pointer + edit smoothing ([`SceneEditContext::step_native_gizmo_drag`] /
-//! [`step_edit_smoothing`](SceneEditContext::step_edit_smoothing) + the
-//! transform smooth-entry/cancel helpers), and
-//! [`SceneEditContext::sync_native_gizmo`].
+//! The backend-neutral editor core: no rendering and no windowing, so input arrives as plain
+//! structs the host fills. The gizmo *geometry* lives in the host; only its hit-test,
+//! projection, and drag *math* lives here.
 
 #![deny(unsafe_code)]
 

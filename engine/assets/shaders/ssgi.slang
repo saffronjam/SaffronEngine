@@ -48,7 +48,7 @@ void computeMain(uint3 tid : SV_DispatchThreadID)
     float viewZ = g.a;
     if (viewZ > -1e-4)  // background contributes no indirect
     {
-        outGi[tid.xy] = float4(0.0, 0.0, 0.0, 1.0);
+        outGi[tid.xy] = float4(0.0, 0.0, 0.0, viewZ);
         return;
     }
     float3 p = viewPosFromUv(uv, viewZ);
@@ -109,5 +109,5 @@ void computeMain(uint3 tid : SV_DispatchThreadID)
         }
     }
     indirect = indirect / float(rayCount) * pc.params.y;
-    outGi[tid.xy] = float4(indirect, 1.0);
+    outGi[tid.xy] = float4(indirect, viewZ);
 }

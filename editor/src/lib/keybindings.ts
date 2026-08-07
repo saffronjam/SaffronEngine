@@ -1,26 +1,20 @@
-/// The keybinding registry: every rebindable editor command, its default key, and
-/// the parse/match/format helpers the handlers and the settings modal share. The
-/// resolved overrides live in the editor store (`keyBindings`, deltas only —
-/// settings.json stores just the changed commands, VS Code-style); handlers call
-/// `matchesBinding(event, id, overrides)` instead of comparing key literals.
+/// The keybinding registry: every rebindable editor command, its default key, and the
+/// parse/match/format helpers the handlers and the settings modal share. Overrides live in the store
+/// as deltas only; handlers call `matchesBinding(event, id, overrides)` rather than comparing key
+/// literals.
 ///
-/// Three command kinds:
-/// - "press": one-shot commands matched on a normalized key-string built from
-///   `event.key` plus modifier prefixes in fixed order ("w", "shift+f", "escape").
-///   Matching is exact-modifier: a binding of "f" does not fire on Ctrl+F, so
-///   menu/OS chords pass through untouched unless explicitly bound.
-/// - "hold": held-state fly-camera keys matched on the physical `event.code`
-///   ("KeyW", "Space", "ShiftLeft"), no modifier combos.
-/// - "mouse": a mouse-button command, bound to a `mouse:<name>` token (the side buttons
-///   and middle button). Rebindable only to another mouse button, never a key, so its
-///   capture and matching never overlap the key value-space.
+/// Three command kinds: "press" one-shots matched on a normalized key-string with exact modifiers,
+/// so a binding of "f" does not fire on Ctrl+F and OS chords pass through untouched; "hold"
+/// fly-camera keys matched on the physical `event.code`; and "mouse" buttons bound to a
+/// `mouse:<name>` token, rebindable only to another mouse button so their value-space never overlaps
+/// the keys.
 export type CommandKind = "press" | "hold" | "mouse";
 
 /// Conflict scope: bindings only collide within one scope. Global press commands
 /// share one window listener; fly keys share the viewport fly listener; the
 /// hierarchy/assets deletes are focus-scoped to their own panels, so the same key
 /// in both is fine; tab mouse commands share the mouse dispatcher.
-export type CommandScope = "global" | "hierarchy" | "assets" | "fly" | "tabs";
+export type CommandScope = "global" | "hierarchy" | "assets" | "fly" | "tabs" | "vegetation";
 
 export type CommandId =
   | "gizmo.translate"
@@ -40,7 +34,25 @@ export type CommandId =
   | "camera.flyLeft"
   | "camera.flyRight"
   | "camera.flyUp"
-  | "camera.flyDown";
+  | "camera.flyDown"
+  | "vegetation.tool.select"
+  | "vegetation.tool.lasso"
+  | "vegetation.tool.paint"
+  | "vegetation.tool.erase"
+  | "vegetation.tool.density"
+  | "vegetation.tool.reapply"
+  | "vegetation.tool.single"
+  | "vegetation.tool.fill"
+  | "vegetation.tool.spline"
+  | "vegetation.tool.volume"
+  | "vegetation.tool.exclude"
+  | "vegetation.tool.pin"
+  | "vegetation.tool.promote"
+  | "vegetation.brushGrow"
+  | "vegetation.brushShrink"
+  | "vegetation.shapeCommit"
+  | "vegetation.shapeCancel"
+  | "vegetation.delete";
 
 export interface CommandDef {
   id: CommandId;
@@ -197,6 +209,150 @@ export const COMMANDS: readonly CommandDef[] = [
     kind: "hold",
     default: "ShiftLeft",
     scope: "fly",
+  },
+  {
+    id: "vegetation.tool.select",
+    label: "Select tool",
+    category: "Vegetation",
+    kind: "press",
+    default: "1",
+    scope: "vegetation",
+  },
+  {
+    id: "vegetation.tool.lasso",
+    label: "Lasso tool",
+    category: "Vegetation",
+    kind: "press",
+    default: "2",
+    scope: "vegetation",
+  },
+  {
+    id: "vegetation.tool.paint",
+    label: "Paint tool",
+    category: "Vegetation",
+    kind: "press",
+    default: "3",
+    scope: "vegetation",
+  },
+  {
+    id: "vegetation.tool.erase",
+    label: "Erase tool",
+    category: "Vegetation",
+    kind: "press",
+    default: "4",
+    scope: "vegetation",
+  },
+  {
+    id: "vegetation.tool.density",
+    label: "Density tool",
+    category: "Vegetation",
+    kind: "press",
+    default: "5",
+    scope: "vegetation",
+  },
+  {
+    id: "vegetation.tool.reapply",
+    label: "Reapply tool",
+    category: "Vegetation",
+    kind: "press",
+    default: "6",
+    scope: "vegetation",
+  },
+  {
+    id: "vegetation.tool.single",
+    label: "Single tool",
+    category: "Vegetation",
+    kind: "press",
+    default: "7",
+    scope: "vegetation",
+  },
+  {
+    id: "vegetation.tool.fill",
+    label: "Fill tool",
+    category: "Vegetation",
+    kind: "press",
+    default: "8",
+    scope: "vegetation",
+  },
+  {
+    id: "vegetation.tool.spline",
+    label: "Spline tool",
+    category: "Vegetation",
+    kind: "press",
+    default: "9",
+    scope: "vegetation",
+  },
+  {
+    id: "vegetation.tool.volume",
+    label: "Volume tool",
+    category: "Vegetation",
+    kind: "press",
+    default: "0",
+    scope: "vegetation",
+  },
+  {
+    id: "vegetation.tool.exclude",
+    label: "Exclude tool",
+    category: "Vegetation",
+    kind: "press",
+    default: "shift+1",
+    scope: "vegetation",
+  },
+  {
+    id: "vegetation.tool.pin",
+    label: "Pin tool",
+    category: "Vegetation",
+    kind: "press",
+    default: "shift+2",
+    scope: "vegetation",
+  },
+  {
+    id: "vegetation.tool.promote",
+    label: "Promote tool",
+    category: "Vegetation",
+    kind: "press",
+    default: "shift+3",
+    scope: "vegetation",
+  },
+  {
+    id: "vegetation.brushGrow",
+    label: "Grow brush",
+    category: "Vegetation",
+    kind: "press",
+    default: "]",
+    scope: "vegetation",
+  },
+  {
+    id: "vegetation.brushShrink",
+    label: "Shrink brush",
+    category: "Vegetation",
+    kind: "press",
+    default: "[",
+    scope: "vegetation",
+  },
+  {
+    id: "vegetation.shapeCommit",
+    label: "Commit spline points",
+    category: "Vegetation",
+    kind: "press",
+    default: "enter",
+    scope: "vegetation",
+  },
+  {
+    id: "vegetation.shapeCancel",
+    label: "Drop spline points",
+    category: "Vegetation",
+    kind: "press",
+    default: "escape",
+    scope: "vegetation",
+  },
+  {
+    id: "vegetation.delete",
+    label: "Delete selected plants",
+    category: "Vegetation",
+    kind: "press",
+    default: "delete",
+    scope: "vegetation",
   },
 ];
 

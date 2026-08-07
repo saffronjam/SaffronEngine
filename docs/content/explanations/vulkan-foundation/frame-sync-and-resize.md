@@ -31,6 +31,24 @@ struct FrameData {
 pool, descriptor pools, profiler queries, readback memory, and transient allocation cursor reusable.
 It then resets the fence and command pool. The scene submit attaches that fence and advances the ring.
 
+## The armed slot
+
+Between the fence reset and a submit that signals it, the slot is *armed*: its fence can never
+signal on its own, so a wait on it would never return. The renderer tracks that state as a fact
+about the fence rather than as a record of what a caller intended, and only a submit carrying the
+fence clears it — the scene submit at the end of `render_scene_offscreen`, or the empty submit
+`finish_unsubmitted_frame` makes.
+
+Every way out of the armed window therefore closes the slot. A frame that draws nothing never
+records a scene submit; a frame that fails while recording or submitting returns early with the
+fence still reset. The run loop closes the slot at the end of every frame, and `begin_offscreen_frame`
+closes it before it waits, so the wait is always on a fence something will signal and the ring
+advances past a failed frame exactly as it does past a rendered one.
+
+A frame that failed part-way through its submit sequence may still have async-compute batches
+executing. The fence is what gates resetting the pools those batches read, so the closing submit
+waits the last compute timeline point the slot actually submitted before signaling.
+
 The editor/headless host needs no acquire semaphore. It records the full offscreen graph, includes the
 shared-memory readback copy, and submits once. When the same slot returns two frames later, the fence
 wait makes the readback host-visible before publication.
@@ -38,8 +56,9 @@ wait makes the readback host-visible before publication.
 ## Windowed present ring
 
 Windowed rendering adds a `PresentSync` slot beside each `FrameRing` slot. A present slot owns a blit
-command pool and buffer, a `scene_finished` semaphore, and a `present_fence`. The offscreen submit
-signals `scene_finished`; the blit submit waits for it before reading the offscreen image.
+command pool and buffer, a `scene_finished` semaphore, and a `present_fence`. `PresentSync` also owns
+the active acquire-to-present transaction: its swapchain image, frame slot, and one-shot scene signal
+state stay together until presentation consumes them.
 
 `begin_present_frame` follows this order:
 
@@ -52,12 +71,14 @@ Acquisition occurs before the scene fence reset. If acquire returns `ERROR_OUT_O
 can return early without leaving an unsignaled scene fence that the next frame would wait for.
 
 The scene render then submits its offscreen command buffer, signals `scene_finished`, fences
-`in_flight`, and advances `FrameRing`. `last_rendered_slot` retains the slot index needed by the
-windowed end-of-frame path.
+`in_flight`, and advances `FrameRing`. The signal is emitted once and only when that slot owns an
+active swapchain acquisition. Thumbnail, IBL convergence, and other internal offscreen renders run
+outside the transaction and never touch presentation semaphores.
 
 ## Blit and present
 
-`present_active_view_to_swapchain` records a second command buffer for the completed slot. It
+`present_active_view_to_swapchain` takes the active transaction and records a second command buffer
+for its exact slot. It
 transitions the offscreen image to `TRANSFER_SRC_OPTIMAL`, transitions the acquired swapchain image
 from `UNDEFINED` to `TRANSFER_DST_OPTIMAL`, blits, and leaves the swapchain image in
 `PRESENT_SRC_KHR`.
@@ -90,7 +111,10 @@ in-flight frame.
 
 `Swapchain::images_in_flight` stores the `present_fence` that last submitted each image. After an
 image is acquired, the renderer waits for that tracking fence before reusing the image's
-`render_finished` semaphore, then records the current slot's present fence in its place.
+`render_finished` semaphore, then records the current slot's present fence in its place. The image's
+tracking fence can equal the current slot's fence. The renderer deduplicates the two handles and
+waits for the complete set before resetting the slot fence, so an alias cannot become an unsignaled
+second wait.
 
 `ERROR_OUT_OF_DATE_KHR` during acquire skips the frame. `ERROR_OUT_OF_DATE_KHR` and
 `SUBOPTIMAL_KHR` from present are nonfatal; the window resize event drives swapchain recreation.
@@ -112,11 +136,11 @@ their VMA allocations through RAII after the device-idle boundary.
 
 ## Swapchain resize
 
-`recreate_swapchain` waits for the device to become idle, clears any acquired image index, destroys
-the old swapchain, and creates a new one for the requested surface extent. Image views,
-`render_finished` semaphores, and `images_in_flight` tracking are recreated with the image set.
-`PresentSync` remains because its per-slot command and synchronization resources do not depend on the
-surface extent.
+`recreate_swapchain` waits for the device to become idle and verifies that no acquire-to-present
+transaction is active. It destroys the old swapchain and creates one for the requested surface
+extent. Image views, `render_finished` semaphores, and `images_in_flight` tracking are recreated with
+the image set. `PresentSync` remains because its per-slot command and synchronization resources do
+not depend on the surface extent.
 
 In the standalone windowed host, `FrameHost::resized` rebuilds the swapchain and applies the same size
 to the active offscreen view. A zero extent represents a minimized window and does not trigger
@@ -129,9 +153,9 @@ recreation.
 | Scene frame slots | `engine/crates/rendering/src/frame.rs` | `MAX_FRAMES_IN_FLIGHT`, `FrameData`, `FrameRing` |
 | Present frame slots and blit | `engine/crates/rendering/src/present.rs` | `PresentSync`, `PresentSlot`, `record_present_blit` |
 | Per-image presentation state | `engine/crates/rendering/src/swapchain.rs` | `Swapchain`, `render_finished`, `image_in_flight`, `set_image_in_flight` |
-| Offscreen begin and submit | `engine/crates/rendering/src/renderer.rs` | `begin_offscreen_frame`, `render_scene_offscreen` |
-| Acquire, blit, and present | `engine/crates/rendering/src/renderer.rs` | `begin_present_frame`, `present_active_view_to_swapchain` |
-| View extent changes | `engine/crates/rendering/src/renderer.rs`, `engine/crates/rendering/src/view_target.rs` | `set_viewport_desired_size`, `apply_render_extent`, `ViewTarget::resize`, `build_aa_targets_preserving_temporal` |
+| Offscreen begin and submit | `engine/crates/rendering/src/renderer/` | `begin_offscreen_frame`, `render_scene_offscreen`, `finish_unsubmitted_frame`, `slot_fence_armed` |
+| Acquire, blit, and present | `engine/crates/rendering/src/renderer/` | `begin_present_frame`, `present_active_view_to_swapchain` |
+| View extent changes | `engine/crates/rendering/src/renderer/`, `engine/crates/rendering/src/view_target/` | `set_viewport_desired_size`, `apply_render_extent`, `ViewTarget::resize`, `build_aa_targets_preserving_temporal` |
 | Window resize bridge | `engine/crates/app/src/lib.rs` | `FrameHost::resized` |
 
 ## Related

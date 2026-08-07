@@ -92,9 +92,9 @@ feature flags ([directional shadow](../directional-light/), IBL, SSAO).
 | What | File | Symbols |
 |---|---|---|
 | The components | `engine/crates/scene/src/component.rs` | `DirectionalLight`, `PointLight`, `SpotLight` |
-| Gather + pack | `engine/crates/assets/src/render_scene.rs` | `gather_directional_light`, `gather_punctual_lights` |
+| Gather + pack | `engine/crates/assets/src/render_scene/` | `gather_directional_light`, `gather_punctual_lights` |
 | The GPU struct | `engine/crates/rendering/src/gpu_types.rs` | `GpuLight` |
-| The upload | `engine/crates/rendering/src/lighting.rs` | `Lighting::set_scene_lighting`, `Lighting::ensure_light_capacity`, `LightUbo` |
+| The upload | `engine/crates/rendering/src/lighting/` | `Lighting::set_scene_lighting`, `Lighting::ensure_light_capacity`, `LightUbo` |
 
 > [!NOTE]
 > Only the first directional light shades the scene; extra ones are silently ignored, and a

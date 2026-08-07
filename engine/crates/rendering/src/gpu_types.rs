@@ -1,17 +1,10 @@
 //! The std430 GPU-upload structs and the übershader material selector.
 //!
-//! Every struct here is a GPU-layout type the Slang shaders read by raw bytes:
-//! [`InstanceData`], [`MaterialParamsData`], and [`GpuLight`]. Each is
-//! `#[repr(C)]` + [`bytemuck::Pod`] / [`bytemuck::Zeroable`] with a pinned
-//! `const _: () = assert!(size_of == N)`, and the field byte offsets are checked in
-//! the tests (README §3: a wrong offset corrupts the per-frame material dedup that
-//! hashes [`MaterialParamsData`] by raw bytes — not just a pixel).
-//!
-//! The glam types come through `saffron_geometry::glam` (the engine's one pinned
-//! math vocabulary) so a glam version split cannot silently change a stride. `Vec4`
-//! / `Mat4` / `UVec4` are all 16-byte aligned, which is exactly the std430 vec4/mat4
-//! alignment, so a `#[repr(C)]` field sequence of them lays out with no implicit
-//! padding.
+//! Every struct here is a GPU-layout type the Slang shaders read by raw bytes, so each is
+//! `#[repr(C)]` + [`bytemuck::Pod`] / [`bytemuck::Zeroable`] with a pinned size assertion and
+//! offset tests. The glam types come through `saffron_geometry::glam` so a version split cannot
+//! silently change a stride; `Vec4` / `Mat4` / `UVec4` are 16-byte aligned, matching std430, so a
+//! `#[repr(C)]` sequence of them lays out with no implicit padding.
 
 use saffron_geometry::glam::{Mat4, UVec4, Vec3, Vec4};
 
@@ -49,51 +42,6 @@ impl Default for Material {
     }
 }
 
-/// One entry per drawn entity in the per-frame instance storage buffer (set 2,
-/// binding 0). The vertex shader indexes it by `InstanceIndex`. std430-compatible:
-/// every member is 16-byte aligned.
-///
-/// Eight 16-byte blocks: three `Mat4` (model, normal matrix, prev-frame model) then
-/// five `vec4`-class fields.
-#[repr(C)]
-#[derive(Debug, Clone, Copy, PartialEq, bytemuck::Pod, bytemuck::Zeroable)]
-pub struct InstanceData {
-    /// The world matrix.
-    pub model: Mat4,
-    /// `transpose(inverse(mat3(model)))` — correct normals under non-uniform scale.
-    pub normal_matrix: Mat4,
-    /// Last frame's world matrix (TAA object-motion reprojection).
-    pub prev_model: Mat4,
-    /// The base color (RGBA).
-    pub base_color: Vec4,
-    /// `.x` albedo bindless index, `.y` joint-palette offset, `.z` metallic-roughness
-    /// bindless index, `.w` material-params index.
-    pub texture: UVec4,
-    /// `.x` metallic, `.y` roughness (the rest reserved).
-    pub pbr: Vec4,
-    /// RGB emissive radiance (strength baked in).
-    pub emissive: Vec4,
-}
-
-const _: () = assert!(
-    size_of::<InstanceData>() == 256,
-    "InstanceData must match the std430 shader layout (8x 16-byte blocks)"
-);
-
-impl Default for InstanceData {
-    fn default() -> Self {
-        Self {
-            model: Mat4::IDENTITY,
-            normal_matrix: Mat4::IDENTITY,
-            prev_model: Mat4::IDENTITY,
-            base_color: Vec4::ONE,
-            texture: UVec4::ZERO,
-            pbr: Vec4::new(0.0, 1.0, 0.0, 0.0),
-            emissive: Vec4::ZERO,
-        }
-    }
-}
-
 /// One static instance's sparse signed distance field (SDST v3), for the lighting
 /// cone-trace's per-instance iteration. For each instance whose world AABB a cone sample is
 /// near, the shader maps the world sample into the local fine-voxel grid, resolves the
@@ -121,7 +69,9 @@ pub struct SdfInstance {
     /// The SDF grid's padded lower corner in local (rest) space (`xyz`; `w` = base-color **blue**) —
     /// the local sample maps to a fine-voxel coordinate via `local_min.xyz` + the voxel dims.
     pub local_min: Vec4,
-    /// The SDF grid's padded upper corner in local space (`xyz`; `w` reserved).
+    /// The SDF grid's padded upper corner in local space (`xyz`; `w` = the entity's
+    /// aggregate occupancy — `1` solid, fractional for porous thin-sheet matter the
+    /// distance-field consumers treat as extinction rather than a hard surface).
     pub local_max: Vec4,
     /// `.x` the shared bindless SDF slot (atlas binding 1 + indirection binding 2 + coverage
     /// binding 3) as a float, `.y` the `R16_SNORM` encode clamp (`max_dist`, local units),
@@ -157,11 +107,13 @@ impl Default for SdfInstance {
     }
 }
 
-/// Per-distinct-material data (set 2, binding 2), indexed by `InstanceData.texture.w`.
+/// Per-distinct-material data (set 2, binding 2), indexed by the resident material
+/// record's `parameterIndex`.
 /// Many instances of one material share one entry (deduplicated per frame by hashing
 /// the raw bytes — so the layout below is load-bearing past correctness).
 ///
-/// Six 16-byte blocks.
+/// Sixteen 16-byte blocks. The final ten blocks are the complete thin-sheet and
+/// aggregate-cluster contract; standard materials leave them zeroed.
 #[repr(C)]
 #[derive(Debug, Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct MaterialParamsData {
@@ -175,13 +127,33 @@ pub struct MaterialParamsData {
     pub uv: Vec4,
     /// Bindless indices: `albedo, orm/mr, normal, emissive`.
     pub tex0: UVec4,
-    /// `height, reserved, reserved, featureBits`.
+    /// `height, occlusion, coverageTemporalPhase, featureBits`.
     pub tex1: UVec4,
+    /// `frontResponse, backResponse, thinRoughness, thicknessMetres`.
+    pub thin_reflection: Vec4,
+    /// `rgb` Beer-Lambert absorption coefficients, `w` energy limit.
+    pub thin_absorption: Vec4,
+    /// `rgb` transmitted-light tint, `w` reserved.
+    pub thin_transmission: Vec4,
+    /// `coverageTexture, sourceKind, classification, normalMode`.
+    pub coverage: UVec4,
+    /// `saltLo, saltHi, sourceWidth, sourceHeight`.
+    pub coverage_hash: UVec4,
+    /// `occupancy, roughnessMean, thicknessMean, reserved`.
+    pub aggregate0: Vec4,
+    /// Coverage-weighted aggregate albedo mean.
+    pub aggregate_albedo: Vec4,
+    /// Coverage-weighted aggregate transmission mean.
+    pub aggregate_transmission: Vec4,
+    /// Aggregate normal second moments `xx, yy, zz, xy`.
+    pub aggregate_normal0: Vec4,
+    /// Aggregate normal second moments `xz, yz, 0, 0`.
+    pub aggregate_normal1: Vec4,
 }
 
 const _: () = assert!(
-    size_of::<MaterialParamsData>() == 96,
-    "MaterialParamsData must match the std430 shader layout (6x 16-byte blocks)"
+    size_of::<MaterialParamsData>() == 256,
+    "MaterialParamsData must match the std430 shader layout (16x 16-byte blocks)"
 );
 
 // The per-frame dedup key is the struct's raw bytes. `glam::Vec4` is float-backed,
@@ -212,6 +184,16 @@ impl Default for MaterialParamsData {
             uv: Vec4::new(1.0, 1.0, 0.0, 0.0),
             tex0: UVec4::ZERO,
             tex1: UVec4::ZERO,
+            thin_reflection: Vec4::ZERO,
+            thin_absorption: Vec4::ZERO,
+            thin_transmission: Vec4::ZERO,
+            coverage: UVec4::ZERO,
+            coverage_hash: UVec4::ZERO,
+            aggregate0: Vec4::ZERO,
+            aggregate_albedo: Vec4::ZERO,
+            aggregate_transmission: Vec4::ZERO,
+            aggregate_normal0: Vec4::ZERO,
+            aggregate_normal1: Vec4::ZERO,
         }
     }
 }
@@ -262,6 +244,7 @@ impl MaterialParamsData {
             uv: Vec4::new(uv_tiling[0], uv_tiling[1], uv_offset[0], uv_offset[1]),
             tex0,
             tex1,
+            ..Self::default()
         }
     }
 }
@@ -271,12 +254,11 @@ mod tests {
     use super::*;
     use std::mem::offset_of;
 
-    /// `MaterialParamsData` is exactly 96 bytes with each field at the std430 offset
-    /// the Slang shader reads — the contract the per-frame material dedup hashes by
-    /// raw bytes (README §3). The phase's named layout gate.
+    /// `MaterialParamsData` is exactly 256 bytes with each field at the std430 offset the Slang
+    /// shader reads — the contract the per-frame material dedup hashes by raw bytes.
     #[test]
     fn material_params_data_byte_layout_matches_std430() {
-        assert_eq!(size_of::<MaterialParamsData>(), 96);
+        assert_eq!(size_of::<MaterialParamsData>(), 256);
         assert_eq!(align_of::<MaterialParamsData>(), 16);
         assert_eq!(offset_of!(MaterialParamsData, base_color), 0);
         assert_eq!(offset_of!(MaterialParamsData, pbr), 16);
@@ -284,21 +266,16 @@ mod tests {
         assert_eq!(offset_of!(MaterialParamsData, uv), 48);
         assert_eq!(offset_of!(MaterialParamsData, tex0), 64);
         assert_eq!(offset_of!(MaterialParamsData, tex1), 80);
-    }
-
-    /// `InstanceData` is exactly 256 bytes with each field at the std430 offset the
-    /// vertex shader indexes — three mat4 then five vec4-class blocks, no padding.
-    #[test]
-    fn instance_data_byte_layout_matches_std430() {
-        assert_eq!(size_of::<InstanceData>(), 256);
-        assert_eq!(align_of::<InstanceData>(), 16);
-        assert_eq!(offset_of!(InstanceData, model), 0);
-        assert_eq!(offset_of!(InstanceData, normal_matrix), 64);
-        assert_eq!(offset_of!(InstanceData, prev_model), 128);
-        assert_eq!(offset_of!(InstanceData, base_color), 192);
-        assert_eq!(offset_of!(InstanceData, texture), 208);
-        assert_eq!(offset_of!(InstanceData, pbr), 224);
-        assert_eq!(offset_of!(InstanceData, emissive), 240);
+        assert_eq!(offset_of!(MaterialParamsData, thin_reflection), 96);
+        assert_eq!(offset_of!(MaterialParamsData, thin_absorption), 112);
+        assert_eq!(offset_of!(MaterialParamsData, thin_transmission), 128);
+        assert_eq!(offset_of!(MaterialParamsData, coverage), 144);
+        assert_eq!(offset_of!(MaterialParamsData, coverage_hash), 160);
+        assert_eq!(offset_of!(MaterialParamsData, aggregate0), 176);
+        assert_eq!(offset_of!(MaterialParamsData, aggregate_albedo), 192);
+        assert_eq!(offset_of!(MaterialParamsData, aggregate_transmission), 208);
+        assert_eq!(offset_of!(MaterialParamsData, aggregate_normal0), 224);
+        assert_eq!(offset_of!(MaterialParamsData, aggregate_normal1), 240);
     }
 
     /// `GpuLight` is exactly 64 bytes — four contiguous vec4, no padding.

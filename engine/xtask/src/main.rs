@@ -1,6 +1,5 @@
 //! Workspace tooling, run via `cargo run -p xtask <task>`: the `slangc` shader fan-out and the
-//! protocol/codegen emitters. Not shipped; an explicit build step invoked by `just engine` and
-//! the gate.
+//! protocol codegen emitters.
 
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -10,6 +9,7 @@ use anyhow::{Context, Result, bail};
 mod protocol;
 mod shaders;
 mod stars;
+mod vegetation_fixture;
 
 fn main() -> ExitCode {
     match run() {
@@ -27,12 +27,33 @@ fn run() -> Result<()> {
     match task.as_deref() {
         Some("shaders") => run_shaders(args.collect()),
         Some("gen-protocol") => run_gen_protocol(),
+        Some("gen-vegetation-e2e-fixture") => run_gen_vegetation_e2e_fixture(args.collect()),
         Some("bake-stars") => run_bake_stars(args.collect()),
-        Some(other) => bail!("unknown task '{other}' (known: shaders, gen-protocol, bake-stars)"),
+        Some(other) => bail!(
+            "unknown task '{other}' (known: shaders, gen-protocol, gen-vegetation-e2e-fixture, bake-stars)"
+        ),
         None => {
-            bail!("usage: cargo run -p xtask <task>  (known: shaders, gen-protocol, bake-stars)")
+            bail!(
+                "usage: cargo run -p xtask <task>  (known: shaders, gen-protocol, gen-vegetation-e2e-fixture, bake-stars)"
+            )
         }
     }
+}
+
+/// `xtask gen-vegetation-e2e-fixture` — emit the canonical authored vegetation package
+/// and the stress-matrix fixtures.
+fn run_gen_vegetation_e2e_fixture(args: Vec<String>) -> Result<()> {
+    if !args.is_empty() {
+        bail!("usage: cargo run -p xtask -- gen-vegetation-e2e-fixture");
+    }
+    let dir = workspace_root_repo()?.join("tests/e2e/fixtures");
+    for output in vegetation_fixture::write_all(&dir)? {
+        println!(
+            "xtask gen-vegetation-e2e-fixture: wrote {}",
+            output.display()
+        );
+    }
+    Ok(())
 }
 
 /// `xtask bake-stars <ybsc5>` — bake the fixed-width Yale BSC5 catalog into the runtime table.
@@ -49,8 +70,8 @@ fn run_bake_stars(args: Vec<String>) -> Result<()> {
     Ok(())
 }
 
-/// `xtask gen-protocol` — emit the editor-facing protocol artifacts (`sa-types.ts`, the OpenRPC
-/// schema, the command manifest) from the `saffron-protocol` DTO crate.
+/// `xtask gen-protocol` — emit the editor-facing TypeScript, Luau, envelope, OpenRPC, and manifest
+/// artifacts from the `saffron-protocol` DTO crate.
 fn run_gen_protocol() -> Result<()> {
     let written = protocol::run(&workspace_root_repo()?)?;
     for path in &written {
@@ -59,9 +80,8 @@ fn run_gen_protocol() -> Result<()> {
     Ok(())
 }
 
-/// The repository root (`engine/`'s parent): the protocol artifacts live under `editor/` and
-/// `schemas/`, outside the Cargo tree, so the emitter writes against the repo root, not the
-/// workspace.
+/// The repository root: the protocol artifacts live under `editor/` and `schemas/`, outside the
+/// Cargo tree.
 fn workspace_root_repo() -> Result<PathBuf> {
     workspace_root()
         .parent()
@@ -89,7 +109,7 @@ fn run_shaders(args: Vec<String>) -> Result<()> {
     println!("xtask shaders: using slangc {}", config.slangc.display());
     let report = shaders::run(&config)?;
     println!(
-        "xtask shaders: {} compiled, {} up to date, lighting module {} -> {}/shaders",
+        "xtask shaders: {} compiled, {} up to date, shared modules {} -> {}/shaders",
         report.spv_compiled,
         report.spv_skipped,
         if report.module_compiled {
@@ -102,8 +122,7 @@ fn run_shaders(args: Vec<String>) -> Result<()> {
     Ok(())
 }
 
-/// The Cargo workspace root (`engine/`): `xtask`'s manifest dir is `engine/xtask`, so the parent
-/// is the workspace. Independent of the process cwd.
+/// The Cargo workspace root (`engine/`), independent of the process cwd.
 fn workspace_root() -> PathBuf {
     let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     manifest_dir

@@ -608,6 +608,19 @@ impl MeshBvh {
     /// The nearest forward triangle hit with source identity and barycentrics.
     #[must_use]
     pub fn raycast_hit(&self, ray: &Ray) -> Option<MeshRayHit> {
+        self.raycast_hit_filtered(ray, |_| true)
+    }
+
+    /// The nearest forward hit accepted by `filter`.
+    ///
+    /// The filter sees stable source-triangle identity and barycentrics. Rejected intersections do
+    /// not tighten traversal, so a farther covered triangle remains discoverable behind a cutout.
+    #[must_use]
+    pub fn raycast_hit_filtered(
+        &self,
+        ray: &Ray,
+        mut filter: impl FnMut(MeshRayHit) -> bool,
+    ) -> Option<MeshRayHit> {
         if self.nodes.is_empty() {
             return None;
         }
@@ -631,6 +644,9 @@ impl MeshBvh {
                             triangle_index: tri.source_triangle,
                             barycentric: hit.barycentric,
                         };
+                        if !filter(candidate) {
+                            continue;
+                        }
                         let replace = best.is_none_or(|current| {
                             candidate.distance < current.distance
                                 || (candidate.distance == current.distance
@@ -1028,6 +1044,28 @@ mod tests {
             bvh.raycast(&miss),
             brute_nearest(&miss, &positions, &indices)
         );
+    }
+
+    #[test]
+    fn filtered_bvh_hit_keeps_farther_intersections_discoverable() {
+        let positions = vec![
+            Vec3::new(0.0, 0.0, 1.0),
+            Vec3::new(1.0, 0.0, 1.0),
+            Vec3::new(0.0, 1.0, 1.0),
+            Vec3::new(0.0, 0.0, 0.0),
+            Vec3::new(1.0, 0.0, 0.0),
+            Vec3::new(0.0, 1.0, 0.0),
+        ];
+        let bvh = MeshBvh::build(&positions, &[0, 1, 2, 3, 4, 5]).unwrap();
+        let ray = Ray {
+            origin: Vec3::new(0.25, 0.25, 2.0),
+            dir: DOWN,
+        };
+        let hit = bvh
+            .raycast_hit_filtered(&ray, |candidate| candidate.triangle_index != 0)
+            .unwrap();
+        assert_eq!(hit.triangle_index, 1);
+        assert_eq!(hit.distance, 2.0);
     }
 
     /// An empty (or index-degenerate) mesh has no BVH — "nothing to pick".

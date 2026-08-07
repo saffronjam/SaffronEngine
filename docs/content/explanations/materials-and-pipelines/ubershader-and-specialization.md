@@ -33,14 +33,15 @@ The translucent mode matters because the opaque buffers at a transparent fragmen
 
 ## Alpha-to-coverage
 
-[Alpha-to-coverage](https://registry.khronos.org/vulkan/specs/latest/man/html/VkPipelineMultisampleStateCreateInfo.html) turns fragment alpha into an implementation-dependent multisample coverage mask. For a masked material under MSAA, the shader widens the cutoff transition to about one pixel:
+[Alpha-to-coverage](https://registry.khronos.org/vulkan/specs/latest/man/html/VkPipelineMultisampleStateCreateInfo.html) turns fragment alpha into an implementation-dependent multisample coverage mask. For a masked material under MSAA, the canonical classifier returns a filtered coverage probability:
 
 ```hlsl
-float coverage = saturate(
-    (surf.opacity - cutoff) / max(fwidth(surf.opacity), 1e-4) + 0.5
+CoverageSample coverage = sampleCanonicalCoverage(
+    source, uv, coverageAnchor, sourceKind, classification, baseColorAlpha,
+    sourceExtent, salt, temporalPhase, cutoff, canonicalProbability, true
 );
-if (coverage <= 0.0) { discard; }
-lit.a = coverage;
+if (!coverage.covered) { discard; }
+lit.a = coverage.alpha;
 ```
 
 The matching PSO enables `alpha_to_coverage_enable`. Masked surfaces at one sample use the hard alpha test, while opaque and translucent surfaces leave this specialization false. Alpha-to-coverage does not enable color blending or require back-to-front sorting.
@@ -58,16 +59,15 @@ Texture-dependent material features use bits in `MaterialParamsData` rather than
 | `FEATURE_ALPHACLIP` | Masked alpha test |
 | `FEATURE_DISPLACE` | Fine normal for compute-displaced geometry |
 | `FEATURE_HEIGHT_BUMP` | Height-derived shading normal |
+| `FEATURE_THIN_SHEET` | Two-sided foliage reflection, transmission, and coverage data |
 
 The feature word travels with the resolved material-table row. Two surfaces can therefore differ in these paths and still use the same shader module and PSO. Texture indices select their resources from the [bindless arrays](../bindless-textures/).
 
 ## Other PSO axes
 
-The mesh module also exports `vertexMain` and `vertexMainSkinned`. Selecting an entry point changes the vertex-input layout and the PSO key; it is not a fragment specialization constant. The standard draw-list path compute-deforms animated vertices and uses the base entry point for the resulting stream.
+The geometry stage is another PSO axis — the `mesh_shader` field of `PsoKey`, not a fragment specialization constant. Every raster PSO binds no vertex input: each draw record resolves its geometry through buffer device addresses, whether that is the page arena, the per-frame deformed buffers holding compute-skinned and morphed vertices, or the displacement arena. `vertexMainExecutor` is the vertex-stage entry and `meshMainExecutor` the mesh-stage one, over the identical records.
 
 Wireframe is another PSO axis rather than shader specialization. It chooses `VK_POLYGON_MODE_LINE` when the device supports non-solid fill. Sample count and fixed-function blend state also belong to the pipeline key.
-
-The meshlet raster path combines the task and mesh stages from `meshlet.spv` with `fragmentMain` from the mesh übershader. This keeps surface evaluation identical between indexed and mesh-shader geometry paths.
 
 ## Generated material shaders
 
@@ -82,7 +82,8 @@ Shader compilation also emits a `_nort.spv` sibling with `SAFFRON_NO_RT=1`. A de
 | What | File | Symbols |
 |---|---|---|
 | Surface and specialized modes | `mesh.slang` | `evalSurface`, `kUnlit`, `kAlphaToCoverage`, `kTranslucent` |
-| Material feature bits | `lighting.slang` | `FEATURE_NORMAL`, `FEATURE_ALPHACLIP`, `FEATURE_DISPLACE` |
+| Material feature bits | `material_params.slang` | `FEATURE_NORMAL`, `FEATURE_ALPHACLIP`, `FEATURE_THIN_SHEET` |
+| Canonical coverage | `coverage.slang` | `sampleCanonicalCoverage`, `classifyCanonicalCoverage` |
 | Specialization payload | `pipelines.rs` | `PsoKey`, `build_mesh_pipeline_with_module` |
 | Generated mesh module | `codegen.rs` | `compile_material_mesh_shader`, `splice_mesh_source` |
 | Ray-tracing-off compilation | `shaders.rs` | `NO_RT_DEFINE`, `NO_RT_SUFFIX` |

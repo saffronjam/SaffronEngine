@@ -1,22 +1,11 @@
-//! The editor fly-camera: its data, the backend-neutral per-frame fly input, the
-//! yaw/pitch → forward/view math, the per-frame `update_scene_edit_camera` (the eye eases
-//! toward a target pose + WASD/Space/Shift move), and the serde the control caller
-//! round-trips into `project.json`.
+//! The editor fly-camera — the scene-view eye, distinct from any ECS `Camera`.
 //!
-//! The camera eases toward a target each rendered frame with the shared `SMOOTH_TAU`, so the
-//! ~60 Hz control samples become continuous motion at render FPS. It has two modes:
-//!
-//! - **Free fly** (the scene view): the eye carries a target pose
-//!   (`target_position`/`target_yaw`/`target_pitch`) it eases toward; WASD moves the eye and
-//!   its target together (instant translation); an absolute `set-camera` snaps both.
-//! - **Orbit** (the preview panes): `orbit` is `Some` and the eye is *derived* on the arc as
-//!   `pivot - forward(yaw,pitch) · distance`. The pivot, distance, and angles ease toward their
-//!   targets, so a fast drag sweeps the circle at a fixed radius instead of the eye lerping
-//!   straight across it (a chord). Preview enter frames into orbit mode; exit restores the
-//!   stashed free camera.
-//!
-//! These are the scene-view eye, distinct from any ECS `Camera` / game camera. SceneEdit
-//! stays SDL-free — `look_delta` and the move bools arrive as plain data the host fills.
+//! Free fly applies each drained input sample directly: look deltas land whole on yaw/pitch and
+//! WASD translates the eye by `move_speed · dt`, so the pose tracks the pointer with no filter
+//! (the editor paces its `fly-input` stream at the monitor refresh, one sample per UI frame).
+//! Orbit *derives* the eye on the arc as `pivot - forward(yaw, pitch) * distance`, easing the
+//! pivot, distance, and angles with the shared `SMOOTH_TAU`, so a fast drag sweeps the circle at
+//! a fixed radius rather than lerping the eye across the chord.
 
 use glam::{Mat4, Vec2, Vec3};
 use saffron_json::json_f32_or;
@@ -63,11 +52,9 @@ pub struct SceneEditCamera {
     pub move_speed: f32,
     /// Look speed, degrees per pixel.
     pub look_speed: f32,
-    /// The eye position the camera eases toward (world space).
-    pub target_position: Vec3,
-    /// The yaw angle the camera eases toward, degrees.
+    /// The yaw angle the orbit ease steps toward, degrees; free fly snaps onto it each frame.
     pub target_yaw: f32,
-    /// The pitch angle the camera eases toward, degrees.
+    /// The pitch angle the orbit ease steps toward, degrees; free fly snaps onto it each frame.
     pub target_pitch: f32,
     /// `Some` while orbiting (a preview pane): the eye is derived on the arc from this pivot +
     /// distance and the eased yaw/pitch, rather than eased in eye space.
@@ -87,7 +74,6 @@ impl Default for SceneEditCamera {
             far_plane: 100.0,
             move_speed: 6.0,
             look_speed: 0.12,
-            target_position: Vec3::new(3.0, 2.5, 4.0),
             target_yaw: -37.0,
             target_pitch: -29.0,
             orbit: None,
@@ -151,11 +137,10 @@ impl SceneEditCamera {
         }
     }
 
-    /// Snaps the targets onto the current pose (both the free-eye pose and, if orbiting, the
+    /// Snaps the ease targets onto the current pose (the angles and, if orbiting, the
     /// pivot + distance), so an absolute set (framing, focus, project load) shows instantly
     /// without easing back toward a stale target.
     pub fn sync_target(&mut self) {
-        self.target_position = self.position;
         self.target_yaw = self.yaw;
         self.target_pitch = self.pitch;
         if let Some(orbit) = self.orbit.as_mut() {
@@ -165,18 +150,19 @@ impl SceneEditCamera {
     }
 
     /// Whether the camera has yet to reach its target — the render-activity signal that holds
-    /// continuous render while the ease (fly look tail or preview orbit sweep) is in flight.
-    /// The ease snaps exactly on convergence, so a settled camera reports `false`.
+    /// continuous render while a preview orbit sweep is in flight. The ease snaps exactly on
+    /// convergence, so a settled orbit reports `false`; free fly applies samples directly and
+    /// never eases.
     #[must_use]
     pub fn is_easing(&self) -> bool {
-        if self.yaw != self.target_yaw || self.pitch != self.target_pitch {
-            return true;
-        }
         match self.orbit {
             Some(orbit) => {
-                orbit.pivot != orbit.target_pivot || orbit.distance != orbit.target_distance
+                self.yaw != self.target_yaw
+                    || self.pitch != self.target_pitch
+                    || orbit.pivot != orbit.target_pivot
+                    || orbit.distance != orbit.target_distance
             }
-            None => self.position != self.target_position,
+            None => false,
         }
     }
 
@@ -213,20 +199,18 @@ impl SceneEditCamera {
     }
 }
 
-/// Advances the editor camera one frame from host-gathered input, easing toward its target.
+/// Advances the editor camera one frame from host-gathered input.
 ///
-/// Look deltas accumulate into `target_yaw`/`target_pitch` and the angles ease toward them
-/// each frame (`alpha = 1 - exp(-dt/TAU)`, the same constant as the gizmo drag), so the ~60 Hz
-/// look samples do not staircase; the ease runs even when inactive, so the tail eases out.
-/// Target pitch clamps to ±89°.
+/// Look deltas accumulate into `target_yaw`/`target_pitch` (target pitch clamps to ±89°). In
+/// **orbit mode** (`camera.orbit`, the preview panes) the visible angles, pivot, and distance
+/// ease toward their targets (`alpha = 1 - exp(-dt/TAU)`, the same constant as the gizmo drag)
+/// and the eye is derived on the arc as `pivot - forward · distance`, so a fast drag sweeps
+/// the circle at the eased radius instead of the eye cutting a chord across it.
 ///
-/// In **orbit mode** (`camera.orbit`, the preview panes) the pivot + distance ease too and the
-/// eye is derived on the arc as `pivot - forward · distance`, so a fast drag sweeps the circle
-/// at the eased radius instead of the eye cutting a chord across it. In **free-fly mode**
-/// `controlling` latches while `active` holds (so a drag can leave the viewport rect), WASD
-/// moves along the camera basis and Space/Shift along world `±Y` scaled by `move_speed · dt`
-/// — translating the eye and its target together so fly movement stays instant — then the eye
-/// eases toward `target_position`.
+/// In **free-fly mode** the sample lands whole the frame it drains: the visible angles snap
+/// onto the targets, and WASD moves along the camera basis and Space/Shift along world `±Y`
+/// scaled by `move_speed · dt` — no filter, no ease-out tail. `controlling` latches while
+/// `active` holds (so a drag can leave the viewport rect).
 pub fn update_scene_edit_camera(
     camera: &mut SceneEditCamera,
     input: &SceneEditCameraInput,
@@ -236,24 +220,26 @@ pub fn update_scene_edit_camera(
     camera.target_pitch -= input.look_delta.y * camera.look_speed;
     camera.target_pitch = camera.target_pitch.clamp(-89.0, 89.0);
 
-    let alpha = 1.0 - (-dt.max(0.0) / SMOOTH_TAU).exp();
-    ease_scalar(&mut camera.yaw, camera.target_yaw, alpha);
-    ease_scalar(&mut camera.pitch, camera.target_pitch, alpha);
-    let forward = camera.forward();
-
     if let Some(mut orbit) = camera.orbit {
-        // Orbit: ease the pivot + radius, then place the eye on the arc looking at the pivot —
-        // the sweep stays on the circle, never chording through it.
+        // Orbit: ease the angles, pivot, and radius, then place the eye on the arc looking at
+        // the pivot — the sweep stays on the circle, never chording through it.
+        let alpha = 1.0 - (-dt.max(0.0) / SMOOTH_TAU).exp();
+        ease_scalar(&mut camera.yaw, camera.target_yaw, alpha);
+        ease_scalar(&mut camera.pitch, camera.target_pitch, alpha);
         ease_vec3(&mut orbit.pivot, orbit.target_pivot, alpha);
         ease_scalar(&mut orbit.distance, orbit.target_distance, alpha);
         camera.orbit = Some(orbit);
         camera.controlling = false;
-        camera.position = orbit.pivot - forward * orbit.distance;
+        camera.position = orbit.pivot - camera.forward() * orbit.distance;
         return;
     }
 
+    camera.yaw = camera.target_yaw;
+    camera.pitch = camera.target_pitch;
+
     if input.active {
         camera.controlling = true;
+        let forward = camera.forward();
         let right = forward.cross(Vec3::Y).normalize();
         let world_up = Vec3::Y;
         let mut mv = Vec3::ZERO;
@@ -275,14 +261,10 @@ pub fn update_scene_edit_camera(
         if input.down {
             mv -= world_up;
         }
-        let delta = mv * (camera.move_speed * dt);
-        camera.position += delta;
-        camera.target_position += delta;
+        camera.position += mv * (camera.move_speed * dt);
     } else {
         camera.controlling = false;
     }
-
-    ease_vec3(&mut camera.position, camera.target_position, alpha);
 }
 
 /// The convergence epsilon: the eased pose snaps exactly onto its target once every field is
@@ -437,17 +419,17 @@ mod tests {
     }
 
     #[test]
-    fn look_eases_monotonically_toward_the_target_orientation() {
+    fn look_sample_lands_whole_on_the_pose() {
         let mut cam = SceneEditCamera {
             yaw: 0.0,
             pitch: 0.0,
             ..SceneEditCamera::default()
         };
         cam.sync_target();
-        // One look sample of +x (yaw) pixels arrives, landing on the target orientation; the
-        // eye then eases toward it with no further input.
-        let dt = 1.0 / 60.0;
-        let target_yaw = 100.0 * cam.look_speed;
+        // One look sample of +x (yaw) pixels arrives; the visible yaw lands on it the same
+        // frame — free fly has no filter.
+        let dt = 1.0 / 240.0;
+        let expected_yaw = 100.0 * cam.look_speed;
         update_scene_edit_camera(
             &mut cam,
             &SceneEditCameraInput {
@@ -458,24 +440,17 @@ mod tests {
             dt,
         );
         assert!(
-            (cam.target_yaw - target_yaw).abs() < 1e-4,
-            "the sample lands whole on the target orientation"
-        );
-        let mut prev = cam.yaw;
-        // The eye keeps easing toward the target each frame, converging monotonically without
-        // overshoot.
-        for _ in 0..200 {
-            update_scene_edit_camera(&mut cam, &SceneEditCameraInput::default(), dt);
-            assert!(cam.yaw >= prev - 1e-6, "yaw advances monotonically");
-            assert!(cam.yaw <= target_yaw + 1e-3, "no overshoot past the target");
-            prev = cam.yaw;
-        }
-        assert!(
-            (cam.yaw - target_yaw).abs() < 1e-2,
-            "the ease converges to the sample ({} vs {target_yaw})",
+            (cam.yaw - expected_yaw).abs() < 1e-4,
+            "the sample lands whole the frame it drains ({} vs {expected_yaw})",
             cam.yaw
         );
-        assert!(!cam.is_easing(), "a converged camera stops easing");
+        assert!(!cam.is_easing(), "free fly never eases");
+        // Further frames without input hold the pose exactly — no ease-out tail.
+        update_scene_edit_camera(&mut cam, &SceneEditCameraInput::default(), dt);
+        assert!(
+            (cam.yaw - expected_yaw).abs() < 1e-6,
+            "the pose holds with no tail"
+        );
     }
 
     #[test]
@@ -485,33 +460,28 @@ mod tests {
             ..SceneEditCamera::default()
         };
         cam.sync_target();
-        // A large sustained down-look (positive look_delta.y lowers pitch) over many frames
-        // must clamp at -89.
-        for _ in 0..2000 {
-            update_scene_edit_camera(
-                &mut cam,
-                &SceneEditCameraInput {
-                    active: true,
-                    look_delta: Vec2::new(0.0, 1000.0),
-                    ..SceneEditCameraInput::default()
-                },
-                1.0 / 60.0,
-            );
-        }
+        // A huge down-look (positive look_delta.y lowers pitch) clamps at -89 in one sample.
+        update_scene_edit_camera(
+            &mut cam,
+            &SceneEditCameraInput {
+                active: true,
+                look_delta: Vec2::new(0.0, 100_000.0),
+                ..SceneEditCameraInput::default()
+            },
+            1.0 / 60.0,
+        );
         assert!((cam.pitch - (-89.0)).abs() < 1e-3, "pitch clamps at -89");
 
         // And the other extreme.
-        for _ in 0..2000 {
-            update_scene_edit_camera(
-                &mut cam,
-                &SceneEditCameraInput {
-                    active: true,
-                    look_delta: Vec2::new(0.0, -1000.0),
-                    ..SceneEditCameraInput::default()
-                },
-                1.0 / 60.0,
-            );
-        }
+        update_scene_edit_camera(
+            &mut cam,
+            &SceneEditCameraInput {
+                active: true,
+                look_delta: Vec2::new(0.0, -100_000.0),
+                ..SceneEditCameraInput::default()
+            },
+            1.0 / 60.0,
+        );
         assert!((cam.pitch - 89.0).abs() < 1e-3, "pitch clamps at +89");
     }
 
@@ -533,18 +503,26 @@ mod tests {
     }
 
     #[test]
-    fn inactive_still_eases_the_look_tail() {
+    fn inactive_look_still_lands_the_sample() {
         let mut cam = SceneEditCamera {
             yaw: 0.0,
             ..SceneEditCamera::default()
         };
         cam.sync_target();
-        // A target orientation the eye has not yet reached (e.g. a flick just before RMB
-        // release) keeps easing out even with no active hold.
-        cam.target_yaw = 10.0;
-        let before = cam.yaw;
-        update_scene_edit_camera(&mut cam, &SceneEditCameraInput::default(), 1.0 / 60.0);
-        assert!(cam.yaw > before, "the tail keeps easing while inactive");
+        // A look delta drained after RMB release (a flick's last sample) still lands whole,
+        // without latching control.
+        update_scene_edit_camera(
+            &mut cam,
+            &SceneEditCameraInput {
+                look_delta: Vec2::new(100.0, 0.0),
+                ..SceneEditCameraInput::default()
+            },
+            1.0 / 60.0,
+        );
+        assert!(
+            (cam.yaw - 100.0 * cam.look_speed).abs() < 1e-4,
+            "the sample lands whole while inactive"
+        );
         assert!(!cam.controlling);
     }
 

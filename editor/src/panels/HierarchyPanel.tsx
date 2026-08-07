@@ -1,15 +1,6 @@
-/// The Hierarchy panel: a tree outliner over the scene entities, built client-side
-/// from the flat `store.entities` slice plus each entry's `parentId` (refreshed by
-/// the reconcile poll only when sceneVersion changes — this component never fetches).
-/// Left-click selects (optimistic + `select`); double-click renames inline (Enter
-/// commits via `rename-entity`, Esc cancels); right-click opens Focus / Rename / Copy /
-/// Parent to… / Unparent / Delete; dragging a row onto another reparents via
-/// `set-parent`.
-///
-/// The context menu and the inline rename input are Radix/native controls anchored
-/// on each row in the left column, and every drag affordance stays in the sidebar
-/// DOM (the reparented X11 viewport paints over anything floating). Rejected control
-/// calls surface via `notifyError` (the shared error toast), never a per-panel banner.
+/// The Hierarchy panel: the tree outliner over the scene entities, refreshed by the reconcile poll
+/// on a sceneVersion change — this component never fetches. Every drag affordance stays in sidebar
+/// DOM, because the viewport surface paints over anything floating.
 import { useCallback, useMemo, useState } from "react";
 import { Bone, ListTree } from "lucide-react";
 import { client } from "../control/client";

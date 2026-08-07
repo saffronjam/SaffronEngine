@@ -1,13 +1,12 @@
-/// Renders a `DockLayout` tree: a branch becomes a `ResizablePanelGroup` (+ handles), a leaf
-/// becomes a `TabStrip` + host-claiming body (a locked leaf — the live subsurface — drops the
-/// strip). Recursive and dockspace-parameterized, so the Scene island and the asset-editor
-/// island share one renderer over their own trees.
+/// Renders a `DockLayout` tree: a branch becomes a `ResizablePanelGroup`, a leaf a `TabStrip` plus a
+/// host-claiming body (a locked leaf — the live subsurface — drops the strip). Recursive and
+/// dockspace-parameterized, so both islands share one renderer.
 ///
-/// rrp v4 does not reconcile a changing child set in place, so each group is keyed by a
-/// STRUCTURE HASH (node id + orientation + rendered child ids, sizes excluded): a
-/// child add/remove/reorder remounts the group against the new `defaultLayout`, while a resize
-/// never changes the key and so never remounts. An empty non-locked leaf is skipped, so its
-/// region collapses (the viewport reclaims the space) while the leaf stays in the model.
+/// react-resizable-panels does not reconcile a changing child set in place, so each group is keyed
+/// by a STRUCTURE HASH (node id + orientation + rendered child ids, sizes excluded): a child
+/// add/remove/reorder remounts the group against the new `defaultLayout`, while a resize never
+/// changes the key and so never remounts. An empty non-locked leaf is skipped, so its region
+/// collapses while the leaf stays in the model.
 import { useMemo } from "react";
 import { useEditorStore } from "../../state/store";
 import {

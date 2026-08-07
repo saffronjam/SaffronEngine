@@ -1,17 +1,13 @@
 //! OBJ (`.obj`) import onto the `tobj` crate.
 //!
-//! The load-bearing concern is **dedup determinism**. `(vertex, normal, texcoord)`
-//! index triples are deduped into unique vertices via a [`BTreeMap`] over the
-//! `[i32; 3]` key, not a `HashMap`: the ordered map preserves both the dedup result
-//! **and the emitted vertex order**, so a given OBJ always emits its vertices in the
-//! same order and the bytes of the subsequent `.smesh` bake stay stable. A `HashMap`
-//! would dedup correctly but emit vertices in a nondeterministic order, silently
-//! changing every baked `.smesh`'s bytes. That choice is the reason this module is
-//! split out and is pinned by a re-import-determinism test.
+//! The load-bearing concern is dedup determinism. `(vertex, normal, texcoord)` index triples
+//! dedupe through a [`BTreeMap`] over the `[i32; 3]` key rather than a `HashMap`: the ordered
+//! map preserves the emitted vertex order as well as the dedup result, so a given OBJ always
+//! bakes byte-identical `.smesh` output.
 //!
-//! Faces are grouped into first-seen material slots (empty slots skipped), the OBJ
-//! **V-flip** (`uv0.y = 1.0 - v`) is applied because OBJ's texture origin is
-//! bottom-left and Vulkan samples top-left, and out-of-range indices are guarded.
+//! Faces are grouped into first-seen material slots, empty slots skipped; the OBJ V-flip
+//! (`uv0.y = 1.0 - v`) is applied because OBJ's texture origin is bottom-left while Vulkan
+//! samples top-left; and out-of-range indices are guarded.
 
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -46,16 +42,14 @@ pub fn import_obj_model(path: impl AsRef<Path>) -> Result<ImportedModel> {
     let materials = materials_result.unwrap_or_default();
 
     let mut mesh = Mesh::default();
-    // De-duplicate (position, normal, texcoord) index triples into unique vertices.
-    // BTreeMap (an ordered tree) emits vertices deterministically across runs.
-    let mut unique_vertices: BTreeMap<[i32; 3], u32> = BTreeMap::new();
 
-    // Faces are grouped into slots in first-seen material order. `slot_to_obj_material`
-    // maps a slot to its tobj material index (`-1` == no material); `indices_by_slot`
-    // collects the slot's triangle indices.
     let mut slots = SlotMap::default();
 
     for model in &models {
+        // The map is per model because tobj re-indexes each object and each `usemtl` run
+        // against its own arrays: two models both start at triple (0, 0, 0) while meaning
+        // different vertices, so one shared map folds later objects onto the first's geometry.
+        let mut unique_vertices: BTreeMap<[i32; 3], u32> = BTreeMap::new();
         let m = &model.mesh;
         // tobj splits a `usemtl` change mid-object into a fresh `Model`, so every
         // model is a run of faces sharing one `material_id`; grouping by that id lands
@@ -82,7 +76,6 @@ pub fn import_obj_model(path: impl AsRef<Path>) -> Result<ImportedModel> {
         let submesh = Submesh {
             first_index: mesh.indices.len() as u32,
             index_count: bucket.len() as u32,
-            // Indices already reference the shared vertex array.
             vertex_offset: 0,
             material_slot: slot,
         };
@@ -126,6 +119,8 @@ pub fn import_obj_model(path: impl AsRef<Path>) -> Result<ImportedModel> {
         animations: Vec::new(),
         skin: None,
         morph: None,
+        // OBJ has no asset block, so it states nothing about its origin.
+        origin: crate::types::ImportedOrigin::default(),
     })
 }
 
@@ -303,9 +298,6 @@ mod tests {
 
     #[test]
     fn cube_obj_imports_with_expected_counts() {
-        // cube.obj: 24 verts / 24 normals / 24 texcoords, 12 triangulated faces, no
-        // material. Every (v, n, t) triple is distinct, so dedup keeps 24 vertices,
-        // 36 indices, one submesh, and one default material slot.
         let model = import_obj_model(fixture("cube.obj")).expect("import cube.obj");
         let mesh = mesh_of(&model);
         assert_eq!(mesh.vertices.len(), 24);
@@ -313,7 +305,6 @@ mod tests {
         assert_eq!(mesh.submeshes.len(), 1);
         assert_eq!(model.materials.len(), 1);
         assert!(model.skin.is_none());
-        // The lone submesh covers the whole index range against the default slot.
         assert_eq!(mesh.submeshes[0].first_index, 0);
         assert_eq!(mesh.submeshes[0].index_count, 36);
         assert_eq!(mesh.submeshes[0].material_slot, 0);
@@ -321,8 +312,6 @@ mod tests {
 
     #[test]
     fn cube_obj_normals_survive_import() {
-        // cube.obj ships normals, so the importer keeps them (no generate_normals
-        // fallback); every vertex normal is unit length.
         let model = import_obj_model(fixture("cube.obj")).expect("import cube.obj");
         for (i, v) in mesh_of(&model).vertices.iter().enumerate() {
             let len = v.normal.length();
@@ -332,9 +321,6 @@ mod tests {
 
     #[test]
     fn cube_obj_applies_the_v_flip() {
-        // OBJ texcoord V origin is bottom-left; the importer flips to Vulkan's
-        // top-left, so every uv0.v lands in [0, 1] as `1 - source_v` (the cube uses
-        // 0/1 texcoords, so the flipped values stay 0 or 1 but swapped).
         let model = import_obj_model(fixture("cube.obj")).expect("import cube.obj");
         for v in &mesh_of(&model).vertices {
             assert!((0.0..=1.0).contains(&v.uv0.y));
@@ -343,14 +329,59 @@ mod tests {
 
     #[test]
     fn obj_import_is_deterministic_in_vertex_order() {
-        // The single decision this phase locks: the BTreeMap dedup emits the exact
-        // same vertex vector across two imports (a HashMap would not). Assert the
-        // FULL vertex vector is identical, not just the counts.
+        // The BTreeMap dedup emits the exact same vertex vector across two imports, which a
+        // HashMap would not, so the whole vector is asserted rather than the counts.
         let first = import_obj_model(fixture("cube.obj")).expect("first import");
         let second = import_obj_model(fixture("cube.obj")).expect("second import");
         assert_eq!(mesh_of(&first).vertices, mesh_of(&second).vertices);
         assert_eq!(mesh_of(&first).indices, mesh_of(&second).indices);
         assert_eq!(mesh_of(&first).submeshes, mesh_of(&second).submeshes);
         assert_eq!(first, second);
+    }
+
+    /// Every object in a multi-object file keeps its own vertices.
+    ///
+    /// tobj re-indexes each object and each `usemtl` run against its own arrays, so two objects
+    /// both start at the triple `(0, 0, 0)` while meaning different vertices. Deduplicating across
+    /// models folds every later object onto the first one's geometry: the index count stays right,
+    /// the vertex array is short, and the later objects draw on top of the first — present in every
+    /// counter and absent from the picture.
+    #[test]
+    fn each_object_in_a_multi_object_obj_keeps_its_own_vertices() {
+        let dir = std::env::temp_dir().join(format!("saffron-obj-multi-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("scratch");
+        let path = dir.join("pair.obj");
+        // Two triangles that share no position, with the same texcoord and normal indices — the
+        // arrangement whose per-model triples collide.
+        std::fs::write(
+            &path,
+            concat!(
+                "o First\nv -1 0 0\nv 1 0 0\nv 0 1 0\n",
+                "vt 0 0\nvt 1 0\nvt 0.5 1\nvn 0 0 1\n",
+                "f 1/1/1 2/2/1 3/3/1\n",
+                "o Second\nv -1 2 0\nv 1 2 0\nv 0 3 0\n",
+                "f 4/1/1 5/2/1 6/3/1\n",
+            ),
+        )
+        .expect("write obj");
+        let model = import_obj_model(&path).expect("import");
+        let mesh = mesh_of(&model);
+        assert_eq!(mesh.indices.len(), 6, "both triangles survive");
+        assert_eq!(
+            mesh.vertices.len(),
+            6,
+            "and neither borrows the other's vertices"
+        );
+        // The second triangle must sit where the file put it, two units up.
+        let top = mesh
+            .vertices
+            .iter()
+            .map(|vertex| vertex.position.y)
+            .fold(f32::MIN, f32::max);
+        assert!(
+            (top - 3.0).abs() < 1e-5,
+            "second object collapsed onto the first: top {top}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

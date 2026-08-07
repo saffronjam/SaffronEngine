@@ -67,12 +67,12 @@ flowchart TD
 
 | What | File | Symbols |
 |---|---|---|
-| The command | `engine/crates/control/src/commands_asset.rs` | the `screenshot` row (viewport vs. window, `pending`) |
+| The command | `engine/crates/control/src/commands_asset/` | the `screenshot` row (viewport vs. window, `pending`) |
 | Renderer seam | `engine/crates/host/src/control_renderer.rs` | `ControlRenderer::capture_viewport`, `request_window_capture` |
-| Synchronous viewport grab | `engine/crates/rendering/src/renderer.rs` | `Renderer::capture_viewport`, `read_active_offscreen` |
-| Deferred window grab | `engine/crates/rendering/src/renderer.rs` | `request_window_capture`, `capture_next_window_path`, `window_capture_pending` |
+| Synchronous viewport grab | `engine/crates/rendering/src/renderer/` | `Renderer::capture_viewport`, `read_active_offscreen` |
+| Deferred window grab | `engine/crates/rendering/src/renderer/` | `request_window_capture`, `capture_next_window_path`, `window_capture_pending` |
 | PNG encode | `engine/crates/rendering/src/thumbnail.rs` | `write_png_file` |
-| Cross-frame layout slot | `engine/crates/rendering/src/render_graph.rs` | `import_image`, `alloc_external_layout` |
+| Cross-frame layout slot | `engine/crates/rendering/src/render_graph/` | `import_image`, `alloc_external_layout` |
 
 > [!NOTE]
 > A window screenshot returns `pending:true` before the file exists. A script that reads the PNG

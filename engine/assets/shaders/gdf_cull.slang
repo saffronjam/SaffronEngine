@@ -1,8 +1,8 @@
 // Global-SDF cull: bins the per-mesh MDF instances into the cascade(s) their world AABB touches.
 // One thread per SDF instance; each tests its world AABB against every cascade's world bounds and
 // atomic-appends its index into that cascade's segment of the compacted cull list. The composite
-// then iterates only the surviving instances per cascade, so the per-voxel `min()` cost no longer
-// scans the whole scene. The bindless brick arrays ride set 0 (the `mdf_brick` import provides the
+// then iterates only the surviving instances per cascade, keeping the per-voxel `min()` off the
+// whole scene. The bindless brick arrays ride set 0 (the `mdf_brick` import provides the
 // `SdfInstance` struct; the cull reads only the world AABB, not the bricks).
 
 import mdf_brick;
@@ -12,6 +12,10 @@ import mdf_brick;
 // atomic counters in the header, then per-cascade segments of `maxCulled` instance indices.
 [[vk::binding(0, 1)]] StructuredBuffer<SdfInstance> instances;
 [[vk::binding(1, 1)]] RWStructuredBuffer<uint> cullList;
+// Binding 2: the occluder scatter's meta words ([0] = instances written this frame).
+// The list is GPU-produced, so the count cannot ride the push; `counts.x` bounds it
+// as the region capacity instead.
+[[vk::binding(2, 1)]] StructuredBuffer<uint> sdfMeta;
 
 // Header words before the per-cascade index segments (the per-cascade atomic counters + pad).
 // Matches `global_sdf.rs::GDF_CULL_HEADER`.
@@ -20,7 +24,7 @@ static const uint kCullHeader = 4u;
 struct Push
 {
     float4 cascade[3];  // xyz = cascade world center, w = cascade half-extent (world)
-    uint4 counts;       // x = instance count, y = max culled per cascade, z = cascade count, w reserved
+    uint4 counts;       // x = instance capacity, y = max culled per cascade, z = cascade count, w reserved
 };
 [[vk::push_constant]] Push pc;
 
@@ -29,7 +33,7 @@ struct Push
 void computeMain(uint3 tid : SV_DispatchThreadID)
 {
     uint i = tid.x;
-    if (i >= pc.counts.x) { return; }
+    if (i >= min(sdfMeta[0], pc.counts.x)) { return; }
 
     SdfInstance inst = instances[i];
     float3 wmin = inst.worldMin.xyz;

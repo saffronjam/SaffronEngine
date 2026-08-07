@@ -1,19 +1,16 @@
-//! The `.smesh` (`SMSH`) byte format: a 64-byte header followed by three contiguous
+//! The `.smesh` (`SMSH`) byte format: an 80-byte header followed by three contiguous
 //! sections (vertices, indices, submeshes) plus two optional sections (skin, morph)
 //! selected by the header flags.
 //!
-//! The image is the canonical triple contract: disk bytes == in-memory payload == the
-//! GPU vertex buffer, so a `.smodel` MESH chunk slice and a standalone `.smesh` file
-//! read the same. The bytes are reinterpreted with **safe** `bytemuck` over
-//! `#[repr(C)]` Pod structs (`bytes_of` / `cast_slice` to write, `from_bytes` /
-//! `cast_slice` to read), so the crate's `#![deny(unsafe_code)]` holds.
+//! The image is the canonical triple contract: disk bytes == in-memory payload == the GPU
+//! vertex buffer, so a `.smodel` MESH chunk slice and a standalone `.smesh` file read the
+//! same. The bytes are reinterpreted with `bytemuck` over `#[repr(C)]` Pod structs.
 //!
-//! One version lives in the format ([`MESH_FORMAT_VERSION`]). A flags word
-//! ([`MESH_FLAG_SKIN`] / [`MESH_FLAG_MORPH`] / [`MESH_FLAG_CONDITIONING`]) selects the optional
-//! sections; the loader accepts only the current version and reads each section when its flag is set.
-//! Morph target names are not in the binary — they ride in the container META, so the `.smesh` is
-//! pure fixed-stride Pod arrays. The trailing conditioning section (always present in v6) carries the
-//! watertight-tessellation data ([`MeshConditioning`]), located by walking past the optional sections.
+//! A flags word ([`MESH_FLAG_SKIN`] / [`MESH_FLAG_MORPH`] / [`MESH_FLAG_CONDITIONING`])
+//! selects the optional sections, and the loader accepts only [`MESH_FORMAT_VERSION`]. Morph
+//! target names ride in the container META rather than the binary, keeping the `.smesh` pure
+//! fixed-stride Pod arrays. The trailing conditioning section carries the
+//! watertight-tessellation data, followed by the portable hierarchy envelope.
 
 use std::fs;
 use std::path::Path;
@@ -25,30 +22,32 @@ use crate::error::{Error, Result};
 use crate::types::{
     Mesh, MeshCounts, MorphData, MorphDelta, MorphTarget, Submesh, Vertex, VertexSkin,
 };
+use crate::{
+    PortableHierarchyInput, PortableVirtualHierarchy, cook_portable_virtual_hierarchy,
+    decode_portable_virtual_hierarchy, encode_portable_virtual_hierarchy,
+};
 
-/// The `.smesh` format version: a 64-byte header, three required sections (vertices,
-/// indices, submeshes), the optional skin/morph sections behind the flags word, and (always in v6)
-/// a trailing watertight-conditioning section. v6 widened [`WeldedVertex`] to 64 bytes (a
-/// representative base UV per welded vertex) for the per-region detail-adaptive tessellation factor.
-pub const MESH_FORMAT_VERSION: u32 = 6;
+/// The `.smesh` format version: an 80-byte header, three required sections (vertices,
+/// indices, submeshes), optional skin/morph sections, watertight conditioning, and the
+/// canonical portable hierarchy envelope.
+pub const MESH_FORMAT_VERSION: u32 = 7;
 
 /// Header flag: a `VertexSkin` section (parallel to the vertices) follows the submeshes.
 const MESH_FLAG_SKIN: u32 = 1 << 0;
 /// Header flag: a morph section (at `morph_offset`) carries sparse per-vertex deltas.
 const MESH_FLAG_MORPH: u32 = 1 << 1;
 /// Header flag: a watertight-conditioning section (edges, tri-edges, welded basis, weld map)
-/// follows the skin/morph sections. Always set in v6 — every mesh is conditioned at import.
+/// follows the skin/morph sections. Always set — every mesh is conditioned at import.
 const MESH_FLAG_CONDITIONING: u32 = 1 << 2;
 
 /// The four-byte tag at the head of every `.smesh` image.
 const MAGIC: [u8; 4] = *b"SMSH";
 
-/// The 64-byte fixed header; the required sections follow at the offsets, the optional
+/// The 80-byte fixed header; the required sections follow at the offsets, the optional
 /// sections behind the flags.
 ///
-/// `#[repr(C)]` Pod with a fixed field order and width. The offsets are self-relative
-/// (from the start of the image), so an embedded `.smodel` chunk slice reads
-/// identically to a standalone file.
+/// The offsets are self-relative, from the start of the image, so an embedded `.smodel`
+/// chunk slice reads identically to a standalone file.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Pod, Zeroable)]
 struct SMeshHeader {
@@ -68,7 +67,7 @@ struct SMeshHeader {
     index_width: u32,
     /// Number of submeshes.
     submesh_count: u32,
-    /// Offset to the vertex section; equals `size_of::<SMeshHeader>()` (64).
+    /// Offset to the vertex section; equals `size_of::<SMeshHeader>()` (80).
     vertices_offset: u64,
     /// Offset to the index section.
     indices_offset: u64,
@@ -77,11 +76,15 @@ struct SMeshHeader {
     /// Offset to the morph section, or 0 when `MESH_FLAG_MORPH` is clear. The morph
     /// section follows the skin section when both are present.
     morph_offset: u64,
+    /// Offset to the canonical portable hierarchy envelope.
+    hierarchy_offset: u64,
+    /// Byte length of the canonical portable hierarchy envelope.
+    hierarchy_size: u64,
 }
 
 const _: () = assert!(
-    size_of::<SMeshHeader>() == 64,
-    "SMeshHeader must be exactly 64 bytes"
+    size_of::<SMeshHeader>() == 80,
+    "SMeshHeader must be exactly 80 bytes"
 );
 
 /// The morph section sub-header (one per morph mesh, at `morph_offset`).
@@ -124,7 +127,14 @@ struct ConditioningSectionHeader {
 /// Builds the `.smesh` byte image: the header, the three required sections, then the
 /// optional skin section (when `skin` is non-empty) and morph section (when `morph` is
 /// `Some` and non-empty), and finally the always-present watertight-conditioning section.
-fn encode_mesh_image(mesh: &Mesh, skin: &[VertexSkin], morph: Option<&MorphData>) -> Vec<u8> {
+fn encode_mesh_image(
+    mesh: &Mesh,
+    skin: &[VertexSkin],
+    morph: Option<&MorphData>,
+) -> Result<Vec<u8>> {
+    let hierarchy_input = PortableHierarchyInput::from_mesh(mesh, skin)?;
+    let hierarchy = cook_portable_virtual_hierarchy(&hierarchy_input)?;
+    let hierarchy_bytes = encode_portable_virtual_hierarchy(&hierarchy)?;
     let vertex_count = mesh.vertices.len() as u32;
     let index_count = mesh.indices.len() as u32;
     let submesh_count = mesh.submeshes.len() as u32;
@@ -142,7 +152,7 @@ fn encode_mesh_image(mesh: &Mesh, skin: &[VertexSkin], morph: Option<&MorphData>
     };
 
     let morph = morph.filter(|m| !m.targets.is_empty());
-    // Conditioning is always present in v6 — a pure function of the mesh, computed here so every
+    // Conditioning is a pure function of the mesh, computed here so every
     // caller's `.smesh` carries it with no signature change.
     let mut flags = MESH_FLAG_CONDITIONING;
     if has_skin {
@@ -155,7 +165,7 @@ fn encode_mesh_image(mesh: &Mesh, skin: &[VertexSkin], morph: Option<&MorphData>
         0
     };
 
-    let header = SMeshHeader {
+    let mut header = SMeshHeader {
         magic: MAGIC,
         version: MESH_FORMAT_VERSION,
         flags,
@@ -168,6 +178,8 @@ fn encode_mesh_image(mesh: &Mesh, skin: &[VertexSkin], morph: Option<&MorphData>
         indices_offset,
         submeshes_offset,
         morph_offset,
+        hierarchy_offset: 0,
+        hierarchy_size: 0,
     };
 
     let mut bytes = Vec::with_capacity(skin_end as usize);
@@ -211,7 +223,12 @@ fn encode_mesh_image(mesh: &Mesh, skin: &[VertexSkin], morph: Option<&MorphData>
     bytes.extend_from_slice(bytemuck::cast_slice(&cond.tri_edges));
     bytes.extend_from_slice(bytemuck::cast_slice(&cond.welded));
     bytes.extend_from_slice(bytemuck::cast_slice(&cond.weld_id));
-    bytes
+    header.hierarchy_offset = u64::try_from(bytes.len()).map_err(|_| Error::NumericOverflow)?;
+    header.hierarchy_size =
+        u64::try_from(hierarchy_bytes.len()).map_err(|_| Error::NumericOverflow)?;
+    bytes.extend_from_slice(&hierarchy_bytes);
+    bytes[..size_of::<SMeshHeader>()].copy_from_slice(bytemuck::bytes_of(&header));
+    Ok(bytes)
 }
 
 /// Encodes `mesh` to a `.smesh` byte image with optional skin and morph sections.
@@ -230,7 +247,7 @@ pub fn save_mesh_to_buffer(
             vertices: mesh.vertices.len(),
         });
     }
-    Ok(encode_mesh_image(mesh, skin, morph))
+    encode_mesh_image(mesh, skin, morph)
 }
 
 /// Reads and validates a `.smesh` header from the front of `bytes`.
@@ -245,6 +262,18 @@ fn read_header(bytes: &[u8]) -> Result<SMeshHeader> {
     Ok(*header)
 }
 
+fn read_current_header(bytes: &[u8]) -> Result<SMeshHeader> {
+    let header = read_header(bytes)?;
+    if header.version != MESH_FORMAT_VERSION {
+        return Err(Error::UnsupportedVersion(header.version));
+    }
+    let known_flags = MESH_FLAG_SKIN | MESH_FLAG_MORPH | MESH_FLAG_CONDITIONING;
+    if header.flags & !known_flags != 0 || header.flags & MESH_FLAG_CONDITIONING == 0 {
+        return Err(Error::BadLayout);
+    }
+    Ok(header)
+}
+
 /// The byte offset just past the submesh section (where the skin section begins).
 fn submeshes_end(header: &SMeshHeader) -> u64 {
     header.submeshes_offset + u64::from(header.submesh_count) * size_of::<Submesh>() as u64
@@ -257,10 +286,7 @@ fn submeshes_end(header: &SMeshHeader) -> u64 {
 /// the span to be long enough. The span length is the chunk length, not a file size, so
 /// an embedded `.smodel` chunk reads identically to a standalone file.
 pub fn load_mesh_from_bytes(bytes: &[u8]) -> Result<Mesh> {
-    let header = read_header(bytes)?;
-    if header.version != MESH_FORMAT_VERSION {
-        return Err(Error::UnsupportedVersion(header.version));
-    }
+    let header = read_current_header(bytes)?;
     if header.vertex_stride != size_of::<Vertex>() as u32
         || header.index_width != size_of::<u32>() as u32
     {
@@ -286,6 +312,8 @@ pub fn load_mesh_from_bytes(bytes: &[u8]) -> Result<Mesh> {
     let submeshes: &[Submesh] =
         bytemuck::cast_slice(&bytes[header.submeshes_offset as usize..submeshes_end as usize]);
 
+    load_mesh_hierarchy_from_bytes(bytes)?;
+
     Ok(Mesh {
         vertices: vertices.to_vec(),
         indices: indices.to_vec(),
@@ -298,7 +326,7 @@ pub fn load_mesh_from_bytes(bytes: &[u8]) -> Result<Mesh> {
 /// Returns an empty stream (not an error) when `MESH_FLAG_SKIN` is clear; a set flag with
 /// a truncated skin section is an [`Error::Truncated`].
 pub fn load_mesh_skin_from_bytes(bytes: &[u8]) -> Result<Vec<VertexSkin>> {
-    let header = read_header(bytes)?;
+    let header = read_current_header(bytes)?;
     if header.flags & MESH_FLAG_SKIN == 0 {
         return Ok(Vec::new());
     }
@@ -317,7 +345,7 @@ pub fn load_mesh_skin_from_bytes(bytes: &[u8]) -> Result<Vec<VertexSkin>> {
 /// `morph_offset` into a [`MorphData`] with **empty** target names (the caller fills
 /// names from META). A truncated section is an [`Error::Truncated`].
 pub fn load_mesh_morph_from_bytes(bytes: &[u8]) -> Result<Option<MorphData>> {
-    let header = read_header(bytes)?;
+    let header = read_current_header(bytes)?;
     if header.flags & MESH_FLAG_MORPH == 0 {
         return Ok(None);
     }
@@ -394,16 +422,63 @@ fn conditioning_offset(header: &SMeshHeader, bytes: &[u8]) -> Result<u64> {
     Ok(off)
 }
 
-/// Decodes the watertight-conditioning section of a `.smesh` v6 image ([`MeshConditioning`]).
+fn conditioning_end(header: &SMeshHeader, bytes: &[u8]) -> Result<u64> {
+    let start = conditioning_offset(header, bytes)?;
+    let start_usize = usize::try_from(start).map_err(|_| Error::BadLayout)?;
+    let section_bytes = bytes
+        .get(start_usize..start_usize + size_of::<ConditioningSectionHeader>())
+        .ok_or(Error::Truncated)?;
+    let section: ConditioningSectionHeader = bytemuck::pod_read_unaligned(section_bytes);
+    if !header.index_count.is_multiple_of(3) {
+        return Err(Error::BadLayout);
+    }
+    let end = start
+        .checked_add(size_of::<ConditioningSectionHeader>() as u64)
+        .and_then(|value| {
+            value.checked_add(u64::from(section.edge_count) * size_of::<Edge>() as u64)
+        })
+        .and_then(|value| {
+            value.checked_add(u64::from(header.index_count / 3) * size_of::<TriEdges>() as u64)
+        })
+        .and_then(|value| {
+            value.checked_add(u64::from(section.welded_count) * size_of::<WeldedVertex>() as u64)
+        })
+        .and_then(|value| {
+            value.checked_add(u64::from(header.vertex_count) * size_of::<u32>() as u64)
+        })
+        .ok_or(Error::BadLayout)?;
+    if end > bytes.len() as u64 {
+        return Err(Error::Truncated);
+    }
+    Ok(end)
+}
+
+/// Decodes the required canonical portable hierarchy from a `.smesh` image.
+pub fn load_mesh_hierarchy_from_bytes(bytes: &[u8]) -> Result<PortableVirtualHierarchy> {
+    let header = read_current_header(bytes)?;
+    let expected_offset = conditioning_end(&header, bytes)?;
+    let hierarchy_end = header
+        .hierarchy_offset
+        .checked_add(header.hierarchy_size)
+        .ok_or(Error::BadLayout)?;
+    if header.hierarchy_size == 0
+        || header.hierarchy_offset != expected_offset
+        || hierarchy_end != bytes.len() as u64
+    {
+        return Err(Error::BadLayout);
+    }
+    let start = usize::try_from(header.hierarchy_offset).map_err(|_| Error::BadLayout)?;
+    let end = usize::try_from(hierarchy_end).map_err(|_| Error::BadLayout)?;
+    decode_portable_virtual_hierarchy(bytes.get(start..end).ok_or(Error::Truncated)?)
+}
+
+/// Decodes the watertight-conditioning section of a `.smesh` image ([`MeshConditioning`]).
 ///
-/// Every v6 image carries it; a missing [`MESH_FLAG_CONDITIONING`] flag or a truncated section is an
+/// Every image carries it; a missing [`MESH_FLAG_CONDITIONING`] flag or a truncated section is an
 /// error. The `TriEdges` count is `index_count / 3` and the `weld_id` count is `vertex_count`, both
 /// read from the header; only the edge / welded counts live in the section sub-header.
 pub fn load_mesh_conditioning_from_bytes(bytes: &[u8]) -> Result<MeshConditioning> {
-    let header = read_header(bytes)?;
-    if header.version != MESH_FORMAT_VERSION {
-        return Err(Error::UnsupportedVersion(header.version));
-    }
+    let header = read_current_header(bytes)?;
     if header.flags & MESH_FLAG_CONDITIONING == 0 {
         return Err(Error::BadLayout);
     }
@@ -429,7 +504,7 @@ pub fn load_mesh_conditioning_from_bytes(bytes: &[u8]) -> Result<MeshConditionin
 
 /// Reads the vertex/index totals from a `.smesh` header without loading the data.
 pub fn mesh_counts_from_bytes(bytes: &[u8]) -> Result<MeshCounts> {
-    let header = read_header(bytes)?;
+    let header = read_current_header(bytes)?;
     Ok(MeshCounts {
         vertex_count: header.vertex_count,
         index_count: header.index_count,
@@ -660,44 +735,54 @@ mod tests {
         let mesh = sample_mesh();
         let baked = save_mesh_to_buffer(&mesh, &[], None).unwrap();
 
-        // 64-byte header + 3*48 vertices + 3*4 indices + 1*16 submesh + the conditioning section.
+        // Fixed sections are followed by conditioning and the canonical portable hierarchy.
+        let header: &SMeshHeader = bytemuck::from_bytes(&baked[..size_of::<SMeshHeader>()]);
         assert_eq!(
             baked.len(),
-            64 + 3 * 48 + 3 * 4 + 16 + cond_section_len(&baked)
+            usize::try_from(header.hierarchy_offset + header.hierarchy_size).unwrap()
         );
-
-        let header: &SMeshHeader = bytemuck::from_bytes(&baked[..64]);
         assert_eq!(&header.magic, b"SMSH");
-        assert_eq!(header.version, 6);
-        // v6 always carries conditioning; no skin/morph here.
+        assert_eq!(header.version, 7);
         assert_eq!(header.flags, MESH_FLAG_CONDITIONING);
         assert_eq!(header.vertex_stride, 48);
         assert_eq!(header.index_width, 4);
         assert_eq!(header.vertex_count, 3);
         assert_eq!(header.index_count, 3);
         assert_eq!(header.submesh_count, 1);
-        assert_eq!(header.vertices_offset, 64);
-        assert_eq!(header.indices_offset, 64 + 3 * 48);
-        assert_eq!(header.submeshes_offset, 64 + 3 * 48 + 3 * 4);
+        assert_eq!(header.vertices_offset, 80);
+        assert_eq!(header.indices_offset, 80 + 3 * 48);
+        assert_eq!(header.submeshes_offset, 80 + 3 * 48 + 3 * 4);
         assert_eq!(header.morph_offset, 0);
+        assert_eq!(
+            header.hierarchy_offset,
+            (80 + 3 * 48 + 3 * 4 + 16 + cond_section_len(&baked)) as u64
+        );
+        assert!(
+            !load_mesh_hierarchy_from_bytes(&baked)
+                .unwrap()
+                .triangle_clusters
+                .is_empty()
+        );
 
         // A skinned image adds MESH_FLAG_SKIN and one VertexSkin stride per vertex (before conditioning).
         let skin = sample_skin();
         let baked_skin = save_mesh_to_buffer(&mesh, &skin, None).unwrap();
-        let header_skin: &SMeshHeader = bytemuck::from_bytes(&baked_skin[..64]);
+        let header_skin: &SMeshHeader =
+            bytemuck::from_bytes(&baked_skin[..size_of::<SMeshHeader>()]);
         assert_eq!(header_skin.flags, MESH_FLAG_CONDITIONING | MESH_FLAG_SKIN);
         assert_eq!(header_skin.morph_offset, 0);
 
         // A skin+morph image sets all three flags and points morph_offset past the skin section.
         let morph = sample_morph();
         let baked_both = save_mesh_to_buffer(&mesh, &skin, Some(&morph)).unwrap();
-        let header_both: &SMeshHeader = bytemuck::from_bytes(&baked_both[..64]);
+        let header_both: &SMeshHeader =
+            bytemuck::from_bytes(&baked_both[..size_of::<SMeshHeader>()]);
         assert_eq!(
             header_both.flags,
             MESH_FLAG_CONDITIONING | MESH_FLAG_SKIN | MESH_FLAG_MORPH
         );
         // morph_offset sits right after the submesh + skin sections (conditioning trails morph).
-        let submeshes_end = 64 + 3 * 48 + 3 * 4 + 16;
+        let submeshes_end = size_of::<SMeshHeader>() + 3 * 48 + 3 * 4 + 16;
         assert_eq!(header_both.morph_offset, (submeshes_end + 3 * 24) as u64);
     }
 
@@ -710,20 +795,57 @@ mod tests {
     }
 
     #[test]
+    fn hierarchy_corruption_and_truncation_are_rejected_by_the_mesh_loader() {
+        let mesh = sample_mesh();
+        let baked = save_mesh_to_buffer(&mesh, &[], None).unwrap();
+
+        let mut corrupted = baked.clone();
+        *corrupted.last_mut().unwrap() ^= 0x80;
+        assert!(load_mesh_from_bytes(&corrupted).is_err());
+
+        assert!(load_mesh_from_bytes(&baked[..baked.len() - 1]).is_err());
+    }
+
+    #[test]
+    fn embedded_hierarchy_is_deterministic_and_describes_the_source_mesh() {
+        let mesh = sample_mesh();
+        let first = save_mesh_to_buffer(&mesh, &[], None).unwrap();
+        let second = save_mesh_to_buffer(&mesh, &[], None).unwrap();
+        assert_eq!(first, second);
+
+        let hierarchy = load_mesh_hierarchy_from_bytes(&first).unwrap();
+        assert_eq!(hierarchy.prototypes.len(), 1);
+        assert_eq!(
+            hierarchy.prototypes[0].vertex_count,
+            mesh.vertices.len() as u32
+        );
+        assert_eq!(
+            hierarchy.prototypes[0].submesh_count,
+            mesh.submeshes.len() as u32
+        );
+        assert!(
+            hierarchy
+                .triangle_clusters
+                .iter()
+                .all(|cluster| cluster.source_vertices.len() == cluster.vertices.len())
+        );
+    }
+
+    #[test]
     fn unknown_version_is_rejected() {
         let mesh = sample_mesh();
         let mut baked = save_mesh_to_buffer(&mesh, &[], None).unwrap();
-        // Overwrite the version field (bytes 4..8) with a non-current value — 6 is accepted.
+        // Overwrite the version field (bytes 4..8) with a non-current value.
         baked[4..8].copy_from_slice(&2u32.to_le_bytes());
         assert!(matches!(
             load_mesh_from_bytes(&baked),
             Err(Error::UnsupportedVersion(2))
         ));
-        // The previous format (5) is rejected — v6 forces a full re-import.
-        baked[4..8].copy_from_slice(&5u32.to_le_bytes());
+        // The previous format is rejected so every asset is re-imported into the single current form.
+        baked[4..8].copy_from_slice(&6u32.to_le_bytes());
         assert!(matches!(
             load_mesh_from_bytes(&baked),
-            Err(Error::UnsupportedVersion(5))
+            Err(Error::UnsupportedVersion(6))
         ));
     }
 
@@ -745,7 +867,7 @@ mod tests {
         // short. (The conditioning section now trails the required sections, so dropping trailing
         // bytes alone would leave `load_mesh_from_bytes` — which reads only the required sections —
         // succeeding; this truncation targets the required span it validates.)
-        let submeshes_end = 64 + 3 * 48 + 3 * 4 + 16;
+        let submeshes_end = size_of::<SMeshHeader>() + 3 * 48 + 3 * 4 + 16;
         let truncated = &baked[..submeshes_end - 8];
         assert!(matches!(
             load_mesh_from_bytes(truncated),
@@ -759,7 +881,7 @@ mod tests {
         let skin = sample_skin();
         let baked = save_mesh_to_buffer(&mesh, &skin, None).unwrap();
         // Cut into the skin section (the conditioning section trails it, so target the skin span).
-        let skin_end = 64 + 3 * 48 + 3 * 4 + 16 + 3 * 24;
+        let skin_end = size_of::<SMeshHeader>() + 3 * 48 + 3 * 4 + 16 + 3 * 24;
         let truncated = &baked[..skin_end - 8];
         assert!(matches!(
             load_mesh_skin_from_bytes(truncated),

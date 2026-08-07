@@ -1,12 +1,7 @@
 //! Raster image decode onto the `image` crate.
 //!
-//! The output is **always 4 channels**, tightly packed `width * height * 4`. The
-//! 8-bit path ([`decode_image`] / [`decode_image_from_memory`]) yields RGBA8; the
-//! float path ([`decode_image_hdr`] / [`decode_image_from_memory_hdr`]) yields linear
-//! RGBA f32 for `.hdr`-class sources.
-//!
-//! The return type (`DecodedImage` / `DecodedImageFloat`) is the contract; the
-//! decoder behind it is not.
+//! The output is always 4 channels, tightly packed `width * height * 4`: the 8-bit path
+//! yields RGBA8, the float path linear RGBA f32 for `.hdr`-class sources.
 
 use std::path::Path;
 
@@ -93,18 +88,15 @@ mod tests {
         let decoded = decode_image_from_memory(&bytes).expect("decode png");
         assert_eq!(decoded.width, 3);
         assert_eq!(decoded.height, 2);
-        // Always 4 channels, tightly packed.
         assert_eq!(
             decoded.rgba.len() as u32,
             decoded.width * decoded.height * 4
         );
-        // The first pixel round-trips exactly (PNG is lossless RGBA8).
         assert_eq!(&decoded.rgba[0..4], &[10, 20, 30, 255]);
     }
 
     #[test]
     fn rgb_source_is_promoted_to_four_channels() {
-        // A 3-channel JPEG-class source still decodes to RGBA, with alpha filled to 255.
         let img = image::DynamicImage::ImageRgb8(image::RgbImage::from_pixel(
             2,
             2,
@@ -134,9 +126,7 @@ mod tests {
             decoded.rgba.len() as u32,
             decoded.width * decoded.height * 4
         );
-        // The bright channel survives past 1.0 (the float path does not clamp).
         assert!(decoded.rgba[0] > 1.5, "got {}", decoded.rgba[0]);
-        // Alpha is the fourth float and always present.
         assert_eq!(decoded.rgba[3], 1.0);
     }
 

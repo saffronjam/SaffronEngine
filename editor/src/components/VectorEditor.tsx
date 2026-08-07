@@ -1,10 +1,7 @@
-/// Multi-axis vector editor over N named axes. Each axis label is a pointer-capture
-/// drag-scrub handle (clientX delta * step); each value is a `NumericInput` that
-/// swallows its own pointer so typing never starts a scrub and only commits a parsed
-/// value on blur. Used for `vec3`/`vec4` fields. Unit conversion (degrees) is handled
-/// by `fieldRenderer` before/after, so this widget stays unit-agnostic. Renders
-/// drag-local state (useScrubValue) so the readouts never wait on the wire; emits one
-/// atomic patch per edit. The panel owns coalescing and drag-gating.
+/// Multi-axis vector editor: each axis label is a pointer-capture scrub handle and each value a
+/// `NumericInput` that swallows its own pointer. Unit conversion happens in `fieldRenderer`, so this
+/// widget stays unit-agnostic. Renders drag-local state and emits one atomic patch per edit; the
+/// panel owns coalescing and drag-gating.
 import { useRef } from "react";
 import { NumericInput, formatNumber } from "./NumericInput";
 import { cn } from "@/lib/utils";

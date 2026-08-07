@@ -12,6 +12,7 @@ workspace = true
 [dependencies]
 tracing.workspace = true
 saffron-core = { path = "../core" }
+saffron-spatial = { path = "../spatial" }
 saffron-scene = { path = "../scene" }
 glam.workspace = true
 mlua.workspace = true

@@ -1,14 +1,10 @@
-//! The hierarchy and transform core: local/world matrix composition, the
-//! parent-uuid → handle cache rebuild, the per-frame world-transform write, the
-//! skinning joint palette, the sanctioned reparent, and the numerically-stable ZYX
-//! Euler extraction.
+//! The hierarchy and transform core: matrix composition, the parent-uuid → handle cache rebuild,
+//! the per-frame world-transform write, the skinning joint palette, and the reparent.
 //!
-//! This is the pure-CPU math the renderer, animation, and gizmo all sit on top of. Two
-//! pieces are hand-rolled rather than delegated to glam because glam's conventions do not
-//! match the engine's: the Euler-XYZ → quaternion composition in [`transform_matrix`] and
-//! the numerically-stable Rz·Ry·Rx extraction in [`quat_to_euler_zyx`]. Getting either
-//! wrong silently corrupts every gizmo-rotate and reparent-rebase that round-trips a
-//! quaternion through the `Transform`'s Euler, so both carry dedicated round-trip tests.
+//! [`transform_matrix`]'s Euler-XYZ → quaternion composition and [`quat_to_euler_zyx`]'s
+//! Rz·Ry·Rx extraction are hand-rolled because glam's `EulerRot` conventions do not match the
+//! engine's. Getting either wrong silently corrupts every gizmo-rotate and reparent-rebase that
+//! round-trips a quaternion through the `Transform`'s Euler.
 
 use glam::{Mat3, Mat4, Quat, Vec3};
 
@@ -41,10 +37,8 @@ pub struct CameraView {
 /// The local matrix `T · R · S` for a [`Transform`], with `R` built from the Euler-XYZ
 /// triple.
 ///
-/// The Euler → quaternion step is hand-rolled rather than delegated to glam's
-/// `Quat::from_euler`, whose `EulerRot` conventions do not match the engine's for a generic
-/// (non-axis-aligned) rotation. This is the single place the authored Euler becomes a
-/// rotation, so the convention here is load-bearing across the whole engine.
+/// The single place the authored Euler becomes a rotation, so the convention here is load-bearing
+/// across the whole engine.
 #[must_use]
 pub fn transform_matrix(transform: &Transform) -> Mat4 {
     Mat4::from_translation(transform.translation)
@@ -52,13 +46,8 @@ pub fn transform_matrix(transform: &Transform) -> Mat4 {
         * Mat4::from_scale(transform.scale)
 }
 
-/// A quaternion from an Euler-XYZ triple in the engine's GLM-compatible convention.
-///
-/// The half-angle product, which is the inverse of [`quat_to_euler_zyx`] up to the
-/// degenerate gimbal case.
-/// The scene owns this convention so consumers ([`Transform`]-reading animation rest
-/// poses) build the rest rotation identically to [`transform_matrix`] rather than
-/// re-deriving the Euler order.
+/// A quaternion from an Euler-XYZ triple in the engine's convention — the half-angle product,
+/// inverse of [`quat_to_euler_zyx`] up to the degenerate gimbal case.
 #[must_use]
 pub fn quat_from_euler_xyz(euler: Vec3) -> Quat {
     let c = Vec3::new(
@@ -80,12 +69,10 @@ pub fn quat_from_euler_xyz(euler: Vec3) -> Quat {
 
 /// A quaternion in the engine's stable Rz·Ry·Rx Euler convention (radians, XYZ order).
 ///
-/// glam's `Quat::to_euler` is unstable at yaw ±90° (its asin/atan2 split poisons
-/// pitch/roll), so this hand-rolls the `Rz·Ry·Rx` matrix extraction. The degenerate branch is implicit in the
-/// `atan2` formulation: at the gimbal pole the recovered triple differs from the input
-/// triple but reproduces the same rotation matrix, which is exactly what the
-/// reparent-rebase needs. This is the one place a quaternion becomes a [`Transform`]
-/// Euler.
+/// glam's `Quat::to_euler` is unstable at yaw ±90° (its asin/atan2 split poisons pitch/roll), so
+/// this hand-rolls the `Rz·Ry·Rx` matrix extraction. At the gimbal pole the recovered triple
+/// differs from the input triple but reproduces the same rotation matrix, which is what the
+/// reparent-rebase needs.
 #[must_use]
 pub fn quat_to_euler_zyx(q: Quat) -> Vec3 {
     let m = Mat4::from_quat(q);
@@ -115,8 +102,7 @@ impl Scene {
     /// when present (composed from its quaternion directly, no Euler round-trip), else
     /// the authored [`Transform`].
     ///
-    /// Preferring the override keeps the rest pose pristine under non-destructive Edit
-    /// preview. Returns identity when the entity carries neither.
+    /// Preferring the override keeps the rest pose pristine under non-destructive Edit preview.
     #[must_use]
     pub fn local_matrix(&self, entity: Entity) -> Mat4 {
         if let Ok(pose) = self.component::<PoseOverride>(entity) {
@@ -214,7 +200,6 @@ impl Scene {
             let _ = self.add_component(e, Relationship::default());
         }
 
-        // Clear the caches before rebuilding.
         self.for_each::<&mut Relationship, _>(|_, rel| {
             rel.parent_handle = None;
             rel.children.clear();
@@ -325,42 +310,104 @@ impl Scene {
         }
     }
 
-    /// Writes the cached [`WorldTransform`] for every transformable entity, roots-first
-    /// then down the children caches.
+    /// Publishes dirty cached [`WorldTransform`] values, roots-first through affected subtrees.
     ///
-    /// Ordering comes from the recursion, never from ECS iteration order. Full `Mat4`
-    /// composition preserves non-uniform parent scale so the downstream
+    /// Ordering comes from the recursion, never from ECS iteration order. The dirty roots
+    /// sort by (hierarchy depth, entity allocation id): depth guarantees a dirty ancestor
+    /// composes before its dirty descendants, and the allocation-id tiebreak keeps the
+    /// processing order — and with it the `WorldTransform` insertion order the ECS storage
+    /// layout inherits — a pure function of scene construction order, never of per-run
+    /// randomness (a uuid tiebreak would reorder archetype storage run to run and leak
+    /// nondeterminism into every downstream iteration, including physics body creation).
+    /// Full `Mat4` composition preserves non-uniform parent scale so the downstream
     /// `normal_matrix = transpose(inverse(mat3(world)))` stays correct. Runs once per
-    /// frame before render; relies on [`Scene::relink_hierarchy`]-fresh caches.
+    /// frame before render; a clean scene performs no entity walk. Relies on
+    /// [`Scene::relink_hierarchy`]-fresh caches.
     pub fn update_world_transforms(&mut self) {
-        let mut roots: Vec<Entity> = Vec::new();
-        self.for_each::<&Relationship, _>(|e, rel| {
-            if rel.parent_handle.is_none() {
-                roots.push(e);
+        let dirty = self.take_world_dirty_entities();
+        let mut roots = dirty.iter().copied().collect::<Vec<_>>();
+        roots.sort_by_key(|&entity| {
+            let mut depth = 0_usize;
+            let mut parent = self.parent_handle(entity);
+            while let Some(ancestor) = parent {
+                depth += 1;
+                if depth > self.len() {
+                    break;
+                }
+                parent = self.parent_handle(ancestor);
             }
+            (depth, entity.allocation_bits())
         });
+
+        let mut processed = std::collections::HashSet::new();
         for root in roots {
-            self.write_subtree(root, Mat4::IDENTITY);
+            if processed.contains(&root) || !self.valid(root) {
+                continue;
+            }
+            let parent = self.parent_handle(root);
+            let (parent_world, parent_revision) =
+                parent.map_or((Mat4::IDENTITY, crate::SceneRevision::ZERO), |parent| {
+                    (
+                        self.world_matrix(parent),
+                        self.entity_revisions(parent)
+                            .map_or(crate::SceneRevision::ZERO, |state| state.world_transform),
+                    )
+                });
+            self.write_dirty_subtree(
+                root,
+                parent_world,
+                parent_revision,
+                false,
+                &dirty,
+                &mut processed,
+            );
         }
     }
 
-    /// Recursive helper for [`Scene::update_world_transforms`]: writes `entity`'s world
-    /// matrix (when it is transformable) then descends its children.
-    fn write_subtree(&mut self, entity: Entity, parent_world: Mat4) {
+    /// Recursive helper for [`Scene::update_world_transforms`].
+    fn write_dirty_subtree(
+        &mut self,
+        entity: Entity,
+        parent_world: Mat4,
+        parent_world_revision: crate::SceneRevision,
+        parent_changed: bool,
+        dirty: &std::collections::HashSet<Entity>,
+        processed: &mut std::collections::HashSet<Entity>,
+    ) {
+        processed.insert(entity);
         let mut world = parent_world;
+        let mut world_revision = parent_world_revision;
+        let explicitly_dirty = dirty.contains(&entity);
+        let mut world_changed = false;
         if self.has_component::<Transform>(entity) {
-            world = parent_world * self.local_matrix(entity);
-            if self.has_component::<WorldTransform>(entity) {
-                let _ = self.with_component_mut::<WorldTransform, _>(entity, |w| w.matrix = world);
+            let before = self
+                .entity_revisions(entity)
+                .map_or(crate::SceneRevision::ZERO, |state| state.world_transform);
+            if parent_changed
+                || explicitly_dirty
+                || self.world_transform_needs_update(entity, parent_world_revision)
+            {
+                world = parent_world * self.local_matrix(entity);
+                world_revision = self.publish_world_transform(entity, parent_world_revision, world);
+                world_changed = world_revision != before;
             } else {
-                let _ = self.add_component(entity, WorldTransform { matrix: world });
+                let state = self
+                    .world_transform_state(entity)
+                    .expect("resolved transformable entity has cached world state");
+                world = state.current;
+                world_revision = state.current_revision;
             }
+        }
+        let descend =
+            world_changed || (explicitly_dirty && !self.has_component::<Transform>(entity));
+        if !descend {
+            return;
         }
         let children = self
             .with_component::<Relationship, _>(entity, |rel| rel.children.clone())
             .unwrap_or_default();
         for child in children {
-            self.write_subtree(child, world);
+            self.write_dirty_subtree(child, world, world_revision, true, dirty, processed);
         }
     }
 
@@ -635,10 +682,10 @@ impl Scene {
     }
 }
 
-/// An un-flipped perspective projection for the resolved camera (GL clip convention).
+/// An un-flipped perspective projection for the resolved camera with Vulkan `[0, 1]` clip depth.
 #[must_use]
 pub fn camera_projection(camera: &CameraView, aspect: f32) -> Mat4 {
-    Mat4::perspective_rh_gl(
+    Mat4::perspective_rh(
         camera.fov.to_radians(),
         aspect,
         camera.near_plane,
@@ -905,9 +952,8 @@ mod tests {
             "parented camera views from its world position"
         );
 
-        // Research gate (CPU half): joint_matrices() must produce world_bone *
-        // inverse_bind in joint order, identity at bind pose, and never compose the
-        // skinned node's own transform.
+        // `joint_matrices()` must produce world_bone * inverse_bind in joint order, identity at
+        // bind pose, and never compose the skinned node's own transform.
         let joint_root = scene.create_entity("JointRoot");
         let joint_tip = scene.create_entity("JointTip");
         set_translation(&mut scene, joint_root, Vec3::new(1.0, 0.0, 0.0));

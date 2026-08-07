@@ -1,17 +1,12 @@
-/// Field-kind dispatcher: maps a `(component, field, value)` to a typed widget.
-/// There is deliberately NO per-component switch — the panel iterates whatever
-/// `inspect` returns and this resolver picks a widget by (1) the explicit
-/// `FIELD_HINTS` parity table for the known components, else (2) the value's shape
-/// ({x,y,z}->vec3, {x,y,z,w}->vec4, number/boolean/string), else (3) a read-only
-/// text fallback so an unmapped field is still visible. So a future engine-side
-/// `registerComponent` surfaces with no edit here beyond an optional hint.
+/// Field-kind dispatcher: maps a `(component, field, value)` to a typed widget. There is
+/// deliberately no per-component switch — a widget is picked from the explicit `FIELD_HINTS` parity
+/// table, else the value's shape, else a read-only text fallback, so a new engine-side component
+/// surfaces with at most an optional hint added here.
 ///
-/// Units (the 57x bug guard): ONLY `Transform.rotation` converts — UI shows degrees,
-/// the wire carries radians — driven by the `convertRadians` hint. SpotLight
-/// innerAngle/outerAngle are degrees on BOTH sides (no conversion); their `unit:"deg"`
-/// is just a label/clamp. The widget value passed in/out of `renderField` is always
-/// already in the WIRE unit (radians for rotation); conversion happens at the widget
-/// boundary inside this file.
+/// Units: ONLY `Transform.rotation` converts — the UI shows degrees, the wire carries radians —
+/// driven by the `convertRadians` hint. SpotLight inner/outer angles are degrees on both sides, so
+/// their `unit:"deg"` is only a label and clamp. Values crossing `renderField` are always already in
+/// the WIRE unit; conversion happens at the widget boundary inside this file.
 import { NumberDrag } from "./NumberDrag";
 import { SliderField } from "./SliderField";
 import { VectorEditor } from "./VectorEditor";
@@ -76,7 +71,6 @@ export const FIELD_HINTS: Record<string, FieldHint> = {
 
   "Mesh.mesh": { kind: "uuid", asset: "mesh" },
   "VegetationField.map": { kind: "uuid", asset: "vegetation-map" },
-  "MaterialAsset.material": { kind: "uuid", asset: "material" },
 
   "Camera.fov": { kind: "number", min: 1, max: 179, step: 0.5 },
   "Camera.near": { kind: "number", min: 0.001, step: 0.01 },
@@ -186,6 +180,8 @@ export const FIELD_HINTS: Record<string, FieldHint> = {
   "Rigidbody.linearDamping": { kind: "slider", min: 0, max: 1, step: 0.01 },
   "Rigidbody.angularDamping": { kind: "slider", min: 0, max: 1, step: 0.01 },
   "Rigidbody.gravityFactor": { kind: "number", min: 0, max: 2, step: 0.05 },
+  // Scales the collider's cross-section into the wind drag; 0 leaves the body inert to wind.
+  "Rigidbody.windFactor": { kind: "number", min: 0, max: 8, step: 0.05 },
   "Rigidbody.lockPosition": { kind: "lockAxes" },
   "Rigidbody.lockRotation": { kind: "lockAxes" },
   // The moving-slot the body lives in (resolveObjectLayer: 0=Moving, 1=Character, 2=Debris).

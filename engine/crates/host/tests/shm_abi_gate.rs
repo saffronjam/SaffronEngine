@@ -1,33 +1,19 @@
 //! The shm-ABI go/no-go gate.
 //!
-//! Proves the frozen frame transport: the producer publishes BGRA8 frames that the editor
-//! reader `editor/shell/src/presenter.rs` accepts byte-for-byte. The acceptance is
-//! byte-level agreement with the *actual* reader's read / accept / reject rules, so this test
-//! embeds an oracle reader ([`OracleReader`]) that replicates `step_view` / `open_shm` /
-//! `stat_shm` field-for-field (the same header words, the same magic + capacity + ring-fits
-//! checks, the same `seq % slots` slot index, the same `buffer_dims` rebuild trigger) and
-//! consumes the producer's segment exactly as the editor would.
+//! Acceptance is byte-level agreement with the editor reader in
+//! `editor/shell/src/presenter.rs`, so this test embeds an [`OracleReader`] replicating
+//! `step_view` / `open_shm` / `stat_shm` field for field: the same header words, the same magic,
+//! capacity, and ring-fits checks, the same `seq % slots` slot index, and the same `buffer_dims`
+//! rebuild trigger. It then drives the host's real [`ViewportShmPublisher`] and asserts the oracle
+//! accepts every frame, reads untorn pixels after each `seq` advance, sees `seq` monotonic with the
+//! first frame in slot 1 (the `next = seq + 1` offset the reader mirrors), and tracks the rendered
+//! size.
 //!
-//! The gate runs the host's [`ViewportShmPublisher`] (the same wiring the run loop drives),
-//! publishes N frames sized by `set-viewport-size`, and asserts the oracle:
-//!   * accepts every published frame (magic matches, `pixel_bytes <= capacity`, the ring
-//!     fits `total`),
-//!   * reads consistent width/height + pixels after the `seq` advances (no torn frame),
-//!   * sees `seq` monotonic over N frames with slot = `seq % 4`, and the first frame in
-//!     slot 1 (the `next = seq + 1` off-by-one the reader mirrors),
-//!   * tracks the displayed dimensions to the rendered size.
+//! Both view segments must exist from startup or the presenter's blocking open stalls, so the
+//! asset-preview segment is probed for `seq 0` even when only the scene view renders.
 //!
-//! Both view segments exist from startup (the presenter's blocking open would otherwise
-//! stall): the asset-preview segment is present with `seq 0` even when only the scene view
-//! renders, found by the same read-only `shm_open` probe `stat_shm` uses.
-//!
-//! This gate covers the byte-exact ABI match against the reader oracle. The full live present
-//! (the editor displaying the frame on a Wayland subsurface) needs the GTK/WebKit/Wayland
-//! editor stack, which does not run headless in the toolbox, so it is not covered here.
-//!
-//! `#![allow(unsafe_code)]` covers the `unsafe { set_var }` the env-contract sub-test needs to
-//! reproduce the editor's `SAFFRON_VIEWPORT_SHM_*` startup contract; the mutation is serialized
-//! by `ENV_LOCK` so no other thread reads the vars concurrently.
+//! `#![allow(unsafe_code)]` covers the `unsafe { set_var }` reproducing the editor's
+//! `SAFFRON_VIEWPORT_SHM_*` startup contract, serialized by `ENV_LOCK`.
 #![allow(unsafe_code)]
 
 use std::ffi::CString;

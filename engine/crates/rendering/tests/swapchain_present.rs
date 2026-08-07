@@ -3,19 +3,22 @@
 //!
 //! Lavapipe's `VK_EXT_headless_surface` swapchain WSI is unimplemented (it crashes
 //! creating native swapchain image memory), so the present-engine path is exercised
-//! against a real Wayland surface — under a headless `weston` in the toolbox per
-//! AGENTS.md. This test creates a winit window, brings up the [`Renderer`] from its
-//! surface handle, runs several `render_frame`s, and asserts the run is
-//! validation-clean. It **skips cleanly** when no Wayland/X11 display is available
-//! (no `WAYLAND_DISPLAY` / `DISPLAY`), so the gate stays green off a display while
-//! the self-contained offscreen smoke in the crate's unit tests always runs.
+//! against a real Wayland surface. Each test spawns its **own headless `weston`**
+//! on a private socket and points winit at it, so the run never touches the session
+//! compositor and nothing ever appears on screen. It **skips cleanly** when weston
+//! (or `XDG_RUNTIME_DIR`) is unavailable, so the gate stays green off the toolbox
+//! while the self-contained offscreen smoke in the crate's unit tests always runs.
 //!
-//! Windowed present is exercised only on Linux: the test drives an off-main-thread Wayland/X11
-//! event loop (`winit::platform::{wayland,x11}` + `with_any_thread`), APIs that exist only there.
+//! Windowed present is exercised only on Linux: the test drives an off-main-thread Wayland
+//! event loop (`winit::platform::wayland` + `with_any_thread`), APIs that exist only there.
 //! The offscreen render-and-read-back path — which is what every other platform uses — is covered
 //! by the always-on unit tests, so gating this one to Linux loses no coverage elsewhere.
 #![cfg(target_os = "linux")]
+// The one `unsafe` is `env::set_var` (unsafe in edition 2024): pointing winit at the
+// private compositor's socket, serialized by `PRESENT_DISPLAY`.
+#![allow(unsafe_code)]
 
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use saffron_geometry::glam::{Mat4, Vec3};
@@ -29,19 +32,79 @@ use winit::window::{Window, WindowId};
 /// How many frames the present smoke records before exiting.
 const FRAMES: u32 = 8;
 
-/// Builds an event loop that may run off the main thread (the test harness spawns
-/// the test). Prefers the Wayland any-thread builder, falling back to X11.
+/// The two windowed tests share the process environment (`WAYLAND_DISPLAY`), so they run
+/// one at a time; the lock also keeps at most one compositor alive.
+static PRESENT_DISPLAY: Mutex<()> = Mutex::new(());
+
+/// A private headless weston compositor owned by one test. The present surface comes from
+/// it, never from the session compositor. Dropping kills it.
+struct HeadlessWeston {
+    child: std::process::Child,
+    socket: String,
+}
+
+impl HeadlessWeston {
+    /// Spawns weston's headless backend on a unique socket and waits until it listens.
+    /// `None` when weston or the runtime dir is unavailable (or it dies on startup).
+    fn spawn() -> Option<Self> {
+        let runtime_dir = std::env::var_os("XDG_RUNTIME_DIR")?;
+        let socket = format!("saffron-present-smoke-{}", std::process::id());
+        let child = std::process::Command::new("weston")
+            .args([
+                "--backend=headless",
+                "--width=1280",
+                "--height=720",
+                "--idle-time=0",
+                &format!("--socket={socket}"),
+            ])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .ok()?;
+        let mut compositor = Self { child, socket };
+        let path = std::path::Path::new(&runtime_dir).join(&compositor.socket);
+        for _ in 0..250 {
+            if path.exists() {
+                return Some(compositor);
+            }
+            if compositor.child.try_wait().ok().flatten().is_some() {
+                return None;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        None
+    }
+}
+
+impl Drop for HeadlessWeston {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+/// Locks out the sibling test, brings up a private compositor, and points winit at it.
+/// `None` means skip: without weston there is no display this test is willing to use.
+fn acquire_headless_display() -> Option<(std::sync::MutexGuard<'static, ()>, HeadlessWeston)> {
+    let guard = PRESENT_DISPLAY
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let compositor = HeadlessWeston::spawn()?;
+    // SAFETY: the guard serializes the only two threads that write this variable, and the
+    // winit build below reads it on this same thread; nothing else in this test binary
+    // touches the environment.
+    unsafe { std::env::set_var("WAYLAND_DISPLAY", &compositor.socket) };
+    Some((guard, compositor))
+}
+
+/// Builds a Wayland event loop that may run off the main thread (the test harness spawns
+/// the test) against the private compositor `acquire_headless_display` armed.
 fn build_any_thread_event_loop() -> Result<EventLoop<()>, winit::error::EventLoopError> {
     use winit::event_loop::EventLoopBuilder;
+    use winit::platform::wayland::EventLoopBuilderExtWayland;
 
     let mut builder = EventLoopBuilder::default();
-    if std::env::var_os("WAYLAND_DISPLAY").is_some() {
-        use winit::platform::wayland::EventLoopBuilderExtWayland;
-        builder.with_any_thread(true);
-    } else {
-        use winit::platform::x11::EventLoopBuilderExtX11;
-        builder.with_any_thread(true);
-    }
+    builder.with_any_thread(true);
     builder.build()
 }
 
@@ -174,10 +237,10 @@ impl PresentSmoke {
 /// Brings up a windowed renderer and runs a validation-clean clear+present.
 #[test]
 fn windowed_clear_present_is_validation_clean() {
-    if std::env::var_os("WAYLAND_DISPLAY").is_none() && std::env::var_os("DISPLAY").is_none() {
-        eprintln!("skipping: no Wayland/X11 display (set up a headless weston per AGENTS.md)");
+    let Some((_guard, _compositor)) = acquire_headless_display() else {
+        eprintln!("skipping: headless weston unavailable (weston + XDG_RUNTIME_DIR required)");
         return;
-    }
+    };
 
     // `cargo test` runs each test on a spawned thread; winit blocks an event loop
     // off the main thread on Linux unless the platform `any_thread` builder is used.
@@ -214,14 +277,14 @@ fn windowed_clear_present_is_validation_clean() {
 /// Arms `request_window_capture` mid-run on a windowed renderer; the next present copies
 /// the composited swapchain image to a PNG. Asserts the file is a valid PNG of the
 /// swapchain extent and the run stays validation-clean. The window/composited-capture
-/// feature's functional validation — it needs a real present surface, so it skips off a
-/// display (DEFERRED-NEEDS-DISPLAY off a display; live under the toolbox weston).
+/// feature's functional validation — it needs a real present surface, so it skips when
+/// its private headless compositor cannot come up.
 #[test]
 fn window_capture_writes_a_png_of_the_composited_output() {
-    if std::env::var_os("WAYLAND_DISPLAY").is_none() && std::env::var_os("DISPLAY").is_none() {
-        eprintln!("skipping: no Wayland/X11 display (DEFERRED-NEEDS-DISPLAY off a display)");
+    let Some((_guard, _compositor)) = acquire_headless_display() else {
+        eprintln!("skipping: headless weston unavailable (weston + XDG_RUNTIME_DIR required)");
         return;
-    }
+    };
     let event_loop = match build_any_thread_event_loop() {
         Ok(event_loop) => event_loop,
         Err(err) => {
@@ -394,8 +457,11 @@ impl BlitSmoke {
         }
         let proj = Mat4::perspective_rh(60.0_f32.to_radians(), 320.0 / 240.0, 0.1, 100.0);
         let view = Mat4::look_at_rh(Vec3::new(0.0, 1.0, 4.0), Vec3::ZERO, Vec3::Y);
-        if let Err(err) = renderer.submit_draw_list(proj * view, &[]) {
-            self.failure = Some(format!("submit_draw_list {}: {err}", self.frames_done));
+        if let Err(err) = renderer.submit_gpu_scene_deformations(proj * view, &[], &[]) {
+            self.failure = Some(format!(
+                "submit_gpu_scene_deformations {}: {err}",
+                self.frames_done
+            ));
             event_loop.exit();
             return;
         }
@@ -424,14 +490,13 @@ impl BlitSmoke {
 /// runs the host's acquire → offscreen-render → blit → present path for several frames,
 /// captures the presented swapchain image, and asserts it is NON-BLANK (the procedural sky's
 /// gradient gives many distinct colors — a bare clear would be one). Also asserts the run is
-/// validation-clean. Skips off a display (DEFERRED-NEEDS-DISPLAY; live under the toolbox
-/// weston or a real Wayland session).
+/// validation-clean. Skips when its private headless compositor cannot come up.
 #[test]
 fn present_only_blit_shows_a_non_blank_scene() {
-    if std::env::var_os("WAYLAND_DISPLAY").is_none() && std::env::var_os("DISPLAY").is_none() {
-        eprintln!("skipping: no Wayland/X11 display (DEFERRED-NEEDS-DISPLAY off a display)");
+    let Some((_guard, _compositor)) = acquire_headless_display() else {
+        eprintln!("skipping: headless weston unavailable (weston + XDG_RUNTIME_DIR required)");
         return;
-    }
+    };
     let event_loop = match build_any_thread_event_loop() {
         Ok(event_loop) => event_loop,
         Err(err) => {

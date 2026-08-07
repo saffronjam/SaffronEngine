@@ -1,0 +1,6 @@
+{
+  "name": "@saffron/tools",
+  "private": true,
+  "type": "module",
+  "description": "Repo tooling run straight from source with bun: the control-schema contract test and the foliage performance budgets."
+}

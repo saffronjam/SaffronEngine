@@ -1,23 +1,6 @@
-//! The shared `wire-type -> Luau` mapper + the `sa.*` API and component-snapshot `.luau` emitters.
-//!
-//! This is the single-source Luau type surface: the same single-source discipline as
-//! `@saffron/protocol`, applied to the Lua-facing types. It emits one plain `.luau` defs file;
-//! there is no `library/sa.lua` hand-written overlay and no `check-script-defs` drift tripwire —
-//! the regen-freshness diff is the drift guard.
-//!
-//! Three pieces, one [`map_type`] mapper:
-//!
-//! - [`emit_api_defs`] walks the [`saffron_script::BINDINGS`] descriptor table — the single
-//!   binding source the runtime VM registers from — to emit the `sa.Vec3` value class
-//!   (fields + `---@operator` overloads + methods), the synthetic `sa.RayHit`/`sa.RagdollState`/
-//!   `sa.ScriptSelf` classes, the `sa.Entity` method set, the `sa.*` free-function/global table,
-//!   and the `sa.ComponentName` alias (the registered-name union from [`REGISTERED`]).
-//! - [`emit_component_defs`] emits the typed `:get_component(name)` snapshots — the
-//!   `---@class sa.<Component>` blocks + the `---@overload` lines — from the same component
-//!   wire-shape catalog the registry knows.
-//! - [`emit_defs`] concatenates the two into the single `.luau` defs file.
-//!
-//! Component wire shapes and registered names come from `saffron-protocol`.
+//! The `wire-type -> Luau` mapper and the `.luau` defs emitters: [`emit_api_defs`] over the
+//! [`saffron_script::BINDINGS`] table, [`emit_component_defs`] over the component wire shapes,
+//! and [`emit_defs`] joining the two.
 
 use std::collections::BTreeSet;
 use std::collections::HashMap;
@@ -40,16 +23,8 @@ pub struct Field {
     pub optional: bool,
 }
 
-/// Map a wire-type token to its Luau type annotation — the one helper both the component-snapshot
-/// emitter and the `sa.*` API emitter call.
-///
-/// - `number` / `boolean` / `string` pass through.
-/// - `WireUuid` -> `string` (ids cross as decimal strings).
-/// - `Vec3` -> `{ x: number, y: number, z: number }`, `Vec4` adds `w`.
-/// - `Record<string, unknown>` -> `table<string, any>`.
-/// - `T[]` -> `<mapped T>[]` (nested, so `T[][]` works).
-/// - a `"a" | "b"` string-literal union -> the union with whitespace stripped.
-/// - any other token is a nested interface -> `sa.<Name>`.
+/// Maps a wire-type token to its Luau annotation. Ids cross as decimal strings, so `WireUuid`
+/// becomes `string`; an unrecognized token is a nested interface, `sa.<Name>`.
 #[must_use]
 pub fn map_type(ty: &str) -> String {
     match ty {
@@ -70,10 +45,8 @@ pub fn map_type(ty: &str) -> String {
     }
 }
 
-/// The interface a field type references (the node the reachability walk follows), or `None` for
-/// primitives, vectors, arrays-of-primitive, unions, and generics — so the emitted `---@class`
-/// set grows transitively from the registered roots: nested DTOs are emitted, unrelated ones are
-/// not.
+/// The interface a field type references, or `None` for primitives, vectors, unions, and
+/// generics. The `---@class` set is the transitive closure of this over the registered roots.
 fn referenced(ty: &str) -> Option<&str> {
     let base = ty.trim_end_matches("[]");
     match base {
@@ -135,9 +108,8 @@ fn canonical_type(ty: &str, aliases: &HashMap<String, String>) -> String {
     }
 }
 
-/// The transitive set of interface names reachable from [`REGISTERED`] via field references — the
-/// `---@class` set. Nested DTOs (`BVec3`, `PhysicsMaterial`, `FootChainDto`, …) are pulled in;
-/// unrelated interfaces are not.
+/// The interface names reachable from [`REGISTERED`] through field references: the `---@class`
+/// set.
 fn reachable(interfaces: &HashMap<String, Vec<Field>>) -> BTreeSet<String> {
     let mut reach = BTreeSet::new();
     let mut queue: Vec<String> = REGISTERED.iter().map(|s| (*s).to_owned()).collect();
@@ -150,20 +122,20 @@ fn reachable(interfaces: &HashMap<String, Vec<Field>>) -> BTreeSet<String> {
         };
         reach.insert(name);
         for field in fields {
-            if let Some(reference) = referenced(&field.ty) {
-                if interfaces.contains_key(reference) && !reach.contains(reference) {
-                    queue.push(reference.to_owned());
-                }
+            if let Some(reference) = referenced(&field.ty)
+                && interfaces.contains_key(reference)
+                && !reach.contains(reference)
+            {
+                queue.push(reference.to_owned());
             }
         }
     }
     reach
 }
 
-/// Emit the component-snapshot `.luau` defs: the `---@class sa.<Component>` blocks (sorted by
-/// name) for every interface reachable from the registered set, plus the `---@overload` lines for
-/// the registered components and the `Entity:get_component` stub. Byte-stable across re-runs (the
-/// freshness gate).
+/// Emits the component-snapshot defs: a name-sorted `---@class sa.<Component>` block per
+/// reachable interface, the registered components' `---@overload` lines, and the
+/// `Entity:get_component` stub. Byte-stable across re-runs.
 #[must_use]
 pub fn emit_component_defs() -> String {
     let interfaces = interfaces();
@@ -209,17 +181,9 @@ pub fn emit_component_defs() -> String {
     )
 }
 
-/// Map an `sa.*` binding-table type token to its Luau type annotation — the API half of the
-/// shared mapper. Unlike [`map_type`] (which expands `Vec3` to the inline `{x,y,z}` snapshot shape
-/// for `:get_component`), the API surface references the value/handle classes by name: `sa.vec3`
-/// returns the `sa.Vec3` userdata, `sa.spawn` an `sa.Entity`. The primitives still go through
-/// [`map_type`], so the mapping has one owner.
-///
-/// - `number`/`boolean`/`string` pass through (via [`map_type`]).
-/// - `Vec3`/`Entity`/`RayHit`/`RagdollState`/`ScriptSelf` -> `sa.<Name>` (the API classes).
-/// - `ComponentName` -> `sa.ComponentName` (the registered-name alias).
-/// - `table`/`any` pass through (an opaque wire snapshot / payload).
-/// - `T[]` -> `<mapped T>[]` (nested).
+/// Maps a binding-table type token to its Luau annotation. The API surface references the
+/// value/handle classes by name (`sa.Vec3`, `sa.Entity`), where [`map_type`] expands `Vec3` to the
+/// inline snapshot shape; primitives defer to [`map_type`] so the mapping has one owner.
 fn map_api_type(ty: &str) -> String {
     match ty {
         "number" | "boolean" | "string" => map_type(ty),
@@ -233,9 +197,8 @@ fn map_api_type(ty: &str) -> String {
     }
 }
 
-/// The `---@param`/`@return` tail for one binding's stub: each argument's `@param name type`
-/// then the `@return type` when the binding returns a value. Empty for a no-arg, no-return
-/// binding (a bare `end`).
+/// The `---@param`/`@return` tail for one binding's stub, empty when it takes and returns
+/// nothing.
 fn doc_tail(binding: &Binding) -> String {
     let mut parts = Vec::new();
     for arg in binding.args {
@@ -251,9 +214,7 @@ fn doc_tail(binding: &Binding) -> String {
     }
 }
 
-/// One method/function stub: `function <owner><sep><name>(<args>) end<doc tail>`. `owner`/`sep`
-/// are `"Entity:"` for a method or `"sa."` for a free function; the parameter list is the bound
-/// argument names.
+/// One stub, `function <owner><sep><name>(<args>) end` plus its doc tail.
 fn stub(owner: &str, sep: &str, binding: &Binding) -> String {
     let params = binding
         .args
@@ -268,12 +229,9 @@ fn stub(owner: &str, sep: &str, binding: &Binding) -> String {
     )
 }
 
-/// The `sa.Vec3` value-class block: the `---@field`s (from the `Field` bindings), the
-/// `---@operator` overloads (from the arithmetic `Meta` bindings), and the method stubs (the
-/// `Method` bindings). The `Static` constructor (`sa.Vec3.new`) and the comparison/string
-/// metamethods (`__eq`/`__tostring`, which are not LuaLS `---@operator`s) are not annotated —
-/// scripts construct via `sa.vec3(...)` and `==`/`tostring` need no type hint. Generated from
-/// [`BINDINGS`].
+/// The `sa.Vec3` value-class block: `---@field`s, the arithmetic `---@operator` overloads, and
+/// the method stubs. `__eq`/`__tostring` are not LuaLS operators, so they carry no annotation, and
+/// scripts construct through `sa.vec3(...)` rather than the static `new`.
 fn emit_vec3_class() -> String {
     let vec3 = |kind: BindingKind| {
         BINDINGS
@@ -290,8 +248,6 @@ fn emit_vec3_class() -> String {
         ));
     }
     for meta in vec3(BindingKind::Meta) {
-        // `__add`/`__sub`/`__mul`/`__unm` are LuaLS arithmetic operators; `__eq`/`__tostring`
-        // are not annotated as `---@operator`.
         let op = match meta.name {
             "__add" => "add",
             "__sub" => "sub",
@@ -314,9 +270,8 @@ fn emit_vec3_class() -> String {
     lines.join("\n")
 }
 
-/// The `sa.Entity` handle block: `---@class sa.Entity`, `local Entity = {}`, and a stub per
-/// `Method` binding owned by `Entity` — minus `get_component`, which the component-snapshot tail
-/// declares with its per-component typed overloads. Generated from [`BINDINGS`].
+/// The `sa.Entity` handle block: one stub per `Entity` method binding, minus `get_component`,
+/// which the component-snapshot tail declares with its typed per-component overloads.
 fn emit_entity_class() -> String {
     let mut lines = vec![
         "---@class sa.Entity".to_owned(),
@@ -332,9 +287,7 @@ fn emit_entity_class() -> String {
     lines.join("\n")
 }
 
-/// The `sa` namespace table: `sa = {}` then a stub per `Free` binding (`sa.vec3`, `sa.log`, the
-/// input trio + mouse, the query/hierarchy helpers, `sa.raycast`/`sa.spherecast`, `sa.broadcast`,
-/// and the scheduler `wait`/`delay`/`spawn_task`). Generated from [`BINDINGS`].
+/// The `sa` namespace table: one stub per `Free` binding.
 fn emit_namespace() -> String {
     let mut lines = vec!["sa = {}".to_owned()];
     for free in BINDINGS
@@ -346,9 +299,9 @@ fn emit_namespace() -> String {
     lines.join("\n")
 }
 
-/// The `sa.ComponentName` alias: the union of every registered component name (the roots of the
-/// snapshot reachability walk, [`REGISTERED`]). `get_component`/`has_component` accept all of
-/// them; the structural ones are rejected by `set/add/remove_component` at runtime.
+/// The `sa.ComponentName` alias: the union of every [`REGISTERED`] name. `get_component` and
+/// `has_component` accept all of them; the structural ones are rejected at runtime by
+/// `set/add/remove_component`.
 fn emit_component_name_alias() -> String {
     let union = REGISTERED
         .iter()
@@ -358,17 +311,12 @@ fn emit_component_name_alias() -> String {
     format!("---@alias sa.ComponentName {union}")
 }
 
-/// Emit the `sa.*` API surface as `.luau` type defs from the [`BINDINGS`] descriptor table — the
-/// single binding source the runtime VM registers from (`saffron-script`'s `register_*` walks the
-/// same table). Covers the `sa.Vec3` value class, the synthetic `sa.RayHit`/`sa.RagdollState`/
-/// `sa.ScriptSelf` result/handler shapes, the `sa.Entity` method set, the `sa = {}` free-function
-/// table, and the `sa.ComponentName` alias. Byte-stable across re-runs (the freshness gate).
+/// Emits the `sa.*` API defs from the [`BINDINGS`] table the runtime VM registers from.
+/// Byte-stable across re-runs.
 ///
-/// The `RayHit`/`RagdollState`/`ScriptSelf` classes are synthetic: `RayHit`/`RagdollState` are the
-/// POD result tables `sa.raycast`/`Entity:ragdoll_state` shape (their fields are not in the
-/// descriptor table — only the return *token* is), and `ScriptSelf` is the handler-shape contract
-/// the runtime calls into. Their literal field/handler lists are supplied here, matching the
-/// `ScriptRayHit`/`ScriptRagdollState` POD and the lifecycle handlers.
+/// `RayHit`, `RagdollState`, and `ScriptSelf` are synthetic: only their return token appears in
+/// the binding table, so their field and handler lists are spelled out here and must match the
+/// `ScriptRayHit`/`ScriptRagdollState` PODs and the lifecycle handlers.
 #[must_use]
 pub fn emit_api_defs() -> String {
     let header = "---@meta\n-- Saffron Anima Lua API. Generated from the saffron-script binding \
@@ -378,8 +326,17 @@ pub fn emit_api_defs() -> String {
     let ray_hit = "---@class sa.RayHit\n---@field hit boolean\n---@field distance number\n---@field \
                    point sa.Vec3\n---@field normal sa.Vec3\n---@field entity sa.Entity?";
 
+    let plant_hit = "---@class sa.PlantHit\n---@field hit boolean\n---@field plant                      string\n---@field position sa.Vec3\n---@field distance number\n---@field                      lifecycle string\n---@field health number\n---@field interaction_policy                      string";
+
     let ragdoll_state = "---@class sa.RagdollState\n---@field present boolean\n---@field active \
                          boolean\n---@field body_weight number\n---@field bones integer";
+
+    let vegetation_event = "---@class sa.VegetationEvent\n---@field seq number\n---@field kind \
+                            string\n---@field plant string?\n---@field cell { x: number, y: \
+                            number, z: number, level: number }\n---@field lifecycle \
+                            string?\n---@field previous_lifecycle string?\n---@field phenotype \
+                            number?\n---@field amount number?\n---@field health number?\n---@field \
+                            moisture number?\n---@field fuel number?\n---@field categories number?";
 
     let script_self = "---@class sa.ScriptSelf\n---@field entity sa.Entity\nlocal ScriptSelf = \
                        {}\nfunction ScriptSelf:on_create() end\nfunction ScriptSelf:on_update(dt) \
@@ -387,13 +344,17 @@ pub fn emit_api_defs() -> String {
                        ScriptSelf:on_trigger_enter(other) end ---@param other sa.Entity\nfunction \
                        ScriptSelf:on_trigger_exit(other) end ---@param other sa.Entity\nfunction \
                        ScriptSelf:on_contact(other, point, normal) end ---@param other sa.Entity \
-                       @param point sa.Vec3 @param normal sa.Vec3";
+                       @param point sa.Vec3 @param normal sa.Vec3\nfunction \
+                       ScriptSelf:on_vegetation_event(event) end ---@param event \
+                       sa.VegetationEvent";
 
     [
         header.to_owned(),
         emit_vec3_class(),
         ray_hit.to_owned(),
+        plant_hit.to_owned(),
         ragdoll_state.to_owned(),
+        vegetation_event.to_owned(),
         emit_component_name_alias(),
         emit_entity_class(),
         script_self.to_owned(),
@@ -403,10 +364,8 @@ pub fn emit_api_defs() -> String {
         + "\n"
 }
 
-/// Assemble the single `.luau` defs file: the `sa.*` API surface ([`emit_api_defs`]) followed by
-/// the component snapshots ([`emit_component_defs`]), generated from one source. This is the LuaLS
-/// def file written into every project's `library/` and the committed artifact the freshness diff
-/// guards.
+/// The `.luau` defs file written into every project's `library/`: [`emit_api_defs`] followed by
+/// [`emit_component_defs`].
 #[must_use]
 pub fn emit_defs() -> String {
     format!("{}\n{}", emit_api_defs(), emit_component_defs())
@@ -493,12 +452,9 @@ mod tests {
     #[test]
     fn nested_dtos_are_pulled_in_unrelated_are_not() {
         let reach = reachable(&interfaces());
-        // Referenced nested shapes are emitted.
         for nested in ["BVec3", "PhysicsMaterial", "FootChainDto", "BonePhysicsDto"] {
             assert!(reach.contains(nested), "expected {nested} reachable");
         }
-        // `AtmosphereSettingsDto` is in the catalog but referenced by no registered component, so
-        // it is not in the `---@class` set.
         assert!(!reach.contains("AtmosphereSettingsDto"));
     }
 
@@ -532,15 +488,12 @@ mod tests {
 
     #[test]
     fn map_api_type_references_value_and_handle_classes() {
-        // The API half references the value/handle classes by name (unlike `map_type`, which
-        // expands Vec3 to the inline snapshot shape).
         assert_eq!(map_api_type("Vec3"), "sa.Vec3");
         assert_eq!(map_api_type("Entity"), "sa.Entity");
         assert_eq!(map_api_type("RayHit"), "sa.RayHit");
         assert_eq!(map_api_type("RagdollState"), "sa.RagdollState");
         assert_eq!(map_api_type("ComponentName"), "sa.ComponentName");
         assert_eq!(map_api_type("Entity[]"), "sa.Entity[]");
-        // Primitives and the opaque tokens pass through.
         assert_eq!(map_api_type("number"), "number");
         assert_eq!(map_api_type("boolean"), "boolean");
         assert_eq!(map_api_type("string"), "string");
@@ -559,7 +512,6 @@ mod tests {
         ] {
             assert!(defs.contains(field), "missing Vec3 {field}");
         }
-        // The arithmetic operators are emitted; `__eq`/`__tostring` are not `---@operator`s.
         for op in [
             "---@operator add(sa.Vec3): sa.Vec3",
             "---@operator sub(sa.Vec3): sa.Vec3",
@@ -568,7 +520,6 @@ mod tests {
         ] {
             assert!(defs.contains(op), "missing Vec3 operator {op}");
         }
-        // The value-class methods.
         for method in [
             "function Vec3:length() end ---@return number",
             "function Vec3:normalized() end ---@return sa.Vec3",
@@ -584,15 +535,12 @@ mod tests {
     fn api_defs_carry_every_entity_method_except_get_component() {
         let defs = emit_api_defs();
         assert!(defs.contains("---@class sa.Entity"));
-        // Every `Entity:` method binding has a stub.
         for binding in BINDINGS
             .iter()
             .filter(|b| b.class == Some("Entity") && b.kind == BindingKind::Method)
         {
             let head = format!("function Entity:{}(", binding.name);
             if binding.name == "get_component" {
-                // get_component is declared in the component-snapshot tail (with typed
-                // per-component overloads), never in the API surface.
                 assert!(
                     !defs.contains(&head),
                     "Entity:get_component must be declared only in the component-snapshot tail"
@@ -614,6 +562,8 @@ mod tests {
         assert!(defs.contains("---@field entity sa.Entity?"));
         assert!(defs.contains("---@class sa.RagdollState\n---@field present boolean"));
         assert!(defs.contains("---@field body_weight number"));
+        assert!(defs.contains("---@class sa.VegetationEvent\n---@field seq number"));
+        assert!(defs.contains("---@field previous_lifecycle string?"));
         assert!(defs.contains("---@class sa.ScriptSelf\n---@field entity sa.Entity"));
         for handler in [
             "function ScriptSelf:on_create() end",
@@ -623,6 +573,7 @@ mod tests {
             "function ScriptSelf:on_trigger_exit(other) end ---@param other sa.Entity",
             "function ScriptSelf:on_contact(other, point, normal) end ---@param other sa.Entity \
              @param point sa.Vec3 @param normal sa.Vec3",
+            "function ScriptSelf:on_vegetation_event(event) end ---@param event sa.VegetationEvent",
         ] {
             assert!(
                 defs.contains(handler),
@@ -653,7 +604,6 @@ mod tests {
                 "sa.ComponentName alias missing {name}"
             );
         }
-        // The alias is one line listing the registered union.
         let alias_line = defs
             .lines()
             .find(|line| line.starts_with("---@alias sa.ComponentName "))
@@ -668,7 +618,6 @@ mod tests {
 
     #[test]
     fn api_defs_open_with_the_meta_header() {
-        // LuaLS treats a `---@meta` file as type-only (never executed).
         assert!(emit_api_defs().starts_with("---@meta\n"));
     }
 
@@ -680,7 +629,6 @@ mod tests {
     #[test]
     fn combined_defs_are_api_then_components_and_byte_stable() {
         let defs = emit_defs();
-        // The API surface comes first, the snapshots second.
         let api_at = defs.find("---@class sa.Vec3").expect("the Vec3 class");
         let snapshot_at = defs
             .find("-- Typed component snapshots.")
@@ -689,20 +637,16 @@ mod tests {
             api_at < snapshot_at,
             "the API surface must precede the snapshots"
         );
-        // get_component is declared exactly once, in the snapshot tail.
         assert_eq!(
             defs.matches("function Entity:get_component(").count(),
             1,
             "Entity:get_component must be declared exactly once (the snapshot tail)"
         );
-        // The freshness gate: byte-stable across re-runs.
         assert_eq!(emit_defs(), emit_defs());
     }
 
     #[test]
     fn combined_defs_match_committed_artifact() {
-        // The committed `schemas/control/sa.generated.luau` (embedded by the host's
-        // `sa_lua_defs`) must equal the live emit — the regen-freshness contract.
         let committed = include_str!(concat!(
             env!("CARGO_MANIFEST_DIR"),
             "/../../schemas/control/sa.generated.luau"

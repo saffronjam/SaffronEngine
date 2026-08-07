@@ -81,10 +81,10 @@ sa set-clouds --enabled true --coverage 0.6 --layerAltitude 50 --layerHeight 400
 | Adaptive march and lighting | `engine/assets/shaders/cloud_raymarch.slang` · `cloud_lighting.slang` | `computeMain`, `cloudIncidentLighting`, `cloudMiePhase` |
 | Temporal reconstruction | `engine/assets/shaders/cloud_reconstruct.slang` | `computeMain` |
 | Bilateral full-resolution outputs | `engine/assets/shaders/cloud_upscale.slang` | `computeMain` |
-| Shared GPU state | `engine/crates/rendering/src/clouds.rs` | `Clouds`, `CloudParams`, `CloudRenderSettings` |
-| Render-graph passes | `engine/crates/rendering/src/renderer.rs` | `add_cloud_passes`, `submit_clouds` |
-| Per-view targets | `engine/crates/rendering/src/view_target.rs` | `cloud_reduced`, `cloud_reduced_depth`, `cloud_full_color`, `cloud_full_depth` |
-| Scene and wire controls | `engine/crates/scene/src/environment.rs` · `engine/crates/protocol/src/dto.rs` | `CloudSettings`, `SetCloudsParams` |
+| Shared GPU state | `engine/crates/rendering/src/clouds/` | `Clouds`, `CloudParams`, `CloudRenderSettings` |
+| Render-graph passes | `engine/crates/rendering/src/renderer/` | `add_cloud_passes`, `submit_clouds` |
+| Per-view targets | `engine/crates/rendering/src/view_target/` | `cloud_reduced`, `cloud_reduced_depth`, `cloud_full_color`, `cloud_full_depth` |
+| Scene and wire controls | `engine/crates/scene/src/environment.rs` · `engine/crates/protocol/src/dto/` | `CloudSettings`, `SetCloudsParams` |
 
 ## Related
 

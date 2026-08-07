@@ -13,8 +13,8 @@
 //! `struct ... / offset ... / hexdump:` text, and matches it byte-for-byte. Reseed
 //! with `UPDATE_GOLDEN=1` only on an intentional layout change.
 
-use saffron_geometry::glam::{Mat4, UVec4, Vec4};
-use saffron_rendering::{GpuLight, InstanceData, MaterialParamsData};
+use saffron_geometry::glam::{UVec4, Vec4};
+use saffron_rendering::{GpuLight, MaterialParamsData};
 use saffron_test_support::assert_bytes_match_golden;
 
 /// Formats raw bytes 16 per row, two-hex-digits + trailing space (a trailing space per
@@ -53,9 +53,19 @@ fn material_params_data_offset_map_matches_cpp_golden() {
         uv: Vec4::new(2.0, 2.0, 0.0, 0.0),
         tex0: UVec4::new(3, 0, 5, 0),
         tex1: UVec4::new(0, 0, 0, 7),
+        thin_reflection: Vec4::new(0.4, 0.3, 0.6, 0.001),
+        thin_absorption: Vec4::new(0.2, 0.3, 0.4, 0.9),
+        thin_transmission: Vec4::new(0.7, 0.8, 0.5, 0.0),
+        coverage: UVec4::new(11, 1, 1, 2),
+        coverage_hash: UVec4::new(13, 17, 1024, 512),
+        aggregate0: Vec4::new(0.5, 0.7, 0.002, 0.0),
+        aggregate_albedo: Vec4::new(0.2, 0.5, 0.1, 0.0),
+        aggregate_transmission: Vec4::new(0.4, 0.6, 0.3, 0.0),
+        aggregate_normal0: Vec4::new(0.5, 0.4, 0.3, 0.1),
+        aggregate_normal1: Vec4::new(0.2, 0.05, 0.0, 0.0),
     };
     let map = offset_map(
-        "struct MaterialParamsData size=96 align=16",
+        "struct MaterialParamsData size=256 align=16",
         &[
             ("baseColor", 0),
             ("pbr", 16),
@@ -63,41 +73,20 @@ fn material_params_data_offset_map_matches_cpp_golden() {
             ("uv", 48),
             ("tex0", 64),
             ("tex1", 80),
+            ("thinReflection", 96),
+            ("thinAbsorption", 112),
+            ("thinTransmission", 128),
+            ("coverage", 144),
+            ("coverageHash", 160),
+            ("aggregate0", 176),
+            ("aggregateAlbedo", 192),
+            ("aggregateTransmission", 208),
+            ("aggregateNormal0", 224),
+            ("aggregateNormal1", 240),
         ],
         bytemuck::bytes_of(&data),
     );
     assert_bytes_match_golden("material_params_data.offsets", map.as_bytes());
-}
-
-#[test]
-fn instance_data_offset_map_matches_cpp_golden() {
-    let data = InstanceData {
-        model: Mat4::from_cols_array(&[
-            1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 2.0, 3.0, 4.0, 1.0,
-        ]),
-        normal_matrix: Mat4::IDENTITY,
-        prev_model: Mat4::from_cols_array(&[
-            1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 1.0, 1.0, 1.0, 1.0,
-        ]),
-        base_color: Vec4::new(0.8, 0.4, 0.2, 1.0),
-        texture: UVec4::new(3, 7, 11, 13),
-        pbr: Vec4::new(0.25, 0.7, 0.0, 0.0),
-        emissive: Vec4::new(0.1, 0.0, 0.0, 0.0),
-    };
-    let map = offset_map(
-        "struct InstanceData size=256 align=16",
-        &[
-            ("model", 0),
-            ("normalMatrix", 64),
-            ("prevModel", 128),
-            ("baseColor", 192),
-            ("texture", 208),
-            ("pbr", 224),
-            ("emissive", 240),
-        ],
-        bytemuck::bytes_of(&data),
-    );
-    assert_bytes_match_golden("instance_data.offsets", map.as_bytes());
 }
 
 #[test]

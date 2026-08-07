@@ -1,7 +1,7 @@
 // Node-TRS animation end to end: import BoxAnimated (a >1-node forest with a translate/rotate
 // clip on a non-skin node), and prove the importer keeps a LIVE node forest — the child node's
 // transform is not baked into vertices, so playing the clip moves the entity — and that
-// `list-clip-bindings` resolves the node channel to the spawned entity. Closes Phase 1/3/6.
+// `list-clip-bindings` resolves the node channel to the spawned entity.
 
 import { afterAll, beforeAll, expect, test } from "bun:test";
 import { join } from "node:path";
@@ -20,10 +20,10 @@ async function screenshot(tag: string): Promise<Buffer> {
 
 beforeAll(async () => {
   engine = await bootEngine(cleaner, { SAFFRON_SCRATCH_PROJECT: "1" });
-  const model = await engine.call<{ id: string }>("import-model", { path: FIXTURE });
-  const inst = await engine.call<{ id: string }>("instantiate-model", { asset: model.id });
+  const model = await engine.call("import-model", { path: FIXTURE });
+  const inst = await engine.call("instantiate-model", { asset: model.id });
   rootId = inst.id;
-  const clips = await engine.call<{ clips: { id: string; name: string }[] }>("list-clips", {
+  const clips = await engine.call("list-clips", {
     asset: model.id,
   });
   clipId = clips.clips[0]?.id ?? "";
@@ -35,9 +35,7 @@ afterAll(async () => {
 });
 
 test("the import keeps a live node forest (>1 entity, AnimatedBox present)", async () => {
-  const { entities } = await engine.call<{ entities: { id: string; name: string }[] }>(
-    "list-entities",
-  );
+  const { entities } = await engine.call("list-entities");
   // The forest did not collapse to a single root: the animated child node survives as its own
   // entity with a drivable Transform.
   const box = entities.find((e) => e.name === "AnimatedBox");
@@ -45,9 +43,7 @@ test("the import keeps a live node forest (>1 entity, AnimatedBox present)", asy
 });
 
 test("list-clip-bindings resolves the node channel against the live forest", async () => {
-  const res = await engine.call<{
-    channels: { kind: string; label: string; targetName: string }[];
-  }>("list-clip-bindings", { entity: rootId, clip: clipId });
+  const res = await engine.call("list-clip-bindings", { entity: rootId, clip: clipId });
   // Two node-TRS channels (translation + rotation) on the AnimatedBox node; both resolve to a
   // node-* kind (not "bone") and a non-empty label.
   expect(res.channels.length).toBeGreaterThanOrEqual(2);

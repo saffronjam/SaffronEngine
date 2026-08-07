@@ -1,12 +1,7 @@
-/// The TimelinePanel's lane/ruler/playhead renderer — a 2D canvas driven imperatively,
-/// never through React state. Like `FrameTimeGraph`, the instance is created once and fed a
-/// model + playhead via `setModel`/`setPlayhead`; it redraws on a coalesced
-/// requestAnimationFrame tick. The webview composites over the live engine viewport, so a
-/// per-tick React re-render of the panel would fight the render-frequency work — the playhead
-/// advancing every poll must touch only this canvas, not the component tree.
-///
-/// The lane renderer draws clip bars. Area-virtualized: only ticks and bars overlapping the
-/// visible width draw.
+/// The timeline's lane/ruler/playhead renderer: a 2D canvas driven imperatively, created once and
+/// fed a model and playhead, redrawing on a coalesced rAF tick. The webview composites over the live
+/// engine viewport, so the playhead advancing every poll must touch only this canvas, never the
+/// component tree. Area-virtualized: only ticks and bars overlapping the visible width draw.
 
 /// Fixed dark-theme palette (the app is dark-only) — the 2D canvas cannot reliably read the
 /// oklch theme tokens, mirroring `GRAPH_COLORS` in `perfThresholds.ts`.

@@ -1,7 +1,8 @@
 import { existsSync, readFileSync, rmSync } from "node:fs";
 import { Engine } from "./harness.ts";
 
-type Cleanup = () => void | Promise<void>;
+// A cleanup's own return value is discarded, so any expression body registers as-is.
+type Cleanup = () => unknown;
 
 /** Runs registered cleanup functions once, in reverse registration order. */
 export class Cleaner {
@@ -11,7 +12,7 @@ export class Cleaner {
     this.cleanups.push(cleanup);
   }
 
-  track<T>(value: T, cleanup: (value: T) => void | Promise<void>): T {
+  track<T>(value: T, cleanup: (value: T) => unknown): T {
     this.defer(() => cleanup(value));
     return value;
   }
@@ -79,7 +80,7 @@ export function trackEntity<T extends string | { id: string }>(
   entity: T,
 ): T {
   const id = typeof entity === "string" ? entity : entity.id;
-  cleaner.defer(() => engine.call("destroy-entity", { entity: id }).then(() => undefined));
+  cleaner.defer(() => engine.call("destroy-entity", { entity: id }));
   return entity;
 }
 
@@ -97,6 +98,37 @@ export async function captureViewport(
   await waitForFile(engine, path, tag, Date.now() + 10_000);
   await engine.settle(settleMs);
   return readFileSync(path);
+}
+
+/**
+ * Captures the scene viewport once the frame has stopped changing.
+ *
+ * A frame is a fixed point of the renderer's temporal state, not of wall-clock time: probe
+ * round-robins and paged shadow residency reach it in steps, so the image can hold still for a
+ * beat and then move again. Any comparison that treats two captures as the same scene has to
+ * wait for that fixed point, and a sleep cannot state when it arrived. This captures until
+ * `stable` consecutive captures are byte-identical, and throws rather than returning an
+ * unsettled frame.
+ */
+export async function captureSettledViewport(
+  engine: Engine,
+  cleaner: Cleaner,
+  tag: string,
+  { stable = 5, intervalMs = 250, timeoutMs = 60_000 } = {},
+): Promise<Buffer> {
+  const deadline = Date.now() + timeoutMs;
+  let previous = await captureViewport(engine, cleaner, tag, 0);
+  let repeats = 1;
+  while (repeats < stable) {
+    if (Date.now() > deadline) {
+      throw new Error(`viewport ${tag} never settled within ${timeoutMs}ms`);
+    }
+    await engine.settle(intervalMs);
+    const next = await captureViewport(engine, cleaner, tag, 0);
+    repeats = next.equals(previous) ? repeats + 1 : 1;
+    previous = next;
+  }
+  return previous;
 }
 
 async function waitForFile(

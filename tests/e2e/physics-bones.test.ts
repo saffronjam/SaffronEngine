@@ -1,4 +1,4 @@
-// Phase 5 of the physics plan: the Kinematic motion type + per-bone kinematic bodies that follow the
+// The Kinematic motion type + per-bone kinematic bodies that follow the
 // animated pose (binding mode b, animation -> physics). A Kinematic body is not pushed by the
 // simulation (it ignores gravity); a rig that opts in via KinematicBonesComponent gets one kinematic
 // body per joint, driven each step by MoveKinematic so a moving character shoves the world.
@@ -13,23 +13,11 @@ const caseCleaner = new Cleaner();
 const suiteCleaner = new Cleaner();
 const LEG = join(REPO, "tests", "e2e", "fixtures", "leg.gltf");
 
-interface PhysicsState {
-  active: boolean;
-  bodyCount: number;
-  dynamicCount: number;
-}
-interface KinematicBonesResult {
-  entity: string;
-  enabled: boolean;
-  boneCount: number;
-}
-
 const worldY = async (entity: string): Promise<number> =>
-  (await engine.call<{ translation: { y: number } }>("get-world-transform", { entity })).translation
-    .y;
+  (await engine.call("get-world-transform", { entity })).translation.y;
 
 async function spawn(name: string): Promise<string> {
-  const id = (await engine.call<{ id: string }>("create-entity", { name })).id;
+  const id = (await engine.call("create-entity", { name })).id;
   return trackEntity(caseCleaner, engine, id);
 }
 
@@ -86,7 +74,7 @@ test("a rig with KinematicBones gets one kinematic body per joint", async () => 
   const rigId = await engine.rig(meshId);
   // Adding the component auto-fits a per-bone capsule (BonePhysicsComponent) and enables following.
   await engine.call("add-component", { entity: rigId, component: "KinematicBones" });
-  const toggled = await engine.call<KinematicBonesResult>("set-kinematic-bones", {
+  const toggled = await engine.call("set-kinematic-bones", {
     entity: meshId, // the model root resolves to the rig descendant server-side
     enabled: true,
   });
@@ -95,7 +83,7 @@ test("a rig with KinematicBones gets one kinematic body per joint", async () => 
 
   await engine.call("play");
   await engine.settle(400);
-  const state = await engine.call<PhysicsState>("physics-state");
+  const state = await engine.call("physics-state");
   expect(state.bodyCount).toBeGreaterThanOrEqual(3); // one kinematic body per joint
   expect(state.dynamicCount).toBe(0); // bone bodies are kinematic, not dynamic
 });

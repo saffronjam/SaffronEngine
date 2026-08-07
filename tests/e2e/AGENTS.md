@@ -7,6 +7,7 @@ control plane — the same wire the editor and `sa` CLI use. The driver is plain
 
 ```sh
 just e2e                       # from anywhere — auto-enters the toolbox
+just typecheck                 # tsc --noEmit alone, no engine needed
 cd tests/e2e && bun test       # inside the toolbox (host bun on PATH)
 ```
 
@@ -14,15 +15,16 @@ cd tests/e2e && bun test       # inside the toolbox (host bun on PATH)
 
 | File | Role |
 |---|---|
-| `harness.ts` | `Engine.boot()` starts the engine (`SAFFRON_ANIMA_BIN`, defaulting to `engine/target/debug/saffron-host`) on a per-run control socket, with headless Weston on Linux and the native offscreen path on macOS. It captures stdout/stderr into `.log` and exposes `call(cmd, params)` + `validationErrors()`. Always `shutdown()`. |
-| `*.test.ts` | The suite, grouped by area: control plane + rendering (`rendering`, `control`, `scene`, `camera`, `picking`, `play`, `perf`, `profiler`, `toggles`, `assets`, `hierarchy`, …), animation (`animation*`, `foot-ik`), skinning (`skinning`, `skinned-*`, `skeleton-overlay`), scripting (`script`), materials (`material*`), and pixel/golden render checks (`*_render`, `material_scene_codegen`). |
+| `harness.ts` | `Engine.boot()` starts the engine (`SAFFRON_ANIMA_BIN`, defaulting to `engine/target/debug/saffron-host`) on a per-run control socket, rendering through the native offscreen path. It captures stdout/stderr into `.log` and exposes `call(cmd, params)` + `validationErrors()`. Always `shutdown()`. |
+| `*.test.ts` | The suite, grouped by area: control plane + rendering (`rendering`, `control`, `scene`, `camera`, `picking`, `play`, `perf`, `profiler`, `toggles`, `assets`, `hierarchy`, …), animation (`animation*`, `foot-ik`), skinning (`skinning`, `skinned-*`, `skeleton-overlay`), scripting (`script`), materials (`material*`), physics (`physics-*`), vegetation (`vegetation-*`, see below), and pixel/golden render checks (`*_render`, `material_scene_codegen`). |
+| `fixtures/` | JSON scene and asset recipes the tests cook from. The `vegetation-*.json` ones are **generated** — see below. |
 
 ## Conventions
 
-- **No display setup needed.** Each `Engine` uses a unique control socket. Linux starts its own
-  headless Weston socket; macOS runs the native offscreen host through MoltenVK. Build the engine
-  first with `just engine`; Linux needs `weston`, and macOS needs Homebrew's
-  `vulkan-validationlayers`. The harness configures its manifest and dynamic-library search path.
+- **No display setup needed.** Each `Engine` uses a unique control socket and boots the host
+  offscreen, so no window and no compositor are involved on any platform. Build the engine first
+  with `just engine`; macOS needs Homebrew's `vulkan-validationlayers`, and the harness configures
+  its manifest and dynamic-library search path.
   The `just` recipes cap the suite at four concurrent engine hosts so GPU initialization and socket
   startup remain deterministic.
 - **Assert on `validationErrors()`.** The engine runs with validation layers on; a test that
@@ -32,5 +34,40 @@ cd tests/e2e && bun test       # inside the toolbox (host bun on PATH)
   Pixel tests drive the `screenshot` command (`target: "viewport"`, a path), wait for the PNG, read it
   back, and compare buffers directly (`Buffer.equals`, no image-diff dep) — see the `*_render.test.ts`
   files. Golden-image baselines are not wired up yet.
-- Type results via `@saffron/protocol` (`engine.call<RenderStats>("render-stats")`) so a schema
-  change that breaks an assertion shows up at typecheck.
+- **The suite is typechecked, and `bun test` is not the thing that does it.** `bun test` strips
+  types without checking them, so `tsc --noEmit` (`just typecheck`, gate step 9) runs over it. The
+  suite belongs to the repo-root `tsconfig.json` program together with `tools/` and `packager/`;
+  there is no tsconfig here. A type error fails the gate; keep it at zero.
+- **`call` types itself from the command name — never pass a type argument.**
+  `engine.call("render-stats")` resolves to `CommandResultMap["render-stats"]` and its params to
+  `CommandParamsMap["render-stats"]`, both generated from the `saffron-protocol` DTOs. So a renamed
+  command, a params field the command does not accept, and a result field the engine stopped sending
+  are each a typecheck failure rather than a live-host surprise. `params` takes the generated params
+  DTO or the positional `{ args: […] }` form, which is also how a test drives a payload the typed
+  DTO cannot express (an invalid enum value a negative case needs the engine to reject).
+- **Assert against the generated DTO, not a hand-written shape.** A local `as { … }` cast or an
+  inline structural result type states what the test wishes the wire were; the DTO states what it
+  is. When the two disagree the DTO is the one to fix (`engine/crates/protocol`) — an internally
+  tagged enum whose tag `ts-rs` dropped reads as a test bug and is not one. Narrow a tagged union
+  through its tag (`vegetationMap`, `anchorOverride`) instead of restating one leg's fields.
+- **Unused locals and parameters fail the typecheck**, so a superseded local result shape cannot sit
+  in the tree unnoticed. Deleting an unused *binding* whose initializer does work (`const world =
+  await bindVegetationField(…)`) means keeping the call: drop the binding, not the statement.
+
+## Vegetation
+
+Eight suites — `vegetation-graph` (the largest), `-botanical`, `-interaction`, `-interchange`,
+`-ecology`, `-stress`, `-export`, plus shared helpers in `vegetation-utils.ts`. They cook a real
+world over the control plane, so they are the main end-to-end coverage for the cooker, the artifact
+store, the runtime cell store, and the ecology clock.
+
+- **Never hand-edit `fixtures/vegetation-*.json`.** They are generated by
+  `cargo run -p xtask -- gen-vegetation-e2e-fixture`, which builds the plant, biome, graph, and map
+  documents in Rust with stable UUIDs. Regenerate whenever a `.splant` (or other vegetation) schema
+  identity changes — a hand-patched fixture passes locally and diverges from what the engine writes.
+- The suites also install each fixture's authored source files before cooking — the trunk OBJ, the
+  leaf-content glTF with its buffer, and the serration cutout PNG. The fixture generator owns those
+  too, and a fixture carries them as a `sources` list of project-relative paths.
+- Cooked artifacts land in the content-addressed store beside `assets/`, not inside it, and a
+  published state baseline lands in a second root beside both. A test that asserts on packaged output
+  must account for `<project>/cache/vegetation/` **and** `<project>/state/vegetation/`.

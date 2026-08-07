@@ -1,13 +1,7 @@
-/// The Editor Settings modal (gear button in the titlebar): editor-wide preferences,
-/// currently one section — Keyboard — listing every rebindable command from the
-/// keybinding registry. Rows group by category and filter through the search box;
-/// clicking a binding chip enters capture mode (the next keydown becomes the
-/// binding, Esc cancels), an overridden row gets a reset button, and "Reset all"
-/// clears every override after a confirm. Changes apply and persist immediately
-/// (deltas to appdata/settings.json via the store) — there is no Apply/Cancel.
-///
-/// Same-scope conflicts are advisory, VS Code-style: the rebind is accepted and
-/// every row whose effective binding collides inside its scope shows a warning.
+/// Editor-wide preferences, currently the Keyboard section: every rebindable command from the
+/// keybinding registry, grouped by category. Clicking a binding chip enters capture mode; changes
+/// apply and persist immediately, so there is no Apply/Cancel. Same-scope conflicts are advisory —
+/// the rebind is accepted and every colliding row inside the scope shows a warning.
 import { useEffect, useMemo, useState } from "react";
 import { listen, type UnlistenFn } from "../shell";
 import { RotateCcw, TriangleAlert } from "lucide-react";

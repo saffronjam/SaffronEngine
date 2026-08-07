@@ -1,10 +1,6 @@
-/// The asset View modal: a large (512 px) square preview of a single catalog asset.
-/// A shadcn Dialog, opened by a tile double-click. The native
-/// viewport is a reparented X11 child that always paints over the webview, so a
-/// dialog centered on the screen would be covered by it.
-/// So while the viewer is open we set `store.viewportHidden`, which the
-/// ViewportPanel reacts to by parking the native window off-screen. The preview is
-/// a base64 PNG fetched over the socket and rendered in the webview.
+/// The asset View modal: a 512 px preview of one catalog asset, fetched as a base64 PNG. The native
+/// viewport surface always paints over the webview, so while the viewer is open `viewportHidden`
+/// parks it and the dialog is visible.
 import { useEffect, useState } from "react";
 import { Loader2 } from "lucide-react";
 import { client } from "../control/client";

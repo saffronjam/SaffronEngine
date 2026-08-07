@@ -1,9 +1,0 @@
-{
-  "name": "check-control-schema",
-  "private": true,
-  "type": "module",
-  "description": "Contract test: validates live Saffron Anima control output against schemas/control/. Zero deps. The engine needs a display — run under a compositor (e.g. weston headless with WAYLAND_DISPLAY + SDL_VIDEODRIVER=wayland).",
-  "scripts": {
-    "check:schema": "bun run check.ts"
-  }
-}

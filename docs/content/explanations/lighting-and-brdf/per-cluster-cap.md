@@ -71,7 +71,7 @@ forces the brute-force path and reveals the difference.
 |---|---|---|
 | Cap + array | `engine/assets/shaders/light_cull.slang` | `MAX_LIGHTS_PER_CLUSTER`, `Cluster`, the `count <` guard |
 | Matching shader-side cap | `engine/assets/shaders/lighting.slang` | `MAX_LIGHTS_PER_CLUSTER`, `Cluster` |
-| Buffer sizing | `engine/crates/rendering/src/lighting.rs` | `MAX_LIGHTS_PER_CLUSTER`, `CLUSTER_STRIDE`, `CLUSTER_COUNT` |
+| Buffer sizing | `engine/crates/rendering/src/lighting/` | `MAX_LIGHTS_PER_CLUSTER`, `CLUSTER_STRIDE`, `CLUSTER_COUNT` |
 
 > [!TIP]
 > Raising the cap means changing `MAX_LIGHTS_PER_CLUSTER` in both shaders and in `lighting.rs`

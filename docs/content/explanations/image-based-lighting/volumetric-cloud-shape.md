@@ -47,7 +47,8 @@ sa set-view-mode --mode cloud-density
 Increasing coverage fills the profile toward a solid core. Moving cloud type toward `1` makes the
 profile taller, and increasing anvil bias spreads its upper edge. `weatherOffset` moves the world-XZ
 lookup without changing the authored noise fields. The scene-wide `WindSettings` advects the weather,
-base, and detail coordinates from the time-of-day clock; a curl-derived warp adds gust-driven motion
+base, and detail coordinates on the monotonic simulation clock, at the shear-scaled mean speed of the
+cloud layer's mid altitude; a curl-derived warp adds gust-driven motion
 without changing the dimensional profile.
 
 The procedural weather path suits broad, repeatable cloud systems. Hero clouds can use a sparse dimensional-profile volume such as the NVDF and SDF construction described in [Nubis, Cubed](https://advances.realtimerendering.com/s2023/Nubis%20Cubed%20(Advances%202023).pdf); the common density function remains the boundary between dimensional authoring and edge erosion.
@@ -59,10 +60,10 @@ The procedural weather path suits broad, repeatable cloud systems. Hero clouds c
 | Static field bakes | `engine/assets/shaders/cloud_noise_base.slang` · `cloud_noise_detail.slang` · `cloud_curl.slang` | `computeMain` |
 | Weather resolve | `engine/assets/shaders/cloud_weather.slang` | `computeMain` |
 | Shared density | `engine/assets/shaders/clouds.slang` | `sampleCloudDensity`, `cloudHeightGradient`, `cloudRemap` |
-| Persistent GPU state | `engine/crates/rendering/src/clouds.rs` | `Clouds`, `CloudRenderSettings`, `CloudParams` |
-| Density view | `engine/crates/rendering/src/renderer.rs` · `engine/assets/shaders/cloud_density_debug.slang` | `ViewMode::CloudDensity`, `add_cloud_passes` |
+| Persistent GPU state | `engine/crates/rendering/src/clouds/` | `Clouds`, `CloudRenderSettings`, `CloudParams` |
+| Density view | `engine/crates/rendering/src/renderer/` · `engine/assets/shaders/cloud_density_debug.slang` | `ViewMode::CloudDensity`, `add_cloud_passes` |
 | Scene state | `engine/crates/scene/src/environment.rs` | `CloudSettings` |
-| Control command | `engine/crates/protocol/src/dto.rs` · `engine/crates/control/src/commands_scene.rs` | `SetCloudsParams`, `set-clouds` |
+| Control command | `engine/crates/protocol/src/dto/` · `engine/crates/control/src/commands_scene/` | `SetCloudsParams`, `set-clouds` |
 
 ## Related
 

@@ -1,11 +1,8 @@
-/// The pure, DOM-free dock-layout tree shared by every dockspace island. A `DockBranch`
-/// is an n-ary split (orientation alternates per depth — the VS Code gridview shape) with
-/// per-child percent sizes; a `DockLeaf` is a tab group. Every function here is a pure
-/// transform `DockLayout -> DockLayout` (or a query), so the store, the persistence layer,
-/// and the unit tests all share one implementation with no React or store coupling.
+/// The pure, DOM-free dock-layout tree shared by every dockspace island: a `DockBranch` is an n-ary
+/// split with per-child percent sizes (orientation alternates per depth), a `DockLeaf` is a tab
+/// group, and every function is a pure `DockLayout -> DockLayout` transform or query.
 ///
-/// The two `DockPanelId` spaces are DISJOINT by construction: a Scene panel id can never
-/// index into the asset-editor tree and vice-versa. That disjointness IS the structural
+/// The two `DockPanelId` spaces are DISJOINT by construction, and that disjointness *is* the
 /// no-cross-main-tab guarantee — there is no runtime cross-kind check anywhere.
 
 export type DockSpaceKind = "scene" | "assetEditor";
@@ -15,12 +12,16 @@ export type DockSpaceKind = "scene" | "assetEditor";
 export const SCENE_PANEL_IDS = [
   "inspector",
   "environment",
+  "windDebug",
   "render",
   "postProcess",
   "stats",
   "profiler",
   "physics",
   "scriptLogs",
+  "vegetation",
+  "ecologyTimeline",
+  "vegetationTelemetry",
   "material",
   "timeline",
   "hierarchy",
@@ -36,6 +37,14 @@ export const ASSET_EDITOR_PANEL_IDS = [
   "assetTimeline",
   "materialEdit",
   "assetStats",
+  "vegSummary",
+  "plantGraph",
+  "plantWind",
+  "plantAtlas",
+  "plantHierarchy",
+  "plantSeason",
+  "plantProxies",
+  "biomeGraph",
 ] as const;
 
 export type SceneDockPanelId = (typeof SCENE_PANEL_IDS)[number];
@@ -857,12 +866,16 @@ export function defaultDockLayouts(): Record<DockSpaceKind, DockLayout> {
 export const DEFAULT_LEAF: Record<DockPanelId, DockNodeId> = {
   inspector: "leaf:leftBottom",
   environment: "leaf:right",
+  windDebug: "leaf:right",
   render: "leaf:right",
   postProcess: "leaf:right",
   stats: "leaf:right",
   profiler: "leaf:right",
   physics: "leaf:right",
   scriptLogs: "leaf:assets",
+  vegetation: "leaf:right",
+  ecologyTimeline: "leaf:right",
+  vegetationTelemetry: "leaf:right",
   material: "leaf:right",
   timeline: "leaf:assets",
   hierarchy: "leaf:hierarchy",
@@ -874,6 +887,14 @@ export const DEFAULT_LEAF: Record<DockPanelId, DockNodeId> = {
   assetTimeline: "leaf:assetTimeline",
   materialEdit: "leaf:aeRight",
   assetStats: "leaf:aeLeft",
+  vegSummary: "leaf:aeRight",
+  plantGraph: "leaf:skeleton",
+  plantWind: "leaf:skeleton",
+  plantAtlas: "leaf:skeleton",
+  plantHierarchy: "leaf:skeleton",
+  plantSeason: "leaf:skeleton",
+  plantProxies: "leaf:skeleton",
+  biomeGraph: "leaf:skeleton",
 };
 
 /// Reset a kind's tree to its default positions WITHOUT closing the panels currently open:

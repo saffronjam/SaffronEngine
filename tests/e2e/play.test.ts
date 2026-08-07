@@ -17,69 +17,43 @@ afterAll(async () => {
 });
 
 afterEach(async () => {
-  const state = await engine.call<PlayState>("get-play-state");
+  const state = await engine.call("get-play-state");
   if (state.state !== "edit") {
     await engine.call("stop");
   }
 });
 
-interface PlayState {
-  state: string;
-  playVersion: number;
-  sceneVersion: number;
-  hasPrimaryCamera: boolean;
-}
-interface Ref {
-  id: string;
-  name: string;
-}
-interface Selection {
-  selectionVersion: number;
-  sceneVersion: number;
-  entity?: Ref;
-  playState: string;
-  playVersion: number;
-}
-interface Inspect {
-  id: string;
-  name: string;
-  components: Record<string, any>;
-}
-interface EntityList {
-  entities: Ref[];
-}
-
 test("the play state machine accepts only legal transitions", async () => {
-  expect((await engine.call<PlayState>("get-play-state")).state).toBe("edit");
+  expect((await engine.call("get-play-state")).state).toBe("edit");
 
-  const playing = await engine.call<PlayState>("play");
+  const playing = await engine.call("play");
   expect(playing.state).toBe("playing");
   await expect(engine.call("play")).rejects.toThrow(); // already playing
   await expect(engine.call("step")).rejects.toThrow(); // step requires pause
 
-  const paused = await engine.call<PlayState>("pause");
+  const paused = await engine.call("pause");
   expect(paused.state).toBe("paused");
   await expect(engine.call("pause")).rejects.toThrow(); // already paused
 
-  const stepped = await engine.call<PlayState>("step", { frames: 1 });
+  const stepped = await engine.call("step", { frames: 1 });
   expect(stepped.state).toBe("paused"); // step does not change state
 
-  const resumed = await engine.call<PlayState>("play"); // play resumes from paused
+  const resumed = await engine.call("play"); // play resumes from paused
   expect(resumed.state).toBe("playing");
 
-  const stopped = await engine.call<PlayState>("stop");
+  const stopped = await engine.call("stop");
   expect(stopped.state).toBe("edit");
   await expect(engine.call("step")).rejects.toThrow(); // step requires pause
-  expect((await engine.call<PlayState>("stop")).state).toBe("edit"); // idempotent in edit
+  expect((await engine.call("stop")).state).toBe("edit"); // idempotent in edit
 
   // playVersion strictly increases across every transition.
   expect(playing.playVersion).toBeLessThan(stopped.playVersion);
 });
 
 test("hasPrimaryCamera reflects whether the scene has one", async () => {
-  const entities = (await engine.call<EntityList>("list-entities")).entities;
+  const entities = (await engine.call("list-entities")).entities;
   const inspected = await Promise.all(
-    entities.map((entity) => engine.call<Inspect>("inspect", { entity: entity.id })),
+    entities.map((entity) => engine.call("inspect", { entity: entity.id })),
   );
   const camera = inspected.find((entity) => entity.components.Camera?.primary === true);
   expect(camera).toBeDefined();
@@ -90,7 +64,7 @@ test("hasPrimaryCamera reflects whether the scene has one", async () => {
     field: "primary",
     value: false,
   });
-  const noCamera = await engine.call<PlayState>("play");
+  const noCamera = await engine.call("play");
   expect(noCamera.hasPrimaryCamera).toBe(false);
   await engine.call("stop");
 
@@ -100,94 +74,96 @@ test("hasPrimaryCamera reflects whether the scene has one", async () => {
     field: "primary",
     value: true,
   });
-  const withCamera = await engine.call<PlayState>("play");
+  const withCamera = await engine.call("play");
   expect(withCamera.hasPrimaryCamera).toBe(true);
   await engine.call("stop");
 });
 
 test("stop discards runtime mutations and restores the authored scene", async () => {
-  const cube = await engine.call<Ref>("add-entity", { args: ["cube"] });
+  const cube = await engine.call("add-entity", { args: ["cube"] });
   await engine.call("set-transform", { entity: cube.id, translation: { x: 1, y: 2, z: 3 } });
-  const countBefore = (await engine.call<EntityList>("list-entities")).entities.length;
+  const countBefore = (await engine.call("list-entities")).entities.length;
 
   await engine.call("play");
   // Reads and writes route to the play duplicate.
   await engine.call("set-transform", { entity: cube.id, translation: { x: 9, y: 9, z: 9 } });
-  const runtime = await engine.call<Inspect>("inspect", { entity: cube.id });
-  expect(runtime.components.Transform.translation).toEqual({ x: 9, y: 9, z: 9 });
+  const runtime = await engine.call("inspect", { entity: cube.id });
+  expect(runtime.components.Transform!.translation).toEqual({ x: 9, y: 9, z: 9 });
   await engine.call("add-entity", { args: ["cube"] }); // a runtime-only entity
 
-  const beforeStop = (await engine.call<PlayState>("get-play-state")).sceneVersion;
-  const stopped = await engine.call<PlayState>("stop");
+  const beforeStop = (await engine.call("get-play-state")).sceneVersion;
+  const stopped = await engine.call("stop");
   expect(stopped.sceneVersion).toBeGreaterThan(beforeStop); // the editor-refresh trigger
 
-  const authored = await engine.call<Inspect>("inspect", { entity: cube.id });
-  expect(authored.components.Transform.translation).toEqual({ x: 1, y: 2, z: 3 });
-  const after = await engine.call<EntityList>("list-entities");
+  const authored = await engine.call("inspect", { entity: cube.id });
+  expect(authored.components.Transform!.translation).toEqual({ x: 1, y: 2, z: 3 });
+  const after = await engine.call("list-entities");
   expect(after.entities.length).toBe(countBefore); // the runtime entity did not survive
   expect(after.entities.some((e) => e.id === cube.id)).toBe(true);
 });
 
 test("selection survives play/stop by uuid; a runtime selection clears on stop", async () => {
-  const cube = await engine.call<Ref>("add-entity", { args: ["cube"] });
+  const cube = await engine.call("add-entity", { args: ["cube"] });
   await engine.call("select", { entity: cube.id });
 
   await engine.call("play");
-  expect((await engine.call<Selection>("get-selection")).entity?.id).toBe(cube.id); // the play twin
+  expect((await engine.call("get-selection")).entity?.id).toBe(cube.id); // the play twin
   await engine.call("stop");
-  expect((await engine.call<Selection>("get-selection")).entity?.id).toBe(cube.id); // the authored entity
+  expect((await engine.call("get-selection")).entity?.id).toBe(cube.id); // the authored entity
 
   // A runtime-spawned selection has no authored twin and clears on stop.
   await engine.call("play");
-  const runtime = await engine.call<Ref>("add-entity", { args: ["cube"] }); // add-entity selects it
-  expect((await engine.call<Selection>("get-selection")).entity?.id).toBe(runtime.id);
+  const runtime = await engine.call("add-entity", { args: ["cube"] }); // add-entity selects it
+  expect((await engine.call("get-selection")).entity?.id).toBe(runtime.id);
   await engine.call("stop");
-  expect((await engine.call<Selection>("get-selection")).entity ?? null).toBeNull();
+  expect((await engine.call("get-selection")).entity ?? null).toBeNull();
 });
 
 test("scene/project swaps are blocked during play", async () => {
   await engine.call("play");
   await expect(engine.call("load-scene", { path: "nope.json" })).rejects.toThrow(/stop play first/);
   await expect(engine.call("load-project", { path: "nope" })).rejects.toThrow(/stop play first/);
-  await expect(engine.call("delete-asset", { asset: "anything" })).rejects.toThrow(/stop play first/);
+  await expect(engine.call("delete-asset", { asset: "anything" })).rejects.toThrow(
+    /stop play first/,
+  );
   await engine.call("stop");
 });
 
 test("environment edits during play are discarded on stop", async () => {
   // get-environment returns the environment object directly (a Json passthrough).
-  const authored = (await engine.call<{ skyIntensity: number }>("get-environment")).skyIntensity;
+  const authored = (await engine.call("get-environment")).skyIntensity;
 
   await engine.call("play");
   await engine.call("set-environment", { skyIntensity: authored + 5 });
-  const during = (await engine.call<{ skyIntensity: number }>("get-environment")).skyIntensity;
+  const during = (await engine.call("get-environment")).skyIntensity;
   expect(during).toBeCloseTo(authored + 5);
 
   await engine.call("stop");
-  const back = (await engine.call<{ skyIntensity: number }>("get-environment")).skyIntensity;
+  const back = (await engine.call("get-environment")).skyIntensity;
   expect(back).toBeCloseTo(authored);
 });
 
 test("an asset assignment during play is discarded; delete-asset is blocked", async () => {
   await engine.importEntity(join(REPO, "tests", "e2e", "fixtures", "mapped-material.glb"));
-  const assets = await engine.call<{ assets: { id: string; type: string }[] }>("list-assets");
+  const assets = await engine.call("list-assets");
   const mesh = assets.assets.find((a) => a.type === "mesh");
   expect(mesh).toBeDefined();
 
-  const target = await engine.call<Ref>("add-entity", { args: ["empty"] }); // no Mesh authored
-  expect((await engine.call<Inspect>("inspect", { entity: target.id })).components.Mesh).toBeUndefined();
+  const target = await engine.call("add-entity", { args: ["empty"] }); // no Mesh authored
+  expect((await engine.call("inspect", { entity: target.id })).components.Mesh).toBeUndefined();
 
   await engine.call("play");
   await engine.call("assign-asset", { entity: target.id, slot: "mesh", asset: mesh!.id });
-  const during = await engine.call<Inspect>("inspect", { entity: target.id });
+  const during = await engine.call("inspect", { entity: target.id });
   expect(during.components.Mesh?.mesh).toBe(mesh!.id);
   await expect(engine.call("delete-asset", { asset: mesh!.id })).rejects.toThrow(/stop play first/);
 
   await engine.call("stop");
-  expect((await engine.call<Inspect>("inspect", { entity: target.id })).components.Mesh).toBeUndefined();
+  expect((await engine.call("inspect", { entity: target.id })).components.Mesh).toBeUndefined();
 });
 
 test("a material edit during play is discarded on stop", async () => {
-  const cube = await engine.call<Ref>("add-entity", { args: ["cube"] });
+  const cube = await engine.call("add-entity", { args: ["cube"] });
   // Author a slot-0 roughness override on the cube's MaterialSet (the cube instantiates with a
   // single default slot).
   const setRoughness = (id: string, roughness: number) =>
@@ -198,9 +174,12 @@ test("a material edit during play is discarded on stop", async () => {
       index: 0,
       value: { overrides: { roughness } },
     });
-  const roughnessOf = async (id: string) =>
-    (await engine.call<Inspect>("inspect", { entity: id })).components.MaterialSet.slots[0].overrides
-      .roughness;
+  // The per-object override map is opaque JSON on the wire, so the numeric read is explicit.
+  const roughnessOf = async (id: string): Promise<number> =>
+    Number(
+      (await engine.call("inspect", { entity: id })).components.MaterialSet!.slots[0].overrides
+        .roughness,
+    );
 
   await setRoughness(cube.id, 0.2);
   await engine.settle();

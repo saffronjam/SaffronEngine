@@ -2,7 +2,12 @@ import { $ } from "bun";
 import { stat } from "node:fs/promises";
 import { join } from "node:path";
 
-const RESOURCES = ["icudtl.dat", "resources.pak", "v8_context_snapshot.bin", "chrome_100_percent.pak"];
+const RESOURCES = [
+  "icudtl.dat",
+  "resources.pak",
+  "v8_context_snapshot.bin",
+  "chrome_100_percent.pak",
+];
 
 async function sizeOf(path: string): Promise<number> {
   return stat(path)
@@ -10,8 +15,7 @@ async function sizeOf(path: string): Promise<number> {
     .catch(() => -1);
 }
 
-/// The CEF resource data (following symlinks) must be present and non-empty; icudtl.dat is ~10 MB, so
-/// anything tiny is a truncated extraction rather than a real file.
+/// icudtl.dat is ~10 MB, so anything tiny is a truncated extraction rather than a real file.
 async function intact(cefDir: string): Promise<boolean> {
   for (const file of RESOURCES) {
     if ((await sizeOf(join(cefDir, file))) <= 0) return false;
@@ -19,12 +23,13 @@ async function intact(cefDir: string): Promise<boolean> {
   return (await sizeOf(join(cefDir, "icudtl.dat"))) >= 1_000_000;
 }
 
-/// cef-dll-sys stages the CEF runtime next to the shell binary. An interrupted extraction leaves
-/// 0-byte icudtl.dat/*.pak, which it never re-provisions on its own (it only downloads when the dir
-/// is absent, never re-checking an existing one) and CEF then aborts at startup with "Couldn't mmap
-/// icu data file". On a truncated resource, purge cef-dll-sys and rebuild once to force a clean
-/// re-provision; throw if it recurs.
-export async function verifyCefRuntime(shellDir: string, profile: "release" | "debug"): Promise<void> {
+/// An interrupted cef-dll-sys extraction leaves 0-byte icudtl.dat/*.pak that it never re-provisions
+/// (it only downloads when the dir is absent), and CEF aborts with "Couldn't mmap icu data file".
+/// Purge and rebuild once on a truncated resource; throw if it recurs.
+export async function verifyCefRuntime(
+  shellDir: string,
+  profile: "release" | "debug",
+): Promise<void> {
   const cefDir = join(shellDir, "target", profile);
   if (await intact(cefDir)) return;
 

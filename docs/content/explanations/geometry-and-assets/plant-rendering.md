@@ -1,0 +1,273 @@
++++
+title = 'Plant rendering'
+weight = 16
++++
+
+# Plant rendering
+
+A cooked plant family renders through the same GPU-scene prototype path as every mesh:
+one flattened geometry, one prototype record, streamed hierarchy pages, and GPU-binned
+executor draws. What makes a family different is assembly — the cooked hierarchy places
+each source prototype through *uses* (per-part local transforms), and the renderer
+expands those uses on the GPU instead of duplicating geometry.
+
+A use places its part's own geometry and nothing more. When several parts share one
+source file, the family's Part-destination submesh semantic targets partition it: the
+compile splits the source into one normalized row per submesh, each row cooks to its
+own prototype, and each use binds to the part its target names — so a combination mask
+that deactivates a part removes that part's geometry from the picture, its shadow, and
+its ray-traced shape alike. Several parts claiming one un-partitioned source is a
+compile error, because their uses would each place the whole source as coincident
+duplicates no mask could tell apart.
+
+## From artifact to family mesh
+
+`AssetServer::load_plant_family` reads the family's validated `.splantc` by exact
+content identity from the vegetation artifact store and decodes three groups of
+sections: the portable triangle/voxel hierarchy (pages, prototypes, uses), the
+geometry rows (one quantized mesh per prototype), and the materials table (slot order
+plus each pinned `.smat` document). Each geometry row is verified against its
+hierarchy prototype: source identity, selector hash, vertex and submesh counts. The
+rows concatenate in prototype-id order into one flat vertex/index stream.
+
+The upload packs the assembly-part table into the geometry's parts arena range: a
+per-prototype record `{first_use, use_count, vertex_base}` (the prototype's base
+vertex within the flattened stream), then every use record (rows 0–2 of the family-
+local transform plus the placed prototype). The prototype count rides the geometry
+record's reserved word so shaders can split the two tables. A plain single-prototype
+mesh keeps its parts range empty and takes none of the assembly paths.
+
+The loaded family registers under its family id in the shared mesh and page-payload
+caches, so the mirror resolves it like any mesh; its pinned material documents
+register under their material ids for interning. An assembly carries no merged BLAS —
+its ray-traced shape is per-use instancing, not the concatenated prototype streams.
+
+Each instance selects one authored `(variation, phenotype)` combination. The
+phenotype it renders derives from typed state, never from an active mesh: a dead or
+stump lifecycle takes the family's `Dead`-role phenotype, a senescent lifecycle the
+`Senescent` role, and every other plant the phenotype whose intrinsic curves express
+most strongly — the cooked phenotype is the fallback throughout.
+
+The resolved pair then matches the family's combination masks (exact pair match,
+then the phenotype alone, then the first authored combination). A plain scene
+entity referencing the family mesh selects the same way through an optional
+`PlantVariant` component — the asset preview's variation scrub sets it via
+`set-asset-preview-options {variation, phenotype}` — and renders the first authored
+combination without one.
+
+## The macro snapshot adapter
+
+`GpuSceneMirror::sync_vegetation` translates the authoritative
+[vegetation runtime world](../../scene-and-ecs/vegetation-state/) into persistent-scene
+instances. Cells diff purely by published generation id: an unchanged cell is skipped,
+and a republished cell (any load, unload, or state mutation) removes and recreates its
+instances inside one sync pass, so a plant never has two visible representations.
+
+A seasonal phase change flips combinations in place instead: every live plant whose
+resolved combination moved gets one instance update carrying the previous combination
+and a flip stamp in the static payload.
+
+During the transition window the traversal emits assembly uses of both masks — a use
+only in the new mask with an incoming crossfade word, only in the old with an
+outgoing one, sharing one flip id so the stochastic coverage partitions every pixel
+exactly. The phase derives from the frame stamp, so the crossfade completes on its
+own and the instance handle never changes.
+Instances key on `(WorldCellKey, PlantId)` — the stable 128-bit identity, never a slot
+index — and survive GPU-scene loss because the map rebuilds from snapshots.
+
+Each accepted macro point becomes one instance: the family's prototype, per-slot
+material overrides from the family's slot table, and a compact static transform
+(`GpuSceneStaticTransform`) packing the exact cell coordinates, local position ticks,
+quantized orientation, and Q15.16 scale with no CPU float conversion. Dormant seeds and
+tombstoned plants are skipped. Streamed vegetation changes request a repaint, so the
+reactive host keeps painting until the temporal effects converge.
+
+```sh
+sa -o json gpu-scene-stats   # instances counts entities + plants; records > 0 once resident
+sa -o json vegetation-runtime-cell '{"coordinates":["0","0","0"],"level":0}'
+sa -o json vegetation-render-stats   # per-family/per-cell population + page faults
+```
+
+## Static transforms on the GPU
+
+Shaders read every instance's world columns through one helper,
+`gpuSceneInstanceColumns`. A dynamic record stores explicit float columns (current and
+previous). A static record stores the 64-byte compact placement, decoded in the
+shader: cell coordinates scale by the 64 m cell edge, ticks add the fractional metre
+(1/4096 m), the quantized XYZW quaternion normalizes into rotation columns, and the
+Q15.16 scale multiplies per axis.
+
+A static point has no motion, so its previous columns equal its current ones. The
+visibility cull, the traversal, the transparent sort keys, and every executor vertex
+path share this decode.
+
+The compact placement fills half the 128-byte transform payload; a plant's remaining
+words carry its vegetation columns. Words 16..24 hold conservative current and
+previous bounds spheres in instance-local pre-scale space — the cull composes them
+instead of the prototype sphere (the `GPU_SCENE_INSTANCE_FLAG_EXPLICIT_BOUNDS` flag).
+Words 24..30 hold the stable surface-attachment identity (provider, primitive,
+barycentrics) when the point is surface-attached, and the instance flags carry the
+two-bit interaction policy.
+
+## Micro vegetation fields
+
+Ground cover reconstructs from authoritative density tiles, never from stored blades.
+Each resident cell's quantized micro tiles (density plus typed attribute channels) pack
+into the fields arena with the same generation lifecycle as the cell's plants, and a
+cell-ordered directory lists every resident tile with its per-family field instance —
+a flagged identity instance the visibility cull skips.
+
+A count → scan → scatter compute chain walks the directory each frame. The count pass
+measures each tile's post-cull blade survivors (density-thresholded, distance-gated,
+frustum-tested); the scan assigns every tile an exact exclusive base under the frame's
+candidate and record budgets; the scatter re-derives the identical blade set and writes
+each survivor's candidate and record at its exact slot. No atomics order the stream, so
+record order is bitwise stable frame to frame.
+
+Placement, height, and facing derive from a hash of the tile's reconstruction seed and
+texel coordinates — camera travel changes residency, never established placement. Blade
+records join the same semantic record stream the traversal emits, ahead of binning.
+
+Those coordinates come back out of a linear index, so the pack order is a contract rather
+than a detail. A tile's samples run Z fastest and X slowest — `(x * dims.y + y) * dims.z + z`
+— which is the order the cooker writes density in and the order every reader rebuilds
+coordinates with. On a cube grid the opposite convention is a symmetric relabel that looks
+right; on any other shape it transposes the field.
+
+Each directory entry also carries the tile's predicted budget: the blade count a fully
+visible frame would reconstruct, summed from the same density derivation at pack time.
+`gpu-scene-stats` reports the directory total as `microPredicted`; the per-frame
+generated count never exceeds it. A tile that does not fit the frame's budgets — and
+every tile after it — skips whole with the pressure flag raised; density is never
+thinned silently and no partial tile ever emits.
+
+Blades draw through the ordinary indexed executor: the bin scatter points blade
+commands at a shared 24-index template block in the pages arena, and the executor
+vertex paths derive each template vertex procedurally from the record's candidate — a
+tapered, bowed strip in world space. No blade vertex data exists anywhere.
+
+The scatter also bakes each survivor's analytic [wind](../../scene-and-ecs/wind-field/)
+bend into its candidate: the shared field sampled at the blade root for the current and
+the previous frame's time, horizontal and capped by blade height. The blade builder
+applies the stored bend tip-weighted with a parabolic tip drop, so every raster pass
+bends the blade identically and the motion pass rebuilds the previous frame's bend for
+exact blade motion vectors. Placement and the survivor count stay bend-independent, so
+the count and scatter passes always agree.
+
+```sh
+sa -o json gpu-scene-stats   # visibility.microCandidates ≤ microPredicted
+```
+
+## Assembly execution
+
+The visibility traversal walks a family's resident pages exactly like a mesh's. A node
+whose subtree belongs to one prototype forks per use: it emits one draw record per use
+of that prototype, scaling the node's appearance error by the use's basis scale, and
+stores the use index in the record's `clusterState` word. `GPU_ASSEMBLY_NO_USE` marks
+the no-assembly case — every plain mesh, and family nodes spanning prototypes.
+
+The executor vertex paths then rebase the vertex fetch to the placed prototype's slice
+(`vertex_base + pulled index`) and premultiply the use's family-local transform before
+the instance transform. Memory stays flat: uses expand at traversal time, never in the
+geometry or page payloads.
+
+## Phenology: what a plant looks like now
+
+Which appearance a plant renders comes from typed lifecycle state and the plant's own persistent
+condition, never from inspecting an active mesh. Lifecycle wins outright: dead and stump take the
+dead role, senescent takes the senescent role. Everything else is a weight.
+
+Each phenotype carries an intrinsic response curve — a season window in per-mille of the year that
+wraps through the new year, a health band, and a moisture band, each a trapezoid with a ramp at
+every edge that is interior to its own domain. Full health is the end of its scale and so is a hard
+edge; a mid-season date is not, and softening it is what makes a tree turn over a fortnight instead
+of overnight. Declared curves multiply, so a family can author fruit that only sets on a
+well-watered plant. The strongest phenotype above the activation threshold wins, and authoring order
+breaks a tie.
+
+Roles carry defaults so a family that authors nothing still behaves: `Flowering`, `Fruiting`, and
+`Senescent` get calendar windows, `Damaged` a low-health band, and `Wet` a high-moisture band. The
+four remaining roles declare no curve at all — they are reached by lifecycle or as the cooked
+default, never derived — and their weight is reported as absent rather than as zero, which is a
+different statement.
+
+`season_phase_mille` folds the calendar date and the hemisphere into the per-mille year phase the
+season curve reads. Health and moisture come from the plant's persistent runtime state, the same
+values a damage event or a weather system writes.
+
+`plant-season-phenotype` answers the whole question for a set of conditions, and reports every
+phenotype's weight beside the winner — a resolved id alone cannot say why it won. The Season panel
+in the Plant workspace scrubs it and binds the answer to the live preview. It calls the same
+resolver the renderer does rather than reimplementing the rule: a preview that resolved conditions
+its own way would be showing an appearance the scene never picks.
+
+The phenotype and its variation bind together, because a phenotype draws a specific variation and
+applying one without the other shows a combination the family never declares.
+
+```sh
+sa plant-season-phenotype '{"plant":"Silver birch","seasonMille":700}'
+sa plant-season-phenotype '{"plant":"Silver birch","seasonMille":700,"lifecycle":"dead"}'
+sa -o json plant-season-phenotype '{"plant":"Silver birch","seasonMille":200,"healthMille":150}' | jq .weights
+```
+
+## One atlas per family
+
+A family's coverage slots pack into a single atlas at cook time, and the family's UVs are rewritten
+to address it. The two are one decision: a family that shipped a packed atlas but slot-local UVs — or
+the reverse — samples texels the cook never placed there, and both halves look well-formed on their
+own, so nothing downstream can detect the disagreement.
+
+The gutter carries the edge texel's *colour* at zero alpha rather than transparent black, because a
+transparent-black gutter filters into the slot's edge as a dark fringe. The mip chain is
+alpha-area-preserving for the same reason in the other direction: a naive box filter loses coverage
+with every level, and distant foliage thins out.
+
+The chain ships in the artifact's texture-container section as a KTX2 container, and the layout —
+extent, gutter, and each slot's rectangle — in the materials-and-coverage section. The container
+declares its own `VkFormat` and extent, so the load path uploads the encoding the bytes state rather
+than the one the calling code assumes: an sRGB chain uploaded as linear shifts every packed slot's
+colour.
+
+The two sections are one atlas. An artifact carrying a layout without texels, texels without a
+layout, disagreeing extents, or a chain that stops short of 1×1 is rejected at the cook and at the
+load.
+
+`plant-atlas` returns one level as a PNG with its placements, read out of the published artifact
+rather than re-packed — a second packing of the same slots produces a different arrangement, and that
+is not the one the plant is sampling. The Atlas panel in the Plant workspace shows it over a checker,
+with the level scrubbable, since a level that lost coverage is invisible at level zero.
+
+```sh
+sa plant-atlas '{"plant":"Silver birch"}' -o json | jq '{width, height, levelCount, placements}'
+```
+
+A family whose slots resolve to catalog materials cooks no atlas. That is a fact about the family,
+not a failure.
+
+## In the code
+
+| What | File | Symbols |
+|---|---|---|
+| Phenology → appearance | `vegetation/src/season.rs`, `control/src/commands_asset/commands_plant.rs` | `PhenotypeResponse`, `PhenologyState`, `phenotype_weight_mille`, `resolve_rendered_phenotype`, `plant-season-phenotype` |
+| Family atlas + coverage mips | `assets/src/atlas.rs`, `coverage.rs` | `generate_family_atlas`, `pack_atlas`, `FamilyAtlas`, `AtlasLayout`, `CoverageMip` |
+| Atlas texture container | `vegetation/src/artifact/texture.rs`, `assets/src/plant_cook/sections.rs` | `PlantTextureContainer`, `PlantTextureFormat`, `write_plant_texture_container`, `texture_container_section` |
+| Atlas inspection | `assets/src/plant_render.rs`, `control/src/commands_asset.rs` | `plant_family_atlas_image`, `PlantAtlasImage`, `plant-atlas` |
+| Family load, decode, and flatten | `assets/src/plant_render.rs` | `load_plant_family`, `PlantFamilyRender` |
+| Section decode mirrors | `assets/src/plant_cook/decode.rs` · `materials.rs` | `decode_mesh_section`, `decode_plant_material_document` |
+| Assembly-part table build | `rendering/src/upload.rs` | `assembly_from_hierarchy`, `MeshAssembly` |
+| Macro snapshot adapter | `assets/src/gpu_scene_mirror.rs` | `sync_vegetation` |
+| Field-tile packing + directory | `assets/src/gpu_scene_mirror.rs` | `pack_field_tiles`, `rebuild_field_directory` |
+| Blade reconstruction chain | `assets/shaders/scene_micro_common.slang` | `microTexel`, `microBlade`, `microTexelSurvivors` |
+| Blade template + candidates | `rendering/src/global_gpu_data.rs` | `micro_blade_template_indices`, `GpuMicroCandidate` |
+| Resident-cell snapshots | `vegetation/src/runtime_world.rs` | `VegetationWorld::resident_cells` |
+| Compact exact placement | `rendering/src/persistent_gpu_scene.rs` | `GpuSceneStaticTransform` |
+| GPU transform decode + assembly loaders | `assets/shaders/global_gpu_data.slang` | `gpuSceneInstanceColumns`, `gpuSceneAssemblyUse` |
+| Traversal use fork | `assets/shaders/scene_traversal.slang` | `emitNodeRecords`, `assemblyUseScale` |
+
+## Related
+
+- [Virtual geometry](../virtual-geometry/) — the portable hierarchy, pages, and cluster records
+- [Vegetation cooking](../vegetation-cooking/) — how the `.splantc` and manifest are produced
+- [Vegetation state](../../scene-and-ecs/vegetation-state/) — the runtime authority the adapter reads
+- [Persistent GPU scene](../../frame-and-render-graph/persistent-gpu-scene/) — prototypes, instances, and deltas
+- [Hierarchical visibility](../../frame-and-render-graph/hierarchical-visibility/) — the cull and traversal chain

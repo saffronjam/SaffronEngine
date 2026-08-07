@@ -34,6 +34,17 @@ pub enum Error {
     /// the importer's message.
     #[error("import error: {0}")]
     Import(String),
+    /// A portable hierarchy count, offset, or byte length overflowed its canonical width.
+    #[error("portable hierarchy numeric overflow")]
+    NumericOverflow,
+    /// A portable hierarchy field violated the canonical format contract.
+    #[error("invalid {format} field '{field}'")]
+    HierarchyFormat {
+        /// Hierarchy section or aggregate format.
+        format: &'static str,
+        /// Invalid field path.
+        field: String,
+    },
 }
 
 /// The crate `Result` alias bound to the typed [`Error`].

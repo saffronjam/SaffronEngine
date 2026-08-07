@@ -8,7 +8,6 @@
 
 import { afterAll, beforeAll, expect, test } from "bun:test";
 import { Engine } from "./harness.ts";
-import type { RenderStats } from "@saffron/protocol";
 
 let engine: Engine;
 beforeAll(async () => {
@@ -18,11 +17,11 @@ afterAll(async () => {
   await engine?.shutdown();
 });
 
-const stats = () => engine.call<RenderStats>("render-stats");
+const stats = () => engine.call("render-stats");
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
-/// Polls render-stats until `idle` reaches `want` (bounded), since the keep-warm window must elapse
-/// first. render-stats is read-only, so polling it never itself re-arms the loop.
+// Polls render-stats until `idle` reaches `want` (bounded), since the keep-warm window must elapse
+// first. render-stats is read-only, so polling it never itself re-arms the loop.
 async function waitForIdle(want: boolean, tries = 50): Promise<boolean> {
   for (let i = 0; i < tries; i++) {
     if ((await stats()).idle === want) {
@@ -53,7 +52,7 @@ test("a mutating command re-arms rendering, then it settles back to idle", async
 });
 
 test("occluded power-state suppresses rendering even after a mutation", async () => {
-  const occluded = await engine.call<{ state: string }>("set-viewport-power-state", {
+  const occluded = await engine.call("set-viewport-power-state", {
     state: "occluded",
   });
   expect(occluded.state).toBe("occluded");
@@ -65,7 +64,7 @@ test("occluded power-state suppresses rendering even after a mutation", async ()
   expect((await stats()).idle).toBe(true);
 
   // Restore focus; the loop renders again.
-  const focused = await engine.call<{ state: string }>("set-viewport-power-state", {
+  const focused = await engine.call("set-viewport-power-state", {
     state: "focused",
   });
   expect(focused.state).toBe("focused");

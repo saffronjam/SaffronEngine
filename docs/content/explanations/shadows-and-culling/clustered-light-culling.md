@@ -59,13 +59,13 @@ Opaque surfaces use the same lists as the candidate pool when ReSTIR direct ligh
 
 | What | File | Symbols |
 |---|---|---|
-| Grid dimensions, record capacity, and params | `engine/crates/rendering/src/lighting.rs` | `CLUSTER_GRID_X`, `CLUSTER_GRID_Y`, `CLUSTER_GRID_Z`, `CLUSTER_COUNT`, `MAX_LIGHTS_PER_CLUSTER`, `ClusterParams` |
-| Cluster-buffer allocation and dispatch gate | `engine/crates/rendering/src/lighting.rs` | `build_frame`, `Lighting::set_cluster_camera`, `Lighting::take_cluster_dispatch_pending` |
+| Grid dimensions, record capacity, and params | `engine/crates/rendering/src/lighting/` | `CLUSTER_GRID_X`, `CLUSTER_GRID_Y`, `CLUSTER_GRID_Z`, `CLUSTER_COUNT`, `MAX_LIGHTS_PER_CLUSTER`, `ClusterParams` |
+| Cluster-buffer allocation and dispatch gate | `engine/crates/rendering/src/lighting/` | `build_frame`, `Lighting::set_cluster_camera`, `Lighting::take_cluster_dispatch_pending` |
 | GPU bounds and sphere assignment | `engine/assets/shaders/light_cull.slang` | `screenToView`, `rayToZ`, `computeMain` |
-| Graph pass and dispatch | `engine/crates/rendering/src/renderer.rs` | `Renderer::record_scene_graph`, `"light-cull"` |
+| Graph pass and dispatch | `engine/crates/rendering/src/renderer/` | `Renderer::record_scene_graph`, `"light-cull"` |
 | Fragment lookup and lighting loops | `engine/assets/shaders/lighting.slang` | `clusterIndexFor`, `evalLighting` |
-| CPU mirror | `engine/crates/rendering/src/lighting.rs` | `cluster_aabb`, `light_intersects_cluster`, `cull_clusters_cpu` |
-| Runtime control | `engine/crates/control/src/commands_render.rs` | `register_render_commands`, `"set-clustered"` |
+| CPU mirror | `engine/crates/rendering/src/lighting/` | `cluster_aabb`, `light_intersects_cluster`, `cull_clusters_cpu` |
+| Runtime control | `engine/crates/control/src/commands_render/` | `register_render_commands`, `"set-clustered"` |
 
 ## Related
 

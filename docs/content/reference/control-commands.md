@@ -6,7 +6,7 @@ math = false
 
 # Control commands
 
-The control plane exposes 198 typed commands over its local Unix socket. This table follows the frozen order in `saffron_protocol::COMMANDS`; the generated OpenRPC methods use the same names, parameter DTOs, and result DTOs.
+The control plane exposes 257 typed commands over its local Unix socket. This table follows the frozen order in `saffron_protocol::COMMANDS`; the generated OpenRPC methods use the same names, parameter DTOs, and result DTOs.
 
 `register_builtin_commands` installs `ping`, the reflective `help` command, and the render, scene, animation, physics, and asset handlers. The host adds `get-script-schema` because its handler depends on the script crate. A registry test compares the registered names with `COMMANDS` as sets, with that host-owned command accounted for explicitly.
 
@@ -40,7 +40,10 @@ sa -o json set-transform --entity 42 --translation '{"x":0,"y":1,"z":0}'
 | Command | Params | Result | Purpose |
 |---|---|---|---|
 | `ping` | `PingParams` | `PingResult` | liveness + engine info |
-| `render-stats` | `EmptyParams` | `RenderStatsDto` | last frame draw counters |
+| `render-stats` | `EmptyParams` | `RenderStatsDto` | last frame draw counters + the `vsm` shadow-page activity block |
+| `gpu-scene-stats` | `EmptyParams` | `GpuSceneMirrorStatsDto` | persistent GPU-scene mirror population and rebuild counters |
+| `vegetation-mutate` | `VegetationMutateParams` | `VegetationMutateResult` | apply one gesture of typed vegetation mutations through the reducer, replying with its inverse |
+| `vegetation-render-stats` | `EmptyParams` | `VegetationRenderStatsDto` | per-family and per-cell vegetation render population plus page faults |
 | `profiler.set-mode` | `ProfilerSetModeParams` | `ProfilerModeResult` | set the GPU profiler mode |
 | `pass-timings` | `EmptyParams` | `RenderPassTimingsDto` | last frame per-pass GPU timings |
 | `profiler.capture-start` | `CaptureStartParams` | `CaptureStartResult` | arm a bounded profiler capture |
@@ -65,6 +68,9 @@ sa -o json set-transform --entity 42 --translation '{"x":0,"y":1,"z":0}'
 | `get-render-quality` | `EmptyParams` | `RenderQualityResult` | the active render-quality tier + resolved per-effect state |
 | `set-tonemap` | `SetTonemapParams` | `TonemapResult` | set the tonemap operator (reinhard/aces/agx/pbr-neutral) |
 | `set-rt-shadows` | `ToggleParams` | `SetRtShadowsResult` | toggle ray-traced shadows |
+| `set-hierarchy-cut` | `SetHierarchyCutParams` | `HierarchyCutResult` | set-hierarchy-cut {auto\|coarse\|fine} [camera\|shadow\|gi] — pin one view's hierarchy cut (omit the cut to read) |
+| `vsm-page-budget` | `VsmPageBudgetParams` | `VsmPageBudgetResult` | read or set the shadow pages a frame may render |
+| `page-request-budget` | `PageRequestBudgetParams` | `PageRequestBudgetResult` | read or set the missing-page requests one view class may raise per frame |
 | `set-restir` | `ToggleParams` | `SetRestirResult` | toggle ReSTIR |
 | `set-ssr` | `ToggleParams` | `SetSsrResult` | toggle screen-space reflections |
 | `set-rt-reflections` | `ToggleParams` | `SetRtReflectionsResult` | toggle ray-traced reflections |
@@ -89,6 +95,7 @@ sa -o json set-transform --entity 42 --translation '{"x":0,"y":1,"z":0}'
 | `set-light` | `SetLightParams` | `EntityRef` | set-light {entity?, direction?, color?, intensity?, ambient?} |
 | `select` | `EntityParams` | `EntityRef` | select {entity} |
 | `pick` | `PickParams` | `PickResult` | pick {u=0.5, v=0.5} |
+| `query-surface-ray` | `QuerySurfaceRayParams` | `SurfaceRayResult` | nearest scene-surface hit |
 | `spatial-cell` | `SpatialCellParams` | `SpatialCellResult` | canonical position ownership and ancestor-cell conversion |
 | `spatial-providers` | `EmptyParams` | `SurfaceProvidersResult` | list live surface providers and capabilities |
 | `spatial-sample` | `SpatialSampleParams` | `SpatialSampleResult` | sample one canonical provider field channel |
@@ -107,6 +114,9 @@ sa -o json set-transform --entity 42 --translation '{"x":0,"y":1,"z":0}'
 | `set-fog` | `SetFogParams` | `EnvironmentDto` | set analytic height & distance fog settings |
 | `set-clouds` | `SetCloudsParams` | `EnvironmentDto` | set volumetric cloud shape settings |
 | `set-wind` | `SetWindParams` | `EnvironmentDto` | set shared global wind settings |
+| `sample-wind` | `SampleWindParams` | `SampleWindResult` | the composed wind velocity at a world position {positionM, timeS?} |
+| `emit-interaction-impulse` | `EmitInteractionImpulseParams` | `EmitInteractionImpulseResult` | push the world interaction field {positionM, radiusM, strength, direction?, depress?} |
+| `wind-interaction-field` | `WindInteractionFieldParams` | `WindInteractionFieldResult` | one whole cascade of the world interaction field, reduced to a grid {cascade?, resolution?} |
 | `set-time-of-day` | `SetTimeOfDayParams` | `EnvironmentDto` | set calendar-driven time-of-day settings |
 | `get-selection` | `EmptyParams` | `SelectionResult` | get current selection |
 | `deselect` | `EmptyParams` | `DeselectResult` | clear selection |
@@ -125,7 +135,7 @@ sa -o json set-transform --entity 42 --translation '{"x":0,"y":1,"z":0}'
 | `get-skeleton-overlay` | `EmptyParams` | `SkeletonOverlayResult` | the line-skeleton overlay toggle, axes, and joint size |
 | `set-skeleton-overlay` | `SetSkeletonOverlayParams` | `SkeletonOverlayResult` | the selected rig's line-skeleton viewport overlay (show\|axes\|jointSize) |
 | `get-debug-overlays` | `EmptyParams` | `DebugOverlaysResult` | the viewport debug-overlay toggles (bounds\|sceneAabb\|lightVolumes\|grid\|colliders) |
-| `set-debug-overlays` | `DebugOverlaysParams` | `DebugOverlaysResult` | toggle viewport debug overlays {bounds?, sceneAabb?, lightVolumes?, grid?, colliders?} |
+| `set-debug-overlays` | `DebugOverlaysParams` | `DebugOverlaysResult` | toggle viewport debug overlays {bounds?, sceneAabb?, lightVolumes?, grid?, colliders?, vegetationCells?, vegetationBounds?, vegetationRejections?, vegetationHeatmap?} |
 | `set-skeleton-highlight` | `SetSkeletonHighlightParams` | `SkeletonOverlayResult` | tint a previewed model's joint by its get-asset-model node index (-1 clears) |
 | `pick-skeleton-joint` | `PickSkeletonJointParams` | `PickSkeletonJointResult` | pick the previewed model's nearest joint to a viewport click (u,v) within radiusPx |
 | `set-asset-preview-options` | `SetAssetPreviewOptionsParams` | `AssetPreviewOptionsResult` | set-asset-preview-options {floor?} — preview-scene settings (show floor) |
@@ -172,10 +182,56 @@ sa -o json set-transform --entity 42 --translation '{"x":0,"y":1,"z":0}'
 | `set-tessellation-quality` | `SetTessellationQualityParams` | `SetTessellationQualityResult` | set-tessellation-quality [factorCap] [minFactor] [edgeLengthTarget] |
 | `vegetation-compile-biome` | `VegetationCompileBiomeParams` | `VegetationCompileBiomeResult` | compile a biome graph and inspect dependencies, halo, estimates, and hard caps |
 | `vegetation-node-schema` | `VegetationNodeSchemaParams` | `VegetationNodeSchemaResult` | inspect typed biome-node pins, parameters, seed namespaces, and execution capability |
-| `vegetation-evaluate-region` | `VegetationEvaluateRegionParams` | `VegetationEvaluationJobDto` | start one bounded asynchronous biome evaluation through the canonical evaluator |
+| `vegetation-preflight-region` | `VegetationPreflightRegionParams` | `VegetationEvaluationJobDto` | bound and retain one evaluation; report retained/generated inputs and both memory peaks |
+| `vegetation-start-evaluation` | `VegetationEvaluationJobParams` | `VegetationEvaluationJobDto` | start the exact evaluator and inputs retained by a prepared job |
 | `vegetation-evaluation-status` | `VegetationEvaluationJobParams` | `VegetationEvaluationStatusDto` | poll an asynchronous vegetation evaluation and its deterministic aggregate |
 | `vegetation-cancel-evaluation` | `VegetationEvaluationJobParams` | `VegetationEvaluationStatusDto` | cancel an asynchronous vegetation evaluation without partial publication |
 | `vegetation-explain-point` | `VegetationExplainPointParams` | `ProvenanceExplanationDto` | trace an accepted plant or rejected candidate through its provenance decision DAG |
+| `vegetation-cook` | `VegetationCookParams` | `VegetationCookJobDto` | start a staged content-addressed map cook for all, bounds, or explicit cells |
+| `vegetation-cook-status` | `VegetationCookJobParams` | `VegetationCookStatusDto` | poll cook progress, terminal statistics, manifest, or failure |
+| `vegetation-cancel-cook` | `VegetationCookJobParams` | `VegetationCookStatusDto` | request cooperative cancellation of one vegetation cook |
+| `vegetation-cell-inspect` | `VegetationCellInspectParams` | `VegetationCellInspectResult` | validate and inspect one immutable cell header and section directory |
+| `vegetation-rejections` | `VegetationRejectionsParams` | `VegetationRejectionsResult` | one cooked cell's rejected candidates: position, reason, and ordinal (capped rows) |
+| `vegetation-topology-diff` | `VegetationTopologyDiffParams` | `VegetationTopologyDiffResult` | diff two cooked manifests per cell: added/removed/moved plants + override conflicts |
+| `vegetation-manifest` | `VegetationManifestParams` | `VegetationManifestResult` | inspect the current or an exact immutable generation manifest |
+| `vegetation-runtime-status` | `EmptyParams` | `VegetationRuntimeStatusDto` | report the exact runtime vegetation generation, state, queues, residency, and budgets |
+| `vegetation-runtime-cell` | `VegetationRuntimeCellParams` | `VegetationRuntimeCellResult` | inspect one immutable CPU-resident vegetation cell generation |
+| `vegetation-runtime-query` | `VegetationRuntimeQueryParams` | `VegetationRuntimeQueryResult` | query CPU-resident macro vegetation by bounds, radius, ray, or nearest |
+| `vegetation-runtime-inspect` | `VegetationRuntimePlantInspectParams` | `VegetationRuntimePlantInspectResult` | inspect one stable plant's effective row, persistent state, and resident provenance |
+| `vegetation-nav-contributions` | `VegetationNavigationParams` | `VegetationNavigationResult` | read vegetation's navigation contributions and the regions awaiting a rebuild |
+| `vegetation-drain-events` | `VegetationDrainEventsParams` | `VegetationDrainEventsResult` | read committed vegetation transitions after a cursor |
+| `vegetation-promote` | `VegetationRuntimePlantParams` | `VegetationPromotionResult` | promote one macro plant to a transient entity view at the next synchronization point |
+| `vegetation-fell` | `VegetationRuntimePlantParams` | `VegetationPromotionResult` | fell one plant: the rooted plant becomes a stump and a separate product entity spawns |
+| `vegetation-demote` | `VegetationRuntimePlantParams` | `VegetationPromotionResult` | demote one promoted plant, writing its state back through the reducer |
+| `vegetation-plant-vitals` | `VegetationPlantVitalsParams` | `VegetationPlantVitalsResult` | read a promoted plant's live biology, replacing the fields that are present |
+| `vegetation-state-export` | `EmptyParams` | `VegetationStateSnapshotDto` | export the canonical strict runtime vegetation state snapshot |
+| `vegetation-state-import` | `VegetationStateImportParams` | `VegetationStateSnapshotDto` | verify and atomically import one exact runtime vegetation state snapshot |
+| `vegetation-advance-ecology` | `VegetationAdvanceEcologyParams` | `VegetationEcologyReportDto` | advance biological time and catch dependency regions up to it |
+| `vegetation-ecology-status` | `EmptyParams` | `VegetationEcologyStatusDto` | where biological time stands, region by region, with the checkpoint identity |
+| `vegetation-ecology-clock` | `VegetationEcologyClockParams` | `VegetationEcologyClockDto` | vegetation-ecology-clock {running?, tickMilliseconds?, maxTicksPerSync?, workers?, water?, warmth?} — the world clock biology advances on (omit to read) |
+| `vegetation-combustion` | `VegetationCombustionParams` | `VegetationCombustionDto` | sample fuel, moisture, health, occupancy, and what is alight in a volume |
+| `vegetation-usd-skeletons` | `UsdSkeletonsParams` | `UsdSkeletonsResult` | vegetation-usd-skeletons {path} — the UsdSkel skeletons a USD stage declares |
+| `vegetation-wind-record` | `VegetationWindRecordParams` | `VegetationWindRecordResult` | vegetation-wind-record {cell, plant} — one plant's GPU wind prepass record |
+| `vegetation-budgets` | `VegetationBudgetsParams` | `VegetationBudgetsResult` | vegetation-budgets {cellPlants?, familyInstances?, familyMicroPredicted?} — resident-population budgets (omit to read) |
+| `vegetation-verify-artifacts` | `VegetationVerifyParams` | `VegetationVerifyResult` | rehash every artifact the current generations name, optionally removing corrupt ones |
+| `vegetation-state-baseline` | `EmptyParams` | `VegetationStateBaselineResult` | publish the current runtime vegetation state as the generation's starting state |
+| `vegetation-telemetry` | `EmptyParams` | `VegetationTelemetryResult` | compact vegetation runtime telemetry: stage times, work counters, resident bytes |
+| `vegetation-network-interest` | `VegetationNetworkInterestParams` | `VegetationNetworkSessionResult` | declare the cells and facets this world is seated with in a network session |
+| `vegetation-network-checkpoint` | `EmptyParams` | `VegetationNetworkSessionResult` | fingerprint the seated scope at the highest agreed transport sequence |
+| `vegetation-import-points` | `VegetationImportPointsParams` | `VegetationImportPointsResult` | import instanced points from a content-creation tool into an authored map layer |
+| `vegetation-export-points` | `VegetationExportPointsParams` | `VegetationExportPointsResult` | export one authored layer's anchors for a content-creation round trip |
+| `plant-create` | `PlantCreateParams` | `PlantCreateResult` | create a native plant family from the starter botanical graph |
+| `plant-graph` | `PlantGrowthParams` | `PlantGraphResult` | read one native plant family's botanical graph and what it grows |
+| `plant-graph-set` | `PlantGraphSetParams` | `PlantGraphResult` | replace one native plant family's botanical graph and regrow it |
+| `plant-growth` | `PlantGrowthParams` | `BotanicalGrowthDto` | what one plant family's botanical graph grows |
+| `plant-proxies` | `PlantProxiesParams` | `PlantProxiesResult` | plant-proxies {plant} — the collision and navigation proxies a family derived |
+| `plant-season-phenotype` | `PlantSeasonPhenotypeParams` | `PlantSeasonPhenotypeResult` | plant-season-phenotype {plant, seasonMille, lifecycle?, healthMille?, moistureMille?} — the appearance a family renders then, with every phenotype's weight |
+| `plant-hierarchy` | `PlantHierarchyParams` | `PlantHierarchyResult` | plant-hierarchy {plant} — the cooked cut: each node's representation, page, and declared error |
+| `plant-atlas` | `PlantAtlasParams` | `PlantAtlasResult` | plant-atlas {plant, level?} — one cooked family's packed coverage atlas as a PNG |
+| `plant-phenotypes` | `PlantPhenotypesParams` | `PlantPhenotypesResult` | plant-phenotypes {plant, phenotypes?} — read or replace one family's authored appearances |
+| `plant-elements` | `PlantGrowthParams` | `PlantElementsResult` | every element of one native plant family a manual edit can address |
+| `plant-validate` | `PlantValidateParams` | `PlantValidationResult` | validate one retained plant source recipe without publication |
+| `plant-recook` | `PlantRecookParams` | `PlantRecookResult` | compile and publish one validated plant-family artifact |
 | `get-project` | `EmptyParams` | `ProjectInfoDto` | active project metadata |
 | `project-status` | `EmptyParams` | `ProjectStatusDto` | project-load phase + progress |
 | `cancel-load` | `EmptyParams` | `ProjectStatusDto` | abort the in-flight project load |
@@ -187,7 +243,12 @@ sa -o json set-transform --entity 42 --translation '{"x":0,"y":1,"z":0}'
 | `asset-placement` | `AssetPlacementParams` | `AssetPlacementResult` | asset-placement {phase, asset?, u?, v?} — preview, commit, or clear a viewport model drop |
 | `import-texture` | `ImportTextureParams` | `ImportTextureResult` | import-texture {path} [colorspace] |
 | `import-lut` | `ImportLutParams` | `ImportLutResult` | import-lut {path} — import a creative .cube look as a LUT asset |
+| `import-vegetation-asset` | `ImportVegetationAssetParams` | `ImportVegetationAssetResult` | import an authored plant, biome, or complete vegetation-map package |
 | `list-assets` | `EmptyParams` | `AssetList` | list project asset catalog |
+| `vegetation-map-layer-commit` | `VegetationMapLayerCommitParams` | `VegetationMapLayerCommitResult` | commit one optimistic authored-map layer transaction (upserts + removals) |
+| `vegetation-map-chunk-commit` | `VegetationMapChunkCommitParams` | `VegetationMapChunkCommitResult` | commit one optimistic authored-map chunk transaction (a brush gesture's tiles + anchors) |
+| `vegetation-map-chunk-read` | `VegetationMapChunkReadParams` | `VegetationMapChunkReadResult` | read authored map chunks by logical key (a brush gesture's read-modify-write baseline) |
+| `vegetation-asset-summary` | `VegetationAssetSummaryParams` | `VegetationAssetSummaryResult` | inspect authored vegetation metadata, validation, dependencies, and cook statistics |
 | `scan-assets` | `EmptyParams` | `ScanAssetsResult` | rescan assets/ and reconcile the catalog from disk |
 | `extract-subasset` | `ExtractSubAssetParams` | `AssetRef` | extract-subasset {asset, subAsset} [dest] — slice an embedded sub-asset to a standalone file |
 | `clear-extraction` | `ClearExtractionParams` | `AssetRef` | clear-extraction {asset, subAsset} — revert an extracted sub-asset to the embedded chunk |
@@ -216,7 +277,6 @@ sa -o json set-transform --entity 42 --translation '{"x":0,"y":1,"z":0}'
 | `material-get` | `MaterialGetParams` | `MaterialGetResult` | material-get {id\|name} |
 | `material-schema` | `MaterialSchemaParams` | `MaterialSchemaResult` | material-schema {id\|name} — the material's exposed override parameters |
 | `material-update` | `MaterialUpdateParams` | `MaterialUpdateResult` | material-update {id} [fields] |
-| `preview-render` | `PreviewRenderParams` | `PreviewRenderResult` | preview-render {material} [size] |
 | `material-set-graph` | `MaterialSetGraphParams` | `MaterialSetGraphResult` | material-set-graph {material, graph} |
 | `material-create-instance` | `MaterialCreateInstanceParams` | `MaterialCreateResult` | material-create-instance {parent} [name] |
 | `material-set-override` | `MaterialSetOverrideParams` | `MaterialSetOverrideResult` | material-set-override {material, field, value} |
@@ -240,11 +300,11 @@ sa -o json set-transform --entity 42 --translation '{"x":0,"y":1,"z":0}'
 
 | What | File | Symbols |
 |---|---|---|
-| Typed command inventory | `engine/crates/protocol/src/command.rs` | `COMMANDS`, `CommandSpec` |
+| Typed command inventory | `engine/crates/protocol/src/command/` | `COMMANDS`, `CommandSpec` |
 | Generated schema | `schemas/control/openrpc.generated.json` | `methods`, `components.schemas` |
 | Registry and dispatch | `engine/crates/control/src/registry.rs` | `register_builtin_commands`, `CommandRegistry::dispatch` |
 | Registry completeness test | `engine/crates/control/src/registry.rs` | `registry_covers_the_protocol_manifest` |
-| Host-owned script command | `engine/crates/host/src/layer.rs` | `register_script_schema_command` |
+| Host-owned script command | `engine/crates/host/src/layer/` | `register_script_schema_command` |
 | CLI argument mapping | `engine/crates/sa/src/main.rs` | `build_params`, `coerce` |
 | Socket envelope | `engine/crates/control-client/src/lib.rs` | `request_envelope`, `Client` |
 

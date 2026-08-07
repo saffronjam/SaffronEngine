@@ -1,11 +1,9 @@
-//! The `slangc` shader pipeline.
-//!
-//! Compiles every `*.slang` entry-point shader in `engine/assets/shaders/` to
-//! `<runtime>/shaders/<name>.spv`, precompiles the shared `lighting.slang` to a reusable
-//! `lighting.slang-module`, copies each `.slang` source into `<runtime>/shaders/source/`
-//! (the runtime node-graph codegen splices `mesh.slang`), and copies the `models/`, `fonts/`, `icons/`
-//! asset trees next to the host binary. A generated qualification manifest binds every SPIR-V
-//! artifact to its compiler, flags, defines, and compiler-resolved transitive source closure.
+//! The `slangc` shader pipeline: compiles every `*.slang` entry point in `engine/assets/shaders/`
+//! to `<runtime>/shaders/<name>.spv`, precompiles the shared modules to reusable `.slang-module`s,
+//! mirrors the `.slang` sources into `<runtime>/shaders/source/` for runtime node-graph codegen,
+//! and copies the `models/`, `fonts/`, `icons/` trees next to the host binary. A generated
+//! manifest binds every SPIR-V artifact to its compiler, flags, defines, and compiler-resolved
+//! transitive source closure.
 
 use std::collections::BTreeSet;
 use std::io::Write as _;
@@ -21,85 +19,55 @@ const SHADER_ARTIFACT_MANIFEST: &str = "shader-artifacts.generated.json";
 const SHADER_ARTIFACT_SCHEMA_VERSION: u32 = 1;
 const COMPILE_INPUT_HASH_DOMAIN: &[u8] = b"saffron-anima/shader-compile-input/v1\0";
 
-/// The Slang module half is special: it has no entry points and emits no `.spv`. It is
-/// precompiled once to `lighting.slang-module`; `mesh.slang` and codegen material variants
-/// `import lighting` against the precompiled module rather than recompiling it.
-const LIGHTING_STEM: &str = "lighting";
+/// The canonical coverage classifier, whose class constants are checked against the Rust enum.
+const COVERAGE_STEM: &str = "coverage";
 
-/// Resource-free lighting types and sampling helpers shared by forward surfaces and volumetric fog.
-const LIGHTING_COMMON_STEM: &str = "lighting_common";
-
-/// The shared SDF sampling module — like `lighting`, it has no entry points and emits no
-/// `.spv`. Precompiled to `sdf.slang-module`; both `lighting` (the GDF reflection-occlusion cone)
-/// and `ddgi_trace` (the unified near/far field sphere-march) `import sdf` against it.
-const SDF_STEM: &str = "sdf";
-
-/// The shared per-mesh MDF brick-sample module — like `sdf`, no entry points, no `.spv`.
-/// Precompiled to `mdf_brick.slang-module`; `sdf` (the cone trace) and the Global-SDF
-/// `gdf_cull` / `gdf_composite` passes `import mdf_brick` for the one brick-sampling impl.
-const MDF_BRICK_STEM: &str = "mdf_brick";
-
-/// The resource-free octahedral encode module — like `lighting`/`sdf`, no entry points, no
-/// `.spv`. Precompiled to `octahedral.slang-module`; `sdf` re-exports it (the DDGI trace + blend
-/// reach octEncode/octDecode through that re-export) without pulling in `sdf`'s field bindings.
-const OCTAHEDRAL_STEM: &str = "octahedral";
-
-/// The shared DDGI probe-cage sampling module — like `sdf`, no entry points, no `.spv`. Precompiled
-/// to `giprobe.slang-module`; both `lighting` (the mesh forward shade) and `gi_resolve` (the half-res
-/// screen-space GI resolve) `import giprobe` for the one `ddgiSampleIrradiance` implementation.
-const GIPROBE_STEM: &str = "giprobe";
-
-/// The resource-free order-2 sky SH module shared by projection and every reconstruction consumer.
-const SKY_SH_STEM: &str = "sky_sh";
-
-/// The resource-free tonemap-operator module — like `octahedral`, no entry points, no `.spv`.
-/// Imported from source (via `-I`) by `tonemap.slang`. No runtime codegen splices it, so it needs no
-/// precompiled `.slang-module`; it is only excluded from the entry-point `.spv` compile.
-const TONEMAP_OPS_STEM: &str = "tonemap_ops";
-
-/// The authoritative fixed-point and counter-RNG module shared by CPU-parity compute work.
-const SPATIAL_NUMERIC_STEM: &str = "spatial_numeric";
-
-/// The resource-free cloud shape/noise module shared by the static bakes, weather fill, density
-/// debugger, and production cloud march. Imported from source through the shader include path.
-const CLOUDS_STEM: &str = "clouds";
-/// The resource-free cloud lighting module shared by the production cloud march.
-const CLOUD_LIGHTING_STEM: &str = "cloud_lighting";
-/// The resource-parameterized bounded atmosphere march shared by AP fill and cloud compositing.
-const ATMOS_AP_STEM: &str = "atmos_ap";
-
-/// The forward/gbuffer übershader stem. It alone gets an RT-off variant (see the fan-out).
-const MESH_STEM: &str = "mesh";
-/// The preprocessor define that compiles the RT-off übershader variant (strips the ray-tracing
-/// descriptor sets 6/7 so the shader interface matches the RT-less PSO layout).
-const NO_RT_DEFINE: &str = "SAFFRON_NO_RT=1";
-/// The output-name suffix for the RT-off variant (`mesh_nort.spv`).
-const NO_RT_SUFFIX: &str = "_nort";
-
-/// The pinned Slang version the toolbox provides (the `SAFFRON_SLANG_VERSION` pin). Used only
-/// to point at the conventional toolbox cache location when `slangc` is not otherwise found.
-const SLANG_VERSION: &str = "2026.10";
-
-/// The exact per-shader `slangc` flag set. A named constant so the flag-drift guard test asserts
-/// against one source of truth.
-pub const SLANGC_SPV_FLAGS: &[&str] = &[
-    "-profile",
-    "glsl_450",
-    "-target",
-    "spirv",
-    "-emit-spirv-directly",
-    "-fvk-use-entrypoint-name",
-    "-matrix-layout-column-major",
-    "-capability",
-    SLANGC_CAPABILITIES,
+/// Modules with no entry points: they emit no `.spv` and never become an entry-point variant.
+const SHARED_STEMS: &[&str] = &[
+    "atmos_ap",
+    "cloud_lighting",
+    "clouds",
+    COVERAGE_STEM,
+    "giprobe",
+    "global_gpu_data",
+    "lighting",
+    "lighting_common",
+    "material_params",
+    "mdf_brick",
+    "octahedral",
+    "scene_bin_common",
+    "scene_micro_common",
+    "sdf",
+    "sky_sh",
+    "spatial_numeric",
+    "thin_sheet",
+    "tonemap_ops",
+    "wind",
 ];
 
-/// Capabilities the shaders actually use that `glsl_450` does not imply (bindless non-uniform
-/// indexing, sparse residency + min-LOD texture sampling, fragment-fully-covered, inline ray query,
-/// the `VK_EXT_mesh_shader` task/mesh stages, and the SPIR-V debug-info extensions). Declared up
-/// front so Slang does not implicitly upgrade the profile and emit an informational warning per
-/// entry point.
-const SLANGC_CAPABILITIES: &str = "SPV_KHR_non_semantic_info+SPV_GOOGLE_user_type+spvSparseResidency+spvMinLod+spvFragmentFullyCoveredEXT+spvShaderNonUniformEXT+spvRayQueryKHR+spvMeshShadingEXT+spvGroupNonUniform+spvGroupNonUniformBallot";
+/// Shared modules precompiled to `<stem>.slang-module`, which `mesh.slang` and the runtime
+/// node-graph codegen `import` instead of recompiling from source.
+const PRECOMPILED_STEMS: &[&str] = &[
+    "giprobe",
+    "lighting",
+    "mdf_brick",
+    "octahedral",
+    "sdf",
+    "sky_sh",
+];
+
+/// The forward/gbuffer übershader stem. It alone gets an RT-off variant.
+const MESH_STEM: &str = "mesh";
+/// Strips the ray-tracing descriptor sets so the shader interface matches the RT-less PSO layout.
+const NO_RT_DEFINE: &str = "SAFFRON_NO_RT=1";
+const NO_RT_SUFFIX: &str = "_nort";
+
+/// The Slang version the toolbox provisions, named in the "not found" guidance.
+const SLANG_VERSION: &str = "2026.10";
+
+/// The exact per-shader `slangc` flag set, so the flag-drift guard test asserts against one source
+/// of truth.
+pub use saffron_core::SLANGC_SPV_FLAGS;
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -173,7 +141,7 @@ pub struct Report {
     pub spv_compiled: usize,
     /// Entry-point shaders skipped because their `.spv` was already up to date.
     pub spv_skipped: usize,
-    /// Whether `lighting.slang-module` was recompiled this run.
+    /// Whether any shared `.slang-module` was recompiled this run.
     pub module_compiled: bool,
 }
 
@@ -200,87 +168,15 @@ pub fn run(config: &Config) -> Result<Report> {
         .as_ref()
         .is_none_or(|manifest| manifest.slangc_version != slangc_version);
 
-    let lighting_src = config.shader_src_dir.join("lighting.slang");
-    if !lighting_src.is_file() {
-        bail!(
-            "shared lighting source not found: {}",
-            lighting_src.display()
-        );
+    for stem in SHARED_STEMS {
+        let path = config.shader_src_dir.join(format!("{stem}.slang"));
+        if !path.is_file() {
+            bail!("shared shader module not found: {}", path.display());
+        }
     }
-
-    let lighting_common_src = config.shader_src_dir.join("lighting_common.slang");
-    if !lighting_common_src.is_file() {
-        bail!(
-            "shared lighting-common source not found: {}",
-            lighting_common_src.display()
-        );
-    }
-
-    let sdf_src = config.shader_src_dir.join("sdf.slang");
-    if !sdf_src.is_file() {
-        bail!("shared sdf source not found: {}", sdf_src.display());
-    }
-
-    let mdf_brick_src = config.shader_src_dir.join("mdf_brick.slang");
-    if !mdf_brick_src.is_file() {
-        bail!(
-            "shared mdf_brick source not found: {}",
-            mdf_brick_src.display()
-        );
-    }
-
-    let octahedral_src = config.shader_src_dir.join("octahedral.slang");
-    if !octahedral_src.is_file() {
-        bail!(
-            "shared octahedral source not found: {}",
-            octahedral_src.display()
-        );
-    }
-
-    let giprobe_src = config.shader_src_dir.join("giprobe.slang");
-    if !giprobe_src.is_file() {
-        bail!("shared giprobe source not found: {}", giprobe_src.display());
-    }
-
-    let sky_sh_src = config.shader_src_dir.join("sky_sh.slang");
-    if !sky_sh_src.is_file() {
-        bail!("shared sky SH source not found: {}", sky_sh_src.display());
-    }
-
-    let tonemap_ops_src = config.shader_src_dir.join("tonemap_ops.slang");
-    if !tonemap_ops_src.is_file() {
-        bail!(
-            "shared tonemap_ops source not found: {}",
-            tonemap_ops_src.display()
-        );
-    }
-
-    let spatial_numeric_src = config.shader_src_dir.join("spatial_numeric.slang");
-    if !spatial_numeric_src.is_file() {
-        bail!(
-            "shared spatial numeric source not found: {}",
-            spatial_numeric_src.display()
-        );
-    }
-
-    let clouds_src = config.shader_src_dir.join("clouds.slang");
-    if !clouds_src.is_file() {
-        bail!("shared clouds source not found: {}", clouds_src.display());
-    }
-    let cloud_lighting_src = config.shader_src_dir.join("cloud_lighting.slang");
-    if !cloud_lighting_src.is_file() {
-        bail!(
-            "shared cloud lighting source not found: {}",
-            cloud_lighting_src.display()
-        );
-    }
-    let atmos_ap_src = config.shader_src_dir.join("atmos_ap.slang");
-    if !atmos_ap_src.is_file() {
-        bail!(
-            "shared atmosphere AP source not found: {}",
-            atmos_ap_src.display()
-        );
-    }
+    validate_coverage_class_constants(
+        &config.shader_src_dir.join(format!("{COVERAGE_STEM}.slang")),
+    )?;
 
     let shader_sources = shader_sources(&config.shader_src_dir)?;
     for (stem, path) in &shader_sources {
@@ -289,61 +185,13 @@ pub fn run(config: &Config) -> Result<Report> {
     let variants = shader_variants(&shader_sources);
     let mut report = Report::default();
 
-    // The `octahedral` module (no imports) compiles first; `sdf` re-exports it and `lighting`
-    // imports `sdf`, so an `octahedral` touch fans out to both modules + every entry-point `.spv`.
-    let octahedral_module = out_dir.join("octahedral.slang-module");
-    if compiler_changed || is_stale(&octahedral_module, &[&octahedral_src])? {
-        compile_module(&config.slangc, &octahedral_src, &octahedral_module)?;
-        report.module_compiled = true;
-    }
-
-    // The `giprobe` module (the DDGI probe-cage sampler, no imports) compiles before `lighting`
-    // (which imports it) and `gi_resolve`; a touch fans out to both.
-    let giprobe_module = out_dir.join("giprobe.slang-module");
-    if compiler_changed || is_stale(&giprobe_module, &[&giprobe_src])? {
-        compile_module(&config.slangc, &giprobe_src, &giprobe_module)?;
-        report.module_compiled = true;
-    }
-
-    let sky_sh_module = out_dir.join("sky_sh.slang-module");
-    if compiler_changed || is_stale(&sky_sh_module, &[&sky_sh_src])? {
-        compile_module(&config.slangc, &sky_sh_src, &sky_sh_module)?;
-        report.module_compiled = true;
-    }
-
-    // The `mdf_brick` module (the per-mesh brick sample) is imported by `sdf` and the Global-SDF
-    // passes, so it compiles before `sdf` and a touch fans out to both.
-    let mdf_brick_module = out_dir.join("mdf_brick.slang-module");
-    if compiler_changed || is_stale(&mdf_brick_module, &[&mdf_brick_src])? {
-        compile_module(&config.slangc, &mdf_brick_src, &mdf_brick_module)?;
-        report.module_compiled = true;
-    }
-
-    // The `sdf` module imports `octahedral` + `mdf_brick`; `lighting` imports `sdf`, so a `sdf`
-    // touch also rebuilds the lighting module + every entry-point `.spv` (the shared dep edge).
-    let sdf_module = out_dir.join("sdf.slang-module");
-    if compiler_changed || is_stale(&sdf_module, &[&sdf_src, &mdf_brick_src, &octahedral_src])? {
-        compile_module(&config.slangc, &sdf_src, &sdf_module)?;
-        report.module_compiled = true;
-    }
-
-    let lighting_module = out_dir.join("lighting.slang-module");
-    if compiler_changed
-        || is_stale(
-            &lighting_module,
-            &[
-                &lighting_src,
-                &lighting_common_src,
-                &sdf_src,
-                &mdf_brick_src,
-                &octahedral_src,
-                &giprobe_src,
-                &sky_sh_src,
-            ],
-        )?
-    {
-        compile_module(&config.slangc, &lighting_src, &lighting_module)?;
-        report.module_compiled = true;
+    for (stem, closure) in precompile_order(&config.shader_src_dir)? {
+        let module = out_dir.join(format!("{stem}.slang-module"));
+        if compiler_changed || is_stale(&module, &closure)? {
+            let source = config.shader_src_dir.join(format!("{stem}.slang"));
+            compile_module(&config.slangc, &source, &module)?;
+            report.module_compiled = true;
+        }
     }
 
     let mut artifacts = Vec::with_capacity(variants.len());
@@ -458,21 +306,132 @@ fn shader_variants(sources: &[(String, PathBuf)]) -> Vec<ShaderVariant> {
 }
 
 fn is_shared_source(stem: &str) -> bool {
-    matches!(
-        stem,
-        LIGHTING_STEM
-            | LIGHTING_COMMON_STEM
-            | SDF_STEM
-            | MDF_BRICK_STEM
-            | OCTAHEDRAL_STEM
-            | GIPROBE_STEM
-            | SKY_SH_STEM
-            | TONEMAP_OPS_STEM
-            | SPATIAL_NUMERIC_STEM
-            | CLOUDS_STEM
-            | CLOUD_LIGHTING_STEM
-            | ATMOS_AP_STEM
-    )
+    SHARED_STEMS.contains(&stem)
+}
+
+/// Every precompiled module paired with the source paths a change to which invalidates it, ordered
+/// so a module follows each module it imports. A module's import closure strictly contains the
+/// closure of everything it imports, so closure size is a topological key.
+fn precompile_order(shader_src_dir: &Path) -> Result<Vec<(&'static str, Vec<PathBuf>)>> {
+    let mut modules = PRECOMPILED_STEMS
+        .iter()
+        .map(|stem| {
+            let closure = import_closure(shader_src_dir, stem)?
+                .into_iter()
+                .map(|name| shader_src_dir.join(name))
+                .collect::<Vec<_>>();
+            Ok((*stem, closure))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    modules.sort_by(|left, right| {
+        left.1
+            .len()
+            .cmp(&right.1.len())
+            .then_with(|| left.0.cmp(right.0))
+    });
+    Ok(modules)
+}
+
+/// The transitive `import` closure of one shader module, as canonical `<stem>.slang` names
+/// including the module itself. Slang resolves a bare `import <name>` to `<name>.slang` on the
+/// include path, so the closure is exactly the set whose contents the compiled module depends on.
+fn import_closure(shader_src_dir: &Path, stem: &str) -> Result<BTreeSet<String>> {
+    let mut closure = BTreeSet::new();
+    let mut pending = vec![stem.to_owned()];
+    while let Some(stem) = pending.pop() {
+        let name = format!("{stem}.slang");
+        if !closure.insert(name.clone()) {
+            continue;
+        }
+        let path = shader_src_dir.join(&name);
+        let source = std::fs::read_to_string(&path)
+            .with_context(|| format!("reading shader source {}", path.display()))?;
+        pending.extend(imported_modules(&source));
+    }
+    Ok(closure)
+}
+
+/// The module names a Slang source imports, from `import <name>;` and `__exported import <name>;`.
+fn imported_modules(source: &str) -> Vec<String> {
+    let mut modules = Vec::new();
+    for line in strip_comments(source).lines() {
+        let line = line.trim();
+        let declaration = line.strip_prefix("__exported ").unwrap_or(line);
+        let Some(rest) = declaration.strip_prefix("import ") else {
+            continue;
+        };
+        let Some((name, _)) = rest.split_once(';') else {
+            continue;
+        };
+        let name = name.trim();
+        if !name.is_empty()
+            && name
+                .chars()
+                .all(|character| character.is_ascii_alphanumeric() || character == '_')
+        {
+            modules.push(name.to_owned());
+        }
+    }
+    modules
+}
+
+/// Drops `//` and `/* */` comments, keeping line structure, so a commented-out `import` is not
+/// read as a dependency.
+fn strip_comments(source: &str) -> String {
+    let mut stripped = String::with_capacity(source.len());
+    let mut characters = source.chars().peekable();
+    let mut in_block = false;
+    while let Some(character) = characters.next() {
+        if in_block {
+            if character == '*' && characters.peek() == Some(&'/') {
+                characters.next();
+                in_block = false;
+            } else if character == '\n' {
+                stripped.push('\n');
+            }
+            continue;
+        }
+        match (character, characters.peek()) {
+            ('/', Some('/')) => {
+                for character in characters.by_ref() {
+                    if character == '\n' {
+                        stripped.push('\n');
+                        break;
+                    }
+                }
+            }
+            ('/', Some('*')) => {
+                characters.next();
+                in_block = true;
+            }
+            _ => stripped.push(character),
+        }
+    }
+    stripped
+}
+
+fn validate_coverage_class_constants(path: &Path) -> Result<()> {
+    use saffron_vegetation::AlphaClassification;
+
+    let source = std::fs::read_to_string(path)
+        .with_context(|| format!("reading canonical coverage source {}", path.display()))?;
+    for (name, value) in [
+        ("COVERAGE_CLASS_OPAQUE", AlphaClassification::Opaque as u32),
+        ("COVERAGE_CLASS_MASKED", AlphaClassification::Masked as u32),
+        (
+            "COVERAGE_CLASS_TRANSMISSIVE",
+            AlphaClassification::Transmissive as u32,
+        ),
+    ] {
+        let declaration = format!("public static const uint {name} = {value}u;");
+        if !source.contains(&declaration) {
+            bail!(
+                "{} must declare `{declaration}` from AlphaClassification",
+                path.display()
+            );
+        }
+    }
+    Ok(())
 }
 
 fn slangc_version(slangc: &Path) -> Result<String> {
@@ -818,9 +777,8 @@ impl Drop for TemporaryDepfile {
     }
 }
 
-/// Resolves `slangc`: a `PATH` lookup, then `SAFFRON_SLANG_DIR/bin`, then the conventional
-/// toolbox cache (`$HOME/.cache/saffron-slang/slang/bin`). A missing `slangc` is a hard error —
-/// the toolbox provisions it; there is no silent prebuilt fetch.
+/// Resolves `slangc`: a `PATH` lookup, then `SAFFRON_SLANG_DIR/bin`, then the toolbox cache
+/// (`$HOME/.cache/saffron-slang/slang/bin`). Missing is a hard error; nothing is fetched.
 fn find_slangc() -> Result<PathBuf> {
     if let Ok(found) = which("slangc") {
         return Ok(found);
@@ -861,8 +819,7 @@ fn which(name: &str) -> Result<PathBuf> {
     bail!("{name} not found on PATH")
 }
 
-/// `<name>.slang -> <name>.slang-module`: `slangc <src> -emit-ir -o <module>`, no entry
-/// points, no `.spv`. Shared by the `lighting` + `sdf` module precompiles.
+/// `<name>.slang -> <name>.slang-module`: `slangc <src> -emit-ir -o <module>`, no entry points.
 fn compile_module(slangc: &Path, src: &Path, module: &Path) -> Result<()> {
     let status = Command::new(slangc)
         .arg(src)
@@ -877,8 +834,7 @@ fn compile_module(slangc: &Path, src: &Path, module: &Path) -> Result<()> {
     Ok(())
 }
 
-/// `<name>.slang -> <name>.spv`: the per-shader entry-point compile with the frozen flag set
-/// plus the `-I <shader_dir>` include path and the `-o <out>`.
+/// `<name>.slang -> <name>.spv`: the per-shader entry-point compile.
 fn compile_spv(
     slangc: &Path,
     src: &Path,
@@ -900,9 +856,8 @@ fn compile_spv(
     Ok(())
 }
 
-/// The exact argument vector `compile_spv` hands `slangc`, factored out as the single source of
-/// truth so the flag-drift test asserts against the same flags the real compile uses. `defines`
-/// are appended as `-D<name>` for feature variants (the RT-off übershader).
+/// The argument vector `compile_spv` hands `slangc`, so the flag-drift test asserts against the
+/// flags the real compile uses. `defines` are appended as `-D<name>`.
 fn spv_arg_vector(src: &Path, include_dir: &Path, out: &Path, defines: &[String]) -> Vec<String> {
     let mut args = vec![src.to_string_lossy().into_owned()];
     args.extend(SLANGC_SPV_FLAGS.iter().map(|s| (*s).to_owned()));
@@ -917,7 +872,7 @@ fn spv_arg_vector(src: &Path, include_dir: &Path, out: &Path, defines: &[String]
 }
 
 /// An output is stale if it is missing or older than any of its source dependencies.
-fn is_stale(output: &Path, deps: &[&Path]) -> Result<bool> {
+fn is_stale(output: &Path, deps: &[PathBuf]) -> Result<bool> {
     let out_mtime = match std::fs::metadata(output).and_then(|m| m.modified()) {
         Ok(t) => t,
         Err(_) => return Ok(true),
@@ -955,8 +910,7 @@ fn files_equal(a: &Path, b: &Path) -> Result<bool> {
     Ok(ab == bb)
 }
 
-/// Copies `<asset_src>/<name>` recursively to `<runtime>/<name>` (models/fonts/icons next to the
-/// binary so `asset_path(...)` resolves).
+/// Copies `<asset_src>/<name>` recursively next to the binary, where `asset_path` resolves it.
 fn copy_asset_tree(asset_src: &Path, runtime: &Path, name: &str) -> Result<()> {
     let from = asset_src.join(name);
     if !from.is_dir() {
@@ -989,9 +943,6 @@ mod tests {
 
     use super::*;
 
-    /// Guards against flag drift: the per-shader argument vector must be exactly `<src> -profile
-    /// glsl_450 -target spirv -emit-spirv-directly -fvk-use-entrypoint-name
-    /// -matrix-layout-column-major -capability <atoms> -I <dir> -o <out>`.
     #[test]
     fn spv_flag_set_is_frozen() {
         let args = spv_arg_vector(
@@ -1012,7 +963,7 @@ mod tests {
                 "-fvk-use-entrypoint-name",
                 "-matrix-layout-column-major",
                 "-capability",
-                SLANGC_CAPABILITIES,
+                saffron_core::SLANGC_CAPABILITIES,
                 "-I",
                 "/shaders",
                 "-o",
@@ -1021,21 +972,28 @@ mod tests {
         );
     }
 
-    /// The module flag set: no spirv flags, just `-emit-ir`.
+    fn shader_dir() -> PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../assets/shaders")
+    }
+
     #[test]
-    fn lighting_module_is_excluded_from_spv_flags() {
+    fn module_flag_set_is_emit_ir_only() {
         assert!(!SLANGC_SPV_FLAGS.contains(&"-emit-ir"));
         assert!(SLANGC_SPV_FLAGS.contains(&"-emit-spirv-directly"));
     }
 
     #[test]
     fn shader_variants_have_deterministic_name_order() {
-        let sources = vec![
+        let mut sources = vec![
             ("zeta".to_owned(), PathBuf::from("zeta.slang")),
-            (LIGHTING_STEM.to_owned(), PathBuf::from("lighting.slang")),
             (MESH_STEM.to_owned(), PathBuf::from("mesh.slang")),
             ("alpha".to_owned(), PathBuf::from("alpha.slang")),
         ];
+        sources.extend(
+            SHARED_STEMS
+                .iter()
+                .map(|stem| ((*stem).to_owned(), PathBuf::from(format!("{stem}.slang")))),
+        );
 
         let variants = shader_variants(&sources);
 
@@ -1047,6 +1005,103 @@ mod tests {
             ["alpha", "mesh", "mesh_nort", "zeta"]
         );
         assert_eq!(variants[2].defines, [NO_RT_DEFINE]);
+    }
+
+    #[test]
+    fn every_precompiled_module_is_a_shared_source() {
+        for stem in PRECOMPILED_STEMS {
+            assert!(
+                SHARED_STEMS.contains(stem),
+                "{stem} is precompiled but would also compile as an entry point"
+            );
+        }
+        assert!(SHARED_STEMS.windows(2).all(|pair| pair[0] < pair[1]));
+        assert!(PRECOMPILED_STEMS.windows(2).all(|pair| pair[0] < pair[1]));
+    }
+
+    #[test]
+    fn precompiled_modules_depend_on_their_whole_import_closure() -> Result<()> {
+        let order = precompile_order(&shader_dir())?;
+        let mut seen = BTreeSet::new();
+        for (stem, closure) in &order {
+            let names = closure
+                .iter()
+                .map(|path| path.file_name().unwrap().to_string_lossy().into_owned())
+                .collect::<BTreeSet<_>>();
+            assert!(names.contains(&format!("{stem}.slang")));
+            for imported in imported_modules(&std::fs::read_to_string(
+                shader_dir().join(format!("{stem}.slang")),
+            )?) {
+                assert!(
+                    names.contains(&format!("{imported}.slang")),
+                    "{stem} omits its import {imported}"
+                );
+                if PRECOMPILED_STEMS.contains(&imported.as_str()) {
+                    assert!(
+                        seen.contains(&imported),
+                        "{stem} compiles before {imported}"
+                    );
+                }
+            }
+            seen.insert((*stem).to_owned());
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn lighting_module_closes_over_its_transitive_imports() -> Result<()> {
+        let (_, closure) = precompile_order(&shader_dir())?
+            .into_iter()
+            .find(|(stem, _)| *stem == "lighting")
+            .expect("lighting is precompiled");
+        let names = closure
+            .iter()
+            .map(|path| path.file_name().unwrap().to_string_lossy().into_owned())
+            .collect::<BTreeSet<_>>();
+        for expected in [
+            "lighting.slang",
+            "lighting_common.slang",
+            "global_gpu_data.slang",
+            "coverage.slang",
+            "sdf.slang",
+            "mdf_brick.slang",
+            "octahedral.slang",
+            "giprobe.slang",
+            "sky_sh.slang",
+            "material_params.slang",
+            "thin_sheet.slang",
+        ] {
+            assert!(
+                names.contains(expected),
+                "lighting closure omits {expected}"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn import_declarations_ignore_commented_out_lines() {
+        let source = "\
+import kept;\n\
+// import commented;\n\
+/* import blocked;\n\
+   import also_blocked; */\n\
+__exported import exported;\n";
+        assert_eq!(imported_modules(source), ["kept", "exported"]);
+    }
+
+    #[test]
+    fn geometry_passes_use_the_canonical_coverage_module() -> Result<()> {
+        let shader_dir = shader_dir();
+        for shader in ["mesh.slang", "gbuffer.slang", "motion.slang"] {
+            let source = std::fs::read_to_string(shader_dir.join(shader))?;
+            assert!(
+                source.contains("sampleCanonicalCoverage("),
+                "{shader} bypasses the canonical coverage sampler"
+            );
+        }
+
+        Ok(())
     }
 
     #[test]
@@ -1096,34 +1151,27 @@ mod tests {
         );
     }
 
-    /// A missing output is always stale; an output newer than every dep is fresh; an output
-    /// older than any dep is stale — the core of the recompile decision.
     #[test]
     fn staleness_tracks_mtime_against_deps() -> Result<()> {
         let tmp = std::env::temp_dir().join(format!("xtask_stale_{}", std::process::id()));
         std::fs::create_dir_all(&tmp)?;
         let out = tmp.join("out.spv");
-        let dep = tmp.join("dep.slang");
+        let deps = vec![tmp.join("dep.slang")];
 
-        std::fs::write(&dep, b"a")?;
-        // No output yet -> stale.
-        assert!(is_stale(&out, &[&dep])?);
+        std::fs::write(&deps[0], b"a")?;
+        assert!(is_stale(&out, &deps)?);
 
-        // Write the output after the dep -> fresh.
         std::fs::write(&out, b"x")?;
-        assert!(!is_stale(&out, &[&dep])?);
+        assert!(!is_stale(&out, &deps)?);
 
-        // Touch the dep to be strictly newer -> stale again.
         let later = SystemTime::now() + std::time::Duration::from_secs(2);
-        let f = std::fs::File::open(&dep)?;
-        f.set_modified(later)?;
-        assert!(is_stale(&out, &[&dep])?);
+        std::fs::File::open(&deps[0])?.set_modified(later)?;
+        assert!(is_stale(&out, &deps)?);
 
         std::fs::remove_dir_all(&tmp)?;
         Ok(())
     }
 
-    /// `copy_if_different` writes when contents differ and leaves an identical target untouched.
     #[test]
     fn copy_if_different_skips_identical() -> Result<()> {
         let tmp = std::env::temp_dir().join(format!("xtask_copy_{}", std::process::id()));
@@ -1136,7 +1184,6 @@ mod tests {
         copy_if_different(&src, &dst)?;
         assert!(files_equal(&src, &dst)?);
 
-        // Mark dst's mtime in the past; an identical-contents copy must not rewrite it.
         let past = SystemTime::now() - std::time::Duration::from_secs(60);
         std::fs::File::open(&dst)?.set_modified(past)?;
         let before = std::fs::metadata(&dst)?.modified()?;

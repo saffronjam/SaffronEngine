@@ -1,25 +1,13 @@
-//! The ECS speed go/no-go gate (03-ecs-and-scene phase 2, master-index #20).
+//! The ECS speed gate: `hecs` driven through the wrapped [`Scene`] surface on this engine's own
+//! access patterns.
 //!
-//! This benchmark drives `hecs` through the wrapped [`Scene`] surface on *this engine's*
-//! actual access patterns, so the go/no-go call is made by measurement rather than by a
-//! third-party micro-bench. It exercises both halves of the workload PP-4 names:
+//! Two halves of the workload: per-frame iteration (world-transform sync, draw enumeration, the
+//! light gather, the primary-camera resolve) and the structural paths (the `enter_play`
+//! JSON-roundtrip duplicate, `relink_hierarchy`, and `PoseOverride` add/remove on every animated
+//! bone every frame — the one site where archetype moves could cost).
 //!
-//! - **Per-frame iteration** (archetype's strength): the world-transform sync
-//!   (`update_world_transforms`), draw enumeration (`for_each::<(&Mesh, &Material)>`),
-//!   the light gather (`for_each::<(&PointLight,)>`), and the primary-camera resolve
-//!   (`for_each::<(&Transform, &Camera)>`).
-//! - **Structural paths**: the `enter_play` JSON-roundtrip duplicate, `relink_hierarchy`
-//!   (rebuild the parent/children caches over N entities), and the decisive measurement —
-//!   `PoseOverride` `add_component`/`remove_component` on every animated bone every frame,
-//!   the one site where archetype moves could cost.
-//!
-//! The component structs here are bench-local stand-ins for the production set: the gate
-//! measures the *access-pattern cost through the wrapper*, not the production structs.
-//! Every operation goes through the public `Scene` methods, so the number reflects what a
-//! consumer actually pays.
-//!
-//! Run with `cargo bench -p saffron-scene`. The recorded verdict lives in
-//! `plans/rust-rewrite/03-ecs-and-scene/phase-2-ecs-benchmark-gate.md`.
+//! The component structs are bench-local stand-ins: the gate measures the access-pattern cost
+//! through the wrapper, not the production structs. Run with `cargo bench -p saffron-scene`.
 
 use std::collections::HashMap;
 use std::hint::black_box;
@@ -193,7 +181,6 @@ fn build_scene() -> (Scene, Vec<Entity>) {
     let mut bone_handles = Vec::with_capacity(CHARACTER_COUNT * BONES_PER_CHARACTER);
 
     for c in 0..CHARACTER_COUNT {
-        // The character root entity, then a chain/tree of bones parented under it.
         let root = scene.create_entity(format!("character{c}"));
         seed_transform(&mut scene, root, 0);
         let root_id = scene.component::<IdComponent>(root).unwrap().id.0;
@@ -213,8 +200,7 @@ fn build_scene() -> (Scene, Vec<Entity>) {
                 )
                 .unwrap();
             scene.add_component(bone, Bone).unwrap();
-            // A loose tree: every 6th bone branches off the root, the rest chain depthwise,
-            // so the hierarchy walk sees realistic depth and fan-out, not a flat list.
+            // A loose tree so the hierarchy walk sees realistic depth and fan-out.
             parent_id = if b % 6 == 0 {
                 root_id
             } else {
@@ -270,8 +256,7 @@ fn build_scene() -> (Scene, Vec<Entity>) {
                     fov: 45.0,
                     near_plane: 0.1,
                     far_plane: 100.0,
-                    // Only the last camera is primary, so the resolve walk must scan past
-                    // the decoys — the realistic worst case for `primaryCamera`.
+                    // Only the last camera is primary, so the resolve walk scans past decoys.
                     primary: k == CAMERA_COUNT - 1,
                 },
             )
@@ -311,15 +296,13 @@ fn relink_hierarchy(scene: &mut Scene) {
         rel.children.clear();
     });
 
-    // Resolve each relationship's parent uuid to a live handle.
     let mut parents: Vec<(Entity, Entity)> = Vec::new();
     scene.for_each::<&Relationship, _>(|e, rel| {
-        if rel.parent != 0 {
-            if let Some(&handle) = uuid_to_handle.get(&rel.parent) {
-                if handle != e {
-                    parents.push((e, handle));
-                }
-            }
+        if rel.parent != 0
+            && let Some(&handle) = uuid_to_handle.get(&rel.parent)
+            && handle != e
+        {
+            parents.push((e, handle));
         }
     });
     for &(child, parent) in &parents {
@@ -444,15 +427,11 @@ fn scene_to_snapshots(scene: &mut Scene) -> Vec<EntitySnapshot> {
 }
 
 /// Rebuilds a fresh scene from the snapshot list: spawn an entity per row, re-add each
-/// component, then `relink_hierarchy`. Note `create_entity` mints a *new* id, so each row's
-/// durable id is restored explicitly.
+/// component, then `relink_hierarchy`.
 fn snapshots_to_scene(snaps: &[EntitySnapshot]) -> Scene {
     let mut scene = Scene::new();
     for snap in snaps {
-        let e = scene.create_entity("");
-        scene
-            .add_component(e, IdComponent::new(Uuid(snap.id)))
-            .unwrap();
+        let e = scene.spawn_with_id(Uuid(snap.id));
         scene
             .add_component(
                 e,
@@ -605,8 +584,7 @@ fn bench_structural(crit: &mut Criterion) {
         b.iter(|| relink_hierarchy(black_box(&mut scene)));
     });
 
-    // The churn target set is every animated bone; report throughput against that count so
-    // the printed rate reads per-bone-per-frame, not against the whole scene.
+    // Report throughput against the animated-bone count, so the rate reads per-bone-per-frame.
     group.bench_function("pose_override_churn", |b| {
         let (mut scene, bones) = build_scene();
         b.iter(|| pose_override_churn(black_box(&mut scene), black_box(&bones)));

@@ -1,10 +1,6 @@
-/// The bottom-dock Timeline: a read-only, canvas-rendered sequencer for the selected entity. A thin
-/// composition over the shared TimelineTransport + TimelineSurface (components/timeline/), built from
-/// the dock's four store reads (selection, animation state/clips, inspect components for the rig gate).
-/// The asset editor mounts the same pieces against the previewed model (a different TimelineTarget); the
-/// two never render simultaneously (the dock is hidden while a non-scene tab is active).
-///
-/// Keyframe AUTHORING is out of scope; the lane renderer draws read-only clip bars.
+/// The bottom-dock Timeline: a read-only, canvas-rendered sequencer over the selected entity, built
+/// as a thin composition of the shared TimelineTransport + TimelineSurface. The asset editor mounts
+/// the same pieces against the previewed model; the two never render simultaneously.
 import { useEditorStore } from "../state/store";
 import { TimelineTransport } from "../components/timeline/TimelineTransport";
 import { TimelineSurface } from "../components/timeline/TimelineSurface";

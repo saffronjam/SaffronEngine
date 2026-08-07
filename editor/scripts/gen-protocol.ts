@@ -7,8 +7,8 @@ const editorDir = dirname(scriptDir);
 const repoRoot = dirname(editorDir);
 const engineDir = join(repoRoot, "engine");
 
-// The protocol artifacts (sa-types.ts, the OpenRPC schema, the command manifest) are emitted by
-// the Rust workspace tooling bin from the saffron-protocol DTO crate, replacing the old gen.ts.
+// The TypeScript and Luau definitions plus the envelope, OpenRPC, and manifest schemas are emitted
+// by the Rust workspace tooling bin from the saffron-protocol DTO crate.
 const child = spawn("cargo", ["run", "-p", "xtask", "--", "gen-protocol"], {
   cwd: engineDir,
   env: process.env,

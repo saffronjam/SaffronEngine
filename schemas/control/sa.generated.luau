@@ -24,13 +24,36 @@ function Vec3:lerp(other, t) end ---@param other sa.Vec3 @param t number @return
 ---@field normal sa.Vec3
 ---@field entity sa.Entity?
 
+---@class sa.PlantHit
+---@field hit boolean
+---@field plant                      string
+---@field position sa.Vec3
+---@field distance number
+---@field                      lifecycle string
+---@field health number
+---@field interaction_policy                      string
+
 ---@class sa.RagdollState
 ---@field present boolean
 ---@field active boolean
 ---@field body_weight number
 ---@field bones integer
 
----@alias sa.ComponentName "Name"|"Transform"|"Mesh"|"VegetationField"|"Camera"|"MaterialSet"|"ModelInstance"|"Script"|"AnimationPlayer"|"DirectionalLight"|"PointLight"|"SpotLight"|"ReflectionProbe"|"FogVolume"|"Relationship"|"SkinnedMesh"|"Morph"|"Bone"|"FootIk"|"BonePhysics"|"Rigidbody"|"Collider"|"KinematicBones"|"CharacterController"
+---@class sa.VegetationEvent
+---@field seq number
+---@field kind string
+---@field plant string?
+---@field cell { x: number, y: number, z: number, level: number }
+---@field lifecycle string?
+---@field previous_lifecycle string?
+---@field phenotype number?
+---@field amount number?
+---@field health number?
+---@field moisture number?
+---@field fuel number?
+---@field categories number?
+
+---@alias sa.ComponentName "Name"|"Transform"|"Mesh"|"VegetationField"|"Camera"|"MaterialSet"|"ModelInstance"|"Script"|"AnimationPlayer"|"DirectionalLight"|"PointLight"|"SpotLight"|"ReflectionProbe"|"FogVolume"|"WindSource"|"Relationship"|"SkinnedMesh"|"Morph"|"Bone"|"FootIk"|"BonePhysics"|"Rigidbody"|"Collider"|"KinematicBones"|"CharacterController"
 
 ---@class sa.Entity
 local Entity = {}
@@ -74,6 +97,7 @@ function ScriptSelf:on_destroy() end
 function ScriptSelf:on_trigger_enter(other) end ---@param other sa.Entity
 function ScriptSelf:on_trigger_exit(other) end ---@param other sa.Entity
 function ScriptSelf:on_contact(other, point, normal) end ---@param other sa.Entity @param point sa.Vec3 @param normal sa.Vec3
+function ScriptSelf:on_vegetation_event(event) end ---@param event sa.VegetationEvent
 
 sa = {}
 function sa.vec3(x, y, z) end ---@param x number @param y number @param z number @return sa.Vec3
@@ -97,6 +121,11 @@ function sa.spawn(name) end ---@param name string @return sa.Entity
 function sa.broadcast(handler, payload) end ---@param handler string @param payload any
 function sa.raycast(ox, oy, oz, dx, dy, dz, max_dist) end ---@param ox number @param oy number @param oz number @param dx number @param dy number @param dz number @param max_dist number @return sa.RayHit
 function sa.spherecast(ox, oy, oz, dx, dy, dz, radius, max_dist) end ---@param ox number @param oy number @param oz number @param dx number @param dy number @param dz number @param radius number @param max_dist number @return sa.RayHit
+function sa.vegetation_raycast(ox, oy, oz, dx, dy, dz, max_dist, filter) end ---@param ox number @param oy number @param oz number @param dx number @param dy number @param dz number @param max_dist number @param filter any @return sa.PlantHit
+function sa.vegetation_nearest(x, y, z, radius, filter) end ---@param x number @param y number @param z number @param radius number @param filter any @return sa.PlantHit
+function sa.vegetation_in_radius(x, y, z, radius, limit, filter) end ---@param x number @param y number @param z number @param radius number @param limit number @param filter any @return any
+function sa.vegetation_damage(plant, amount) end ---@param plant string @param amount number @return boolean
+function sa.vegetation_harvest(plant, phenotype) end ---@param plant string @param phenotype number @return boolean
 function sa.spawn_task(fn) end ---@param fn any @return any
 function sa.wait(seconds) end ---@param seconds number @return number
 function sa.delay(seconds, fn) end ---@param seconds number @param fn any @return any
@@ -239,6 +268,7 @@ function sa.delay(seconds, fn) end ---@param seconds number @param fn any @retur
 ---@field linearDamping number
 ---@field angularDamping number
 ---@field gravityFactor number
+---@field windFactor number
 ---@field lockPosition sa.BVec3
 ---@field lockRotation sa.BVec3
 ---@field collisionLayer number
@@ -275,6 +305,13 @@ function sa.delay(seconds, fn) end ---@param seconds number @param fn any @retur
 ---@field map string
 ---@field enabled boolean
 
+---@class sa.WindSource
+---@field kind "directional"|"point"|"vortex"|"wake"|"volume"
+---@field strength number
+---@field radius number
+---@field falloff number
+---@field enabled boolean
+
 ---@overload fun(self: sa.Entity, name: "AnimationPlayer"): sa.AnimationPlayer?
 ---@overload fun(self: sa.Entity, name: "Bone"): sa.Bone?
 ---@overload fun(self: sa.Entity, name: "BonePhysics"): sa.BonePhysics?
@@ -299,4 +336,5 @@ function sa.delay(seconds, fn) end ---@param seconds number @param fn any @retur
 ---@overload fun(self: sa.Entity, name: "SpotLight"): sa.SpotLight?
 ---@overload fun(self: sa.Entity, name: "Transform"): sa.Transform?
 ---@overload fun(self: sa.Entity, name: "VegetationField"): sa.VegetationField?
+---@overload fun(self: sa.Entity, name: "WindSource"): sa.WindSource?
 function Entity:get_component(name) end  ---@param name sa.ComponentName @return table?

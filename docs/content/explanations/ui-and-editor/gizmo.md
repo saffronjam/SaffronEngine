@@ -76,9 +76,9 @@ childLocal = inverse(parentWorld) * frozenChildWorld
 | Topbar controls | `editor/src/panels/Topbar.tsx` | `Topbar` |
 | Rebindable shortcuts | `editor/src/app/useGizmoShortcuts.ts` | `useGizmoShortcuts`, `GIZMO_COMMANDS` |
 | Gizmo state, hit test, and drag math | `engine/crates/sceneedit/src/gizmo.rs` | `NativeGizmoState`, `SceneEditContext::hit_native_gizmo`, `SceneEditContext::apply_native_gizmo_drag`, `SceneEditContext::step_native_gizmo_drag` |
-| Overlay builder | `engine/crates/host/src/overlay.rs` | `build_native_gizmo`, `build_scene_edit_overlay` |
+| Overlay builder | `engine/crates/host/src/overlay/` | `build_native_gizmo`, `build_scene_edit_overlay` |
 | Overlay vertex and recorder | `engine/crates/rendering/src/overlay.rs` | `OverlayVertex`, `OverlayState`, `record_overlay` |
-| Control commands | `engine/crates/control/src/commands_scene.rs` | `get-gizmo`, `set-gizmo`, `gizmo-pointer` |
+| Control commands | `engine/crates/control/src/commands_scene/` | `get-gizmo`, `set-gizmo`, `gizmo-pointer` |
 | Child-local decomposition | `engine/crates/scene/src/hierarchy.rs` | `Scene::set_local_from_matrix` |
 
 ## Related

@@ -115,15 +115,15 @@ active and its physical or celestial inputs change.
 | What | File | Symbols |
 |---|---|---|
 | Scene settings and defaults | `engine/crates/scene/src/environment.rs` | `AtmosphereSettings`, `AtmosphereSettings::default` |
-| Renderer parameter packing | `engine/crates/rendering/src/ibl.rs` | `AtmosphereParams`, `AtmosPush`, `AtmosPush::new` |
-| Dynamic refresh | `engine/crates/rendering/src/ibl.rs` | `Ibl::bake`, `Ibl::update_refresh`, `Ibl::record_atmosphere_base`, `Ibl::record_sky_view`, `should_rebake` |
-| Coupled key lights | `engine/crates/rendering/src/ibl.rs` · `engine/crates/rendering/src/renderer.rs` | `sun_transmittance`, `SOLAR_ILLUMINANCE_TOA`, `Renderer::set_scene_lighting` |
+| Renderer parameter packing | `engine/crates/rendering/src/ibl/` | `AtmosphereParams`, `AtmosPush`, `AtmosPush::new` |
+| Dynamic refresh | `engine/crates/rendering/src/ibl/` | `Ibl::bake`, `Ibl::update_refresh`, `Ibl::record_atmosphere_base`, `Ibl::record_sky_view`, `should_rebake` |
+| Coupled key lights | `engine/crates/rendering/src/ibl/` · `engine/crates/rendering/src/renderer/` | `sun_transmittance`, `SOLAR_ILLUMINANCE_TOA`, `Renderer::set_scene_lighting` |
 | Celestial roles and settings | `engine/crates/scene/src/component.rs` · `engine/crates/scene/src/environment.rs` | `AtmosphereRole`, `DirectionalLight`, `AtmosphereSettings` |
 | Transmittance integration | `engine/assets/shaders/atmos_transmittance.slang` | `densities`, `rayTopDistance`, `computeMain` |
 | Repeated scattering | `engine/assets/shaders/atmos_multiscatter.slang` | `sampleTransmittance`, `hitsGround`, `computeMain` |
 | Sky radiance | `engine/assets/shaders/atmos_skyview.slang` | `rayleighPhase`, `hgPhase`, `computeMain` |
 | Solar and lunar discs | `engine/assets/shaders/atmos_skygen.slang` | `atmosphereTransmittance`, `solidAngle`, `computeMain` |
-| Source resolution | `engine/crates/assets/src/render_scene.rs` | `drive_env_bake` |
+| Source resolution | `engine/crates/assets/src/render_scene/` | `drive_env_bake` |
 
 ## Related
 

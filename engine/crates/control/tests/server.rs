@@ -7,6 +7,7 @@ use std::io::{BufRead, BufReader, Read, Write};
 use std::os::unix::net::UnixStream;
 
 use saffron_control::start_control_server;
+use saffron_protocol::ControlFailureDto;
 use serde_json::Value;
 
 /// A unique short socket path for one test. Unix-domain socket paths have a small fixed limit, and
@@ -67,15 +68,30 @@ fn invalid_json_request_returns_the_frozen_error_envelope() {
 
     server.drain(|line| match serde_json::from_str::<Value>(line) {
         Ok(_) => unreachable!("the line is not valid json"),
-        Err(_) => r#"{"ok":false,"error":"invalid JSON request"}"#.to_owned(),
+        Err(_) => serde_json::to_string(&serde_json::json!({
+            "id": Value::Null,
+            "ok": false,
+            "error": ControlFailureDto::InvalidRequest {
+                message: "invalid JSON request".to_owned(),
+            },
+        }))
+        .unwrap(),
     });
 
     let mut reader = BufReader::new(&mut client);
     let mut reply = String::new();
     reader.read_line(&mut reply).expect("read");
     let parsed: Value = serde_json::from_str(reply.trim_end()).unwrap();
+    assert_eq!(parsed["id"], Value::Null);
     assert_eq!(parsed["ok"], serde_json::json!(false));
-    assert_eq!(parsed["error"], serde_json::json!("invalid JSON request"));
+    assert_eq!(
+        parsed["error"]["code"],
+        serde_json::json!("invalid-request")
+    );
+    assert_eq!(
+        parsed["error"]["message"],
+        serde_json::json!("invalid JSON request")
+    );
 }
 
 #[test]

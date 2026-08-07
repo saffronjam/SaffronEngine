@@ -90,10 +90,10 @@ sa get-render-quality
 | Ray march | `engine/assets/shaders/contact.slang` | `computeMain`, `ign`, `viewPosFromUv`, `Push` |
 | Lighting application | `engine/assets/shaders/lighting.slang` | `contactMap`, `screenFlags.x`, `evalLighting` |
 | Push constants and camera transform | `engine/crates/rendering/src/ssao.rs` | `ContactPush`, `Ssao::contact_push`, `Ssao::set_camera` |
-| Pass scheduling | `engine/crates/rendering/src/renderer.rs` | `add_screen_space_passes`, `contact-shadows`, `contact_map` |
-| Per-view target and descriptors | `engine/crates/rendering/src/view_target.rs` | `ViewTarget::contact_map`, `contact_set`, `mesh_set` |
+| Pass scheduling | `engine/crates/rendering/src/renderer/` | `add_screen_space_passes`, `contact-shadows`, `contact_map` |
+| Per-view target and descriptors | `engine/crates/rendering/src/view_target/` | `ViewTarget::contact_map`, `contact_set`, `mesh_set` |
 | Tier settings | `engine/crates/rendering/src/quality.rs` | `QualityTier`, `RenderQuality::contact_enabled`, `contact_steps` |
-| Control commands | `engine/crates/control/src/commands_render.rs` | `set-render-quality`, `get-render-quality`, `render_quality_result` |
+| Control commands | `engine/crates/control/src/commands_render/` | `set-render-quality`, `get-render-quality`, `render_quality_result` |
 
 ## Related
 

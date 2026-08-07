@@ -1,12 +1,6 @@
-/// A reusable entity-add dropdown listing every spawn preset, wired to
-/// `client.addEntity(preset)`, plus a "Named Empty…" flow that opens a small inline
-/// input and calls `client.createEntity(name)`. The engine auto-selects the new
-/// entity, so on success we mirror that locally (optimistic `selectEntity`) and the
-/// reconcile poll's sceneVersion bump refreshes the hierarchy list. A rejected call
-/// surfaces via `notifyError` (the shared error toast).
-///
-/// The menu and the named-empty popover live in the left column (the Hierarchy
-/// header) and anchor there.
+/// The entity-add dropdown: every spawn preset plus a Named Empty flow. The engine auto-selects the
+/// new entity, so the local selection mirrors it optimistically and the poll's sceneVersion bump
+/// refreshes the hierarchy.
 import { useState } from "react";
 import type { LucideIcon } from "lucide-react";
 import {

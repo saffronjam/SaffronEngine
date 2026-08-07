@@ -5,29 +5,35 @@ use std::str::FromStr;
 use std::sync::Arc;
 
 use saffron_assets::{
-    ResolvedBiomeGraph, assemble_biome_graph_evaluation_job, compile_catalog_biome_graph,
-    compile_catalog_biome_instance_graph, load_vegetation_map_asset, scene_surface_field_snapshots,
+    CookProjectView, ResolvedBiomeGraph, VegetationCookRequest,
+    assemble_biome_graph_evaluation_job, compile_catalog_biome_graph,
+    compile_catalog_biome_instance_graph, load_vegetation_map_snapshot,
+    portable_vegetation_platform_profile, scene_surface_field_snapshots,
     vegetation_graph_dependency_hashes,
 };
 use saffron_core::Uuid;
 use saffron_protocol::{
     ProvenanceDecisionDto, ProvenanceDecisionOutcomeDto, ProvenanceDto, ProvenanceExplanationDto,
     Uuid as WireUuid, VegetationCandidateIdentityDto, VegetationCandidateRejectionReasonDto,
+    VegetationCellInspectParams, VegetationCellInspectResult, VegetationCellSummaryDto,
     VegetationCompileBiomeParams, VegetationCompileBiomeResult, VegetationCompileTargetDto,
-    VegetationEvaluateRegionParams, VegetationEvaluationJobDto, VegetationEvaluationJobParams,
+    VegetationCookJobDto, VegetationCookJobParams, VegetationCookParams, VegetationCookScopeDto,
+    VegetationCookStatusDto, VegetationEvaluationJobDto, VegetationEvaluationJobParams,
     VegetationEvaluationStatusDto, VegetationExplainPointParams, VegetationExplainSubjectDto,
     VegetationGraphDependencyDto, VegetationGraphEstimateDto, VegetationGraphLimitsDto,
     VegetationGraphOperatorDto, VegetationGraphParameterDto, VegetationGraphPinDto, VegetationGuid,
-    VegetationNodeSchemaDto, VegetationNodeSchemaParams, VegetationNodeSchemaResult,
+    VegetationManifestParams, VegetationManifestResult, VegetationNodeSchemaDto,
+    VegetationNodeSchemaParams, VegetationNodeSchemaResult, VegetationPreflightRegionParams,
     WorldBoundsDto, WorldCellDto,
 };
+use saffron_scene::{IdComponent, VegetationField};
 use saffron_spatial::{
     FieldChannel, SurfaceField, WorldBounds, WorldCellKey, world_cells_covering_bounds,
 };
 use saffron_vegetation::{
-    BiomeGraphEvaluator, CandidateIdentity, CandidateRejectionReason, GraphCompileOptions,
-    GraphDependencySource, GraphOperator, PlantId, ProvenanceDecisionOutcome,
-    ProvenanceExplanation,
+    BiomeGraphEvaluator, CandidateIdentity, CandidateRejectionReason, ContentHash,
+    GraphCompileOptions, GraphDependencySource, GraphOperator, GraphSafetyLimits, PlantId,
+    ProvenanceDecisionOutcome, ProvenanceExplanation, VegetationBaseManifest,
 };
 
 use crate::error::{Error, Result};
@@ -35,6 +41,7 @@ use crate::registry::{CommandRegistry, EngineContext};
 
 /// Registers the one production biome-graph control surface.
 pub fn register_vegetation_commands(reg: &mut CommandRegistry) {
+    crate::commands_vegetation_runtime::register_runtime_vegetation_commands(reg);
     reg.register::<VegetationCompileBiomeParams, VegetationCompileBiomeResult>(
         "vegetation-compile-biome",
         "compile a biome graph and inspect its dependencies, halo, estimates, and caps",
@@ -64,9 +71,9 @@ pub fn register_vegetation_commands(reg: &mut CommandRegistry) {
         },
     );
 
-    reg.register::<VegetationEvaluateRegionParams, VegetationEvaluationJobDto>(
-        "vegetation-evaluate-region",
-        "start one bounded asynchronous biome evaluation through the canonical evaluator",
+    reg.register::<VegetationPreflightRegionParams, VegetationEvaluationJobDto>(
+        "vegetation-preflight-region",
+        "assemble, comprehensively bound, and retain one biome evaluation without starting a worker",
         |ctx, params| {
             require_project_loaded(ctx)?;
             let map = Uuid::from(params.map);
@@ -76,7 +83,7 @@ pub fn register_vegetation_commands(reg: &mut CommandRegistry) {
                 parse_optional_u64(params.ecology_tick.as_deref(), "ecologyTick")?.unwrap_or(0);
             let providers = capture_surface_snapshots(ctx)?;
             let dependencies = vegetation_graph_dependency_hashes(ctx.assets, map, &providers)
-                .map_err(|error| Error::command(error.to_string()))?;
+                .map_err(Error::from)?;
             let resolved = compile_catalog_biome_instance_graph(
                 ctx.assets,
                 map,
@@ -84,9 +91,9 @@ pub fn register_vegetation_commands(reg: &mut CommandRegistry) {
                 &dependencies,
                 GraphCompileOptions::canonical(),
             )
-            .map_err(|error| Error::command(error.to_string()))?;
-            let map_asset = load_vegetation_map_asset(ctx.assets, map)
-                .map_err(|error| Error::command(error.to_string()))?;
+            .map_err(Error::from)?;
+            let map_asset = load_vegetation_map_snapshot(ctx.assets, map)
+                .map_err(Error::from)?;
             let instance = map_asset
                 .biome_instances
                 .iter()
@@ -104,7 +111,7 @@ pub fn register_vegetation_commands(reg: &mut CommandRegistry) {
                 params.level,
                 resolved.graph.limits.max_output_cells,
             )
-            .map_err(|error| Error::command(error.to_string()))?;
+            .map_err(Error::command)?;
             let inputs = assemble_biome_graph_evaluation_job(
                 ctx.assets,
                 &resolved,
@@ -113,18 +120,24 @@ pub fn register_vegetation_commands(reg: &mut CommandRegistry) {
                 ecology_tick,
                 providers.iter().map(Arc::clone).collect(),
             )
-            .map_err(|error| Error::command(error.to_string()))?;
+            .map_err(Error::from)?;
             let workers = match params.workers {
                 Some(workers) => usize::from(workers),
                 None => std::thread::available_parallelism().map_or(1, usize::from),
             };
             let mut evaluator = BiomeGraphEvaluator::new(Arc::new(resolved.graph), workers)
-                .map_err(|error| Error::command(error.to_string()))?;
+                .map_err(Error::from)?;
             if let Some(compute) = ctx.vegetation_compute_executor()? {
                 evaluator = evaluator.with_compute_executor(compute);
             }
-            ctx.vegetation_jobs.start(evaluator, inputs)
+            ctx.vegetation_jobs.prepare(evaluator, inputs)
         },
+    );
+
+    reg.register::<VegetationEvaluationJobParams, VegetationEvaluationJobDto>(
+        "vegetation-start-evaluation",
+        "start the exact evaluator and inputs retained by a prepared vegetation job",
+        |ctx, params| ctx.vegetation_jobs.start(parse_u64(&params.job, "job")?),
     );
 
     reg.register::<VegetationEvaluationJobParams, VegetationEvaluationStatusDto>(
@@ -147,8 +160,7 @@ pub fn register_vegetation_commands(reg: &mut CommandRegistry) {
             let cell = parse_cell(&params.cell)?;
             let explanation = match params.subject {
                 VegetationExplainSubjectDto::Plant { plant } => {
-                    let plant = PlantId::from_str(&plant.0)
-                        .map_err(|error| Error::command(error.to_string()))?;
+                    let plant = PlantId::from_str(&plant.0).map_err(Error::from)?;
                     ctx.vegetation_jobs.explain_plant(job, cell, plant)?
                 }
                 VegetationExplainSubjectDto::Rejected { candidate } => ctx
@@ -158,6 +170,459 @@ pub fn register_vegetation_commands(reg: &mut CommandRegistry) {
             Ok(provenance_explanation(explanation))
         },
     );
+
+    reg.register::<VegetationCookParams, VegetationCookJobDto>(
+        "vegetation-cook",
+        "start one deterministic content-addressed vegetation cook",
+        |ctx, params| {
+            require_project_loaded(ctx)?;
+            let map = crate::commands_asset::resolve_asset(ctx, &params.map)?;
+            let map_asset = load_vegetation_map_snapshot(ctx.assets, map).map_err(Error::from)?;
+            let world = vegetation_world_identity(ctx, map)?;
+            let scope = params.scope.clone();
+            let cells = cook_scope_cells(&params.scope, &map_asset)?;
+            let providers = capture_surface_snapshots(ctx)?;
+            let workers = params.workers.unwrap_or_else(default_cook_workers);
+            if workers == 0 {
+                return Err(Error::command(
+                    "vegetation cook workers must be greater than zero",
+                ));
+            }
+            let store = ctx.assets.vegetation_artifact_store();
+            let request = VegetationCookRequest {
+                world,
+                map,
+                expected_manifest: store.current_manifest_hash(map).map_err(Error::from)?,
+                cells,
+                ecology_tick: 0,
+                workers,
+                platform: portable_vegetation_platform_profile(params.platform_profile.as_deref()),
+                surface_providers: providers,
+            };
+            ctx.vegetation_cook_jobs
+                .enqueue(CookProjectView::capture(ctx.assets), request, scope)
+        },
+    );
+
+    reg.register::<VegetationCookJobParams, VegetationCookStatusDto>(
+        "vegetation-cook-status",
+        "poll one asynchronous vegetation cook",
+        |ctx, params| {
+            ctx.vegetation_cook_jobs
+                .status(parse_u64(&params.job, "job")?)
+        },
+    );
+
+    reg.register::<VegetationCookJobParams, VegetationCookStatusDto>(
+        "vegetation-cancel-cook",
+        "cancel one vegetation cook without publishing partial output",
+        |ctx, params| {
+            ctx.vegetation_cook_jobs
+                .cancel(parse_u64(&params.job, "job")?)
+        },
+    );
+
+    reg.register::<VegetationManifestParams, VegetationManifestResult>(
+        "vegetation-manifest",
+        "inspect one current or content-addressed vegetation manifest",
+        |ctx, params| {
+            require_project_loaded(ctx)?;
+            let map = crate::commands_asset::resolve_asset(ctx, &params.map)?;
+            let store = ctx.assets.vegetation_artifact_store();
+            let identity = match params.identity {
+                Some(identity) => parse_content_hash(&identity, "identity")?,
+                None => store
+                    .current_manifest_hash(map)
+                    .map_err(Error::from)?
+                    .ok_or_else(|| Error::command("vegetation map has no cooked generation"))?,
+            };
+            let manifest = read_manifest(&store, identity, map)?;
+            let latest_cook = ctx
+                .vegetation_cook_jobs
+                .latest_statistics(map, identity)
+                .as_ref()
+                .map(crate::vegetation_cook_dto::statistics_dto);
+            Ok(VegetationManifestResult {
+                manifest: crate::vegetation_cook_dto::manifest_dto(&manifest)?,
+                latest_cook,
+            })
+        },
+    );
+
+    reg.register::<VegetationCellInspectParams, VegetationCellInspectResult>(
+        "vegetation-cell-inspect",
+        "inspect one validated immutable vegetation cell header and section table",
+        |ctx, params| {
+            require_project_loaded(ctx)?;
+            let map = crate::commands_asset::resolve_asset(ctx, &params.map)?;
+            let cell = parse_cell(&params.cell)?;
+            let store = ctx.assets.vegetation_artifact_store();
+            let manifest_identity = match params.manifest {
+                Some(identity) => parse_content_hash(&identity, "manifest")?,
+                None => store
+                    .current_manifest_hash(map)
+                    .map_err(Error::from)?
+                    .ok_or_else(|| Error::command("vegetation map has no cooked generation"))?,
+            };
+            let manifest = read_manifest(&store, manifest_identity, map)?;
+            let row = manifest
+                .cells
+                .iter()
+                .find(|candidate| candidate.cell == cell)
+                .ok_or_else(|| Error::command("cell is absent from the selected manifest"))?;
+            let reader = store.open_cell(row.artifact_hash).map_err(Error::from)?;
+            let index = reader.index();
+            Ok(VegetationCellInspectResult {
+                cell: VegetationCellSummaryDto {
+                    map: WireUuid(map.value()),
+                    manifest: manifest_identity.to_string(),
+                    cell: crate::vegetation_cook_dto::world_cell_dto(cell),
+                    content_hash: row.artifact_hash.to_string(),
+                    cook_key: index.cook_key.to_string(),
+                    platform_profile: index.platform_profile.to_string(),
+                    payload_hash: index.payload_hash.to_string(),
+                    bounds: crate::vegetation_cook_dto::world_bounds_dto(row.bounds),
+                    macro_points: row.macro_count.to_string(),
+                    micro_samples: row.micro_count.to_string(),
+                    sections: index
+                        .sections
+                        .iter()
+                        .map(crate::vegetation_cook_dto::cell_section_dto)
+                        .collect(),
+                },
+            })
+        },
+    );
+
+    reg.register::<saffron_protocol::VegetationRejectionsParams, saffron_protocol::VegetationRejectionsResult>(
+        "vegetation-rejections",
+        "one cooked cell's rejected candidates: position, reason, and ordinal (capped rows)",
+        |ctx, params| {
+            require_project_loaded(ctx)?;
+            let map = crate::commands_asset::resolve_asset(ctx, &params.map)?;
+            let cell = parse_cell(&params.cell)?;
+            let store = ctx.assets.vegetation_artifact_store();
+            let manifest_identity = match &params.manifest {
+                Some(identity) => parse_content_hash(identity, "manifest")?,
+                None => store
+                    .current_manifest_hash(map)
+                    .map_err(Error::from)?
+                    .ok_or_else(|| Error::command("vegetation map has no cooked generation"))?,
+            };
+            let manifest = read_manifest(&store, manifest_identity, map)?;
+            let row = manifest
+                .cells
+                .iter()
+                .find(|candidate| candidate.cell == cell)
+                .ok_or_else(|| Error::command("cell is absent from the selected manifest"))?;
+            let bytes = store
+                .read_cell_section(
+                    row.artifact_hash,
+                    saffron_vegetation::VegetationCellSectionKind::RejectionDiagnostics,
+                )
+                .map_err(Error::from)?
+                .ok_or_else(|| {
+                    Error::command("vegetation cell has no rejection diagnostics section")
+                })?;
+            let facet =
+                saffron_vegetation::decode_vegetation_rejection_diagnostics(bytes.as_ref())
+                    .map_err(Error::from)?;
+            let limit = usize::try_from(params.limit.unwrap_or(1024))
+                .map_err(|_| Error::command("limit is not representable"))?;
+            Ok(saffron_protocol::VegetationRejectionsResult {
+                candidates: facet.candidate_count.to_string(),
+                accepted: facet.accepted_count.to_string(),
+                total_rejected: facet.rejected.len().to_string(),
+                rows: facet
+                    .rejected
+                    .iter()
+                    .take(limit)
+                    .map(|rejected| saffron_protocol::VegetationRejectionDto {
+                        reason: crate::commands_asset::rejection_reason_dto(rejected.reason),
+                        position_ticks: rejected
+                            .position
+                            .global_ticks()
+                            .map(|ticks| ticks.to_string()),
+                        ordinal: rejected.candidate.ordinal.to_string(),
+                    })
+                    .collect(),
+            })
+        },
+    );
+
+    reg.register::<saffron_protocol::VegetationTopologyDiffParams, saffron_protocol::VegetationTopologyDiffResult>(
+        "vegetation-topology-diff",
+        "diff two cooked manifests per cell: added/removed/moved plants + override conflicts",
+        |ctx, params| {
+            require_project_loaded(ctx)?;
+            let map = crate::commands_asset::resolve_asset(ctx, &params.map)?;
+            let cell_filter = params
+                .cells
+                .as_ref()
+                .map(|cells| {
+                    cells
+                        .iter()
+                        .map(parse_cell)
+                        .collect::<Result<std::collections::BTreeSet<_>>>()
+                })
+                .transpose()?;
+            let store = ctx.assets.vegetation_artifact_store();
+            let from_identity = parse_content_hash(&params.from, "from")?;
+            let to_identity = match &params.to {
+                Some(identity) => parse_content_hash(identity, "to")?,
+                None => store
+                    .current_manifest_hash(map)
+                    .map_err(Error::from)?
+                    .ok_or_else(|| Error::command("vegetation map has no cooked generation"))?,
+            };
+            let from = read_manifest(&store, from_identity, map)?;
+            let to = read_manifest(&store, to_identity, map)?;
+            let from_cells: std::collections::BTreeMap<_, _> = from
+                .cells
+                .iter()
+                .map(|row| (row.cell, row.artifact_hash))
+                .collect();
+            let to_cells: std::collections::BTreeMap<_, _> = to
+                .cells
+                .iter()
+                .map(|row| (row.cell, row.artifact_hash))
+                .collect();
+            let union: std::collections::BTreeSet<_> = from_cells
+                .keys()
+                .chain(to_cells.keys())
+                .copied()
+                .filter(|cell| {
+                    cell_filter
+                        .as_ref()
+                        .is_none_or(|filter| filter.contains(cell))
+                })
+                .collect();
+            let macro_map = |hash: Option<&saffron_vegetation::ContentHash>| -> Result<
+                std::collections::BTreeMap<saffron_vegetation::PlantId, [i128; 3]>,
+            > {
+                let Some(hash) = hash else {
+                    return Ok(Default::default());
+                };
+                let Some(bytes) = store
+                    .read_cell_section(
+                        *hash,
+                        saffron_vegetation::VegetationCellSectionKind::MacroPoints,
+                    )
+                    .map_err(Error::from)?
+                else {
+                    return Ok(Default::default());
+                };
+                let columns = saffron_vegetation::PlantPointColumns::from_canonical_bytes(&bytes)
+                    .map_err(Error::from)?;
+                Ok(columns
+                    .ids
+                    .iter()
+                    .zip(&columns.positions)
+                    .map(|(id, position)| (*id, position.global_ticks()))
+                    .collect())
+            };
+            const ID_CAP: usize = 64;
+            let mut cells = Vec::new();
+            let mut changed_cells = Vec::new();
+            for cell in union {
+                let from_hash = from_cells.get(&cell);
+                let to_hash = to_cells.get(&cell);
+                if from_hash == to_hash {
+                    continue;
+                }
+                let from_points = macro_map(from_hash)?;
+                let to_points = macro_map(to_hash)?;
+                let added: Vec<_> = to_points
+                    .keys()
+                    .filter(|id| !from_points.contains_key(id))
+                    .copied()
+                    .collect();
+                let removed: Vec<_> = from_points
+                    .keys()
+                    .filter(|id| !to_points.contains_key(id))
+                    .copied()
+                    .collect();
+                let moved: Vec<_> = to_points
+                    .iter()
+                    .filter(|(id, position)| {
+                        from_points
+                            .get(*id)
+                            .is_some_and(|previous| previous != *position)
+                    })
+                    .map(|(id, _)| *id)
+                    .collect();
+                changed_cells.push((cell, to_points));
+                cells.push((cell, added, removed, moved));
+            }
+            drop(store);
+            // Unresolved authored overrides: rows in the changed cells' AnchorOverride
+            // chunks whose plant is absent from the newer manifest's macro set.
+            let root = saffron_assets::load_vegetation_map_root(ctx.assets, map)
+                .map_err(Error::command)?;
+            let mut result_cells = Vec::new();
+            for ((cell, added, removed, moved), (_, to_points)) in
+                cells.into_iter().zip(changed_cells)
+            {
+                let keys: Vec<_> = root
+                    .inventory
+                    .iter()
+                    .filter(|reference| {
+                        reference.key.tile
+                            == saffron_vegetation::VegetationMapTileKey::Cell(cell)
+                            && reference.key.kind
+                                == saffron_vegetation::VegetationMapChunkKind::AnchorOverride
+                    })
+                    .map(|reference| reference.key)
+                    .collect();
+                let chunks = saffron_assets::load_vegetation_map_chunks(ctx.assets, map, &keys)
+                    .map_err(Error::command)?;
+                let mut conflicts = Vec::new();
+                for chunk in &chunks {
+                    let saffron_vegetation::VegetationMapChunkPayload::AnchorOverride(payload) =
+                        &chunk.payload
+                    else {
+                        continue;
+                    };
+                    let layer = vegetation_guid(chunk.key.layer);
+                    let mut push = |kind: &str, plant: saffron_vegetation::PlantId| {
+                        if !to_points.contains_key(&plant) {
+                            conflicts.push(saffron_protocol::VegetationOverrideConflictDto {
+                                kind: kind.to_owned(),
+                                plant: saffron_protocol::PlantId(plant.to_string()),
+                                layer: layer.clone(),
+                            });
+                        }
+                    };
+                    for anchor in &payload.explicit_plants {
+                        push("anchor", anchor.id);
+                    }
+                    for pin in &payload.pins {
+                        push("pin", *pin);
+                    }
+                    for row in &payload.transform_overrides {
+                        push("transform-override", row.plant);
+                    }
+                    for row in &payload.state_overrides {
+                        push("state-override", row.plant);
+                    }
+                }
+                result_cells.push(saffron_protocol::VegetationTopologyCellDiffDto {
+                    cell: crate::vegetation_cook_dto::world_cell_dto(cell),
+                    added: added.len().to_string(),
+                    removed: removed.len().to_string(),
+                    moved: moved.len().to_string(),
+                    added_ids: added
+                        .iter()
+                        .take(ID_CAP)
+                        .map(|id| saffron_protocol::PlantId(id.to_string()))
+                        .collect(),
+                    removed_ids: removed
+                        .iter()
+                        .take(ID_CAP)
+                        .map(|id| saffron_protocol::PlantId(id.to_string()))
+                        .collect(),
+                    moved_ids: moved
+                        .iter()
+                        .take(ID_CAP)
+                        .map(|id| saffron_protocol::PlantId(id.to_string()))
+                        .collect(),
+                    conflicts,
+                });
+            }
+            Ok(saffron_protocol::VegetationTopologyDiffResult {
+                from: from_identity.to_string(),
+                to: to_identity.to_string(),
+                cells: result_cells,
+            })
+        },
+    );
+}
+
+fn vegetation_world_identity(ctx: &mut EngineContext<'_>, map: Uuid) -> Result<Uuid> {
+    let mut matches = Vec::new();
+    ctx.scene_edit
+        .active_scene()
+        .for_each::<(&VegetationField, &IdComponent), _>(|_, (field, id)| {
+            if field.enabled && field.map == map {
+                matches.push(id.id);
+            }
+        });
+    match matches.as_slice() {
+        [world] if world.value() != 0 => Ok(*world),
+        [] => Err(Error::command(
+            "active scene has no enabled VegetationField for this map",
+        )),
+        _ => Err(Error::command(
+            "active scene vegetation world identity is invalid",
+        )),
+    }
+}
+
+fn cook_scope_cells(
+    scope: &VegetationCookScopeDto,
+    map: &saffron_vegetation::VegetationMapSnapshot,
+) -> Result<Vec<WorldCellKey>> {
+    let max_cells = GraphSafetyLimits::default().max_output_cells;
+    match scope {
+        VegetationCookScopeDto::All => {
+            world_cells_covering_bounds(map.bounds, map.root.chunk_layout.level, max_cells)
+                .map_err(Error::command)
+        }
+        VegetationCookScopeDto::Bounds { bounds, level } => {
+            let bounds = intersect_bounds(parse_bounds(bounds)?, map.bounds)
+                .ok_or_else(|| Error::command("cook bounds do not intersect the map"))?;
+            world_cells_covering_bounds(bounds, *level, max_cells).map_err(Error::command)
+        }
+        VegetationCookScopeDto::Cells { cells } => {
+            if u64::try_from(cells.len()).unwrap_or(u64::MAX) > max_cells {
+                return Err(Error::command(
+                    "vegetation cook cell scope exceeds the hard cap",
+                ));
+            }
+            let mut parsed = cells.iter().map(parse_cell).collect::<Result<Vec<_>>>()?;
+            parsed.sort_unstable();
+            if parsed.windows(2).any(|pair| pair[0] == pair[1]) {
+                return Err(Error::command(
+                    "vegetation cook cell scope contains duplicates",
+                ));
+            }
+            if parsed
+                .iter()
+                .any(|cell| intersect_bounds(cell.bounds(), map.bounds).is_none())
+            {
+                return Err(Error::command("vegetation cook cell lies outside the map"));
+            }
+            Ok(parsed)
+        }
+    }
+}
+
+fn default_cook_workers() -> u16 {
+    std::thread::available_parallelism()
+        .map_or(1, usize::from)
+        .try_into()
+        .unwrap_or(u16::MAX)
+}
+
+fn parse_content_hash(value: &str, field: &str) -> Result<ContentHash> {
+    value
+        .parse()
+        .map_err(|error: saffron_vegetation::Error| Error::command(format!("{field}: {error}")))
+}
+
+fn read_manifest(
+    store: &saffron_assets::VegetationArtifactStore,
+    identity: ContentHash,
+    map: Uuid,
+) -> Result<VegetationBaseManifest> {
+    let bytes = store.read_manifest(identity).map_err(Error::from)?;
+    let manifest = VegetationBaseManifest::from_canonical_bytes(&bytes).map_err(Error::from)?;
+    if manifest.map != map || manifest.identity().map_err(Error::from)? != identity {
+        return Err(Error::command(
+            "vegetation manifest does not belong to the selected map",
+        ));
+    }
+    Ok(manifest)
 }
 
 fn require_project_loaded(ctx: &EngineContext<'_>) -> Result<()> {
@@ -180,7 +645,7 @@ fn compile_target(
             &BTreeMap::new(),
             GraphCompileOptions::canonical(),
         )
-        .map_err(|error| Error::command(error.to_string())),
+        .map_err(Error::from),
         VegetationCompileTargetDto::Instance {
             map,
             biome_instance,
@@ -189,7 +654,7 @@ fn compile_target(
             let biome_instance = parse_guid(&biome_instance)?;
             let providers = capture_surface_snapshots(ctx)?;
             let dependencies = vegetation_graph_dependency_hashes(ctx.assets, map, &providers)
-                .map_err(|error| Error::command(error.to_string()))?;
+                .map_err(Error::from)?;
             compile_catalog_biome_instance_graph(
                 ctx.assets,
                 map,
@@ -197,7 +662,7 @@ fn compile_target(
                 &dependencies,
                 GraphCompileOptions::canonical(),
             )
-            .map_err(|error| Error::command(error.to_string()))
+            .map_err(Error::from)
         }
     }
 }
@@ -214,7 +679,7 @@ fn capture_surface_snapshots(ctx: &mut EngineContext<'_>) -> Result<Vec<Arc<dyn 
     });
     snapshots
         .ok_or_else(|| Error::command("renderer did not provide a vegetation surface snapshot"))?
-        .map_err(|error| Error::command(error.to_string()))
+        .map_err(Error::from)
 }
 
 fn compile_result(resolved: &ResolvedBiomeGraph) -> VegetationCompileBiomeResult {
@@ -233,19 +698,7 @@ fn compile_result(resolved: &ResolvedBiomeGraph) -> VegetationCompileBiomeResult
             memory_bytes: estimate.memory_bytes.to_string(),
             transfer_bytes: estimate.transfer_bytes.to_string(),
         },
-        limits: VegetationGraphLimitsDto {
-            workers: limits.max_workers,
-            output_cells: limits.max_output_cells.to_string(),
-            global_stage_tiles: limits.max_global_stage_tiles.to_string(),
-            input_tiles: limits.max_input_tiles.to_string(),
-            candidates: limits.max_candidates.to_string(),
-            macro_points: limits.max_macro_points.to_string(),
-            micro_samples: limits.max_micro_samples.to_string(),
-            memory_bytes: limits.max_memory_bytes.to_string(),
-            transfer_bytes: limits.max_transfer_bytes.to_string(),
-            module_depth: limits.max_module_depth,
-            time_ms: limits.max_time_ms.to_string(),
-        },
+        limits: graph_limits_dto(limits),
         dependencies: graph
             .dependencies()
             .iter()
@@ -258,6 +711,22 @@ fn compile_result(resolved: &ResolvedBiomeGraph) -> VegetationCompileBiomeResult
                 }
             })
             .collect(),
+    }
+}
+
+pub(crate) fn graph_limits_dto(limits: GraphSafetyLimits) -> VegetationGraphLimitsDto {
+    VegetationGraphLimitsDto {
+        workers: limits.max_workers,
+        output_cells: limits.max_output_cells.to_string(),
+        global_stage_tiles: limits.max_global_stage_tiles.to_string(),
+        input_tiles: limits.max_input_tiles.to_string(),
+        candidates: limits.max_candidates.to_string(),
+        macro_points: limits.max_macro_points.to_string(),
+        micro_samples: limits.max_micro_samples.to_string(),
+        memory_bytes: limits.max_memory_bytes.to_string(),
+        transfer_bytes: limits.max_transfer_bytes.to_string(),
+        module_depth: limits.max_module_depth,
+        time_ms: limits.max_time_ms.to_string(),
     }
 }
 
@@ -412,14 +881,14 @@ fn candidate_identity(value: &VegetationCandidateIdentityDto) -> Result<Candidat
 fn parse_bounds(value: &WorldBoundsDto) -> Result<WorldBounds> {
     let minimum = parse_i128_lanes(&value.min_ticks, "bounds.minTicks")?;
     let maximum = parse_i128_lanes(&value.max_ticks_exclusive, "bounds.maxTicksExclusive")?;
-    WorldBounds::new(minimum, maximum).map_err(|error| Error::command(error.to_string()))
+    WorldBounds::new(minimum, maximum).map_err(Error::command)
 }
 
 fn parse_cell(value: &WorldCellDto) -> Result<WorldCellKey> {
     let x = parse_i64(&value.coordinates[0], "cell.coordinates[0]")?;
     let y = parse_i64(&value.coordinates[1], "cell.coordinates[1]")?;
     let z = parse_i64(&value.coordinates[2], "cell.coordinates[2]")?;
-    WorldCellKey::new(x, y, z, value.level).map_err(|error| Error::command(error.to_string()))
+    WorldCellKey::new(x, y, z, value.level).map_err(Error::command)
 }
 
 fn parse_i128_lanes(values: &[String; 3], field: &str) -> Result<[i128; 3]> {
@@ -439,7 +908,7 @@ fn parse_optional_u64(value: Option<&str>, field: &str) -> Result<Option<u64>> {
     value.map(|value| parse_u64(value, field)).transpose()
 }
 
-fn parse_u64(value: &str, field: &str) -> Result<u64> {
+pub(crate) fn parse_u64(value: &str, field: &str) -> Result<u64> {
     value
         .parse()
         .map_err(|_| Error::command(format!("{field} must be a canonical u64 decimal string")))
@@ -624,7 +1093,7 @@ mod tests {
                 }),
             );
             assert_eq!(reply["ok"], json!(false));
-            assert_eq!(reply["error"], json!("no project loaded"));
+            assert_eq!(reply["error"]["message"], json!("no project loaded"));
         });
     }
 

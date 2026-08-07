@@ -28,6 +28,9 @@ flowchart TD
     Log[saffron-log]
     Signal[saffron-signal]
     Json[saffron-json]
+    Spatial[saffron-spatial]
+    Wind[saffron-wind]
+    Material[saffron-material]
     Geometry[saffron-geometry]
     Window[saffron-window]
     Scene[saffron-scene]
@@ -37,6 +40,8 @@ flowchart TD
     PhysicsSys[saffron-physics-sys]
     Physics[saffron-physics]
     Rendering[saffron-rendering]
+    Vegetation[saffron-vegetation]
+    VegetationGpu[saffron-vegetation-gpu]
     Assets[saffron-assets]
     Runtime[saffron-runtime]
     Protocol[saffron-protocol]
@@ -49,34 +54,51 @@ flowchart TD
 
     Signal --> Core
     Json --> Core
-    Geometry --> Core
+    Material --> Spatial
+    Material --> Core
+    Geometry --> Material
     Protocol --> Core
     Window --> Signal
     Scene --> Json
+    Scene --> Spatial
+    Scene --> Wind
     Script --> Scene
+    Script --> Spatial
     SceneEdit --> Signal
     SceneEdit --> Scene
     Animation --> Geometry
     Animation --> Scene
     Physics --> Animation
     Physics --> PhysicsSys
+    Physics --> Spatial
+    Physics --> Wind
     Rendering --> Window
     Rendering --> Geometry
+    Rendering --> Wind
+    Vegetation --> Geometry
+    Vegetation --> Json
+    VegetationGpu --> Vegetation
+    VegetationGpu --> Rendering
     Assets --> Rendering
+    Assets --> Vegetation
     Assets --> Scene
     Runtime --> Assets
     Runtime --> Script
     Runtime --> Physics
+    Runtime --> Vegetation
     App --> Rendering
     Control --> SceneEdit
     Control --> Assets
     Control --> Physics
     Control --> Protocol
+    Control --> Vegetation
+    Control --> Runtime
     ControlClient --> Protocol
     Sa --> ControlClient
     Host --> App
     Host --> Control
     Host --> Runtime
+    Host --> VegetationGpu
     Host --> Log
     Player --> App
     Player --> Runtime
@@ -84,10 +106,10 @@ flowchart TD
     Player --> Log
 ```
 
-Three crates in the diagram have no Saffron dependency at all: `saffron-core` (the
+Four crates in the diagram have no Saffron dependency at all: `saffron-core` (the
 `Result`/`Error` model, `Uuid`, `Ref = Arc`), `saffron-log` (the tracing subscriber stack behind
-`init_logging`), and `saffron-physics-sys` (the vendored-Jolt FFI). Every other crate reaches
-`saffron-core` transitively.
+`init_logging`), `saffron-spatial` (world coordinates and deterministic numerics), and
+`saffron-physics-sys` (the vendored-Jolt FFI). Most other crates reach `saffron-core` transitively.
 
 Three workspace members are tooling and stay out of the runtime graph: `saffron-test-support`
 (shared test helpers, consumed as a dev-dependency), `saffron-e2e` (the `tests/e2e` driver, on
@@ -96,12 +118,14 @@ Three workspace members are tooling and stay out of the runtime graph: `saffron-
 
 ## Reading the layers
 
-- **Vocabulary crates** (`saffron-signal`, `saffron-json`, `saffron-geometry`,
-  `saffron-window`) each add one small concern directly on the roots.
+- **Vocabulary crates** (`saffron-signal`, `saffron-json`, `saffron-spatial`, `saffron-material`,
+  `saffron-geometry`, `saffron-window`) define contracts without depending on product glue.
 - **Domain crates** (`saffron-scene`, `saffron-rendering`, `saffron-animation`,
-  `saffron-physics`, `saffron-script`, `saffron-assets`, `saffron-sceneedit`) see only the
-  domains they consume. `saffron-rendering` lists `saffron-window` and `saffron-geometry` but
-  not `saffron-scene`: the renderer knows nothing of entities, and the scene nothing of Vulkan.
+  `saffron-physics`, `saffron-script`, `saffron-vegetation`, `saffron-assets`,
+  `saffron-sceneedit`) see only the domains they consume. `saffron-rendering` consumes geometry,
+  material, spatial, window, and wind contracts but neither scene nor vegetation. The
+  `saffron-vegetation-gpu` adapter joins renderer compute facilities to vegetation graph programs
+  above both crates.
 - **`saffron-runtime`** bundles the simulation crates into the shared play-mode spine. It has no
   window, renderer, or control-plane dependency; drawing and editing live above it.
 - **The apexes** are the two product binaries, `saffron-host` and `saffron-player`.
@@ -148,6 +172,8 @@ game carries no editor.
 | Root crate | `crates/core/src/lib.rs` | `Error`, `Result`, `Ref`, `Uuid` |
 | Logging root | `crates/log/src/lib.rs` | `init_logging` |
 | Play-mode spine | `crates/runtime/src/lib.rs` | `RuntimeSession` |
+| Material vocabulary | `crates/material/src/lib.rs` | `MaterialSurface`, `CoverageSource` |
+| Vegetation Vulkan adapter | `crates/vegetation-gpu/src/lib.rs` | `VulkanGraphComputeExecutor`, `capture_compute_conformance` |
 | Top-of-graph glue | `crates/host/src/lib.rs` | `run_host`, `HostLayer` |
 | Binary entry points | `crates/host/src/main.rs`, `crates/player/src/main.rs` | `saffron_host::run_host`, `fn main` |
 

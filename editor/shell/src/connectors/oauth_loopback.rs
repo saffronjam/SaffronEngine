@@ -17,9 +17,6 @@ use super::Credentials;
 /// What a connector must declare to use the loopback flow.
 pub struct OAuthLoopbackConfig {
     pub authorize_url: String,
-    /// Recorded for a future Authorization-Code store; unused by the implicit flow.
-    #[allow(dead_code)]
-    pub token_url: String,
     pub client_id: String,
     pub scope: String,
     /// `"token"` for implicit.

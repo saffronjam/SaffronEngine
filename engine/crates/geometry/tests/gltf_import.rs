@@ -96,6 +96,20 @@ fn two_materials_yields_two_slots_in_first_seen_order() {
     assert_eq!(mesh.submeshes[1].material_slot, 1);
 }
 
+/// A file's own asset block says what wrote it and what it says about reuse, and both come across
+/// verbatim — a studio's plant export names its authoring tool, and some tools' licences require
+/// attribution.
+#[test]
+fn the_source_files_stated_origin_survives_import() {
+    let model = import("two-materials.gltf");
+    assert_eq!(model.origin.generator, "SpeedTree Modeler 9.5.2");
+    assert!(model.origin.copyright.contains("attribution required"));
+    // A file that states no copyright states none; nothing is invented for it.
+    let plain = import("cube.gltf");
+    assert_eq!(plain.origin.generator, "saffron gen_cube.py");
+    assert!(plain.origin.copyright.is_empty());
+}
+
 #[test]
 fn cube_import_is_deterministic() {
     // Two imports of the same source yield structurally identical graphs.

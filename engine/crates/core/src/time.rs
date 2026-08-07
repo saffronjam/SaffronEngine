@@ -8,7 +8,6 @@ pub struct TimeSpan {
 }
 
 impl TimeSpan {
-    /// Constructs a span from a duration in seconds.
     #[must_use]
     pub const fn from_seconds(seconds: f32) -> Self {
         Self { seconds }

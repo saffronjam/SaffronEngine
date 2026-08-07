@@ -46,13 +46,11 @@ impl<const FRACTION_BITS: u32> FixedI32<FRACTION_BITS> {
         1_i128 << FRACTION_BITS
     }
 
-    /// Constructs a value from its canonical signed bits.
     #[must_use]
     pub const fn from_bits(bits: i32) -> Self {
         Self(bits)
     }
 
-    /// The canonical signed bits.
     #[must_use]
     pub const fn bits(self) -> i32 {
         self.0
@@ -97,7 +95,6 @@ impl<const FRACTION_BITS: u32> FixedI32<FRACTION_BITS> {
         f64::from(self.0) / Self::scale_i128() as f64
     }
 
-    /// Checked addition.
     pub fn checked_add(self, other: Self) -> Result<Self> {
         self.0
             .checked_add(other.0)
@@ -105,7 +102,6 @@ impl<const FRACTION_BITS: u32> FixedI32<FRACTION_BITS> {
             .ok_or(Error::NumericOverflow)
     }
 
-    /// Checked subtraction.
     pub fn checked_sub(self, other: Self) -> Result<Self> {
         self.0
             .checked_sub(other.0)
@@ -158,28 +154,19 @@ pub type DecisionScalar = FixedI32<16>;
 /// A three-axis decision vector.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub struct DecisionVec3 {
-    /// X component.
     pub x: DecisionScalar,
-    /// Y component.
     pub y: DecisionScalar,
-    /// Z component.
     pub z: DecisionScalar,
 }
 
 /// A symmetric three-dimensional Hessian in canonical component order.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub struct DecisionHessian3 {
-    /// Second derivative along X.
     pub xx: DecisionScalar,
-    /// Mixed X/Y derivative.
     pub xy: DecisionScalar,
-    /// Mixed X/Z derivative.
     pub xz: DecisionScalar,
-    /// Second derivative along Y.
     pub yy: DecisionScalar,
-    /// Mixed Y/Z derivative.
     pub yz: DecisionScalar,
-    /// Second derivative along Z.
     pub zz: DecisionScalar,
 }
 
@@ -188,18 +175,14 @@ pub struct DecisionHessian3 {
 pub struct UnitInterval(u16);
 
 impl UnitInterval {
-    /// Zero.
     pub const ZERO: Self = Self(0);
-    /// One.
     pub const ONE: Self = Self(u16::MAX);
 
-    /// Constructs from canonical bits.
     #[must_use]
     pub const fn from_bits(bits: u16) -> Self {
         Self(bits)
     }
 
-    /// Canonical bits.
     #[must_use]
     pub const fn bits(self) -> u16 {
         self.0
@@ -242,7 +225,6 @@ impl SignedUnit {
         Ok(Self(bits))
     }
 
-    /// Canonical bits.
     #[must_use]
     pub const fn bits(self) -> i16 {
         self.0
@@ -266,6 +248,55 @@ impl SignedUnit {
     }
 }
 
+/// A quantized unit quaternion in canonical XYZW order.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct QuantizedOrientation([SignedUnit; 4]);
+
+impl QuantizedOrientation {
+    #[must_use]
+    pub fn identity() -> Self {
+        Self([
+            SignedUnit::from_bits(0).expect("zero is a signed unit"),
+            SignedUnit::from_bits(0).expect("zero is a signed unit"),
+            SignedUnit::from_bits(0).expect("zero is a signed unit"),
+            SignedUnit::from_bits(i16::MAX).expect("positive one is a signed unit"),
+        ])
+    }
+
+    /// Constructs a non-zero normalized quaternion within quantization tolerance.
+    pub fn new(bits: [i16; 4]) -> Result<Self> {
+        let lanes = bits
+            .map(SignedUnit::from_bits)
+            .into_iter()
+            .collect::<Result<Vec<_>>>()?;
+        let length_squared: i64 = bits
+            .into_iter()
+            .map(|value| i64::from(value) * i64::from(value))
+            .sum();
+        let unit = i64::from(i16::MAX) * i64::from(i16::MAX);
+        let tolerance = unit / 512;
+        if length_squared.abs_diff(unit) > tolerance as u64 {
+            return Err(Error::InvalidOrientation);
+        }
+        Ok(Self(
+            lanes
+                .try_into()
+                .expect("four orientation lanes were collected"),
+        ))
+    }
+
+    #[must_use]
+    pub fn bits(self) -> [i16; 4] {
+        self.0.map(SignedUnit::bits)
+    }
+}
+
+impl Default for QuantizedOrientation {
+    fn default() -> Self {
+        Self::identity()
+    }
+}
+
 /// A finite float with canonical zero and total ordering, for non-authoritative sort keys.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct CanonicalF32(f32);
@@ -279,7 +310,6 @@ impl CanonicalF32 {
         Ok(Self(if value == 0.0 { 0.0 } else { value }))
     }
 
-    /// The finite value.
     #[must_use]
     pub const fn get(self) -> f32 {
         self.0
@@ -327,13 +357,18 @@ pub struct DecisionCurve {
 impl DecisionCurve {
     /// Validates and stores a canonical curve. The caller must supply the stable order.
     pub fn new(points: Vec<(UnitInterval, DecisionScalar)>) -> Result<Self> {
-        if points.is_empty() || points.windows(2).any(|pair| pair[0].0 >= pair[1].0) {
-            return Err(Error::CurveOrder);
-        }
+        Self::validate_points(&points)?;
         Ok(Self { points })
     }
 
-    /// The canonical points.
+    /// Validates canonical borrowed curve points without taking ownership.
+    pub fn validate_points(points: &[(UnitInterval, DecisionScalar)]) -> Result<()> {
+        if points.is_empty() || points.windows(2).any(|pair| pair[0].0 >= pair[1].0) {
+            return Err(Error::CurveOrder);
+        }
+        Ok(())
+    }
+
     #[must_use]
     pub fn points(&self) -> &[(UnitInterval, DecisionScalar)] {
         &self.points
@@ -341,15 +376,24 @@ impl DecisionCurve {
 
     /// Samples with endpoint clamping and ties-to-even linear interpolation.
     pub fn sample(&self, x: UnitInterval) -> Result<DecisionScalar> {
-        if x <= self.points[0].0 {
-            return Ok(self.points[0].1);
+        Self::sample_points(&self.points, x)
+    }
+
+    /// Samples validated borrowed curve points without allocating an owned curve.
+    pub fn sample_points(
+        points: &[(UnitInterval, DecisionScalar)],
+        x: UnitInterval,
+    ) -> Result<DecisionScalar> {
+        Self::validate_points(points)?;
+        if x <= points[0].0 {
+            return Ok(points[0].1);
         }
-        if x >= self.points[self.points.len() - 1].0 {
-            return Ok(self.points[self.points.len() - 1].1);
+        if x >= points[points.len() - 1].0 {
+            return Ok(points[points.len() - 1].1);
         }
-        let index = self.points.partition_point(|(point_x, _)| *point_x < x);
-        let (x0, y0) = self.points[index - 1];
-        let (x1, y1) = self.points[index];
+        let index = points.partition_point(|(point_x, _)| *point_x < x);
+        let (x0, y0) = points[index - 1];
+        let (x1, y1) = points[index];
         let numerator = u32::from(x.bits() - x0.bits());
         let denominator = u32::from(x1.bits() - x0.bits());
         let weight_bits = div_round_ties_even(
@@ -386,6 +430,24 @@ mod tests {
             DecisionScalar::from_bits(i32::MAX)
                 .checked_add(DecisionScalar::from_bits(1))
                 .is_err()
+        );
+    }
+
+    #[test]
+    fn quantized_orientation_requires_a_unit_quaternion() {
+        let identity = QuantizedOrientation::identity();
+        assert_eq!(identity.bits(), [0, 0, 0, i16::MAX]);
+        assert_eq!(
+            QuantizedOrientation::new([0, 0, 0, i16::MAX]).unwrap(),
+            identity
+        );
+        assert_eq!(
+            QuantizedOrientation::new([0, 0, 0, 0]).unwrap_err(),
+            Error::InvalidOrientation
+        );
+        assert_eq!(
+            QuantizedOrientation::new([i16::MIN, 0, 0, 0]).unwrap_err(),
+            Error::NormalizedRange
         );
     }
 

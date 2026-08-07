@@ -38,7 +38,7 @@ The context menu changes with its target. Empty space offers Import and New Fold
 Asset deletion first calls `asset-usages`. The confirmation lists component slots that reference the asset, and `delete-asset` clears those usages before removing the catalog entry and imported file. The Details dialog calls `probe-asset` for file size, creation time, and mesh geometry counts.
 
 Double-click routes models, meshes, animations, textures, and materials to the [asset editor](../asset-editor/).
-Plant, biome, and vegetation-map rows open the vegetation asset workspace. Other file kinds use the
+Plant, biome, and vegetation-map rows open a [vegetation asset workspace](../vegetation-asset-workspaces/). Other file kinds use the
 flat image viewer. Renaming is inline: Enter or blur commits `rename-asset`, while Escape restores the
 catalog name.
 
@@ -82,14 +82,15 @@ The cache is capped at 1 GiB. A write above the cap removes the oldest files unt
 | Folder hierarchy | `editor/src/panels/AssetFolderTree.tsx` | `AssetFolderTree`, `buildFolderTree`, `folderAncestorPaths` |
 | Tile preview, rename, and drag payload | `editor/src/components/AssetTile.tsx` | `AssetTile`, `ASSET_DND_MIME`, `FOLDER_DND_MIME` |
 | File metadata dialog | `editor/src/components/AssetDetailsDialog.tsx` | `AssetDetailsDialog` |
-| Webview thumbnail cache | `editor/src/state/store.ts` | `getCachedThumbnailUrl`, `getThumbnailUrl`, `invalidateThumbnails` |
-| Thumbnail classification and disk cache | `engine/crates/assets/src/thumbnail.rs` | `request_thumbnail`, `write_thumbnail_cache`, `THUMBNAIL_CACHE_VERSION` |
-| Main-graph preview drain | `engine/crates/host/src/layer.rs` | `drive_preview_render_queue`, `render_preview_scene_to_png` |
-| Control commands | `engine/crates/control/src/commands_asset.rs` | `get-thumbnail`, `view-asset`, `probe-asset`, `asset-usages` |
+| Webview thumbnail cache | `editor/src/state/store/thumbnails.ts` | `getCachedThumbnailUrl`, `getThumbnailUrl`, `invalidateThumbnails` |
+| Thumbnail classification and disk cache | `engine/crates/assets/src/thumbnail/` | `request_thumbnail`, `write_thumbnail_cache`, `THUMBNAIL_CACHE_VERSION` |
+| Main-graph preview drain | `engine/crates/host/src/layer/` | `drive_preview_render_queue`, `start_preview_job`, `advance_preview_job` |
+| Control commands | `engine/crates/control/src/commands_asset/` | `get-thumbnail`, `view-asset`, `probe-asset`, `asset-usages` |
 
 ## Related
 
 - [Asset editor](../asset-editor/) — the interactive preview opened from a tile
+- [Vegetation asset workspaces](../vegetation-asset-workspaces/) — the panels a plant, biome, or map tile opens
 - [Vegetation assets](../../geometry-and-assets/vegetation-assets/) — plant, biome, and map catalog formats
 - [Asset pickers and drag-drop](../asset-pickers-and-drag-drop/) — inspector targets for catalog drags
 - [Asset catalog in the scene](../../scene-and-ecs/asset-catalog-in-scene/) — catalog identity and persistence

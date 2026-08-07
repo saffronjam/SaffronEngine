@@ -1,19 +1,12 @@
-/// The Render Stats panel: the performance-telemetry dashboard. The render configuration
-/// (anti-aliasing, feature toggles, exposure) lives in the Render panel beside Environment.
-///
-/// Two timing families that must not be conflated:
-///   - "Engine frame" / "GPU" / the percentile graph come from the engine
-///     (`render-stats`, `frame-history`, `pass-timings`). GPU + per-pass timing need the
-///     profiler in timestamps mode; the frame-time history is always recorded.
-///   - "UI poll" / "UI frame" are client-side: the webview reconcile cadence and repaint
-///     rate. The native viewport paints independently of the webview.
-///
-/// Everything is graded through the shared `PerfConfig` (lib/perfThresholds) so the HUD
-/// agrees with the engine and the e2e tests. Under a software rasterizer (llvmpipe) the
-/// GPU numbers are CPU rasterization time — a banner says so.
+/// The performance-telemetry dashboard. Two timing families that must not be conflated: engine
+/// frame / GPU / percentile numbers come from the engine (GPU and per-pass timing need the profiler
+/// in timestamps mode), while UI poll / UI frame are client-side — the native viewport paints
+/// independently of the webview. Everything grades through the shared `PerfConfig` so the HUD agrees
+/// with the engine and the e2e tests.
 import { useCallback, useEffect, useState } from "react";
 import { client } from "../control/client";
 import { useEditorStore } from "../state/store";
+import { ControlRow } from "../components/PanelRows";
 import { errorText } from "../lib/flash";
 import { FrameTimeGraph } from "../components/FrameTimeGraph";
 import { MetricsRefreshControl } from "../components/MetricsRefreshControl";
@@ -228,14 +221,11 @@ export function RenderStatsPanel() {
             </div>
             {/* The frame-budget target (which also paces the render loop) lives in the Render tab,
                 since it is render config, not telemetry. The bar below grades against it. */}
-            <div className="grid grid-cols-[1fr_auto] items-center gap-1.5">
-              <Label className="truncate text-[11px] font-normal text-muted-foreground">
-                Target FPS
-              </Label>
+            <ControlRow label="Target FPS">
               <span className="font-mono text-[11px] text-muted-foreground">
                 {perfConfig ? `${Math.round(perfConfig.targetFps)} Hz` : "—"}
               </span>
-            </div>
+            </ControlRow>
           </section>
 
           {/* Headline frame time: budget-fill bar, the CPU/GPU bottleneck, percentile lows. */}

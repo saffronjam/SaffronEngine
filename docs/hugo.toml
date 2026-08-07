@@ -25,6 +25,3 @@ disablePathToLower = true
     style = 'base16-snazzy'             # dark-friendly code colours
     noClasses = true
     tabWidth = 4
-
-# Pages with `math = true` in their front matter load KaTeX (see
-# layouts/_partials/docs/inject/head.html) and render the $…$ / $$…$$ above.

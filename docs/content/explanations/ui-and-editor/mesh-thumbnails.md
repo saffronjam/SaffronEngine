@@ -40,28 +40,34 @@ The eye vector produces the three-quarter view. Subject-specific margins frame a
 
 Queued jobs render on the engine's render thread through `ViewId::Thumbnail`. The view owns separate targets and temporal state, so the Scene and asset-preview views retain their accumulated histories. A separate preview IBL state also prevents a thumbnail environment bake from replacing the project's lighting state.
 
+One tile is in flight at a time, and it advances by exactly one frame per update tick: a preview is an amortized job on the ordinary frame loop, costing a tick the same single frame a viewport does. The tile's furnished scene is built once when the job starts; each later tick re-renders it, so the thumbnail view accumulates its temporal history across ticks the way a viewport does.
+
 ```mermaid
 flowchart LR
     A[PreviewRenderJob] --> B[Build throwaway scene]
-    B --> C[Select Thumbnail view]
-    C --> D[Render 8 convergence frames]
-    D --> E[Read post-processed offscreen]
+    B --> C[Request Thumbnail view size]
+    C --> D[One converge frame per tick]
+    D -->|not converged| D
+    D -->|converged| E[Read post-processed offscreen]
     E --> F[Encode PNG]
     F --> G[Write content cache]
-    G --> H[Restore prior view without reset]
 ```
 
-Eight frames let temporal effects settle before readback. The render disables the editor grid and camera models but otherwise uses the scene pipeline, materials, post-processing, and the requested square extent. Restoring the previous active view uses `restore_active_view_no_reset`, which avoids clearing its temporal resources.
+A tile reads back once it has rendered at least eight frames and the preview environment's asynchronous bake has landed; 256 frames bound a bake that never completes. The render disables the editor grid and camera models but otherwise uses the scene pipeline, materials, post-processing, and the requested square extent.
+
+Each tick enters and leaves the thumbnail view through `set_active_view_no_reset`, so neither the tile's accumulated history nor the viewport's is cleared by the excursion. Only the tile's first frame resets the thumbnail view, giving a fresh subject a clean history.
+
+The tile's square size is requested through `set_viewport_desired_size`, which records it and reallocates at the next frame boundary. A view resize idles the GPU and rebuilds every target of the view, so landing it between a frame slot's begin and its submit would strand that slot's fence.
 
 `encode_active_offscreen_png` waits for a safe readback, converts the post-processed framebuffer to RGB, and encodes it with the Rust `image` crate's PNG encoder. The reply reports dimensions read from the encoded image rather than echoing the request.
 
 ## Pending requests
 
-`get-thumbnail` defaults to 128 pixels and `view-asset` defaults to 512. A disk-cache hit returns PNG data immediately. A miss inserts a deduplicated `PreviewRenderJob` and returns a pending response with empty image data.
+`get-thumbnail` defaults to 128 pixels and `view-asset` defaults to 512; either takes an explicit size. A disk-cache hit returns PNG data immediately. A miss inserts a deduplicated `PreviewRenderJob` and returns a pending response with empty image data.
 
-The host renders at most two queued previews in one update tick because each job executes eight convergence frames. After the PNG reaches the cache, the editor's next request becomes a cache hit. Rendering and readback stay on the render thread; the pending control response keeps the initial request from blocking on that work.
+Every caller takes that one path, so the material editor's live pane, an Assets tile, and the View modal are one mechanism at three sizes. After the PNG reaches the cache, the next request becomes a cache hit. Rendering and readback stay on the render thread; the pending control response keeps the request from blocking on that work, and a queued or converging tile is a render-activity reason, so the reactive loop holds full cadence until the queue empties.
 
-The editor retries a pending response after 60 milliseconds, doubles the delay after each miss, and caps it at 1 second. A rejected request settles the tile to its asset-type icon without an error toast.
+The editor retries a pending response after 60 milliseconds, doubles the delay after each miss, and caps it at 1 second — `getThumbnailUrl` for a tile, `getMaterialPreviewBase64` for the material editor's pane. A rejected request settles the tile to its asset-type icon without an error toast.
 
 ## Content-addressed cache
 
@@ -87,13 +93,14 @@ The in-flight map lets concurrent consumers share one retry loop per asset. Repl
 
 | What | File | Symbols |
 |---|---|---|
-| Request classification and disk cache | `engine/crates/assets/src/thumbnail.rs` | `request_thumbnail`, `PreviewRenderKind`, `PreviewRenderJob`, `THUMBNAIL_CACHE_VERSION`, `write_thumbnail_cache` |
-| Preview scene and framing | `engine/crates/control/src/commands_asset.rs` | `PreviewSubject`, `build_preview_scene_for_thumbnail`, `compute_preview_bounds`, `frame_preview_camera` |
-| Queue drain and convergence | `engine/crates/host/src/layer.rs` | `HostLayer::drive_preview_render_queue`, `render_preview_scene_to_png` |
-| Offscreen view isolation | `engine/crates/rendering/src/renderer.rs` | `ViewId::Thumbnail`, `scene_ibl`, `encode_active_offscreen_png`, `restore_active_view_no_reset` |
+| Request classification and disk cache | `engine/crates/assets/src/thumbnail/` | `request_thumbnail`, `PreviewRenderKind`, `PreviewRenderJob`, `THUMBNAIL_CACHE_VERSION`, `write_thumbnail_cache` |
+| Preview scene and framing | `engine/crates/control/src/commands_asset/` | `PreviewSubject`, `build_preview_scene_for_thumbnail`, `compute_preview_bounds`, `frame_preview_camera` |
+| Preview job and convergence | `engine/crates/host/src/layer/` | `HostLayer::drive_preview_render_queue`, `start_preview_job`, `advance_preview_job`, `PreviewRenderState` |
+| Offscreen view isolation | `engine/crates/rendering/src/renderer/` | `ViewId::Thumbnail`, `scene_ibl`, `encode_active_offscreen_png`, `set_active_view_no_reset` |
+| Deferred view resize | `engine/crates/rendering/src/renderer/` | `set_viewport_desired_size`, `reconcile_pending_view_targets`, `begin_offscreen_frame` |
 | PNG conversion | `engine/crates/rendering/src/thumbnail.rs` | `convert_to_rgb`, `encode_to_png`, `ThumbnailPng` |
-| Thumbnail commands | `engine/crates/control/src/commands_asset.rs` | `thumbnail_result`, `get-thumbnail`, `view-asset`, `thumbnail-cache` |
-| Blob URL cache and retries | `editor/src/state/store.ts` | `getThumbnailUrl`, `getCachedThumbnailUrl`, `base64ToBlob`, `invalidateThumbnails` |
+| Thumbnail commands | `engine/crates/control/src/commands_asset/` | `thumbnail_result`, `get-thumbnail`, `view-asset`, `thumbnail-cache` |
+| Blob URL cache and retries | `editor/src/state/store/thumbnails.ts` | `getThumbnailUrl`, `getMaterialPreviewBase64`, `getCachedThumbnailUrl`, `invalidateThumbnails` |
 | Grid tile display | `editor/src/components/AssetTile.tsx` | `AssetTile`, `THUMBNAIL_FETCH_SIZE`, `ThumbnailLoading` |
 
 ## Related

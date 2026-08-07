@@ -14,6 +14,8 @@ import { TimelineSurface } from "../components/timeline/TimelineSurface";
 import type { TimelineTarget } from "../components/timeline/shared";
 import { useEditorStore } from "../state/store";
 import type { AssetModelResult } from "../protocol";
+import { VegetationAssetWorkspace } from "./VegetationAssetWorkspace";
+import type { VegetationAssetType } from "../state/store";
 
 export interface AssetPreviewOrbitHandlers {
   onPointerDown(event: PointerEvent<HTMLDivElement>): void;
@@ -33,6 +35,13 @@ export interface AssetPreviewContextValue {
   active: boolean;
   /// Whether the model's capabilities are known and the preview is entered.
   ready: boolean;
+  /// The previewed catalog asset id (the workspace's subject).
+  assetId: string;
+  /// The subject's vegetation domain when it is a plant/biome/map (else `null`).
+  ///
+  /// A PLANT does drive the live preview surface — only biome and vegetation-map subjects
+  /// short-circuit to a summary, because neither has a single renderable form to show.
+  vegetationType: VegetationAssetType | null;
   /// The previewed material's id when the subject is a material (else `null`) — pins the
   /// Material panel's sidebar to this subject.
   materialSubject: string | null;
@@ -50,7 +59,7 @@ export function AssetPreviewProvider({
   return <AssetPreviewContext.Provider value={value}>{children}</AssetPreviewContext.Provider>;
 }
 
-function useAssetPreview(): AssetPreviewContextValue {
+export function useAssetPreview(): AssetPreviewContextValue {
   const ctx = useContext(AssetPreviewContext);
   if (ctx === null) {
     throw new Error("asset-editor panel rendered outside AssetPreviewProvider");
@@ -74,7 +83,17 @@ export function Preparing({ className }: { className: string }) {
 /// The locked preview leaf body: the transparent hole down to the engine's own "assetPreview" subsurface
 /// (permanently sized to this pane — no resize mask needed). No bg — the pane stays transparent.
 export function AssetPreviewPanel() {
-  const { hostRef, orbit } = useAssetPreview();
+  const { hostRef, orbit, vegetationType } = useAssetPreview();
+  if (vegetationType === "biome" || vegetationType === "vegetation-map") {
+    // Biome/map subjects render no preview surface (a plant previews its compiled
+    // renderable form like any model): paint opaque so the parked subsurface region
+    // never shows the desktop through the hole.
+    return (
+      <div className="flex h-full w-full items-center justify-center bg-background">
+        <span className="text-[11px] text-muted-foreground">No 3D preview for this asset</span>
+      </div>
+    );
+  }
   return (
     <div
       className="relative h-full w-full overflow-hidden"
@@ -87,6 +106,16 @@ export function AssetPreviewPanel() {
       <div ref={hostRef} className="viewport-host" />
     </div>
   );
+}
+
+/// The vegetation summary dock panel: the read-only catalog view of the subject
+/// plant/biome/map, hosted in the asset-editor island.
+export function VegetationSummaryPanel() {
+  const { assetId, vegetationType } = useAssetPreview();
+  if (vegetationType === null) {
+    return null;
+  }
+  return <VegetationAssetWorkspace assetId={assetId} assetType={vegetationType} />;
 }
 
 export function AssetSkeletonPanel() {

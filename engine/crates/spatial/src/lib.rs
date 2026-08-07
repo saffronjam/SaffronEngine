@@ -8,8 +8,8 @@
 
 mod coordinate;
 mod error;
-mod fixture;
 mod numeric;
+mod plant_identity;
 mod random;
 mod residency;
 mod surface;
@@ -17,19 +17,19 @@ mod surface;
 pub use coordinate::{
     BASE_CELL_EDGE_METERS, BASE_CELL_TICKS, LOCAL_FRACTION_BITS, LOCAL_TICKS_PER_METER,
     MAX_HIERARCHY_LEVEL, QuantizedLocalPosition, WorldBounds, WorldCellKey, WorldPosition,
-    world_cells_covering_bounds,
+    world_cell_count_covering_bounds, world_cells_covering_bounds,
 };
 pub use error::{Error, Result};
-pub use fixture::{FOREST_BASELINE_SPEC, ForestBaselineSpec, SpatialFixture};
 pub use numeric::{
     CanonicalF32, DecisionCurve, DecisionHessian3, DecisionScalar, DecisionVec3, FixedI32,
-    SignedUnit, UnitInterval, div_round_ties_even,
+    QuantizedOrientation, SignedUnit, UnitInterval, div_round_ties_even,
 };
+pub use plant_identity::{PlantId, PlantIdNamespace};
 pub use random::{PHILOX4X32_ZERO_VECTOR, RandomDomain, RandomStream, philox4x32_10};
 pub use residency::{
-    DEFAULT_SOURCE_CLAIM_BUDGET, FACET_COUNT, GenerationSlot, GenerationToken, JobPriorityKey,
-    ResidencyFacet, ResidencyManager, ResidencyMask, ResidencySnapshot, SourceLevel,
-    SpatialJobQueue, SpatialSource, SpatialSourceId,
+    DEFAULT_SOURCE_CLAIM_BUDGET, FACET_COUNT, GenerationSlot, GenerationToken, ResidencyFacet,
+    ResidencyManager, ResidencyMask, ResidencySnapshot, SourceLevel, SourceMotion, SpatialSource,
+    SpatialSourceId,
 };
 pub use surface::{
     FieldAvailability, FieldChannel, FieldDerivative, FieldSample, HessianFieldSample,

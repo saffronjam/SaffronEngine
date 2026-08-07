@@ -1,18 +1,19 @@
-/// The Render panel owns rendering algorithms, quality, performance, and diagnostics. Image
-/// formation controls such as view transform, exposure, bloom, and color grading live in Post.
-///
-/// Values are read with a shallow-selected subset of `renderStats` so the panel only re-renders when
-/// a config field actually changes — not on the 20 Hz render-stats poll that rewrites the full bag. A
-/// write optimistically folds the new value in (and the echoed result) so the control reflects the
-/// change at once; the reconcile poll re-reads the full bag right after.
+/// The Render panel owns rendering algorithms, quality, performance, and diagnostics; image
+/// formation lives in Post. Values are read through a shallow-selected subset of `renderStats` so
+/// the panel re-renders only when a config field changes, not on every stats poll. A write folds the
+/// new value (and the echoed result) in optimistically.
 import { useEffect, useRef, useState } from "react";
 import { useShallow } from "zustand/react/shallow";
 import { client } from "../control/client";
 import { useEditorStore } from "../state/store";
 import { NumberDrag } from "../components/NumberDrag";
+import { ControlRow, FieldRow, SectionBreak } from "../components/PanelRows";
+import {
+  applyOptimisticRenderStats as optimistic,
+  recordRenderEdit as recordRender,
+} from "../lib/renderSettings";
 import { errorText, notifyError } from "../lib/flash";
 import type { Environment, RenderStats } from "../protocol";
-import { Label } from "@/components/ui/label";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { Switch } from "@/components/ui/switch";
 import {
@@ -113,13 +114,30 @@ const TOGGLES: {
 /// distinct from the feature toggles above, which are project render config.
 const DEBUG_OVERLAYS: {
   label: string;
-  field: "bounds" | "sceneAabb" | "lightVolumes" | "grid" | "colliders";
+  field:
+    | "bounds"
+    | "sceneAabb"
+    | "lightVolumes"
+    | "grid"
+    | "colliders"
+    | "vegetationCells"
+    | "vegetationBounds"
+    | "vegetationRejections"
+    | "vegetationHeatmap"
+    | "vegetationNavigation"
+    | "windVectors";
 }[] = [
   { label: "Bounding Boxes", field: "bounds" },
   { label: "Scene AABB", field: "sceneAabb" },
   { label: "Light Volumes", field: "lightVolumes" },
   { label: "Grid", field: "grid" },
   { label: "Colliders", field: "colliders" },
+  { label: "Vegetation Cells", field: "vegetationCells" },
+  { label: "Vegetation Bounds", field: "vegetationBounds" },
+  { label: "Vegetation Rejections", field: "vegetationRejections" },
+  { label: "Vegetation Heatmap", field: "vegetationHeatmap" },
+  { label: "Vegetation Navigation", field: "vegetationNavigation" },
+  { label: "Wind Vectors", field: "windVectors" },
 ];
 
 function ToggleRow({
@@ -136,10 +154,9 @@ function ToggleRow({
   onCheckedChange(next: boolean): void;
 }) {
   const row = (
-    <div className="grid grid-cols-[1fr_auto] items-center gap-1.5">
-      <Label className="truncate text-[11px] font-normal text-muted-foreground">{label}</Label>
+    <ControlRow label={label}>
       <Switch checked={checked} disabled={disabled} onCheckedChange={onCheckedChange} />
-    </div>
+    </ControlRow>
   );
   if (!tooltip) {
     return row;
@@ -157,7 +174,6 @@ function ToggleRow({
 export function RenderPanel() {
   const ready = useEditorStore((s) => s.engineStatus.phase === "ready");
   const hasStats = useEditorStore((s) => s.renderStats !== null);
-  const setRenderStats = useEditorStore((s) => s.setRenderStats);
   const setDragActive = useEditorStore((s) => s.setDragActive);
   const environment = useEditorStore((s) => s.environment);
   const setEnvironment = useEditorStore((s) => s.setEnvironment);
@@ -191,13 +207,6 @@ export function RenderPanel() {
       };
     }),
   );
-
-  const optimistic = (patch: Partial<RenderStats>): void => {
-    const cur = useEditorStore.getState().renderStats;
-    if (cur) {
-      setRenderStats({ ...cur, ...patch });
-    }
-  };
 
   useEffect(() => {
     if (ready && environment === null) {
@@ -278,15 +287,6 @@ export function RenderPanel() {
         }
         notifyError(errorText(err));
       });
-  };
-
-  // Render settings persist with the project, so their edits are scene-tab undoable.
-  const recordRender = (
-    label: string,
-    undo: () => Promise<unknown>,
-    redo: () => Promise<unknown>,
-  ): void => {
-    useEditorStore.getState().pushEdit({ label, undo, redo }, "scene");
   };
 
   const setEnvironmentQualityBlock = (
@@ -458,10 +458,7 @@ export function RenderPanel() {
     <div className="flex h-full min-h-0 flex-col">
       <ScrollArea className="min-h-0 flex-1">
         <div className="flex flex-col gap-2 p-2.5">
-          <div className="grid grid-cols-[1fr_auto] items-center gap-1.5">
-            <Label className="truncate text-[11px] font-normal text-muted-foreground">
-              Anti-aliasing
-            </Label>
+          <ControlRow label="Anti-aliasing">
             <Select value={cfg.aa} disabled={!ready} onValueChange={(v) => onAa(v as AaMode)}>
               <SelectTrigger size="sm" className="h-7 w-[112px] font-mono text-[11px]">
                 <SelectValue />
@@ -474,12 +471,9 @@ export function RenderPanel() {
                 ))}
               </SelectContent>
             </Select>
-          </div>
+          </ControlRow>
 
-          <div className="grid grid-cols-[1fr_auto] items-center gap-1.5">
-            <Label className="truncate text-[11px] font-normal text-muted-foreground">
-              Quality
-            </Label>
+          <ControlRow label="Quality">
             <Select value={cfg.quality} disabled={!ready} onValueChange={(v) => onQuality(v)}>
               <SelectTrigger size="sm" className="h-7 w-[112px] font-mono text-[11px]">
                 <SelectValue />
@@ -492,12 +486,9 @@ export function RenderPanel() {
                 ))}
               </SelectContent>
             </Select>
-          </div>
+          </ControlRow>
 
-          <div className="grid grid-cols-[1fr_auto] items-center gap-1.5">
-            <Label className="truncate text-[11px] font-normal text-muted-foreground">
-              Resolution
-            </Label>
+          <ControlRow label="Resolution">
             <Select
               value={upscale ? nearestResolutionPreset(upscale.ratio) : "1"}
               disabled={!ready || upscale === null || upscale.dynamic}
@@ -514,7 +505,7 @@ export function RenderPanel() {
                 ))}
               </SelectContent>
             </Select>
-          </div>
+          </ControlRow>
 
           <ToggleRow
             label="Dynamic resolution"
@@ -525,21 +516,15 @@ export function RenderPanel() {
           />
 
           {upscale && (
-            <div className="grid grid-cols-[1fr_auto] items-center gap-1.5">
-              <Label className="truncate text-[11px] font-normal text-muted-foreground">
-                Render → display
-              </Label>
+            <ControlRow label="Render → display">
               <span className="font-mono text-[11px] text-muted-foreground">
                 {upscale.inputWidth}×{upscale.inputHeight} → {upscale.displayWidth}×
                 {upscale.displayHeight}
               </span>
-            </div>
+            </ControlRow>
           )}
 
-          <div className="grid grid-cols-[1fr_auto] items-center gap-1.5">
-            <Label className="truncate text-[11px] font-normal text-muted-foreground">
-              Target FPS
-            </Label>
+          <ControlRow label="Target FPS">
             <Select
               value={typeof targetFpsMode === "number" ? String(targetFpsMode) : "default"}
               disabled={!ready}
@@ -556,7 +541,7 @@ export function RenderPanel() {
                 ))}
               </SelectContent>
             </Select>
-          </div>
+          </ControlRow>
 
           {TOGGLES.map((t) => {
             const disabled = !ready || (t.rtGated === true && !cfg.rtSupported);
@@ -576,11 +561,7 @@ export function RenderPanel() {
             );
           })}
 
-          <div className="mt-1 border-t border-border pt-2.5">
-            <Label className="text-[10px] font-medium uppercase tracking-wide text-muted-foreground">
-              Environment quality
-            </Label>
-          </div>
+          <SectionBreak>Environment quality</SectionBreak>
 
           {environment ? (
             <>
@@ -596,10 +577,7 @@ export function RenderPanel() {
                   )
                 }
               />
-              <div className="grid grid-cols-[1fr_120px] items-center gap-1.5">
-                <Label className="truncate text-[11px] font-normal text-muted-foreground">
-                  Sky capture cadence
-                </Label>
+              <FieldRow label="Sky capture cadence">
                 <NumberDrag
                   value={environment.atmosphere.skyCaptureCadence}
                   min={1}
@@ -615,11 +593,8 @@ export function RenderPanel() {
                   onDragStart={() => onQualityDragStart("atmosphere", "Atmosphere quality")}
                   onDragEnd={onQualityDragEnd}
                 />
-              </div>
-              <div className="grid grid-cols-[1fr_120px] items-center gap-1.5">
-                <Label className="truncate text-[11px] font-normal text-muted-foreground">
-                  Cloud primary steps
-                </Label>
+              </FieldRow>
+              <FieldRow label="Cloud primary steps">
                 <NumberDrag
                   value={environment.cloud.primarySteps}
                   min={1}
@@ -635,11 +610,8 @@ export function RenderPanel() {
                   onDragStart={() => onQualityDragStart("cloud", "Cloud quality")}
                   onDragEnd={onQualityDragEnd}
                 />
-              </div>
-              <div className="grid grid-cols-[1fr_120px] items-center gap-1.5">
-                <Label className="truncate text-[11px] font-normal text-muted-foreground">
-                  Cloud light steps
-                </Label>
+              </FieldRow>
+              <FieldRow label="Cloud light steps">
                 <NumberDrag
                   value={environment.cloud.lightSteps}
                   min={1}
@@ -655,11 +627,8 @@ export function RenderPanel() {
                   onDragStart={() => onQualityDragStart("cloud", "Cloud quality")}
                   onDragEnd={onQualityDragEnd}
                 />
-              </div>
-              <div className="grid grid-cols-[1fr_120px] items-center gap-1.5">
-                <Label className="truncate text-[11px] font-normal text-muted-foreground">
-                  Cloud temporal factor
-                </Label>
+              </FieldRow>
+              <FieldRow label="Cloud temporal factor">
                 <NumberDrag
                   value={environment.cloud.temporalFactor}
                   min={0}
@@ -671,11 +640,8 @@ export function RenderPanel() {
                   onDragStart={() => onQualityDragStart("cloud", "Cloud quality")}
                   onDragEnd={onQualityDragEnd}
                 />
-              </div>
-              <div className="grid grid-cols-[1fr_auto] items-center gap-1.5">
-                <Label className="truncate text-[11px] font-normal text-muted-foreground">
-                  Volumetric fog quality
-                </Label>
+              </FieldRow>
+              <ControlRow label="Volumetric fog quality">
                 <Select
                   value={environment.fog.quality}
                   disabled={!ready}
@@ -698,11 +664,8 @@ export function RenderPanel() {
                     ))}
                   </SelectContent>
                 </Select>
-              </div>
-              <div className="grid grid-cols-[1fr_120px] items-center gap-1.5">
-                <Label className="truncate text-[11px] font-normal text-muted-foreground">
-                  Fog history blend
-                </Label>
+              </ControlRow>
+              <FieldRow label="Fog history blend">
                 <NumberDrag
                   value={environment.fog.historyBlend}
                   min={0}
@@ -714,7 +677,7 @@ export function RenderPanel() {
                   onDragStart={() => onQualityDragStart("fog", "Fog quality")}
                   onDragEnd={onQualityDragEnd}
                 />
-              </div>
+              </FieldRow>
               <ToggleRow
                 label="Fog neighborhood clamp"
                 checked={environment.fog.neighborhoodClamp}
@@ -723,10 +686,7 @@ export function RenderPanel() {
                   patchEnvironmentQuality("fog", { neighborhoodClamp: next }, "Fog quality")
                 }
               />
-              <div className="grid grid-cols-[1fr_120px] items-center gap-1.5">
-                <Label className="truncate text-[11px] font-normal text-muted-foreground">
-                  Fog light clamp
-                </Label>
+              <FieldRow label="Fog light clamp">
                 <NumberDrag
                   value={environment.fog.lightClamp}
                   min={0}
@@ -738,17 +698,13 @@ export function RenderPanel() {
                   onDragStart={() => onQualityDragStart("fog", "Fog quality")}
                   onDragEnd={onQualityDragEnd}
                 />
-              </div>
+              </FieldRow>
             </>
           ) : (
             <span className="text-[11px] text-muted-foreground">Loading environment quality…</span>
           )}
 
-          <div className="mt-1 border-t border-border pt-2.5">
-            <Label className="text-[10px] font-medium uppercase tracking-wide text-muted-foreground">
-              Debug
-            </Label>
-          </div>
+          <SectionBreak>Debug</SectionBreak>
           {DEBUG_OVERLAYS.map((d) => (
             <ToggleRow
               key={d.field}

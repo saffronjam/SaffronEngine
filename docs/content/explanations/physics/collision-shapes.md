@@ -100,11 +100,11 @@ their contacts do not apply impulses.
 | What | File | Symbols |
 |---|---|---|
 | Shape and material components | `engine/crates/scene/src/component.rs`, `serde.rs` | `Shape`, `Collider`, `PhysicsMaterial`, `SceneSerialize for Collider` |
-| Shape cooking and body population | `engine/crates/physics/src/world.rs` | `cook_shape_geometry`, `CookedGeometry`, `World::populate`, `MeshCook` |
+| Shape cooking and body population | `engine/crates/physics/src/world/` | `cook_shape_geometry`, `CookedGeometry`, `World::populate`, `MeshCook` |
 | Typed cooking errors | `engine/crates/physics/src/error.rs` | `Error::MeshShapeOnDynamic`, `Error::NoCookSource`, `Error::CookFailed` |
 | Jolt shape construction | `engine/crates/physics-sys/shim/jolt_bridge.cpp` | `build_collider_shape`, `jolt_create_body` |
-| CPU mesh loading | `engine/crates/assets/src/load.rs` | `AssetServer::load_mesh_cpu_asset` |
-| Auto-fit and control command | `engine/crates/physics/src/world.rs`, `engine/crates/control/src/commands_physics.rs` | `fit_collider_to_mesh`, `register_physics_commands`, `FitColliderResult` |
+| CPU mesh loading | `engine/crates/assets/src/load/` | `AssetServer::load_mesh_cpu_asset` |
+| Auto-fit and control command | `engine/crates/physics/src/world/`, `engine/crates/control/src/commands_physics.rs` | `fit_collider_to_mesh`, `register_physics_commands`, `FitColliderResult` |
 
 ## Related
 

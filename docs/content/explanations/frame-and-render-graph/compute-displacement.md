@@ -5,7 +5,7 @@ weight = 11
 
 # Compute displacement
 
-Compute displacement turns a material height field into generated micro-geometry. The renderer dices conditioned base triangles, displaces the resulting vertices, and writes per-frame vertex and index buffers. Depth, shadow, G-buffer, motion, and scene passes then draw those buffers through the normal mesh pipelines.
+Compute displacement turns a material height field into generated micro-geometry. The renderer dices conditioned base triangles, displaces the resulting vertices, and writes the frame's amplification arena: a vertex stream, a previous-frame vertex stream, an index stream, and one draw seed per displaced instance. The arena is a geometry source the visibility traversal names in a draw record, so displaced geometry reaches the raster passes through the same binned counted-indirect draws as every other representation.
 
 This path changes the silhouette and supplies real triangles to ray queries. Bump mapping changes only the shading normal, while parallax mapping offsets texture coordinates on an unchanged surface.
 
@@ -18,20 +18,22 @@ flowchart LR
   factor --> scan[tess-scan]
   scan --> finalize[tess-finalize]
   scan --> emit[tess-emit]
-  finalize --> args[indirect draw command]
-  emit --> raster[depth, shadows, G-buffer, scene]
+  finalize --> seed[per-row draw seed]
+  seed --> bin[scene-bucket-scatter]
+  bin --> raster[depth, G-buffer, scene]
+  emit --> raster
   emit --> motion[motion vectors]
   factor --> coarse[coarse RT factor, scan, emit]
   coarse --> blas[per-frame tessellated BLAS]
 ```
 
-`Instancing::submit_draw_list` creates one `TessBucket` for each displacement-enabled instance whose `GpuMesh` carries conditioning data. The renderer accepts at most `TESS_MAX_INSTANCES = 64` buckets per frame. A bucket contains the base mesh, object transform, texture slots, UV transform, height scale, and tessellation quality controls.
+`gather_instance_deformation` creates one `TessBucket` for each displaced instance the scene driver submits through `Renderer::submit_gpu_scene_deformations`, provided its `GpuMesh` carries conditioning data. The renderer accepts at most `TESS_MAX_INSTANCES = 64` buckets per frame. A bucket contains the base mesh, object transform, texture slots, UV transform, height scale, and tessellation quality controls.
 
 The primary chain contains five compute passes:
 
 1. `tess-factor` writes one fractional factor per unique base edge.
 2. `tess-scan` calculates each base triangle's exact output counts and atomically assigns packed offsets.
-3. `tess-finalize` writes one `VkDrawIndexedIndirectCommand` per displaced instance.
+3. `tess-finalize` writes one draw seed per displaced instance: the exact packed index count plus the row's slice bases, in `VkDrawIndexedIndirectCommand` order.
 4. `tess-args` converts the global micro-vertex total into a `VkDispatchIndirectCommand`.
 5. `tess-emit` dispatches one 64-lane workgroup per base triangle and writes current vertices, previous vertices, and indices.
 
@@ -41,7 +43,7 @@ The renderer submits `tess-emit` with direct dispatches. The command written by 
 
 The factor kernel measures the angular screen extent of an edge from its two welded endpoints. If either endpoint crosses the near-plane guard, it uses a finite length-over-distance fallback. Both forms divide the projected extent by the target pixels per micro-edge.
 
-Displacement detail also affects the factor. Each displacement height texture owns an `R32G32_SFLOAT` min/max pyramid at bindless binding 4. The kernel chooses a mip from the edge's tiled UV span, reads a conservative local height range, projects `height_range * height_scale`, and uses the larger of base-edge and displacement extents.
+Displacement detail also affects the factor. Each displacement height texture owns an `R32G32_SFLOAT` min/max pyramid at bindless binding 4, built on the GPU at upload time: the `height_minmax` compute chain writes level 0 as `(h, h)` per texel and reduces each coarser mip as the exact min/max of its children, so every texel is a conservative bound and the pyramid must be point-sampled with explicit LOD. The kernel chooses a mip from the edge's tiled UV span, reads a conservative local height range, projects `height_range * height_scale`, and uses the larger of base-edge and displacement extents.
 
 The calculation uses mesh-local endpoints and a camera position transformed into local space. It is exact for uniform object scale; non-uniform scale distorts the angular metric.
 
@@ -71,19 +73,27 @@ The fractional factor also drives a geomorph. Boundary points blend between floo
 
 ## Raster and motion consumers
 
-`tess-finalize` seeds an indirect indexed draw whose `firstInstance` points at the instance's material rows. `record_batch_submeshes` takes the tessellated branch and issues one `cmd_draw_indexed_indirect`. `bind_batch_vertices` binds the amplified vertex and index buffers for every raster consumer.
+The arena is addressed through the frame's GPU-scene address block, and every displaced instance owns a row in a slot-sorted row table published there. A view that consumes the arena walks the hierarchy as usual until it reaches an instance holding a row; that instance emits one draw record whose representation is `GPU_REPRESENTATION_DISPLACED_MICRO` and whose content index is the row. There is no cut to descend — the amplification already covers the whole base mesh in one packed slice.
 
-The emit kernel also writes `tess.vb.prev`. It evaluates the current grid with the previous frame's per-edge factors, stored in a persistent two-slot ping-pong. A changed edge-count layout falls back to current factors so previous and current positions match. `record_motion` binds current and previous tessellated streams separately, which captures camera-driven geomorph motion as well as object motion.
+The row also carries the relief's local-space bound, and the [visibility cull](../hierarchical-visibility/) adds it to the instance's cooked bounds sphere. The cooked sphere describes the base surface, so without that term relief reaching outside it is frustum-culled or HZB-occluded at the screen edge — the instance disappears exactly where its displacement is most visible.
+
+`scene-bucket-scatter` builds that record's command from the row's draw seed: the seed's index count, first index, and vertex offset, with the record index in `firstInstance`. The record's `psoBin` names the displaced representation, so it lands in its own draw bucket and the pass binds the arena's index stream for that bucket in place of the pages arena. Each executor vertex path reads the micro-vertex at `SV_VulkanVertexID` through the arena address; its position and normal are already displaced.
+
+The index values the emit kernel writes are relative to the row's reserved vertex slice, and the draw's `vertexOffset` supplies the base — which is why the vertex entries read the Vulkan vertex index rather than Slang's D3D-flavoured `SV_VertexID`, since that one subtracts the base back out and every row past the first would fetch the previous row's vertices. The mesh executor adds the same base by hand, because a mesh stage pulls indices itself and no fixed-function stage applies the offset for it.
+
+A view reading the undisplaced surface — a shadow page, the global-illumination reach walk — leaves the row lookup off and walks the base pages instead. Those views also bind no arena, so a displaced draw bucket there falls back to the pages arena rather than fetching a stream the view never allocated.
+
+The emit kernel also writes the previous-frame vertex stream. It evaluates the current grid with the previous frame's per-edge factors, stored in a persistent two-slot ping-pong. A changed edge-count layout falls back to current factors so previous and current positions match. The motion pass reads that stream at the same micro-vertex slot, which captures camera-driven geomorph motion as well as object motion.
 
 ## Ray-tracing geometry
 
 An RT-consumed displaced instance runs a second factor, scan, and emit chain. `TESS_RT_COARSEN = 2` doubles the micro-edge target and divides the factor cap by two. The result remains displaced and edge-welded, but it contains fewer triangles than the raster surface.
 
-`Rt::plan_tessellated_blas_builds` performs a full `MODE_BUILD` each frame because the generated topology can change. The acceleration structure is sized for the coarse chain's worst case and reused while that bound stays unchanged. The index reservation is cleared before emission, so unused tail triangles are degenerate and can remain in the worst-case build range without a GPU count readback.
+`Rt::plan_generated_blas_builds` performs a full `MODE_BUILD` each frame because the generated topology can change. The acceleration structure is sized for the coarse chain's worst case and reused while that bound stays unchanged. The index reservation is cleared before emission, so unused tail triangles are degenerate and can remain in the worst-case build range without a GPU count readback.
 
 ## Synchronization
 
-The primary emit pass declares storage writes for its transient buffers. Raster passes bind those buffers without importing them as graph resources, so `record_tess_prep` emits a manual compute-to-vertex/index/indirect memory barrier at the end of `tess-emit`.
+The amplification chain is recorded before the visibility chain, because the frame's address block carries the arena's addresses and both the traversal and the binner resolve displaced rows through them. Every consumer declares its read: `scene-bucket-scatter` declares the draw seeds, and each raster pass declares the vertex and index streams, so the graph derives the compute-to-fetch dependencies rather than the chain asserting them.
 
 The coarse RT vertex and index buffers do enter the graph. `tess-emit-rt` declares `StorageWriteCompute`, and `tlas-build` declares `AccelStructBuildRead`; the graph derives that compute-to-acceleration-structure dependency.
 
@@ -106,11 +116,12 @@ This selects a 128 factor cap, a minimum factor of 1, and a six-pixel micro-edge
 | Count and offset pass | `engine/assets/shaders/tess_scan.slang` | `dicePlan`, `computeMain` |
 | Draw command | `engine/assets/shaders/tess_finalize.slang` | `computeMain` |
 | Amplifying kernel | `engine/assets/shaders/tessellate.slang` | `emitLeafVertex`, `emitLeafTriangle`, `computeMain` |
-| Pass recording | `engine/crates/rendering/src/renderer.rs` | `Renderer::record_tess_prep` |
-| Raster and motion draws | `engine/crates/rendering/src/scene_pass.rs`, `engine/crates/rendering/src/aa.rs` | `record_batch_submeshes`, `bind_batch_vertices`, `record_motion` |
-| Ray-tracing build | `engine/crates/rendering/src/rt.rs` | `TessellatedBlas`, `Rt::plan_tessellated_blas_builds` |
-| Material feature | `engine/crates/rendering/src/instancing.rs` | `FEATURE_DISPLACE`, `resolve_material` |
-| Control commands | `engine/crates/control/src/commands_render.rs` | `set-displacement`, `set-tessellation-quality` |
+| Pass recording | `engine/crates/rendering/src/renderer/` | `Renderer::record_tess_prep` |
+| Arena addressing and the displaced record | `engine/assets/shaders/global_gpu_data.slang`, `engine/assets/shaders/scene_traversal.slang` | `gpuSceneDisplacedRow`, `gpuSceneDisplacedVertex`, `emitDisplacedRecord` |
+| Displaced command and bucket bind | `engine/assets/shaders/scene_bin_scatter.slang`, `engine/crates/rendering/src/scene_pass.rs` | `gpuSceneDisplacedDraw`, `bucket_index_buffer` |
+| Ray-tracing build | `engine/crates/rendering/src/rt/` | `TessellatedBlas`, `Rt::plan_generated_blas_builds` |
+| Material feature | `engine/crates/rendering/src/instancing.rs` | `FEATURE_DISPLACE`, `resolve_material_params` |
+| Control commands | `engine/crates/control/src/commands_render/` | `set-displacement`, `set-tessellation-quality` |
 
 ## Related
 

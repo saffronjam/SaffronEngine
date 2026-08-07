@@ -163,7 +163,7 @@ methods for anything cacheable.
 | Image scheme | `editor/shell/src/scheme.rs` | the `saffron-img` scheme |
 | Store tab + gallery hook | `StoreWorkspace.tsx`, `useGallery.ts` | `StoreWorkspace`, `useGallery` |
 | Per-project enablement | `engine/crates/assets/src/project.rs`, `commands_asset.rs` | `ProjectSidecar`, `get-stores`, `set-stores` |
-| Import commands | `engine/crates/control/src/commands_asset.rs` | `import-model`, `material-import`, `import-texture` |
+| Import commands | `engine/crates/control/src/commands_asset/` | `import-model`, `material-import`, `import-texture` |
 
 ## Related
 

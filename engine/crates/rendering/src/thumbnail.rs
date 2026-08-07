@@ -1,9 +1,5 @@
 //! Screenshot/thumbnail read-back encode: the captured-framebuffer → RGB conversion and the PNG
 //! encode.
-//!
-//! The PNG encode uses the `image` crate's [`image::codecs::png::PngEncoder`] rather
-//! than an stb binding — the bytes are an internal preview artifact, not a hash-parity
-//! wire contract, so any conforming RGB8 PNG encoder is correct.
 
 use ash::vk;
 use image::ImageEncoder;
@@ -143,8 +139,7 @@ pub fn convert_to_rgb(
 ///
 /// # Errors
 ///
-/// Returns [`crate::Error::ShaderLoad`] is never produced here; a PNG encode failure is
-/// surfaced as [`std::io::Error`].
+/// Returns [`std::io::Error`] when the PNG encoder rejects the image.
 pub fn encode_to_png(
     pixels: &[u8],
     width: u32,

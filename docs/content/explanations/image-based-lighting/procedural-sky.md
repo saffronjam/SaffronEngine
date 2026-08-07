@@ -76,11 +76,11 @@ Color mode draws `SceneEnvironment::clear_color` while IBL can still use the pro
 | What | File | Symbols |
 |---|---|---|
 | Gradient, sun, and face mapping | `engine/assets/shaders/ibl_skygen.slang` | `proceduralSky`, `cubeFaceDir`, `computeMain` |
-| Bake inputs | `engine/crates/rendering/src/ibl.rs` | `EnvSource::Procedural`, `SkygenParams`, `SkygenPush` |
-| Dispatch and mip generation | `engine/crates/rendering/src/ibl.rs` | `Ibl::bake`, `generate_cube_mips`, `IBL_ENV_SIZE` |
-| Source and sun resolution | `engine/crates/assets/src/render_scene.rs` | `drive_env_bake` |
+| Bake inputs | `engine/crates/rendering/src/ibl/` | `EnvSource::Procedural`, `SkygenParams`, `SkygenPush` |
+| Dispatch and mip generation | `engine/crates/rendering/src/ibl/` | `Ibl::bake`, `generate_cube_mips`, `IBL_ENV_SIZE` |
+| Source and sun resolution | `engine/crates/assets/src/render_scene/` | `drive_env_bake` |
 | Background modes | `engine/crates/scene/src/environment.rs`, `engine/assets/shaders/sky.slang` | `SkyMode`, `fragmentMain` |
-| Visible-sky state | `engine/crates/rendering/src/ibl.rs` | `SkyRenderSettings`, `Sky::submit`, `Sky::bind_env_cube` |
+| Visible-sky state | `engine/crates/rendering/src/ibl/` | `SkyRenderSettings`, `Sky::submit`, `Sky::bind_env_cube` |
 
 ## Related
 

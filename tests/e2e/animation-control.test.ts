@@ -10,23 +10,15 @@ import { Engine, REPO } from "./harness.ts";
 
 let engine: Engine;
 let meshId = "";
+let modelId = "";
 const FIXTURE = join(REPO, "engine", "assets", "models", "animated-strip.gltf");
-
-interface AnimState {
-  clip: string;
-  clipName: string;
-  duration: number;
-  time: number;
-  playing: boolean;
-  wrap: string;
-  speed: number;
-  animationVersion: number;
-}
 
 beforeAll(async () => {
   engine = await Engine.boot({ SAFFRON_SCRATCH_PROJECT: "1" });
-  const imported = await engine.importEntity(FIXTURE);
-  meshId = imported.id;
+  const model = await engine.call("import-model", { path: FIXTURE });
+  modelId = model.id;
+  const instance = await engine.call("instantiate-model", { asset: model.id });
+  meshId = instance.id;
   await engine.settle();
 });
 afterAll(async () => {
@@ -34,34 +26,32 @@ afterAll(async () => {
 });
 
 test("list-clips reports the imported clip", async () => {
-  const { clips } = await engine.call<{ clips: { id: string; name: string; duration: number }[] }>("list-clips", {
-    entity: meshId,
-  });
+  const { clips } = await engine.call("list-clips", { asset: modelId });
   expect(clips.length).toBe(1);
   expect(clips[0].name).toBe("Bend");
   expect(clips[0].duration).toBeCloseTo(1.0, 3);
 });
 
 test("play-animation advances the playhead in Edit preview", async () => {
-  const started = await engine.call<AnimState>("play-animation", { entity: meshId, clip: "Bend", loop: true });
+  const started = await engine.call("play-animation", { entity: meshId, clip: "Bend", loop: true });
   expect(started.playing).toBe(true);
   expect(started.clipName).toBe("Bend");
   expect(started.wrap).toBe("loop");
 
   await engine.settle(300);
-  const state = await engine.call<AnimState>("get-animation-state", { entity: meshId });
+  const state = await engine.call("get-animation-state", { entity: meshId });
   expect(state.playing).toBe(true);
   expect(state.time).toBeGreaterThan(0); // advanced without entering Play
 });
 
 test("seek-animation sets the playhead, pause freezes it", async () => {
-  await engine.call<AnimState>("set-animation-playing", { entity: meshId, playing: false });
-  const seeked = await engine.call<AnimState>("seek-animation", { entity: meshId, time: 0.25 });
+  await engine.call("set-animation-playing", { entity: meshId, playing: false });
+  const seeked = await engine.call("seek-animation", { entity: meshId, time: 0.25 });
   expect(seeked.time).toBeCloseTo(0.25, 3);
   expect(seeked.playing).toBe(false);
 
   await engine.settle(200);
-  const state = await engine.call<AnimState>("get-animation-state", { entity: meshId });
+  const state = await engine.call("get-animation-state", { entity: meshId });
   expect(state.playing).toBe(false);
   expect(state.time).toBeCloseTo(0.25, 3); // paused, so the playhead did not move
 });
@@ -69,29 +59,29 @@ test("seek-animation sets the playhead, pause freezes it", async () => {
 test("set-animation-playing resumes from the paused playhead, not the start", async () => {
   await engine.call("play-animation", { entity: meshId, clip: "Bend", loop: true });
   await engine.settle(200);
-  const paused = await engine.call<AnimState>("set-animation-playing", { entity: meshId, playing: false });
+  const paused = await engine.call("set-animation-playing", { entity: meshId, playing: false });
   expect(paused.playing).toBe(false);
   expect(paused.time).toBeGreaterThan(0); // advanced before the pause
 
   // Resuming must continue from the paused time, not reset to 0.
-  const resumed = await engine.call<AnimState>("set-animation-playing", { entity: meshId, playing: true });
+  const resumed = await engine.call("set-animation-playing", { entity: meshId, playing: true });
   expect(resumed.playing).toBe(true);
   expect(resumed.time).toBeCloseTo(paused.time, 3);
 
   await engine.settle(200);
-  const later = await engine.call<AnimState>("get-animation-state", { entity: meshId });
+  const later = await engine.call("get-animation-state", { entity: meshId });
   expect(later.time).toBeGreaterThan(paused.time); // kept advancing from where it resumed
 });
 
 test("set-animation-loop changes the wrap mode", async () => {
-  const once = await engine.call<AnimState>("set-animation-loop", { entity: meshId, wrap: "once" });
+  const once = await engine.call("set-animation-loop", { entity: meshId, wrap: "once" });
   expect(once.wrap).toBe("once");
 });
 
 test("the animationVersion bumps on each mutation", async () => {
-  const a = await engine.call<AnimState>("get-animation-state", { entity: meshId });
+  const a = await engine.call("get-animation-state", { entity: meshId });
   await engine.call("seek-animation", { entity: meshId, time: 0.5 });
-  const b = await engine.call<AnimState>("get-animation-state", { entity: meshId });
+  const b = await engine.call("get-animation-state", { entity: meshId });
   expect(b.animationVersion).toBeGreaterThan(a.animationVersion);
 });
 

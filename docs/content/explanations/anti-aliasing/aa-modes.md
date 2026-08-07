@@ -85,7 +85,7 @@ runs is gated per frame rather than by the target's existence.
 
 `Aa::set` returns `true` when the MSAA sample count changed; on that signal the
 sample-count-baked pipelines go too. `Pipelines::set_sample_count` clears the mesh PSO cache and
-drops the depth-prepass and meshlet PSOs so they rebuild lazily at the new count, and
+drops the depth-prepass PSOs so they rebuild lazily at the new count, and
 `Sky::set_sample_count` rebuilds the sky PSO immediately — it draws straight into the scene color
 and would otherwise rasterize a multisampled attachment with a 1× pipeline. The screen-space and
 shadow PSOs are always 1× and stay untouched.

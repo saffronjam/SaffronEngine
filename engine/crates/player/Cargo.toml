@@ -24,6 +24,8 @@ saffron-window = { path = "../window" }
 saffron-scene = { path = "../scene" }
 saffron-assets = { path = "../assets" }
 saffron-protocol = { path = "../protocol" }
+saffron-spatial = { path = "../spatial" }
+saffron-geometry = { path = "../geometry" }
 serde_json.workspace = true
 
 [dev-dependencies]

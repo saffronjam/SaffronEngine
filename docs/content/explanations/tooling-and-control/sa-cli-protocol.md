@@ -69,7 +69,10 @@ Parsing unsigned integers before floating-point values preserves positive IDs th
 
 `saffron-control-client::Client` owns a socket path and a monotonic request ID. Each call opens a Unix stream, writes one request line, reads one reply line, then closes the connection.
 
-`Client::call_raw` returns the reply's `result` value. An `ok: false` envelope becomes `Error::Engine`; connection, malformed JSON, and typed-result failures use distinct error variants. The Rust end-to-end harness uses the same client and can deserialize results directly into protocol DTOs.
+`Client::call_raw` returns the reply's `result` value. An `ok: false` envelope becomes
+`Error::Engine` and retains its complete `ControlFailureDto`. Connection, malformed-envelope, and
+typed-result failures use distinct variants. The Rust end-to-end harness uses the same client and
+can deserialize results directly into protocol DTOs.
 
 The client and server share the same socket-path precedence: `SAFFRON_CONTROL_SOCK`, then `$XDG_RUNTIME_DIR/saffron-control.sock`, then the per-user `/tmp` path.
 
@@ -77,13 +80,34 @@ The client and server share the same socket-path precedence: `SAFFRON_CONTROL_SO
 
 `-o text` is the default. Command-specific formatters render common results such as `ping`, entity and asset lists, render statistics, play state, physics queries, and profiler captures. Unmatched results use readable pretty JSON.
 
-`-o json` prints pretty JSON for reliable use with `jq`:
+`-o json` prints successful results as pretty JSON for reliable use with `jq`:
 
 ```sh
 sa -o json get-selection | jq -r '.id // empty'
 ```
 
-A successful engine result exits `0`. Transport and engine errors print an `sa:`-prefixed message to standard error and exit `1`. A missing command or Clap usage failure exits `2`.
+In text mode, transport and engine errors print an `sa:`-prefixed message to standard error. In JSON
+mode, an error prints the complete typed failure object to standard error, including a diagnostic
+payload when present:
+
+```json
+{
+  "code": "diagnostic",
+  "message": "graph estimate exceeds the candidate limit",
+  "diagnostic": {
+    "domain": "vegetation-graph",
+    "detail": {
+      "category": "limit",
+      "resource": "candidates",
+      "requested": "1000001",
+      "limit": "1000000"
+    }
+  }
+}
+```
+
+A successful engine result exits `0`. Transport and engine failures exit `1`. A missing command or
+Clap usage failure exits `2`.
 
 ## Discovery
 
@@ -114,7 +138,7 @@ Detached mode discards host standard streams and polls the socket for five secon
 | Start and export routes | `engine/crates/sa/src/main.rs` | `start`, `export`, `engine_binary_path` |
 | Shared wire implementation | `engine/crates/control-client/src/lib.rs` | `Client`, `request_envelope`, `socket_path` |
 | Position-to-DTO folding | `engine/crates/control/src/registry.rs` | `fold_positional_args` |
-| Static command metadata | `engine/crates/protocol/src/command.rs` | `COMMANDS`, `CommandSpec` |
+| Static command metadata | `engine/crates/protocol/src/command/` | `COMMANDS`, `CommandSpec` |
 
 ## Related
 

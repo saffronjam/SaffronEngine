@@ -1,13 +1,11 @@
-//! The 12 physics-domain control commands: world state + body listing, impulse,
-//! contact-event draining, collider/bone auto-fit, kinematic bones, character movement,
-//! ray/sphere queries, and the ragdoll surface.
+//! The physics-domain control commands: world state and body listing, impulse, contact-event
+//! draining, collider and bone auto-fit, kinematic bones, character movement, ray/sphere queries,
+//! and the ragdoll surface.
 //!
-//! This is the one domain that touches the **nullable** [`EngineContext::physics`] field
-//! — the live play world, `None` in Edit. Every world-querying handler guards the null
-//! and returns an inactive/empty result so the editor can poll unconditionally;
-//! mutation/query-on-world handlers return the typed "no physics world" error. The
-//! collider/bone-fit + kinematic/ragdoll-config handlers reach `sceneEdit` instead (they
-//! configure authored components and work in Edit).
+//! The one domain that touches the nullable [`EngineContext::physics`] field — the live play world,
+//! `None` in Edit. A querying handler guards the null and returns an inactive result so the editor
+//! can poll unconditionally; a handler that needs the world returns the typed "no physics world"
+//! error. The fit and config handlers reach `sceneEdit` instead and work in Edit.
 
 use saffron_physics::{ContactKind, MotionType, World};
 use saffron_protocol::{
@@ -104,7 +102,7 @@ pub fn register_physics_commands(reg: &mut CommandRegistry) {
                 .list_bodies()
                 .into_iter()
                 .map(|body| PhysicsBodyDto {
-                    entity: Uuid(body.entity.0),
+                    target: body.target.map(target_dto),
                     motion: motion_name(body.motion).to_owned(),
                     active: body.active,
                     position: to_vec3(body.position),
@@ -186,8 +184,8 @@ pub fn register_physics_commands(reg: &mut CommandRegistry) {
                         ContactKind::End => "end",
                     }
                     .to_owned(),
-                    entity_a: Uuid(event.entity_a.0),
-                    entity_b: Uuid(event.entity_b.0),
+                    target_a: event.target_a.map(target_dto),
+                    target_b: event.target_b.map(target_dto),
                     sensor: event.sensor,
                     point: to_vec3(event.point),
                     normal: to_vec3(event.normal),
@@ -316,7 +314,7 @@ pub fn register_physics_commands(reg: &mut CommandRegistry) {
                 let world = ctx.physics.as_deref_mut().ok_or_else(no_world)?;
                 world
                     .enable_ragdoll(ctx.scene_edit.active_scene(), rig)
-                    .map_err(|e| Error::command(e.to_string()))?;
+                    .map_err(Error::command)?;
             } else {
                 ctx.physics
                     .as_deref_mut()
@@ -347,7 +345,7 @@ pub fn register_physics_commands(reg: &mut CommandRegistry) {
                 let world = ctx.physics.as_deref_mut().ok_or_else(no_world)?;
                 world
                     .enable_ragdoll(ctx.scene_edit.active_scene(), rig)
-                    .map_err(|e| Error::command(e.to_string()))?;
+                    .map_err(Error::command)?;
             }
             ctx.physics
                 .as_deref_mut()
@@ -359,7 +357,7 @@ pub fn register_physics_commands(reg: &mut CommandRegistry) {
                     params.bone,
                     params.weight,
                 )
-                .map_err(|e| Error::command(e.to_string()))?;
+                .map_err(Error::command)?;
             ctx.scene_edit.animation_version += 1;
             let world = ctx.physics.as_deref().ok_or_else(no_world)?;
             Ok(ragdoll_result_for(world, ctx.scene_edit.active_scene(), rig))
@@ -389,10 +387,24 @@ pub fn register_physics_commands(reg: &mut CommandRegistry) {
 fn ray_hit_result(hit: saffron_physics::RayHit) -> RaycastResult {
     RaycastResult {
         hit: hit.hit,
-        entity: Uuid(hit.entity.0),
+        target: hit.target.map(target_dto),
         point: to_vec3(hit.point),
         normal: to_vec3(hit.normal),
         distance: hit.distance,
+    }
+}
+
+/// Maps a physics tagged target onto the wire DTO.
+fn target_dto(target: saffron_physics::WorldHitTarget) -> saffron_protocol::WorldHitTargetDto {
+    match target {
+        saffron_physics::WorldHitTarget::SceneEntity(uuid) => {
+            saffron_protocol::WorldHitTargetDto::SceneEntity { id: Uuid(uuid.0) }
+        }
+        saffron_physics::WorldHitTarget::Vegetation(plant) => {
+            saffron_protocol::WorldHitTargetDto::Vegetation {
+                plant: saffron_protocol::PlantId(plant.canonical_hex()),
+            }
+        }
     }
 }
 
@@ -452,7 +464,7 @@ mod tests {
             );
             assert_eq!(raycast["ok"], json!(false));
             assert_eq!(
-                raycast["error"],
+                raycast["error"]["message"],
                 json!("no physics world — enter play first")
             );
 
@@ -465,7 +477,7 @@ mod tests {
             );
             assert_eq!(impulse["ok"], json!(false));
             assert_eq!(
-                impulse["error"],
+                impulse["error"]["message"],
                 json!("no physics world — enter play first")
             );
         });
@@ -485,7 +497,7 @@ mod tests {
                 &json!({ "cmd": "fit-collider", "params": { "entity": uuid.to_string() } }),
             );
             assert_eq!(reply["ok"], json!(false));
-            assert_eq!(reply["error"], json!("entity has no Collider"));
+            assert_eq!(reply["error"]["message"], json!("entity has no Collider"));
         });
     }
 }

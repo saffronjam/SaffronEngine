@@ -3,24 +3,11 @@
 //! spatial reuse, and resolve (one shadow ray per pixel via the TLAS, then shade) —
 //! writing a per-pixel direct-radiance image the mesh fragment samples via set 7.
 //!
-//! It splits into a device-shared half and a per-view half:
-//!
-//! - [`Restir`] holds the **device-shared** scaffolding — the nearest G-buffer/motion
-//!   sampler, the four descriptor-set *layouts* (initial / reuse / resolve incl. the TLAS
-//!   binding / the set-7 mesh layout), and the candidate count K. Built once in
-//!   `Renderer::new`, borrowed `&Restir` afterward; gated on [`Device::rt_supported`] (the
-//!   resolve needs ray-query), so on a software device it resolves no layouts and stays
-//!   inert.
-//! - [`RestirView`] holds the **per-view** state — the three per-pixel reservoir SSBOs
-//!   (initial / combined / previous, 32 B/pixel), the resolved-radiance image (rgba16f),
-//!   the descriptor *sets* binding them, and the per-view temporal state (`frame_index`,
-//!   `history_reset`). Sized to the view's pixel count, recreated with the offscreen. It
-//!   rides alongside the [`crate::ViewTarget`] so two views never read each other's
-//!   reservoirs (README §2's per-view borrow split).
-//!
-//! The three compute PSOs are requested lazily through [`crate::Pipelines`]; the
-//! `do_restir` gate is `rt_supported && tlas_ready && has_gbuffer && do_cull &&
-//! use_restir`.
+//! [`Restir`] holds the device-shared scaffolding (the nearest G-buffer/motion sampler, the four
+//! descriptor-set layouts, and the candidate count K), gated on [`Device::rt_supported`] because
+//! the resolve needs ray-query. [`RestirView`] holds the per-view state — the three per-pixel
+//! reservoir SSBOs, the resolved-radiance image, the sets binding them, and the temporal state —
+//! sized to the view's pixel count, so two views never read each other's reservoirs.
 
 use std::sync::Arc;
 
@@ -31,6 +18,7 @@ use crate::descriptors::Descriptors;
 use crate::lighting::{CLUSTER_GRID_X, CLUSTER_GRID_Y, CLUSTER_GRID_Z};
 use crate::resources::{Buffer, DeviceResources, Image, ImageDesc};
 use crate::ssao::G_NORMAL_FORMAT;
+use crate::vk_write::{write_combined_sampler, write_storage_image, write_uniform_buffer};
 use crate::{Device, Result, checked};
 
 /// Default initial-candidate count K per pixel.
@@ -49,7 +37,7 @@ pub const RESTIR_RADIANCE_FORMAT: vk::Format = G_NORMAL_FORMAT;
 /// shaders read by std430 layout (`Reservoir { float4 a; float4 b; }` in
 /// `restir_initial.slang:25`). `a` packs the chosen light index / unbiased weight / weight
 /// sum / sample count; `b` carries the chosen target pdf. Pinned `#[repr(C)]` + byte-asserted
-/// like the other GPU structs (README §3) — a wrong stride corrupts every reservoir read.
+/// like the other GPU structs — a wrong stride corrupts every reservoir read.
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct Reservoir {
@@ -169,7 +157,8 @@ pub struct Restir {
     initial_layout: vk::DescriptorSetLayout,
     /// Reuse set layout: gbuffer + motion + initial + previous + lights + combined (6).
     reuse_layout: vk::DescriptorSetLayout,
-    /// Resolve set layout: gbuffer + combined + previousOut + lights + TLAS + radiance (6).
+    /// Resolve set layout: gbuffer + combined + previousOut + lights + TLAS + radiance +
+    /// the GPU-scene address block (7).
     resolve_layout: vk::DescriptorSetLayout,
     /// Set-7 mesh layout (the radiance sampler) — borrowed from [`Descriptors`], freed with
     /// its pool; `null` on a software device.
@@ -348,7 +337,7 @@ impl Drop for Restir {
             return;
         }
         // SAFETY: the ash seam. The `Arc<DeviceResources>` keeps the device alive for the
-        // call; the run loop idled it before teardown (README §4). The set-7 mesh layout is
+        // call; the run loop idled it before teardown. The set-7 mesh layout is
         // owned by `Descriptors` (freed with its pool); only the three compute layouts + the
         // sampler are destroyed here, each exactly once.
         let raw = self.resources.device();
@@ -620,8 +609,9 @@ impl RestirView {
 
     /// Writes the PER-FRAME bindings before the three passes: the G-buffer + motion samplers
     /// (they recreate with the offscreen and motion may be absent → fall back to the
-    /// G-buffer), the punctual-light + cluster SSBOs (they regrow per frame), and the TLAS
-    /// into the resolve set (it is a per-frame ring slot). A no-op when not ready.
+    /// G-buffer), the punctual-light + cluster SSBOs (they regrow per frame), the TLAS
+    /// into the resolve set (it is a per-frame ring slot), and the frame's GPU-scene
+    /// address-block slice `(buffer, offset, range)`. A no-op when not ready.
     #[allow(clippy::too_many_arguments)]
     pub fn write_frame_bindings(
         &self,
@@ -632,6 +622,7 @@ impl RestirView {
         light_buffer: (vk::Buffer, vk::DeviceSize),
         cluster_buffer: (vk::Buffer, vk::DeviceSize),
         tlas: vk::AccelerationStructureKHR,
+        address_block: (vk::Buffer, vk::DeviceSize, vk::DeviceSize),
     ) {
         if !self.ready {
             return;
@@ -651,10 +642,18 @@ impl RestirView {
         write_combined_sampler(raw, self.reuse_set, 0, g_normal_view, ro, sampler);
         write_combined_sampler(raw, self.reuse_set, 1, motion, ro, sampler);
         write_storage_buffer(raw, self.reuse_set, 4, light_buffer.0, light_buffer.1);
-        // resolve: b0 gbuffer, b3 lights, b4 TLAS.
+        // resolve: b0 gbuffer, b3 lights, b4 TLAS, b6 the frame's address-block slice.
         write_combined_sampler(raw, self.resolve_set, 0, g_normal_view, ro, sampler);
         write_storage_buffer(raw, self.resolve_set, 3, light_buffer.0, light_buffer.1);
         write_tlas(raw, self.resolve_set, 4, tlas);
+        write_uniform_buffer(
+            raw,
+            self.resolve_set,
+            6,
+            address_block.0,
+            address_block.1,
+            address_block.2,
+        );
     }
 }
 
@@ -683,8 +682,10 @@ fn build_layouts(raw: &ash::Device) -> Result<RestirLayouts> {
             return Err(err);
         }
     };
-    // resolve: gbuffer + combined + previousOut + lights + TLAS + radianceImage.
-    let resolve = match make_compute_layout(raw, &[cs, sb, sb, sb, as_, si]) {
+    // resolve: gbuffer + combined + previousOut + lights + TLAS + radianceImage + the
+    // GPU-scene address block (the candidate coverage confirmation resolves through it).
+    let ub = vk::DescriptorType::UNIFORM_BUFFER;
+    let resolve = match make_compute_layout(raw, &[cs, sb, sb, sb, as_, si, ub]) {
         Ok(layout) => layout,
         Err(err) => {
             // SAFETY: the ash seam. Free the prior layouts.
@@ -703,47 +704,22 @@ fn build_layouts(raw: &ash::Device) -> Result<RestirLayouts> {
     })
 }
 
-/// A compute-stage set layout with one binding per `types` entry, in order (binding 0, 1,
-/// …). The ReSTIR compute sets are all single-descriptor-per-binding.
 fn make_compute_layout(
     raw: &ash::Device,
     types: &[vk::DescriptorType],
 ) -> Result<vk::DescriptorSetLayout> {
-    let bindings: Vec<vk::DescriptorSetLayoutBinding> = types
-        .iter()
-        .enumerate()
-        .map(|(i, &ty)| {
-            vk::DescriptorSetLayoutBinding::default()
-                .binding(i as u32)
-                .descriptor_type(ty)
-                .descriptor_count(1)
-                .stage_flags(vk::ShaderStageFlags::COMPUTE)
-        })
-        .collect();
-    let info = vk::DescriptorSetLayoutCreateInfo::default().bindings(&bindings);
-    // SAFETY: the ash seam. The bindings outlive the call; the layout is freed in `Drop`
-    // (or the partial-failure cleanup).
-    checked(
-        unsafe { raw.create_descriptor_set_layout(&info, None) },
-        "restir compute layout",
-    )
+    crate::vk_write::compute_layout(raw, types, "restir compute layout")
 }
 
-/// A device-local storage buffer of `size` bytes (a reservoir SSBO — written by compute,
-/// never host-mapped). The ReSTIR per-view state owns its own copy of the helper.
+/// A device-local reservoir SSBO of at least one [`Reservoir`], written by compute, never mapped.
 fn make_device_storage_buffer(
     resources: &Arc<DeviceResources>,
     size: vk::DeviceSize,
 ) -> Result<Buffer> {
-    let alloc_info = vk_mem::AllocationCreateInfo {
-        usage: vk_mem::MemoryUsage::AutoPreferDevice,
-        ..Default::default()
-    };
-    Buffer::new(
+    crate::vk_write::device_buffer(
         resources,
         size.max(size_of::<Reservoir>() as u64),
         vk::BufferUsageFlags::STORAGE_BUFFER,
-        &alloc_info,
     )
 }
 
@@ -761,7 +737,7 @@ fn create_nearest_clamp_sampler(raw: &ash::Device) -> Result<vk::Sampler> {
     checked(unsafe { raw.create_sampler(&info, None) }, "restir sampler")
 }
 
-/// Writes a storage buffer into `(set, binding)`.
+/// Writes the whole storage buffer into `(set, binding)`.
 fn write_storage_buffer(
     raw: &ash::Device,
     set: vk::DescriptorSet,
@@ -769,61 +745,7 @@ fn write_storage_buffer(
     buffer: vk::Buffer,
     size: vk::DeviceSize,
 ) {
-    let info = [vk::DescriptorBufferInfo {
-        buffer,
-        offset: 0,
-        range: size,
-    }];
-    let write = vk::WriteDescriptorSet::default()
-        .dst_set(set)
-        .dst_binding(binding)
-        .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
-        .buffer_info(&info);
-    // SAFETY: the ash seam. The set + buffer outlive the call; written single-threaded at
-    // the (fence-waited) frame build point.
-    unsafe { raw.update_descriptor_sets(&[write], &[]) };
-}
-
-/// Writes a storage image into `(set, binding)` at `layout` (no sampler).
-fn write_storage_image(
-    raw: &ash::Device,
-    set: vk::DescriptorSet,
-    binding: u32,
-    view: vk::ImageView,
-    layout: vk::ImageLayout,
-) {
-    let info = [vk::DescriptorImageInfo::default()
-        .image_view(view)
-        .image_layout(layout)];
-    let write = vk::WriteDescriptorSet::default()
-        .dst_set(set)
-        .dst_binding(binding)
-        .descriptor_type(vk::DescriptorType::STORAGE_IMAGE)
-        .image_info(&info);
-    // SAFETY: the ash seam. The set + view outlive the call.
-    unsafe { raw.update_descriptor_sets(&[write], &[]) };
-}
-
-/// Writes a combined-image-sampler into `(set, binding)` at `layout`.
-fn write_combined_sampler(
-    raw: &ash::Device,
-    set: vk::DescriptorSet,
-    binding: u32,
-    view: vk::ImageView,
-    layout: vk::ImageLayout,
-    sampler: vk::Sampler,
-) {
-    let info = [vk::DescriptorImageInfo::default()
-        .sampler(sampler)
-        .image_view(view)
-        .image_layout(layout)];
-    let write = vk::WriteDescriptorSet::default()
-        .dst_set(set)
-        .dst_binding(binding)
-        .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
-        .image_info(&info);
-    // SAFETY: the ash seam. The set + view + sampler outlive the call.
-    unsafe { raw.update_descriptor_sets(&[write], &[]) };
+    crate::vk_write::write_storage_buffer(raw, set, binding, buffer, 0, size);
 }
 
 /// Writes an acceleration structure (the TLAS) into the resolve set's `(set, binding)`.
@@ -1075,10 +997,21 @@ mod tests {
 
         // Write the per-frame bindings: a valid G-buffer view stand-in (the radiance view),
         // no motion (falls back to the G-buffer view), the (empty) light + cluster SSBOs are
-        // not yet sized here — use the radiance view as the sampler source and a 256-byte
-        // dummy buffer for the SSBO bindings, and the seeded empty TLAS into the resolve set.
+        // not yet sized here — use the radiance view as the sampler source, a 256-byte
+        // dummy buffer for the SSBO bindings, the seeded empty TLAS into the resolve set,
+        // and a small uniform buffer standing in for the GPU-scene address block.
         let g_view = view.radiance().expect("radiance").1;
         let dummy = make_device_storage_buffer(device.resources(), 256).expect("dummy ssbo");
+        let addresses = Buffer::new(
+            device.resources(),
+            size_of::<crate::GpuSceneAddressBlock>() as u64,
+            vk::BufferUsageFlags::UNIFORM_BUFFER,
+            &vk_mem::AllocationCreateInfo {
+                usage: vk_mem::MemoryUsage::Auto,
+                ..Default::default()
+            },
+        )
+        .expect("address-block ubo");
         view.write_frame_bindings(
             &device,
             &restir,
@@ -1087,12 +1020,14 @@ mod tests {
             (dummy.handle(), dummy.size()),
             (dummy.handle(), dummy.size()),
             rt.frame_tlas(0),
+            (addresses.handle(), 0, addresses.size()),
         );
 
         // Enabling on an RT device + a ready view arms the history reset.
         assert!(restir.set_enabled(true));
         assert!(restir.use_restir());
 
+        drop(addresses);
         drop(dummy);
         drop(view);
         drop(rt);

@@ -1,9 +1,7 @@
-/// The no-drag fallback for moving a docked panel (VS Code "Move View", JetBrains "Move
-/// to…"): a right-click menu on a dock tab with a per-destination submenu — tab into a leaf
-/// or split it on any edge — plus Close for a closable panel. Everything routes through the
-/// same `movePanel`/`closePanel` the drag layer uses, so the menu is a pure alternative entry
-/// point, not a second code path. Dock tabs only (the strip is few-tabbed, so a menu per tab
-/// is fine — the one-menu-per-surface rule targets hundreds-of-rows lists).
+/// The no-drag route for moving a docked panel: a right-click menu on a dock tab with a
+/// per-destination submenu, plus Close for a closable panel. Everything routes through the same
+/// `movePanel`/`closePanel` the drag layer uses, so it is an alternative entry point rather than a
+/// second code path.
 import type { ReactNode } from "react";
 import { useEditorStore } from "../../state/store";
 import {

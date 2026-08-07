@@ -16,9 +16,11 @@ live viewport. All window-system code is a compile-time backend per OS (`shell/s
 ```
 src/
   app/         shell (App.tsx), docking layout, menu/topbar, lifecycle wiring
-  panels/      Hierarchy, Inspector, Assets, Environment, Render(+Stats), Viewport, Topbar,
-               MaterialEditor + MaterialGraph, Profiler, Timeline, Physics, ScriptLogs (+ tree helpers);
-               the dock/tab layout lives in `components/dock/` + `state/dockLayout.ts`
+  panels/      Hierarchy, Inspector, Assets, Environment, WindDebug, Render(+Stats), Viewport, Topbar,
+               MaterialEditor + MaterialGraph, Profiler, Timeline, Physics, ScriptLogs (+ tree helpers),
+               and the vegetation surface — Vegetation + EcologyTimeline (scene island), VegSummary +
+               PlantGraph + BiomeGraph (asset-editor island), plus the brush/planting helpers; has its
+               own AGENTS.md. The dock/tab layout lives in `components/dock/` + `state/dockLayout.ts`
   components/  shadcn/ui (ui/) + field renderers (NumberDrag, ColorField, VectorEditor, …); plus
                reusable subsystems: dock/ (the docking model), timeline/ (animation timeline surface
                + transport), anima/ (a generic keyword:value chip-search — *not* animation)
@@ -43,13 +45,14 @@ shell/         the CEF/Rust editor shell (`saffron-editor-shell`): a winit tople
 Stack (see `package.json` + `shell/Cargo.toml`): CEF (Chromium 149) OSR shell, React 19, Zustand 5, Vite 7, Tailwind v4
 (`@tailwindcss/vite`), shadcn/ui (Radix), `react-resizable-panels` (docking), `@xyflow/react`
 (material node graph), `flame-chart-js` + `uplot` (profiler / frame-time stats), `react-colorful`,
-`lucide-react` (icons), and `sonner` (toasts). Lint/format via **oxc** (`oxlint` + `oxfmt`, configs in
-`.oxlintrc.json` / `.oxfmtrc.json`).
+`lucide-react` (icons), and `sonner` (toasts). Lint/format via **oxc** (`oxlint` + `oxfmt`), configured
+once at the repo root (`.oxlintrc.json` / `.oxfmtrc.json`) for every TypeScript file in the tree — run
+them with `just lint` / `just format`.
 
 ## Workflow
 
 ```sh
-bun install
+bun install      # at the repo root: one Bun workspace installs editor/, tools/, tests/e2e/, packager/
 bun run check    # gen:protocol + tsc --noEmit
 bun run build    # gen:protocol + tsc + vite build
 just run         # from the repo root: builds the host + the CEF shell, starts Vite, launches the shell
@@ -99,9 +102,9 @@ user confirms it against real output — say "this should fix it, please verify 
   desktop never shows through.
 - **The control client is one generic passthrough.** Rust exposes a single
   `control(cmd, params)` command (it rejects on `ok:false`); the ~120 typed wrappers in
-  `client.ts` layer on top. Dedicated lifecycle/presenter commands (`start_engine`,
-  `set_viewport_bounds`, `set_viewport_parked`, `viewport_refresh_hz`, `quit_engine`,
-  `engine_alive`) are their own dedicated shell commands, separate from the passthrough. There is **no**
+  `client.ts` layer on top. Dedicated lifecycle/presenter commands (`session_start`,
+  `session_stop`, `session_status`, `set_viewport_bounds`, `set_viewport_parked`,
+  `viewport_refresh_hz`) are their own dedicated shell commands, separate from the passthrough. There is **no**
   runtime escape hatch for an untyped command: to add one, add its DTO in
   `engine/crates/protocol/src/dto.rs`, run `bun run gen:protocol`, then add a typed wrapper in
   `client.ts` — every dispatched name is checked against the generated `CommandName` union.
@@ -126,7 +129,7 @@ user confirms it against real output — say "this should fix it, please verify 
   bug — the user must see why an action did nothing). The Inspector's add/remove/fit-collider, every
   panel button, every drag-drop op: all route here. Use `notify(...)` for a non-error *result* toast
   (save/load/import) and `toast.error/warning` directly only for the fingerprint-keyed alarm stream
-  (`alarmToasts.ts`). Panel-anchored *status* — the startup modal's inline name/validation line — is a
+  (`alarmToasts.ts`). Panel-anchored *status* — the launcher create form's inline name/collision line — is a
   local `useState` message inside that panel's own DOM, never a stand-in for a toast on a transient
   operation failure and never over the viewport.
 - **State sync is a focus-gated poll, not push.** `store.ts` runs a cheap state lane at ~20 Hz
@@ -190,8 +193,8 @@ user confirms it against real output — say "this should fix it, please verify 
   invokes otherwise pile into the engine's per-frame drain and trip the 5 s read timeout
   ("read control reply: Resource temporarily unavailable (os error 11)"). On the UI side never
   fire a control call per keystroke/scrub-tick: buffer through a `makeCoalescer` (one
-  `preview-render` per edit-burst, not one per field) and keep the heavy GPU calls
-  (`preview-render`, thumbnail readback) off the hot path.
+  `get-thumbnail` per edit-burst, not one per field) and keep the heavy GPU calls
+  (thumbnail render + readback) off the hot path.
 - **A large list re-renders only the rows that changed, never the whole list.** A grid/tree
   whose rows number in the hundreds (Assets tiles, Hierarchy rows) follows three rules so a
   selection click costs two row renders, not N (verify with the dev-mode `logRender` counters
@@ -240,11 +243,14 @@ user confirms it against real output — say "this should fix it, please verify 
   during play. Shortcuts in `app/useUndoRedoShortcuts.ts`, buttons in `panels/Topbar.tsx`. When you add a
   mutating action, record its inverse — an edit with no `pushEdit` is silently un-undoable.
 - **Two independent lifecycle axes — do not conflate them.** `engineStatus.phase` (`EnginePhase`:
-  idle → starting → attaching → ready → error) tracks the host/renderer process; `projectLoad.phase`
-  (`ProjectLoadPhase`: idle / loading / ready / error) tracks project loading and can run while the engine
-  stays `ready` (a reload) or before it is (bootstrap). One entry point (`startProjectLoad`), polled by
-  `app/useProjectLoadPoll.ts`, surfaced by the single `app/ProjectStartupModal.tsx` (picker / loading /
-  error). Gate viewport-ready UI on the engine axis, project-content UI on the load axis.
+  idle → starting → attaching → ready → error) tracks the host session, and `idle` means **no session
+  exists** — the attach probe and the crash watchdog stay quiet until a session start flips it to
+  `attaching`. `projectLoad.phase` (`ProjectLoadPhase`: idle / loading / ready / error) tracks project
+  loading and can run while the engine stays `ready` (a menu reload) or before it is (a session boot).
+  One entry point (`startProjectLoad` — it starts a host session when none is live, since the pick is
+  the session's boot intent), polled by `app/useProjectLoadPoll.ts`, surfaced by the launcher's cards
+  (`launcher/Launcher.tsx`: picker / boot / load-error / crash). Gate viewport-ready UI on the engine
+  axis, project-content UI on the load axis.
 - **Shortcuts are a registry, never inline key comparisons.** Every shortcut is a command in
   `lib/keybindings.ts` (`COMMANDS`) with a kind (`press`/`hold`/`mouse`) and a scope
   (`global`/`hierarchy`/`assets`/`fly`/`tabs`); handlers match with `matchesBinding`, never by comparing

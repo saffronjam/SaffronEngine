@@ -91,7 +91,7 @@ the `Ready` progress snapshot, and releases render suppression.
 
 ## Dispatch during loading
 
-Most commands return an envelope with code `busy-loading` while the phase is `Loading`. They are
+Most commands return an envelope whose `error.code` is `busy-loading` while the phase is `Loading`. They are
 discarded rather than queued, because replaying a scene edit after a project swap could target an
 unrelated entity. The loading-safe commands are:
 

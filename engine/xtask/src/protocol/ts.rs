@@ -24,11 +24,27 @@ pub fn emit_sa_types(decls: &DtoDecls) -> String {
 
     format!(
         "/**\n * GENERATED - do not edit.\n *\n * Produced by cargo run -p xtask -- \
-         gen-protocol.\n */\n\nexport type WireUuid = string;\n\n{}\n\nexport \
+         gen-protocol.\n */\n\nexport type WireUuid = string;\n\n{}\n\n{}\n\nexport \
          interface CommandParamsMap {{\n{}\n}}\n\nexport interface CommandResultMap \
          {{\n{}\n}}\n",
-        interfaces, params_map, result_map,
+        emit_component_names(),
+        interfaces,
+        params_map,
+        result_map,
     )
+}
+
+/// The `ComponentName` union over the registered scene components, in registry order. The editor's
+/// canonical ordering and hidden sets are checked exhaustively against it, so a component added to
+/// the registry without an editor slot is a typecheck failure rather than a silently unreachable
+/// Add-component entry.
+fn emit_component_names() -> String {
+    let union = saffron_protocol::COMPONENT_NAMES
+        .iter()
+        .map(|name| format!("  | {name:?}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    format!("export type ComponentName =\n{union};")
 }
 
 /// The declaration emission order, matching the complete Rust DTO inventory.
@@ -60,9 +76,8 @@ fn emit_declaration(decls: &DtoDecls, name: &str) -> String {
     }
 }
 
-/// Map a `ts-rs` type token to its TS spelling, returning `(type, optional)`. `T | null` is
-/// optional; `Array<T>` -> `T[]`; `bigint` -> `number`; `Uuid` -> `WireUuid`; `JsonValue` ->
-/// `unknown`; named DTOs and primitives pass through.
+/// Maps a `ts-rs` type token to its TS spelling, returning `(type, optional)`. `T | null` is the
+/// optional form; `bigint` narrows to `number` and `Uuid` to the `WireUuid` alias.
 fn ts_type(ty: &str) -> (String, bool) {
     let (core, optional) = match ty.strip_suffix("| null") {
         Some(inner) => (inner.trim(), true),
@@ -97,7 +112,6 @@ mod tests {
     #[test]
     fn empty_struct_emits_blank_body() {
         let decls = DtoDecls::load();
-        // `PingParams`/`EmptyParams` are `Record<string, never>` -> `{\n\n}`.
         assert_eq!(
             emit_declaration(&decls, "PingParams"),
             "export interface PingParams {\n\n}"

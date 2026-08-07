@@ -1,10 +1,7 @@
-// Per-provider square logos, rendered as inline SVG (not <img>) so WebKitGTK draws them as
-// crisp vectors at the displayed size — the same path the lucide icons take. An <img src=svg>
-// is rasterized at the file's intrinsic size and bilinearly scaled, which looks jagged.
-//
-// The SVGs under assets/connectors/ are imported as raw markup (?raw). They are replaced by the
-// user's brand files at the same paths. A connector with no mapped asset falls back to an
-// initials monogram so a new provider still renders cleanly.
+// Per-provider square logos, rendered as inline SVG rather than <img> so the webview draws them as
+// crisp vectors at the displayed size — an <img src=svg> is rasterized at the file's intrinsic size
+// and bilinearly scaled, which looks jagged. A connector with no mapped asset falls back to an
+// initials monogram.
 import { cn } from "@/lib/utils";
 
 import ambientcg from "../assets/connectors/ambientcg.svg?raw";

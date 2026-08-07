@@ -26,11 +26,11 @@ ray queries. ReSTIR uses that visibility path for many-light direct lighting.
 | Page | Covers | Code |
 |---|---|---|
 | `ddgi-overview` | what DDGI is, the four-pass probe pipeline, sky-on-miss, the camera-centered clipmap, replacing the IBL diffuse by coverage | `lighting.slang` · `ddgiSampleIrradiance`; `rendering/src/renderer.rs` · `add_ddgi_passes` |
-| `distance-field-reflection-occlusion` | a roughness-widened cone marching the Global Distance Field along the reflection vector to occlude the reflected skybox | `sdf.slang` · `sdfReflectionOcclusion`, `gdfDistance` |
+| `distance-field-reflection-occlusion` | a roughness-widened cone marching the Global Distance Field along the reflection vector to occlude the reflected skybox, and the occluder set the field is composited from | `sdf.slang` · `sdfReflectionOcclusion`, `gdfDistanceOccupancy`; `gi_occluder_micro.slang` · `computeMain` |
 | `probe-volume-and-sampling` | the 16×8×16 camera-centered cage, the toroidal tile fold, octahedral encoding, trilinear + backface + Chebyshev weights | `lighting.slang` · `ddgiSampleIrradiance`, `ddgiOctEncode`; `rendering/src/ddgi.rs` · `Ddgi` |
 | `software-ray-trace` | Fibonacci-sphere rays, sphere-marching the MDF→GDF field, sky-on-miss + albedo-cache hit color, free multi-bounce via probe reuse | `ddgi_trace.slang` · `computeMain`, `sphericalFibonacci`, `sampleAlbedo` |
 | `irradiance-and-moment-atlases` | temporal irradiance blend, Chebyshev moment atlas, octahedral border wrap | `ddgi_blend_irradiance.slang`, `ddgi_blend_distance.slang`, `ddgi_border.slang` |
-| `raytracing-foundation` | per-mesh BLAS, per-frame TLAS + instance buffer, buffer device address | `rendering/src/resources.rs` · `AccelerationStructure`; `rt.rs` · `record_mesh_blas_build`, `record_tlas_build_plan` |
+| `raytracing-foundation` | per-mesh BLAS, per-frame TLAS + instance buffer, buffer device address, deforming refits, and materialized wind and micro-blade geometry | `rendering/src/resources/` · `AccelerationStructure`; `rt/` · `record_mesh_blas_build`, `record_tlas_build_plan`; `rt_deform.rs` · `plan_wind_deformation`; `rt_micro.rs` · `plan_micro_rt_tiles` |
 | `raytracing-device-gating` | optional RT extensions, `rt_supported`, the `ash::khr::acceleration_structure` dispatch | `rendering/src/device.rs` · `probe_optional_features`, `Device::accel_dispatch` |
 | `ray-query-shadows` | inline `RayQuery` shadow rays in the mesh fragment, replacing shadow maps | `lighting.slang` · `rayQueryShadow`; `rendering/src/renderer.rs` · `set_rt_shadows` |
 | `restir-overview` | reservoirs, RIS, the three-pass spatiotemporal resampling pipeline | `restir_initial.slang` · `Reservoir`; `rendering/src/restir.rs` · `Restir` |

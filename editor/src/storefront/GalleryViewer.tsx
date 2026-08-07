@@ -14,6 +14,8 @@ import type { GalleryNav } from "./useGallery";
 
 // One slide, owning its own load state so a pulsing skeleton covers it until the bytes arrive
 // (through the async `saffron-img://` handler) and it fades in — never a blank frame on navigate.
+// The large view paints the card's small image underneath first, so the slide shows the asset
+// immediately and sharpens when the high-res lands rather than sitting empty through the download.
 function Slide({
   img,
   alt,
@@ -31,20 +33,38 @@ function Slide({
   tick: number;
 }) {
   const [loaded, setLoaded] = useState(false);
+  const [baseLoaded, setBaseLoaded] = useState(false);
+  const src = large ? (img.fullUrl ?? img.url) : img.url;
+  // The low-res stand-in, only when the slide is showing something else: the grid card already
+  // fetched it, so it is a cache hit and paints on the first frame.
+  const base = src === img.url ? null : img.url;
   return (
     <div className="relative h-full w-full shrink-0">
-      {loaded ? null : <div className="absolute inset-0 animate-pulse bg-muted" />}
+      {loaded || baseLoaded ? null : <div className="absolute inset-0 animate-pulse bg-muted" />}
+      {base ? (
+        <img
+          src={cachedImage(base)}
+          alt=""
+          aria-hidden
+          onLoad={() => setBaseLoaded(true)}
+          onError={() => setBaseLoaded(true)}
+          className={cn(
+            "absolute inset-0 h-full w-full object-contain transition-opacity duration-200",
+            baseLoaded ? "opacity-100" : "opacity-0",
+          )}
+        />
+      ) : null}
       {/* No `loading="lazy"`: the gallery is a handful of images and the user navigates them, so
           preload every slide concurrently — a slid-to image is already there. The skeleton state
           lives on the Slide, so a fade re-key of the inner <img> doesn't flash it for a cached image. */}
       <img
         key={fade ? `fade-${tick}` : "slide"}
-        src={cachedImage(large ? (img.fullUrl ?? img.url) : img.url)}
+        src={cachedImage(src)}
         alt={active ? alt : ""}
         onLoad={() => setLoaded(true)}
         onError={() => setLoaded(true)}
         className={cn(
-          "h-full w-full object-contain transition-opacity duration-200",
+          "relative h-full w-full object-contain transition-opacity duration-200",
           loaded ? "opacity-100" : "opacity-0",
           fade && "animate-in fade-in",
         )}

@@ -1,7 +1,6 @@
 import { spinner } from "@clack/prompts";
 
-/// Run one pipeline stage under a clack spinner: the title spins while `fn` runs, resolves to a
-/// success line, and on failure stops with an error mark before rethrowing (surfaced by the caller).
+/// Run one pipeline stage under a clack spinner, marking it failed before rethrowing.
 export async function step<T>(title: string, fn: () => Promise<T>): Promise<T> {
   const s = spinner();
   s.start(title);

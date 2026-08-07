@@ -1,11 +1,8 @@
-/// A free-typing numeric `<input>`. Once the user starts typing it holds the raw text
-/// as a draft string — they may clear it, type a partial value ("-", "1."), or leave
-/// it empty — and parses NOTHING until the edit ends. On blur or Enter it parses the
-/// draft, and commits only a finite, clamped number; empty or non-numeric input
-/// reverts to the current `value` and emits nothing (so erasing a field to retype it
-/// never sends 0 to the engine). Escape reverts. Idle, the readout follows `value`.
-/// No focus handler runs, so clicking in just places the caret where clicked — no
-/// select-all flash, no caret jump.
+/// A free-typing numeric input. While editing it holds the raw text as a draft — a partial value
+/// like "-" or "1." is allowed — and parses nothing until blur or Enter, committing only a finite,
+/// clamped number; empty or non-numeric input reverts and emits nothing, so erasing a field to
+/// retype it never sends 0 to the engine. No focus handler runs, so clicking in just places the
+/// caret where clicked.
 import { useRef, useState } from "react";
 import { Input } from "@/components/ui/input";
 

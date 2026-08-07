@@ -1,29 +1,18 @@
 //! The BLOCKING cross-arch bit-exact determinism gate.
 //!
-//! This harness proves that the vendored-Jolt-5.3.0 + `cxx` bridge, built with the determinism
-//! flags (`JPH_CROSS_PLATFORM_DETERMINISTIC` + single precision + `-ffp-model=precise`
-//! `-ffp-contract=off` + a confined `-mavx2`), produces a simulation whose per-step trace is
-//! **byte-for-byte identical** run-to-run and build-to-build. Bit-exactness is a property of the
-//! *build*, not of Jolt the library, so this gate is the only thing that proves the flag set
-//! actually took. There is no tolerance knob: floats are compared as raw little-endian bytes,
-//! folded into a SHA-256 whole-run hash.
+//! Bit-exactness is a property of the *build*, not of Jolt the library, so this gate is the only
+//! thing that proves the determinism flag set took. There is no tolerance knob: floats are compared
+//! as raw little-endian bytes folded into a SHA-256 whole-run hash.
 //!
-//! The scenario is a frozen fixture (hardcoded here, never loaded from disk so it cannot drift): a
-//! 10-box dynamic stack on a static floor, one 4-bone passive SwingTwist ragdoll, one
-//! `CharacterVirtual` driven by a fixed desired-velocity sequence, and one kinematic-bones rig
-//! swept by a fixed step function so its capsules shove a parked dynamic box (the
-//! `MoveKinematic`-vs-teleport contact-velocity subtlety, in the trace). It is stepped 600 fixed
-//! substeps (10 s at `1/60`).
+//! The scenario is hardcoded rather than loaded from disk so it cannot drift: a 10-box dynamic
+//! stack on a static floor, one 4-bone passive SwingTwist ragdoll, one `CharacterVirtual` on a
+//! fixed desired-velocity sequence, and one kinematic-bones rig swept so its capsules shove a
+//! parked dynamic box, which puts the `MoveKinematic`-versus-teleport contact velocity in the
+//! trace. It runs 600 fixed substeps.
 //!
-//! ## Cross-arch status
-//!
-//! The toolbox is x86_64-only, so this harness verifies the **x86 half** thoroughly: the trace hash
-//! is identical across repeated in-process runs *and* across a freshly rebuilt world, with the
-//! determinism flags confirmed active end-to-end. The **aarch64 / ARM half** of the gate — the
-//! non-negotiable `Rust-x86 hash == Rust-aarch64 hash` assertion — cannot be run on this hardware:
-//! it must be run on the self-hosted aarch64 runner before the gate is unconditionally green. The
-//! committed [`GOLDEN_TRACE_HASH`] is the x86_64 build's hash; the aarch64 runner re-derives the
-//! same trace and asserts equality against it.
+//! The toolbox is x86_64-only, so [`GOLDEN_TRACE_HASH`] is the x86_64 build's hash and the aarch64
+//! half of the gate — `Rust-x86 hash == Rust-aarch64 hash` — must run on the self-hosted aarch64
+//! runner, which re-derives the same trace and asserts equality against it.
 
 use glam::Vec3;
 use saffron_core::Uuid;
@@ -179,12 +168,23 @@ impl Scenario {
     /// sampled value was non-finite at any step (an exploded constraint), which the gate fails on;
     /// `kinematic_shoved` is `true` once the kinematic bone capsules pushed the target box (so the
     /// trace addition is proven load-bearing, not inert).
-    fn run(mut self) -> (String, bool, bool) {
+    fn run(self) -> (String, bool, bool) {
+        self.run_traced(None)
+    }
+
+    /// [`Scenario::run`] with an optional per-step trace sink for [`divergence_probe`]: each
+    /// step's bytes land in `TRACE_SECTIONS`-ordered buffers, which are folded into the run
+    /// hash in that same order — the hashed byte stream is identical with or without a sink.
+    fn run_traced(
+        mut self,
+        mut probe: Option<&mut Vec<[Vec<u8>; TRACE_SECTIONS.len()]>>,
+    ) -> (String, bool, bool) {
         let mut hasher = Sha256::new();
         let mut finite = true;
         let mut kinematic_shoved = false;
 
         for step in 0..STEP_COUNT {
+            let mut sections: [Vec<u8>; TRACE_SECTIONS.len()] = Default::default();
             // Drive the character with the fixed, step-indexed velocity before the step.
             let desired = character_desired_velocity(step);
             let _ = self
@@ -215,10 +215,10 @@ impl Scenario {
                     .component::<Transform>(e)
                     .expect("stack box transform");
                 finite &= t.translation.is_finite();
-                hash_vec3(&mut hasher, t.translation);
+                put_vec3(&mut sections[0], t.translation);
                 // The Transform stores rotation as Euler radians; hash it directly (it is the
                 // write-back the engine itself produces, so it is the load-bearing quantity).
-                hash_vec3(&mut hasher, t.rotation);
+                put_vec3(&mut sections[0], t.rotation);
             }
 
             // 2) The character's resolved world position.
@@ -228,7 +228,7 @@ impl Scenario {
                 .expect("character transform")
                 .translation;
             finite &= cp.is_finite();
-            hash_vec3(&mut hasher, cp);
+            put_vec3(&mut sections[1], cp);
 
             // 3) Each ragdoll part's WORLD transform, pre-blend, read straight from the solver.
             let parts = self.world.ragdoll_part_count(self.ragdoll_rig);
@@ -238,11 +238,11 @@ impl Scenario {
                     .ragdoll_part_transform(self.ragdoll_rig, part)
                     .expect("ragdoll part transform");
                 finite &= pos.is_finite() && rot.is_finite();
-                hash_vec3(&mut hasher, pos);
-                hash_f32(&mut hasher, rot.x);
-                hash_f32(&mut hasher, rot.y);
-                hash_f32(&mut hasher, rot.z);
-                hash_f32(&mut hasher, rot.w);
+                put_vec3(&mut sections[2], pos);
+                put_f32(&mut sections[2], rot.x);
+                put_f32(&mut sections[2], rot.y);
+                put_f32(&mut sections[2], rot.z);
+                put_f32(&mut sections[2], rot.w);
             }
 
             // 4) Each Kinematic bone body's resolved world position, in creation order (the bodies
@@ -250,7 +250,7 @@ impl Scenario {
             for body in self.world.list_bodies() {
                 if body.motion == MotionType::Kinematic {
                     finite &= body.position.is_finite();
-                    hash_vec3(&mut hasher, body.position);
+                    put_vec3(&mut sections[3], body.position);
                 }
             }
 
@@ -259,24 +259,40 @@ impl Scenario {
             let kt = self.world.body_linear_velocity(self.kinematic_target);
             finite &= kt.is_finite();
             kinematic_shoved |= kt.x > 0.05;
-            hash_vec3(&mut hasher, kt);
+            put_vec3(&mut sections[4], kt);
+
+            for section in &sections {
+                hasher.update(section);
+            }
+            if let Some(sink) = probe.as_deref_mut() {
+                sink.push(sections);
+            }
         }
 
         (hasher.finish_hex(), finite, kinematic_shoved)
     }
 }
 
-/// Hash a `Vec3` as three little-endian `f32`s (12 bytes), the GPU/file layout glam guarantees.
-fn hash_vec3(hasher: &mut Sha256, v: Vec3) {
-    hash_f32(hasher, v.x);
-    hash_f32(hasher, v.y);
-    hash_f32(hasher, v.z);
+/// The named per-step trace sections [`Scenario::run_traced`] buffers, in hash order.
+const TRACE_SECTIONS: [&str; 5] = [
+    "stack write-back",
+    "character position",
+    "ragdoll parts",
+    "kinematic bone bodies",
+    "kinematic target velocity",
+];
+
+/// Append a `Vec3` as three little-endian `f32`s (12 bytes), the GPU/file layout glam guarantees.
+fn put_vec3(buf: &mut Vec<u8>, v: Vec3) {
+    put_f32(buf, v.x);
+    put_f32(buf, v.y);
+    put_f32(buf, v.z);
 }
 
-/// Hash one `f32` as its 4 little-endian bytes — the frozen trace element. No tolerance: the raw
+/// Append one `f32` as its 4 little-endian bytes — the frozen trace element. No tolerance: the raw
 /// bit pattern is the comparison unit.
-fn hash_f32(hasher: &mut Sha256, value: f32) {
-    hasher.update(&value.to_le_bytes());
+fn put_f32(buf: &mut Vec<u8>, value: f32) {
+    buf.extend_from_slice(&value.to_le_bytes());
 }
 
 /// Spawn a static box collider of the given half-extents at `translation`.
@@ -538,6 +554,41 @@ fn determinism_gate() {
         "the trace hash drifted from the committed x86 golden hash. If the scenario or the bridge \
          legitimately changed, RE-FREEZE the golden hash to the new value (and re-run the aarch64 \
          half); otherwise this is a determinism-flag regression — escalate per the go/no-go rule."
+    );
+}
+
+/// Diagnostic probe for a `determinism_gate` repeatability failure: runs the scenario twice with
+/// per-step trace capture and names the first step + section whose bytes differ, so a
+/// nondeterminism report points at the mechanism (stack write-back vs character vs ragdoll vs
+/// kinematic bones vs contact velocity) instead of one whole-run hash mismatch. Ignored in the
+/// normal run; run it with `--ignored` when the gate reports differing in-process hashes.
+#[test]
+#[ignore = "diagnostic probe; run with --ignored when determinism_gate reports differing hashes"]
+fn divergence_probe() {
+    let _guard = jolt_guard();
+
+    let mut trace_a = Vec::new();
+    let mut trace_b = Vec::new();
+    let (hash_a, ..) = Scenario::build().run_traced(Some(&mut trace_a));
+    let (hash_b, ..) = Scenario::build().run_traced(Some(&mut trace_b));
+    if hash_a == hash_b {
+        println!("no divergence: two runs produced identical traces ({hash_a})");
+        return;
+    }
+    for (step, (a, b)) in trace_a.iter().zip(&trace_b).enumerate() {
+        for (index, name) in TRACE_SECTIONS.iter().enumerate() {
+            assert!(
+                a[index] == b[index],
+                "first divergence at step {step}, section '{name}':\n  run A: {:02x?}\n  run B: {:02x?}",
+                a[index],
+                b[index]
+            );
+        }
+    }
+    panic!(
+        "hashes differ but no per-step section diverged — trace lengths {} vs {}",
+        trace_a.len(),
+        trace_b.len()
     );
 }
 

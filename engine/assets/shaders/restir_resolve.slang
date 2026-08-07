@@ -5,7 +5,10 @@
 // loop) when ReSTIR is on. Also copies the combined reservoir into the previous buffer for
 // next frame's temporal reuse. Set 0: b0 = G-buffer, b1 = combined reservoirs (in),
 // b2 = previous reservoirs (out, for next frame), b3 = light SSBO, b4 = TLAS,
-// b5 = restir output radiance (rgba16f storage).
+// b5 = restir output radiance (rgba16f storage), b6 = the GPU-scene address block.
+// Set 1: the bindless albedo array (binding 0) the candidate coverage confirmation samples.
+
+import global_gpu_data;
 
 struct GpuLight
 {
@@ -23,6 +26,8 @@ struct Reservoir { float4 a; float4 b; };
 [[vk::binding(4, 0)]] RaytracingAccelerationStructure tlas;
 [[vk::image_format("rgba16f")]]
 [[vk::binding(5, 0)]] RWTexture2D<float4> radianceOut;
+[[vk::binding(6, 0)]] ConstantBuffer<GpuSceneAddressBlock> sceneAddresses;
+[[vk::binding(0, 1)]] Sampler2D albedoTextures[1024];
 
 struct Push
 {
@@ -56,7 +61,22 @@ float rayShadow(float3 p, float3 l, float dist)
     ray.TMax = dist;
     RayQuery<RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH | RAY_FLAG_SKIP_PROCEDURAL_PRIMITIVES> q;
     q.TraceRayInline(tlas, RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH | RAY_FLAG_SKIP_PROCEDURAL_PRIMITIVES, 0xFF, ray);
-    q.Proceed();
+    // Opaque candidates auto-commit; a non-opaque candidate commits only when the canonical
+    // classifier confirms its coverage, so cutout texels stay transparent to visibility rays.
+    while (q.Proceed())
+    {
+        if (q.CandidateType() == CANDIDATE_NON_OPAQUE_TRIANGLE
+            && gpuSceneRayCandidateCovered(
+                sceneAddresses,
+                albedoTextures,
+                q.CandidateInstanceID(),
+                q.CandidateGeometryIndex(),
+                q.CandidatePrimitiveIndex(),
+                q.CandidateTriangleBarycentrics()))
+        {
+            q.CommitNonOpaqueTriangleHit();
+        }
+    }
     return q.CommittedStatus() == COMMITTED_TRIANGLE_HIT ? 0.0 : 1.0;
 }
 

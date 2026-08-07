@@ -148,21 +148,19 @@ fn cube_clip() -> AnimClip {
 }
 
 #[test]
-fn cube_smesh_bytes_match_cpp_golden() {
+fn cube_smesh_bytes_match_the_golden() {
     let bytes = save_mesh_to_buffer(&cube_mesh(), &[], None).unwrap();
     assert_bytes_match_golden("cube.smesh", &bytes);
 }
 
 #[test]
-fn cube_sanim_bytes_match_cpp_golden() {
+fn cube_sanim_bytes_match_the_golden() {
     let bytes = save_animation_to_buffer(&cube_clip());
     assert_bytes_match_golden("cube.sanim", &bytes);
 }
 
 #[test]
-fn cube_smodel_bytes_match_cpp_golden() {
-    // A self-contained container: a small fixed META JSON + the cube MESH chunk. The META
-    // string is two-space-indented with sorted keys.
+fn cube_smodel_bytes_match_the_golden() {
     let meta = concat!(
         "{\n",
         "  \"materialCount\": 0,\n",
@@ -198,8 +196,8 @@ fn cube_smodel_bytes_match_cpp_golden() {
 
     assert_bytes_match_golden("cube.smodel", &bytes);
 
-    // Re-opening the committed bytes must round-trip the MESH chunk, proving the golden is a
-    // valid container the reader accepts (not just a byte blob).
+    // Re-opening the committed bytes proves the golden is a container the reader accepts,
+    // not merely a matching byte blob.
     let golden = saffron_test_support::golden_dir().join("cube.smodel");
     let reader = read_container(&golden).expect("open the golden container");
     let mesh_entry = reader

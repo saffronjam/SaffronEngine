@@ -1,11 +1,7 @@
-/// The Scene dockspace: a recursive `DockRoot` renders the Scene dock tree — a horizontal
-/// [left sidebar | center column | right dock] over the center's vertical
-/// [viewport | assets | bottom dock]. Every region is a dock leaf: drag a tab to retab or
-/// split it; an empty left/right/bottom region collapses and the viewport reclaims the space.
-/// The per-project layout loads on mount (App remounts this component per project via its
-/// `key`). The viewport leaf is the only host the engine paints over — it is `locked` (no
-/// strip, no drops) and keeps the live subsurface; reveal bands stand in for the empty
-/// left/right/bottom regions during a torn drag so a panel can be dropped back into them.
+/// The Scene dockspace: a recursive `DockRoot` over the Scene dock tree. Every region is a dock
+/// leaf, so a tab can retab or split it and an empty side region collapses into the viewport. The
+/// viewport leaf is the only host the engine paints over — `locked`, no strip, no drops — and reveal
+/// bands stand in for the empty regions during a torn drag so a panel can be dropped back.
 import { useEffect } from "react";
 import { useEditorStore } from "../state/store";
 import { DockRoot } from "@/components/dock/DockRoot";

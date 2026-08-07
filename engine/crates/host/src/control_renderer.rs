@@ -1,29 +1,22 @@
 //! The live [`ControlRenderer`] the host hands the control plane each frame.
 //!
-//! The control crate defines the trait but cannot implement it for the bare
-//! [`Renderer`]: the GPU-upload seam ([`ControlRenderer::with_gpu_uploader`]) needs the
-//! host-owned one-off [`Uploader`] (the renderer owns none — the host constructs one
-//! alongside it, `layer.rs`). So the concrete impl lives here, on a wrapper that bundles
-//! `&mut Renderer` with `&Uploader` for one frame's control drain and is dropped at the
-//! end of it.
-//!
-//! The render-domain query/toggle methods delegate straight to [`Renderer`]; the
-//! view-select / screenshot / wait-idle methods route the matching `Renderer` entry
-//! points; and [`ControlRenderer::with_gpu_uploader`] builds a transient
-//! [`RendererUploader`] over the bundled uploader + the renderer's descriptors and hands
-//! it to the asset loaders (`import_texture`, `load_mesh_asset`, `resolve_material_asset`,
-//! `pick_entity`, …) for the call's duration.
+//! The control crate cannot implement the trait for a bare [`Renderer`], because
+//! [`ControlRenderer::with_gpu_uploader`] needs the host-owned [`Uploader`] the renderer does not
+//! carry. So the impl lives on a wrapper that bundles `&mut Renderer` with `&Uploader` for one
+//! frame's control drain and drops at the end of it, and `with_gpu_uploader` builds a transient
+//! [`RendererUploader`] over that pair for the asset loaders' duration.
 
 use std::path::Path;
 use std::sync::Arc;
 
-use saffron_assets::{AssetServer, GpuUploader, PREVIEW_THUMBNAIL_MATERIAL_ID, RendererUploader};
+use saffron_assets::{GpuUploader, RendererUploader};
 use saffron_control::{ControlRenderer, VegetationComputeExecutor};
 use saffron_rendering::{
     ActiveAlarm, AlarmDrain, CaptureMode, CaptureState, FrameHistoryStats, FrameSample, PassTiming,
     PerfConfig, ProfileCapture, ProfilerMode, ReflectionProbe, RenderStatsFull, Renderer, Uploader,
-    ViewId, ViewMode, VulkanGraphComputeExecutor,
+    ViewId, ViewMode,
 };
+use saffron_vegetation_gpu::VulkanGraphComputeExecutor;
 use serde_json::Value;
 
 /// Maps a wire grade range onto the renderer's [`saffron_rendering::GradeRange`].
@@ -56,16 +49,23 @@ fn grade_to_range(r: &saffron_rendering::GradeRange) -> saffron_protocol::GradeR
 pub struct HostControlRenderer<'a> {
     renderer: &'a mut Renderer,
     uploader: &'a Uploader,
+    mirror: &'a mut saffron_assets::GpuSceneMirror,
     skinning_enabled: bool,
 }
 
 impl<'a> HostControlRenderer<'a> {
-    /// Bundles the renderer + the host-owned uploader for a control drain.
-    pub fn new(renderer: &'a mut Renderer, uploader: &'a Uploader) -> Self {
+    /// Bundles the renderer, the host-owned uploader, and the GPU-scene mirror for a
+    /// control drain.
+    pub fn new(
+        renderer: &'a mut Renderer,
+        uploader: &'a Uploader,
+        mirror: &'a mut saffron_assets::GpuSceneMirror,
+    ) -> Self {
         let skinning_enabled = renderer.skinning_enabled();
         Self {
             renderer,
             uploader,
+            mirror,
             skinning_enabled,
         }
     }
@@ -76,11 +76,83 @@ impl ControlRenderer for HostControlRenderer<'_> {
         self.renderer.render_stats()
     }
 
+    fn gpu_scene_mirror_stats(&self) -> saffron_assets::GpuSceneMirrorStats {
+        self.mirror.stats()
+    }
+
+    fn page_residency_stats(&self) -> saffron_rendering::PageResidencyStats {
+        self.renderer.page_residency_stats()
+    }
+
+    fn visibility_counters(
+        &self,
+    ) -> [u32; saffron_rendering::SCENE_VISIBILITY_COUNTER_WORDS as usize] {
+        self.renderer.visibility_counters()
+    }
+
+    fn gi_visibility_counters(
+        &self,
+    ) -> [u32; saffron_rendering::SCENE_VISIBILITY_COUNTER_WORDS as usize] {
+        self.renderer.gi_visibility_counters()
+    }
+
+    fn wind_interaction_resets(&self) -> u64 {
+        self.renderer.wind_interaction_resets()
+    }
+
+    fn vegetation_budgets(&self) -> saffron_assets::VegetationBudgets {
+        self.mirror.vegetation_budgets()
+    }
+
+    fn set_vegetation_budgets(&mut self, budgets: saffron_assets::VegetationBudgets) {
+        self.mirror.set_vegetation_budgets(budgets);
+    }
+
+    fn vegetation_breakdown(&self) -> saffron_assets::VegetationRenderBreakdown {
+        self.mirror.vegetation_breakdown()
+    }
+
+    fn capture_plant_wind_record(
+        &self,
+        cell: saffron_spatial::WorldCellKey,
+        plant: saffron_runtime::PlantId,
+    ) -> Result<Option<saffron_control::PlantWindRecord>, String> {
+        let Some((slot, mechanics)) = self.mirror.plant_instance_slot(cell, plant) else {
+            return Ok(None);
+        };
+        Ok(self
+            .renderer
+            .capture_wind_record(slot)
+            .map_err(|error| error.to_string())?
+            .map(|record| saffron_control::PlantWindRecord {
+                slot,
+                record,
+                mechanics,
+            }))
+    }
+
+    fn capture_interaction_field(
+        &self,
+        cascade: u32,
+        resolution: u32,
+    ) -> Result<Option<saffron_rendering::InteractionFieldCapture>, String> {
+        self.renderer
+            .capture_interaction_field(cascade, resolution)
+            .map_err(|error| error.to_string())
+    }
+
+    fn page_faults(&self) -> u64 {
+        self.renderer.page_faults()
+    }
+
     fn clustered_enabled(&self) -> bool {
         self.renderer.clustered_enabled()
     }
     fn set_clustered(&mut self, enabled: bool) {
         self.renderer.set_clustered(enabled);
+    }
+    fn submit_interaction_impulse(&mut self, impulse: saffron_rendering::InteractionImpulse) {
+        self.renderer.submit_interaction_impulses(&[impulse]);
     }
     fn depth_prepass_enabled(&self) -> bool {
         self.renderer.depth_prepass_enabled()
@@ -249,8 +321,165 @@ impl ControlRenderer for HostControlRenderer<'_> {
     fn set_rt_reflections(&mut self, enabled: bool) {
         self.renderer.set_rt_reflections(enabled);
     }
+    fn mesh_shader_supported(&self) -> bool {
+        self.renderer.mesh_shader_supported()
+    }
+    fn mesh_executor_active(&self) -> bool {
+        self.renderer.mesh_executor_active()
+    }
+
+    fn mesh_executor_supported(&self) -> bool {
+        saffron_rendering::mesh_executor_supported(&self.renderer.device().capabilities)
+    }
+
+    fn set_mesh_executor(&mut self, mesh: bool) -> bool {
+        self.renderer.set_mesh_executor(mesh)
+    }
+    fn async_compute_queue_supported(&self) -> bool {
+        self.renderer.async_compute_queue_supported()
+    }
+
+    fn pick_selection_id(
+        &mut self,
+        u: f32,
+        v: f32,
+    ) -> Result<Option<saffron_control::SelectionPick>, String> {
+        let world = self.renderer.active_view_id().gpu_scene_world();
+        let Some(hit) = self
+            .renderer
+            .pick_selection_id(u, v)
+            .map_err(|error| error.to_string())?
+        else {
+            return Ok(None);
+        };
+        let position = hit.position;
+        let normal = hit.normal;
+        // A blade never has a persistent identity, whatever instance anchors its field.
+        if hit.representation == saffron_rendering::GpuRepresentation::MicroBlade {
+            return Ok(Some(saffron_control::SelectionPick::Micro {
+                position,
+                normal,
+            }));
+        }
+        Ok(
+            match self.mirror.identify_instance_slot(world, hit.instance_slot) {
+                Some(saffron_assets::MirrorInstanceIdentity::Entity(entity)) => {
+                    Some(saffron_control::SelectionPick::Entity {
+                        entity,
+                        position,
+                        normal,
+                    })
+                }
+                Some(saffron_assets::MirrorInstanceIdentity::Plant { cell, plant }) => {
+                    Some(saffron_control::SelectionPick::Plant {
+                        cell,
+                        plant,
+                        position,
+                        normal,
+                    })
+                }
+                Some(saffron_assets::MirrorInstanceIdentity::MicroField) => {
+                    Some(saffron_control::SelectionPick::Micro { position, normal })
+                }
+                None => None,
+            },
+        )
+    }
+    fn sdf_instances_dropped(&self) -> u32 {
+        self.renderer.sdf_instances_dropped()
+    }
+    fn sdf_instances_culled(&self) -> u32 {
+        self.renderer.sdf_instances_culled()
+    }
+
+    fn rt_instances_culled(&self) -> u32 {
+        self.renderer.rt_instances_culled()
+    }
+    fn rt_omm_supported(&self) -> bool {
+        self.renderer.omm_supported()
+    }
     fn rt_blas_count(&self) -> u32 {
         self.renderer.rt_blas_count()
+    }
+    fn rt_skinned_blas_count(&self) -> u32 {
+        self.renderer.rt_skinned_blas_count()
+    }
+    fn rt_tessellated_blas_count(&self) -> u32 {
+        self.renderer.rt_tessellated_blas_count()
+    }
+    fn rt_wind_deformed(&self) -> u32 {
+        self.renderer.rt_wind_deformed()
+    }
+    fn cluster_as_supported(&self) -> bool {
+        self.renderer.cluster_as_supported()
+    }
+    fn rt_cluster_blas_count(&self) -> u32 {
+        self.renderer.rt_cluster_blas_count()
+    }
+    fn rt_clas_count(&self) -> u32 {
+        self.renderer.rt_clas_count()
+    }
+    fn ptlas_supported(&self) -> bool {
+        self.renderer.ptlas_supported()
+    }
+    fn rt_ptlas_ops(&self) -> (u32, u32, u32) {
+        self.renderer.rt_ptlas_ops()
+    }
+    fn view_history_invalidation(&self) -> &'static str {
+        self.renderer.view_history_invalidation()
+    }
+
+    fn vsm_page_budget(&self) -> u32 {
+        u32::try_from(self.renderer.vsm_page_budget()).unwrap_or(u32::MAX)
+    }
+
+    fn set_vsm_page_budget(&mut self, pages: u32) {
+        self.renderer.set_vsm_page_budget(pages as usize);
+    }
+
+    fn page_request_budget(&self) -> u32 {
+        self.renderer.page_request_budget()
+    }
+
+    fn set_page_request_budget(&mut self, entries: u32) {
+        self.renderer.set_page_request_budget(entries);
+    }
+
+    fn rt_accel_build_us(&self) -> u64 {
+        self.renderer.rt_accel_build_us()
+    }
+
+    fn cut_override(&self, view: saffron_rendering::SceneViewClass) -> u32 {
+        self.renderer.cut_override(view)
+    }
+
+    fn set_cut_override(&mut self, view: saffron_rendering::SceneViewClass, cut: u32) {
+        self.renderer.set_cut_override(view, cut);
+    }
+
+    fn rt_omm_micromaps(&self) -> u32 {
+        self.renderer.rt_omm_micromaps()
+    }
+
+    fn rt_omm_classes(&self) -> (u64, u64, u64) {
+        self.renderer.rt_omm_classes()
+    }
+
+    fn rt_omm_derived(&self) -> (u64, u64, u64, u64) {
+        self.renderer.rt_omm_derived()
+    }
+
+    fn rt_blas_bytes(&self) -> u64 {
+        self.renderer.rt_blas_bytes()
+    }
+    fn rt_blas_built_bytes(&self) -> u64 {
+        self.renderer.rt_blas_built_bytes()
+    }
+    fn rt_tlas_bytes(&self) -> u64 {
+        self.renderer.rt_tlas_bytes()
+    }
+    fn rt_scratch_bytes(&self) -> u64 {
+        self.renderer.rt_scratch_bytes()
     }
 
     fn pipeline_count(&self) -> u32 {
@@ -543,15 +772,8 @@ impl ControlRenderer for HostControlRenderer<'_> {
             self.renderer.view_desired_height(view),
         )
     }
-    fn set_view_desired_size(
-        &mut self,
-        view: ViewId,
-        width: u32,
-        height: u32,
-    ) -> Result<(), String> {
-        self.renderer
-            .set_viewport_desired_size(view, width, height)
-            .map_err(|e| e.to_string())
+    fn set_view_desired_size(&mut self, view: ViewId, width: u32, height: u32) {
+        self.renderer.set_viewport_desired_size(view, width, height);
     }
 
     fn capture_viewport(&mut self, path: &Path) -> Result<(), String> {
@@ -583,42 +805,6 @@ impl ControlRenderer for HostControlRenderer<'_> {
         let executor = VulkanGraphComputeExecutor::new(self.renderer.device_arc())
             .map_err(|error| error.to_string())?;
         Ok(Some(Arc::new(executor)))
-    }
-
-    fn render_material_preview_png(
-        &mut self,
-        assets: &mut AssetServer,
-        subject: saffron_control::PreviewSubject,
-        size: u32,
-    ) -> Result<Vec<u8>, String> {
-        // Build the furnished preview scene through a transient uploader over the renderer's
-        // descriptors, then render it through the main graph on the offscreen thumbnail view. The
-        // uploader borrow of the renderer ends with the block, freeing it for the render pass.
-        let (mut scene, _root, camera) = {
-            let gpu = RendererUploader::new(
-                self.uploader,
-                self.renderer.descriptors(),
-                self.skinning_enabled,
-            );
-            saffron_control::build_preview_scene_for_thumbnail(
-                assets,
-                &gpu,
-                subject,
-                PREVIEW_THUMBNAIL_MATERIAL_ID,
-            )
-        };
-        let view = camera.view();
-        crate::layer::render_preview_scene_to_png(
-            self.renderer,
-            self.uploader,
-            self.skinning_enabled,
-            &mut scene,
-            assets,
-            &view,
-            size,
-        )
-        .map(|png| png.bytes)
-        .map_err(|e| e.to_string())
     }
 
     fn render_settings_to_json(&self) -> Value {

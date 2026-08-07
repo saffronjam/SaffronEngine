@@ -225,6 +225,33 @@ pub struct FogVolume {
     pub speed: f32,
 }
 
+/// The influence shape of a local wind source.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema, TS)]
+#[serde(rename_all = "lowercase")]
+#[ts(export)]
+pub enum WindSourceKindDto {
+    Directional,
+    Point,
+    Vortex,
+    Wake,
+    Volume,
+}
+
+/// A serialized local wind influence composited over the environment wind.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema, TS)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[ts(export)]
+pub struct WindSource {
+    pub kind: WindSourceKindDto,
+    /// Peak speed in metres per second; the global scale factor for `volume`.
+    pub strength: f32,
+    /// Influence radius in metres.
+    pub radius: f32,
+    /// Edge-falloff fraction of the radius, in 0..1.
+    pub falloff: f32,
+    pub enabled: bool,
+}
+
 /// A serialized hierarchy parent reference.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema, TS)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -344,6 +371,7 @@ pub struct Rigidbody {
     pub linear_damping: f32,
     pub angular_damping: f32,
     pub gravity_factor: f32,
+    pub wind_factor: f32,
     pub lock_position: BVec3,
     pub lock_rotation: BVec3,
     pub collision_layer: i32,
@@ -437,6 +465,8 @@ pub struct Components {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub fog_volume: Option<FogVolume>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub wind_source: Option<WindSource>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub relationship: Option<Relationship>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub skinned_mesh: Option<SkinnedMesh>,
@@ -477,6 +507,7 @@ pub enum ComponentBody {
     SpotLight(SpotLight),
     ReflectionProbe(ReflectionProbe),
     FogVolume(FogVolume),
+    WindSource(WindSource),
     Relationship(Relationship),
     SkinnedMesh(SkinnedMesh),
     Morph(Morph),
@@ -607,6 +638,17 @@ pub struct WindSettingsDto {
     pub speed: f32,
     #[schemars(range(min = 0.0))]
     pub gust: f32,
+    #[schemars(range(min = 0, max = 8))]
+    pub turbulence_octaves: u32,
+    #[schemars(range(min = 0.0, max = 1.0))]
+    pub turbulence_roughness: f32,
+    #[schemars(range(min = 0.0))]
+    pub gust_frequency: f32,
+    #[schemars(range(min = 0.0))]
+    pub reference_height: f32,
+    #[schemars(range(min = 0.0))]
+    pub height_exponent: f32,
+    pub seed: u32,
 }
 
 /// One time-of-day curve control point.
@@ -694,6 +736,7 @@ pub const COMPONENT_NAMES: &[&str] = &[
     "SpotLight",
     "ReflectionProbe",
     "FogVolume",
+    "WindSource",
     "Relationship",
     "SkinnedMesh",
     "Morph",

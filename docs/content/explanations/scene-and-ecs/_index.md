@@ -16,12 +16,19 @@ needs editing when a component is added.
 | Page | Covers | Code |
 |---|---|---|
 | `ecs-architecture` | `hecs`-backed `Scene`/`Entity`, component-access methods, `for_each` | `scene/src/scene.rs` |
+| `scene-mutation-journal` | Revisioned entity, component, and world-transform changes | `scene/src/journal.rs` · `SceneMutation` |
 | `built-in-components` | Id, Name, Transform, Mesh, MaterialSet, Camera, the three light types | `scene/src/component.rs` |
 | `transform-and-matrices` | `Transform` (Euler XYZ radians), `T·R·S` composition, the stable Euler extraction | `scene/src/hierarchy.rs` · `transform_matrix` |
 | `scene-hierarchy` | parent/child via `Relationship`, cached world transforms, reparent + subtree destroy | `scene/src/hierarchy.rs` · `set_parent` |
 | `component-registry` | the fn-pointer itable, `register_component!`, lookup by name/type | `scene/src/registry.rs` · `ComponentRegistry` |
 | `scene-serialization` | registry-driven JSON save/load, uuid stability, version migration | `scene/src/document.rs` |
 | `asset-catalog-in-scene` | `AssetCatalog` lives here; `Scene` holds an `Arc<AssetCatalog>` handle | `scene/src/environment.rs` · `AssetCatalog` |
-| `picking` | ray vs. mesh triangles (AABB broad-phase), static + skinned, click-to-select | `assets/src/render_scene.rs` · `pick_entity` |
+| `picking` | billboards in screen space, then a GPU selection-ID replay of the frame's cut, resolved to an entity or a `PlantId` | `rendering/src/renderer/selection_pick.rs` · `pick_selection_id` |
 | `spatial-world` | exact world positions, hierarchical cells, surface fields, deterministic numerics, facet residency | `spatial/src/lib.rs` · `WorldCellKey` · `SurfaceField` |
-| `vegetation-state` | Stable plant identity, point columns, layers, and persistent mutations | `vegetation/src/mutation.rs` · `VegetationState`, `reduce_mutations` |
+| `vegetation-state` | Runtime cells, facet residency, queries, and strict persistence | `vegetation/src/runtime_world.rs` · `VegetationWorld`, `reduce_mutations` |
+| `plant-promotion` | Transient entity views for macro plants, and state write-back | `runtime/src/vegetation_promotion.rs` · `VegetationPromotion`, `PlantOrigin` |
+| `ecology-catchup` | The world simulation clock, fixed ecology ticks, dependency regions, and budgeted catch-up | `vegetation/src/ecology_region.rs` · `runtime/src/vegetation_ecology.rs` · `advance_region` |
+| `vegetation-navigation` | Obstacle/cost contributions and dirty-region delivery | `runtime/src/vegetation_navigation.rs` · `VegetationNavigationSeam` |
+| `vegetation-telemetry` | Compact stage times and work counters, no per-instance readback | `runtime/src/vegetation_telemetry.rs` · `VegetationTelemetry` |
+| `vegetation-network-session` | The base handshake, per-cell facet interest, sequenced envelopes, late join, and checkpoint fingerprints | `vegetation/src/network/` · `CellInterestSet`, `VegetationCheckpoint`, `LateJoinGrant` |
+| `wind-field` | One deterministic sampled wind field every consumer reads identically | `wind/src/lib.rs` · `WindProfile`, `sample` |

@@ -1,20 +1,10 @@
-/// Global viewport keyboard shortcuts. W/E/R map to the gizmo operation (translate
-/// / rotate / scale); F focuses the editor camera on the selection; Escape deselects.
+/// Global viewport keyboard shortcuts: the gizmo operation, focus-on-selection, and deselect.
 ///
-/// INPUT MODEL: the editor input is **control-command-driven** — the webview owns
-/// the DOM and forwards intent to the engine over the control socket. The engine
-/// renders windowless and gets no raw
-/// keyboard from the webview, so the webview is the right place to bind W/E/R: it
-/// sets `store.gizmo` optimistically and fires `set-gizmo` (mirroring the Topbar
-/// buttons). The engine therefore never handles W/E/R itself, so this hook cannot
-/// double-fire with it.
-///
-/// The handler is gated OFF while a text input / textarea / select / contentEditable
-/// is focused, so typing a value (e.g. an entity name or a number field) never
-/// retargets the gizmo, and while the Editor Settings modal is open (it holds focus
-/// on non-text elements, so the text-entry guard alone would not catch it). Each
-/// shortcut is matched against the configured binding (see lib/keybindings), so a
-/// rebind in settings takes effect immediately.
+/// The engine renders windowless and receives no raw keyboard, so the webview owns these bindings —
+/// it writes `store.gizmo` optimistically and fires `set-gizmo`, and the engine can never
+/// double-fire with it. The handler is gated off while a text input is focused and while the
+/// Settings modal is open (it holds focus on non-text elements, so the text-entry guard alone would
+/// not catch it). Each shortcut matches the configured binding, so a rebind applies immediately.
 import { useEffect } from "react";
 import { client } from "../control/client";
 import { useEditorStore } from "../state/store";

@@ -1,23 +1,8 @@
-# Saffron Anima CI — SELF-HOSTED RUNNER ONLY.
-#
-# This workflow CANNOT run on a stock GitHub-hosted runner (ubuntu-latest et al.).
-# Saffron Anima builds only on a Fedora Silverblue host inside the `saffron-build`
-# toolbox, which provides the full toolchain that hosted runners do not have:
-#   - the Rust toolchain (cargo + the xtask build driver),
-#   - the Vulkan SDK (headers/loader/validation/tools 1.4.341) + SDL3 + slang,
-#   - weston for a headless display (the engine smoke + schema contract test open a
-#     Vulkan swapchain and need a Wayland display),
-#   - the host bun on PATH (frontend build).
-# An immutable-OS toolbox cannot be reproduced by `apt install` on ubuntu-latest, so
-# there is intentionally NO hosted pipeline here — that would be a fabricated green.
-#
-# TO ENABLE THIS WORKFLOW you must provision a SELF-HOSTED runner that either runs on
-# the Silverblue host with the `saffron-build` toolbox present, or runs in a container
-# image that replicates it (Rust/cargo/xtask, Vulkan, SDL3, slang, weston, bun).
-# Register that runner with the labels below.
-#
-# Until such a runner exists, this workflow will simply queue (no hosted fallback).
-# The everyday gate is `just` / tools/ci/check.sh run locally in the toolbox.
+# Runs only on a self-hosted runner labelled `saffron-build`, on a host carrying the
+# `saffron-build` toolbox (Rust/cargo + xtask, the Vulkan SDK, SDL3, slang), bun on
+# PATH, and weston for a headless Wayland display — the engine smoke and the schema
+# contract test open a Vulkan swapchain. There is no hosted fallback; without such a
+# runner the workflow queues. The everyday gate is tools/ci/check.sh in the toolbox.
 
 name: ci
 
@@ -30,13 +15,9 @@ on:
 
 jobs:
   gate:
-    # Self-hosted ONLY. Requires a runner with the saffron-build toolbox (or an
-    # equivalent container image) AND a headless weston display. Do NOT change this
-    # to ubuntu-latest — a hosted runner cannot build the engine.
     runs-on: [self-hosted, saffron-build]
 
     env:
-      # Host bun (frontend build) + the headless display the gate needs.
       PATH: /var/home/saffronjam/.bun/bin:/usr/local/bin:/usr/bin:/bin
       WAYLAND_DISPLAY: wl-ci
       SDL_VIDEODRIVER: wayland
@@ -53,7 +34,7 @@ jobs:
           weston --backend=headless --width=1280 --height=720 \
                  --socket=wl-ci --idle-time=0 &
           echo "WESTON_PID=$!" >> "$GITHUB_ENV"
-          # Give the compositor a moment to create the wl-ci socket.
+          # Wait for the compositor to create the wl-ci socket.
           sleep 2
 
       - name: Run reproducible gate (tools/ci/check.sh)

@@ -43,8 +43,8 @@ an `Image` releases its view before its VMA image, while an `AccelerationStructu
 acceleration-structure handle before the backing buffer.
 
 The wrapper and `Arc<T>` solve different problems. The wrapper uniquely owns the Vulkan objects.
-`Arc<GpuMesh>`, `Arc<GpuTexture>`, or `Arc<Pipeline>` lets caches, draw lists, and recorded work share
-that logical resource. Destruction starts only when the last logical owner releases its `Arc`.
+`Arc<GpuMesh>`, `Arc<GpuTexture>`, or `Arc<Pipeline>` lets caches, per-frame state, and recorded work
+share that logical resource. Destruction starts only when the last logical owner releases its `Arc`.
 
 ## The device lifetime anchor
 
@@ -70,7 +70,7 @@ application to destroy child objects before their parents, as defined by the
 ## CPU lifetime is not GPU completion
 
 An `Arc` proves that CPU owners still retain a wrapper; it does not prove that the GPU has finished
-using its handles. Per-frame code therefore pins resources in structures such as `DrawList::live_textures`
+using its handles. Per-frame code therefore pins resources in structures such as `FrameDeformation::live_textures`
 and retains replaced buffers for the frame ring where required. Whole-application teardown calls
 `Device::wait_idle` before layer detachment and resource release.
 
@@ -89,11 +89,11 @@ slot through `Arc<Mutex<Vec<u32>>>` even when its last owner drops on a worker t
 
 | What | File | Symbols |
 |---|---|---|
-| Resource wrappers and destruction | `engine/crates/rendering/src/resources.rs` | `Buffer`, `Image`, `Image3D`, `GpuTexture`, `GpuLut`, `GpuSdf`, `GpuMesh`, `Pipeline`, `AccelerationStructure` |
-| Shared device and allocator bundle | `engine/crates/rendering/src/resources.rs` | `DeviceResources`, `DeviceResources::drop` |
-| Logical-resource sharing | `engine/crates/rendering/src/draw_list.rs` | `DrawItem`, `DrawList::live_textures` |
-| Wrapper construction | `engine/crates/rendering/src/upload.rs` | `Uploader::upload_mesh`, `GpuTexture::from_parts` |
-| Ordered device teardown | `engine/crates/rendering/src/device.rs` | `Device::wait_idle`, `Device::drop` |
+| Resource wrappers and destruction | `engine/crates/rendering/src/resources/` | `Buffer`, `Image`, `Image3D`, `GpuTexture`, `GpuLut`, `GpuSdf`, `GpuMesh`, `Pipeline`, `AccelerationStructure` |
+| Shared device and allocator bundle | `engine/crates/rendering/src/resources/` | `DeviceResources`, `DeviceResources::drop` |
+| Logical-resource sharing | `engine/crates/rendering/src/draw_list.rs` | `FrameDeformation`, `FrameDeformation::live_textures` |
+| Wrapper construction | `engine/crates/rendering/src/upload/` | `Uploader::upload_mesh`, `GpuTexture::from_parts` |
+| Ordered device teardown | `engine/crates/rendering/src/device/` | `Device::wait_idle`, `Device::drop` |
 
 ## Related
 

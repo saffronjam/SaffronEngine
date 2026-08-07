@@ -91,9 +91,22 @@ reply sets `overflowed: true` with the `oldestSeq` still retained, and the clien
 ### One FIRING, one RESOLVED
 
 Two structures back the wire surface. The **active set** holds the alarms firing right now, keyed
-by an FNV-1a fingerprint of `metric + "|" + pass`, and drives the badge (`list-active-alarms`);
-the whole-frame detectors leave `pass` empty. The **event ring** is the append-only, seq-stamped
-FIRING/RESOLVED history behind the cursor.
+by an FNV-1a fingerprint of `metric + "|" + pass + "|" + owner`, and drives the badge
+(`list-active-alarms`); the whole-frame detectors leave `pass` and `owner` empty. The **event ring**
+is the append-only, seq-stamped FIRING/RESOLVED history behind the cursor.
+
+### Owned budgets
+
+A detector here reads frame timings and GPU counters, so the most it can name is a pass. Which
+vegetation cell filled up, or which plant family filled it, is invisible from this crate and must
+stay that way — the renderer has no vegetation dependency to grow. So a subsystem that CAN see its
+own content computes the breach itself and hands it in as an `OwnedBudgetBreach`, and everything
+below applies unchanged: coalescing, escalation, the FIRING/RESOLVED pair, the drain cursor.
+
+The owner is part of the fingerprint, so two cells over the same budget stay two alarms rather than
+collapsing into whichever breached last. Resolution is by absence — the reporter publishes the
+complete live breach set every frame, and an alarm whose breach stops being reported resolves. See
+[Vegetation telemetry](../../scene-and-ecs/vegetation-telemetry/) for the budgets that use this.
 
 While a fingerprint is active, a repeat breach updates its `count` and `peak` in place; a second
 FIRING is emitted only on a severity escalation. When the metric recovers past its exit threshold,
@@ -120,7 +133,8 @@ sa drain-alarms --since 0        # ... plus the RESOLVED event, with duration + 
 | What | File | Symbols |
 |---|---|---|
 | Per-frame detector tick + focus gate | `frame_history.rs` | `AlarmState::tick`, `AlarmInputs`, `ALARM_RESUME_SETTLE_FRAMES`, `reset_focus_settle` |
-| Active set, event ring, fingerprint | `frame_history.rs` | `AlarmState`, `ActiveAlarm`, `AlarmEvent`, `AlarmSeverity`, `alarm_fingerprint`, `ALARM_EVENT_RING_CAPACITY` |
+| Active set, event ring, fingerprint | `frame_history.rs` | `AlarmState`, `ActiveAlarm`, `AlarmEvent`, `AlarmSeverity`, `alarm_fingerprint`, `AlarmKey`, `ALARM_EVENT_RING_CAPACITY` |
+| Owned budgets from outside the crate | `frame_history.rs`, `renderer.rs` | `OwnedBudgetBreach`, `AlarmInputs::owned_budgets`, `Renderer::set_owned_budgets` |
 | Non-blocking drain + cursor | `frame_history.rs`, `renderer.rs` | `AlarmState::drain`, `AlarmDrain`, `Renderer::drain_alarms`, `active_alarms` |
 | Shared thresholds | `frame_history.rs` | `PerfConfig`, `budget_ms` |
 | Wire surface | `protocol/src/dto.rs`, `control/src/commands_render.rs` | `AlarmEventDto`, `ActiveAlarmDto`, `DrainAlarmsResult`, `drain-alarms`, `list-active-alarms` |

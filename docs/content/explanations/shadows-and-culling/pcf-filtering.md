@@ -13,67 +13,52 @@ Reeves, Salesin, and Cook (SIGGRAPH 1987); GPU Gems'
 [Shadow Map Antialiasing](https://developer.nvidia.com/gpugems/gpugems/part-ii-lighting-and-shadows/chapter-11-shadow-map-antialiasing)
 is the practical treatment.
 
-The 2D shadow maps (directional and spot) share one `pcfShadow` function: a 3×3 grid of hardware
-comparison taps.
+Every [virtual-shadow](../virtual-shadow-maps/) sampler (directional, spot, and point) funnels
+into one function, `vsmTilePcf`: a 3×3 grid of hardware comparison taps inside a single resident
+atlas page.
 
 ## How it works
 
-The maps are bound as `Sampler2DShadow`, a comparison sampler: each tap returns the result of a
-depth test, not the depth itself. `pcfShadow` projects the world position into the light's clip
-space, takes `ndc.z` as the reference depth, and averages nine `SampleCmp` taps stepped one texel
-apart (`texel = 1/2048`, matching `SHADOW_MAP_SIZE`):
+The atlas is bound as `Sampler2DShadow` behind the layout's immutable comparison sampler: each tap
+returns the result of a depth test, not the depth itself. The caller resolves the receiver to a
+page and a fractional position within it; `vsmTilePcf` maps that to the page's physical tile and
+averages nine `SampleCmpLevelZero` taps stepped one atlas texel apart:
 
 ```hlsl
-sum += map.SampleCmp(uv + float2(x, y) * texel, ndc.z);
+float2 texel = clamp(pageFrac * VSM_PAGE_TEXELS, 1.5, VSM_PAGE_TEXELS - 1.5);
+float2 baseUv = (tileBase + texel) / VSM_ATLAS_TEXELS;
+sum += atlas.SampleCmpLevelZero(baseUv + float2(dx, dy) / VSM_ATLAS_TEXELS, depth);
 ```
 
 The sampler compares with `LESS_OR_EQUAL` and filters with `LINEAR`, so the hardware blends the
-comparison results of the four texels under each tap. Each tap is a small percentage-closer
-filter on its own. Nine of them give a smooth $[0, 1]$ gradient across the penumbra.
+comparison results of the four texels under each tap. Nine taps give a smooth $[0, 1]$ gradient
+across the penumbra.
 
-## Off-map and beyond-far cases
+## The tile gutter
 
-A fragment can project outside the map, past its far plane, or behind the light. None of these
-positions carry valid shadow information, so an early-out guard handles each case:
+Adjacent atlas tiles belong to unrelated pages, often of different lights, so a filter kernel must
+never cross a tile edge. The clamp above keeps the tap centre 1.5 texels inside the tile, which
+bounds all nine one-texel-offset taps (plus their linear-filter footprint) within the page. The
+cost is that the outermost 1.5 texels of each 128² page filter slightly flatter than the interior.
 
-| Condition | Meaning | Result |
-|---|---|---|
-| `clip.w <= 0` | behind the light | lit |
-| `uv` outside $[0,1]^2$ | outside the light frustum | lit |
-| `ndc.z > 1` | past the far plane | lit |
+## Absent information
 
-Treating absent information as lit is the safe default. Shadowing these fragments instead would
-draw a hard black band at the frustum edge and put everything past the far plane in shadow. The
-sampler applies the same policy in hardware: `CLAMP_TO_BORDER` with an opaque-white border makes
-a stray off-map tap compare against depth 1.0 and pass as lit.
-
-The cost is that geometry genuinely outside the frustum is never shadowed. That is why the
-directional frustum is [fit to the whole scene](../directional-shadows/).
-
-## Trade-offs
-
-A fixed 3×3 kernel is the cheapest filter that visibly helps. It hides the texel grid, but the
-penumbra width is constant: the softening does not grow with occluder distance, so shadows do not
-contact-harden the way
-[percentage-closer soft shadows](https://developer.download.nvidia.com/shaderlibrary/docs/shadow_PCSS.pdf)
-do. A wider or jittered kernel smooths more and costs more taps per fragment.
-
-The point light does not use this path: its cube map stores distance and does a hard comparison,
-described in [point shadows](../point-light-cube-shadows/).
+A receiver can project outside a light's space, behind it, or past its far plane; a page can simply
+not be resident. Every such case reads fully lit — the safe default for missing shadow information.
+The directional walk has a gentler middle ground first: a missing fine page falls back to a coarser
+clip level's valid content before giving up.
 
 ## In the code
 
 | What | File | Symbols |
 |---|---|---|
-| The 3×3 comparison filter | `assets/shaders/lighting.slang` | `pcfShadow` |
-| Comparison samplers | `assets/shaders/lighting.slang` | `shadowMap`, `spotShadowMap` (`Sampler2DShadow`) |
-| Where it's called | `assets/shaders/lighting.slang` | `evalLighting`, `punctual` |
-| Map size (texel step) | `crates/rendering/src/lighting.rs` | `SHADOW_MAP_SIZE` |
-| The compare sampler object | `crates/rendering/src/descriptors.rs` | `shadow_sampler`, `create_shadow_sampler` |
+| The shared tile filter | `assets/shaders/lighting_common.slang` | `vsmTilePcf` |
+| Its callers | `assets/shaders/lighting_common.slang` | `vsmSampleDirectional`, `vsmSampleSpot`, `vsmSamplePoint` |
+| The compare sampler object | `crates/rendering/src/descriptors.rs` | `shadow_sampler`, `create_light_layout` (binding 13) |
+| Page + atlas texel sizes | `crates/rendering/src/vsm.rs` | `VSM_PAGE_SIZE`, `VSM_ATLAS_SIZE` |
 
 ## Related
 
-- [Directional shadows](../directional-shadows/) — the map this filters
-- [Spot-light shadows](../spot-light-shadows/) — the other map on the same path
+- [Virtual shadow maps](../virtual-shadow-maps/) — the pages the filter stays inside
+- [Directional shadows](../directional-shadows/) — the fine-to-coarse walk that calls it
 - [Shadow bias](../shadow-bias/) — the bias the reference depth carries into the compare
-- [Point shadows](../point-light-cube-shadows/) — the hard-comparison alternative for points

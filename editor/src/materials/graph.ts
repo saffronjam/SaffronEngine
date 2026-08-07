@@ -1,10 +1,6 @@
 // The material node-graph model shared between the engine wire format and the React Flow editor.
-//
-// Wire format (what the engine's emitGraphSurface / lowerGraphToParams consume, and what
-// material-get / material-set-graph carry):
-//   { nodes: [{ id, type, props? }], edges: [{ from: [nodeId, pin], to: [nodeId, pin] }] }
-// The node `type` strings match the engine emitter's switch. Editor-only data (node
-// canvas position) rides along in `props.editorPos`; the engine ignores unknown props.
+// The node `type` strings match the engine emitter's switch; editor-only data (canvas position)
+// rides along in `props.editorPos`, and the engine ignores unknown props.
 
 import type { Edge, Node } from "@xyflow/react";
 
@@ -114,7 +110,21 @@ export const NODE_SPECS: Record<string, NodeSpec> = {
     type: "materialOutput",
     label: "Material Output",
     category: "output",
-    inputs: ["baseColor", "metallic", "roughness", "normal", "emissive"],
+    inputs: [
+      "baseColor",
+      "metallic",
+      "roughness",
+      "normal",
+      "emissive",
+      "occlusion",
+      "opacity",
+      "frontAlbedoResponse",
+      "backAlbedoResponse",
+      "thickness",
+      "absorption",
+      "transmission",
+      "energyLimit",
+    ],
     outputs: [],
   },
 };

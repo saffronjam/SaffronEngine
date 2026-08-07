@@ -1,17 +1,1125 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "envelope.schema.json",
-  "title": "Envelope",
-  "description": "Outer response envelope for every control-protocol reply. ok signals success; error carries a message on failure; result is the open per-command payload.",
-  "type": "object",
-  "properties": {
-    "ok": { "type": "boolean" },
-    "error": { "type": "string" },
-    "code": {
-      "type": "string",
-      "description": "machine-readable error code (present on ok:false)"
+  "$comment": "cargo run -p xtask -- gen-protocol",
+  "title": "ControlReplyEnvelope",
+  "description": "Outer response envelope for every control-protocol reply.",
+  "oneOf": [
+    {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "id": {},
+        "ok": {
+          "const": true
+        },
+        "result": {}
+      },
+      "required": [
+        "id",
+        "ok",
+        "result"
+      ]
     },
-    "result": { "type": "object" }
-  },
-  "required": ["ok"]
+    {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "id": {},
+        "ok": {
+          "const": false
+        },
+        "error": {
+          "oneOf": [
+            {
+              "description": "A command was unknown or rejected by its domain handler.",
+              "type": "object",
+              "properties": {
+                "message": {
+                  "type": "string"
+                },
+                "code": {
+                  "type": "string",
+                  "const": "command"
+                }
+              },
+              "additionalProperties": false,
+              "required": [
+                "code",
+                "message"
+              ]
+            },
+            {
+              "description": "Request parameters did not match the command DTO.",
+              "type": "object",
+              "properties": {
+                "message": {
+                  "type": "string"
+                },
+                "code": {
+                  "type": "string",
+                  "const": "params"
+                }
+              },
+              "additionalProperties": false,
+              "required": [
+                "code",
+                "message"
+              ]
+            },
+            {
+              "description": "A command was discarded while a project load owned the engine state.",
+              "type": "object",
+              "properties": {
+                "message": {
+                  "type": "string"
+                },
+                "code": {
+                  "type": "string",
+                  "const": "busy-loading"
+                }
+              },
+              "additionalProperties": false,
+              "required": [
+                "code",
+                "message"
+              ]
+            },
+            {
+              "description": "The request envelope was not valid JSON.",
+              "type": "object",
+              "properties": {
+                "message": {
+                  "type": "string"
+                },
+                "code": {
+                  "type": "string",
+                  "const": "invalid-request"
+                }
+              },
+              "additionalProperties": false,
+              "required": [
+                "code",
+                "message"
+              ]
+            },
+            {
+              "description": "The client could not complete the socket round-trip.",
+              "type": "object",
+              "properties": {
+                "message": {
+                  "type": "string"
+                },
+                "code": {
+                  "type": "string",
+                  "const": "transport"
+                }
+              },
+              "additionalProperties": false,
+              "required": [
+                "code",
+                "message"
+              ]
+            },
+            {
+              "description": "A peer returned a reply that did not match the control contract.",
+              "type": "object",
+              "properties": {
+                "message": {
+                  "type": "string"
+                },
+                "code": {
+                  "type": "string",
+                  "const": "malformed-reply"
+                }
+              },
+              "additionalProperties": false,
+              "required": [
+                "code",
+                "message"
+              ]
+            },
+            {
+              "description": "A native editor command failed outside the engine control socket.",
+              "type": "object",
+              "properties": {
+                "message": {
+                  "type": "string"
+                },
+                "code": {
+                  "type": "string",
+                  "const": "bridge"
+                }
+              },
+              "additionalProperties": false,
+              "required": [
+                "code",
+                "message"
+              ]
+            },
+            {
+              "description": "A domain operation produced a machine-readable diagnostic.",
+              "type": "object",
+              "properties": {
+                "message": {
+                  "type": "string"
+                },
+                "diagnostic": {
+                  "$ref": "#/$defs/ControlDiagnosticDto"
+                },
+                "code": {
+                  "type": "string",
+                  "const": "diagnostic"
+                }
+              },
+              "additionalProperties": false,
+              "required": [
+                "code",
+                "message",
+                "diagnostic"
+              ]
+            }
+          ],
+          "description": "One failure carried by a control reply or the editor's native bridge."
+        }
+      },
+      "required": [
+        "id",
+        "ok",
+        "error"
+      ]
+    }
+  ],
+  "$defs": {
+    "ControlDiagnosticDto": {
+      "description": "Domain-specific diagnostic payload carried by [`ControlFailureDto::Diagnostic`].",
+      "oneOf": [
+        {
+          "description": "A vegetation graph failed compilation, admission, or execution.",
+          "type": "object",
+          "properties": {
+            "domain": {
+              "type": "string",
+              "const": "vegetation-graph"
+            },
+            "detail": {
+              "$ref": "#/$defs/VegetationGraphDiagnosticDto"
+            }
+          },
+          "required": [
+            "domain",
+            "detail"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "description": "A content-addressed vegetation artifact failed strict validation or publication.",
+          "type": "object",
+          "properties": {
+            "domain": {
+              "type": "string",
+              "const": "vegetation-artifact"
+            },
+            "detail": {
+              "$ref": "#/$defs/VegetationArtifactDiagnosticDto"
+            }
+          },
+          "required": [
+            "domain",
+            "detail"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "description": "Plant reimport would discard one or more authored semantic targets.",
+          "type": "object",
+          "properties": {
+            "domain": {
+              "type": "string",
+              "const": "reimport-conflict"
+            },
+            "detail": {
+              "$ref": "#/$defs/ReimportConflictDiagnosticDto"
+            }
+          },
+          "required": [
+            "domain",
+            "detail"
+          ],
+          "additionalProperties": false
+        }
+      ]
+    },
+    "VegetationGraphDiagnosticDto": {
+      "description": "Exact structured fields for every vegetation graph failure category.",
+      "oneOf": [
+        {
+          "description": "A checked integer or fixed-point operation overflowed.",
+          "type": "object",
+          "properties": {
+            "category": {
+              "type": "string",
+              "const": "numeric-overflow"
+            }
+          },
+          "required": [
+            "category"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "description": "A graph-owned collection could not reserve its checked capacity.",
+          "type": "object",
+          "properties": {
+            "resource": {
+              "type": "string"
+            },
+            "reason": {
+              "type": "string"
+            },
+            "category": {
+              "type": "string",
+              "const": "memory-reservation"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "category",
+            "resource",
+            "reason"
+          ]
+        },
+        {
+          "description": "An evaluator worker could not be created.",
+          "type": "object",
+          "properties": {
+            "reason": {
+              "type": "string"
+            },
+            "category": {
+              "type": "string",
+              "const": "worker-spawn"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "category",
+            "reason"
+          ]
+        },
+        {
+          "description": "An evaluator worker panicked before atomic publication.",
+          "type": "object",
+          "properties": {
+            "category": {
+              "type": "string",
+              "const": "worker-panicked"
+            }
+          },
+          "required": [
+            "category"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "description": "A typed graph document was malformed.",
+          "type": "object",
+          "properties": {
+            "path": {
+              "type": "string"
+            },
+            "reason": {
+              "type": "string"
+            },
+            "category": {
+              "type": "string",
+              "const": "document"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "category",
+            "path",
+            "reason"
+          ]
+        },
+        {
+          "description": "A dependency cycle closed through a stable node GUID.",
+          "type": "object",
+          "properties": {
+            "node": {
+              "type": "string",
+              "pattern": "^[0-9a-f]{32}$",
+              "minLength": 32,
+              "maxLength": 32
+            },
+            "category": {
+              "type": "string",
+              "const": "cycle"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "category",
+            "node"
+          ]
+        },
+        {
+          "description": "An edge connected incompatible typed pin domains.",
+          "type": "object",
+          "properties": {
+            "fromNode": {
+              "type": "string",
+              "pattern": "^[0-9a-f]{32}$",
+              "minLength": 32,
+              "maxLength": 32
+            },
+            "fromPin": {
+              "type": "string"
+            },
+            "fromDomain": {
+              "type": "string"
+            },
+            "toNode": {
+              "type": "string",
+              "pattern": "^[0-9a-f]{32}$",
+              "minLength": 32,
+              "maxLength": 32
+            },
+            "toPin": {
+              "type": "string"
+            },
+            "toDomain": {
+              "type": "string"
+            },
+            "category": {
+              "type": "string",
+              "const": "type-mismatch"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "category",
+            "fromNode",
+            "fromPin",
+            "fromDomain",
+            "toNode",
+            "toPin",
+            "toDomain"
+          ]
+        },
+        {
+          "description": "A cosmetic value reached authoritative state.",
+          "type": "object",
+          "properties": {
+            "node": {
+              "type": "string",
+              "pattern": "^[0-9a-f]{32}$",
+              "minLength": 32,
+              "maxLength": 32
+            },
+            "reason": {
+              "type": "string"
+            },
+            "category": {
+              "type": "string",
+              "const": "authority"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "category",
+            "node",
+            "reason"
+          ]
+        },
+        {
+          "description": "A partition-local node had no finite influence bound.",
+          "type": "object",
+          "properties": {
+            "node": {
+              "type": "string",
+              "pattern": "^[0-9a-f]{32}$",
+              "minLength": 32,
+              "maxLength": 32
+            },
+            "category": {
+              "type": "string",
+              "const": "unbounded-influence"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "category",
+            "node"
+          ]
+        },
+        {
+          "description": "A graph estimate or evaluation exceeded an explicit cap.",
+          "type": "object",
+          "properties": {
+            "resource": {
+              "type": "string"
+            },
+            "requested": {
+              "type": "string"
+            },
+            "limit": {
+              "type": "string"
+            },
+            "category": {
+              "type": "string",
+              "const": "limit"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "category",
+            "resource",
+            "requested",
+            "limit"
+          ]
+        },
+        {
+          "description": "Evaluation was cancelled before atomic publication.",
+          "type": "object",
+          "properties": {
+            "category": {
+              "type": "string",
+              "const": "cancelled"
+            }
+          },
+          "required": [
+            "category"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "description": "Runtime-authoritative evaluation lacked a canonical input.",
+          "type": "object",
+          "properties": {
+            "node": {
+              "type": "string",
+              "pattern": "^[0-9a-f]{32}$",
+              "minLength": 32,
+              "maxLength": 32
+            },
+            "input": {
+              "type": "string"
+            },
+            "category": {
+              "type": "string",
+              "const": "authoritative-input"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "category",
+            "node",
+            "input"
+          ]
+        },
+        {
+          "description": "An equivalent-GPU node lacked qualification for the device profile.",
+          "type": "object",
+          "properties": {
+            "node": {
+              "type": "string",
+              "pattern": "^[0-9a-f]{32}$",
+              "minLength": 32,
+              "maxLength": 32
+            },
+            "profile": {
+              "type": "string"
+            },
+            "category": {
+              "type": "string",
+              "const": "gpu-qualification"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "category",
+            "node",
+            "profile"
+          ]
+        },
+        {
+          "description": "A qualified Slang dispatch failed before completing its batch.",
+          "type": "object",
+          "properties": {
+            "profile": {
+              "type": "string"
+            },
+            "reason": {
+              "type": "string"
+            },
+            "category": {
+              "type": "string",
+              "const": "gpu-execution"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "category",
+            "profile",
+            "reason"
+          ]
+        }
+      ]
+    },
+    "VegetationArtifactDiagnosticDto": {
+      "description": "Exact structured fields for strict vegetation artifact failures.",
+      "oneOf": [
+        {
+          "description": "The artifact ended before its declared structure was complete.",
+          "type": "object",
+          "properties": {
+            "format": {
+              "type": "string"
+            },
+            "category": {
+              "type": "string",
+              "const": "truncated"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "category",
+            "format"
+          ]
+        },
+        {
+          "description": "The authored or derived format version is not accepted by this build.",
+          "type": "object",
+          "properties": {
+            "format": {
+              "type": "string"
+            },
+            "found": {
+              "type": "integer",
+              "format": "uint32",
+              "minimum": 0
+            },
+            "expected": {
+              "type": "integer",
+              "format": "uint32",
+              "minimum": 0
+            },
+            "category": {
+              "type": "string",
+              "const": "version"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "category",
+            "format",
+            "found",
+            "expected"
+          ]
+        },
+        {
+          "description": "The artifact schema identity is not accepted by this build.",
+          "type": "object",
+          "properties": {
+            "format": {
+              "type": "string"
+            },
+            "category": {
+              "type": "string",
+              "const": "schema"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "category",
+            "format"
+          ]
+        },
+        {
+          "description": "A TOC section kind is outside the exact artifact vocabulary.",
+          "type": "object",
+          "properties": {
+            "format": {
+              "type": "string"
+            },
+            "section": {
+              "type": "integer",
+              "format": "uint16",
+              "minimum": 0,
+              "maximum": 65535
+            },
+            "category": {
+              "type": "string",
+              "const": "unknown-section"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "category",
+            "format",
+            "section"
+          ]
+        },
+        {
+          "description": "A TOC codec is outside the exact artifact vocabulary.",
+          "type": "object",
+          "properties": {
+            "format": {
+              "type": "string"
+            },
+            "codec": {
+              "type": "integer",
+              "format": "uint8",
+              "minimum": 0,
+              "maximum": 255
+            },
+            "category": {
+              "type": "string",
+              "const": "unknown-codec"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "category",
+            "format",
+            "codec"
+          ]
+        },
+        {
+          "description": "A TOC section kind occurs more than once.",
+          "type": "object",
+          "properties": {
+            "format": {
+              "type": "string"
+            },
+            "section": {
+              "type": "integer",
+              "format": "uint16",
+              "minimum": 0,
+              "maximum": 65535
+            },
+            "category": {
+              "type": "string",
+              "const": "duplicate-section"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "category",
+            "format",
+            "section"
+          ]
+        },
+        {
+          "description": "A TOC section violates its declared alignment.",
+          "type": "object",
+          "properties": {
+            "format": {
+              "type": "string"
+            },
+            "section": {
+              "type": "integer",
+              "format": "uint16",
+              "minimum": 0,
+              "maximum": 65535
+            },
+            "category": {
+              "type": "string",
+              "const": "misaligned-section"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "category",
+            "format",
+            "section"
+          ]
+        },
+        {
+          "description": "Two TOC section spans overlap.",
+          "type": "object",
+          "properties": {
+            "format": {
+              "type": "string"
+            },
+            "section": {
+              "type": "integer",
+              "format": "uint16",
+              "minimum": 0,
+              "maximum": 65535
+            },
+            "category": {
+              "type": "string",
+              "const": "overlapping-section"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "category",
+            "format",
+            "section"
+          ]
+        },
+        {
+          "description": "A header, payload, section, or manifest digest does not match its canonical bytes.",
+          "type": "object",
+          "properties": {
+            "format": {
+              "type": "string"
+            },
+            "subject": {
+              "type": "string"
+            },
+            "category": {
+              "type": "string",
+              "const": "hash-mismatch"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "category",
+            "format",
+            "subject"
+          ]
+        },
+        {
+          "description": "A structural field violates the exact artifact contract.",
+          "type": "object",
+          "properties": {
+            "format": {
+              "type": "string"
+            },
+            "field": {
+              "type": "string"
+            },
+            "category": {
+              "type": "string",
+              "const": "format"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "category",
+            "format",
+            "field"
+          ]
+        },
+        {
+          "description": "A content-addressed artifact is absent from the project cache.",
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string"
+            },
+            "contentHash": {
+              "type": "string"
+            },
+            "category": {
+              "type": "string",
+              "const": "not-found"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "category",
+            "kind",
+            "contentHash"
+          ]
+        },
+        {
+          "description": "Two different byte streams resolved to the same content address.",
+          "type": "object",
+          "properties": {
+            "path": {
+              "type": "string"
+            },
+            "category": {
+              "type": "string",
+              "const": "content-address-collision"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "category",
+            "path"
+          ]
+        },
+        {
+          "description": "Publication was cancelled before the complete generation became visible.",
+          "type": "object",
+          "properties": {
+            "category": {
+              "type": "string",
+              "const": "cancelled"
+            }
+          },
+          "required": [
+            "category"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "description": "A superseded generation attempted to publish after a newer generation started.",
+          "type": "object",
+          "properties": {
+            "category": {
+              "type": "string",
+              "const": "superseded"
+            }
+          },
+          "required": [
+            "category"
+          ],
+          "additionalProperties": false
+        }
+      ]
+    },
+    "ReimportConflictDiagnosticDto": {
+      "description": "Complete visible conflict report for one rejected plant reimport.",
+      "type": "object",
+      "properties": {
+        "plant": {
+          "type": "string"
+        },
+        "conflicts": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/ReimportConflictEntryDto"
+          }
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "plant",
+        "conflicts"
+      ]
+    },
+    "ReimportConflictEntryDto": {
+      "description": "One authored plant mapping that cannot be preserved by reimport.",
+      "type": "object",
+      "properties": {
+        "target": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{32}$",
+          "minLength": 32,
+          "maxLength": 32
+        },
+        "source": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{32}$",
+          "minLength": 32,
+          "maxLength": 32
+        },
+        "selector": {
+          "$ref": "#/$defs/PlantSourceSelectorDto"
+        },
+        "destination": {
+          "$ref": "#/$defs/PlantSemanticDestinationDto"
+        },
+        "reason": {
+          "$ref": "#/$defs/PlantReimportConflictReasonDto"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "target",
+        "source",
+        "selector",
+        "destination",
+        "reason"
+      ]
+    },
+    "PlantSourceSelectorDto": {
+      "description": "Stable selection within one imported source snapshot.",
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "whole"
+            }
+          },
+          "required": [
+            "kind"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "id": {
+              "type": "string",
+              "pattern": "^[0-9a-f]{32}$",
+              "minLength": 32,
+              "maxLength": 32
+            },
+            "path": {
+              "type": "string"
+            },
+            "kind": {
+              "type": "string",
+              "const": "element"
+            }
+          },
+          "required": [
+            "kind",
+            "id",
+            "path"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "element": {
+              "type": "string",
+              "pattern": "^[0-9a-f]{32}$",
+              "minLength": 32,
+              "maxLength": 32
+            },
+            "index": {
+              "type": "integer",
+              "format": "uint32",
+              "minimum": 0
+            },
+            "kind": {
+              "type": "string",
+              "const": "submesh"
+            }
+          },
+          "required": [
+            "kind",
+            "element",
+            "index"
+          ]
+        }
+      ]
+    },
+    "PlantSemanticDestinationDto": {
+      "description": "Authored semantic destination of one stable imported-source selector.",
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "id": {
+              "type": "string",
+              "pattern": "^[0-9a-f]{32}$",
+              "minLength": 32,
+              "maxLength": 32
+            },
+            "kind": {
+              "type": "string",
+              "const": "part"
+            }
+          },
+          "required": [
+            "kind",
+            "id"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "id": {
+              "type": "string",
+              "pattern": "^[0-9a-f]{32}$",
+              "minLength": 32,
+              "maxLength": 32
+            },
+            "kind": {
+              "type": "string",
+              "const": "spine"
+            }
+          },
+          "required": [
+            "kind",
+            "id"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "slot": {
+              "type": "integer",
+              "format": "uint32",
+              "minimum": 0
+            },
+            "kind": {
+              "type": "string",
+              "const": "material-slot"
+            }
+          },
+          "required": [
+            "kind",
+            "slot"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "id": {
+              "type": "string",
+              "pattern": "^[0-9a-f]{32}$",
+              "minLength": 32,
+              "maxLength": 32
+            },
+            "kind": {
+              "type": "string",
+              "const": "collision-proxy"
+            }
+          },
+          "required": [
+            "kind",
+            "id"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "id": {
+              "type": "string",
+              "pattern": "^[0-9a-f]{32}$",
+              "minLength": 32,
+              "maxLength": 32
+            },
+            "kind": {
+              "type": "string",
+              "const": "navigation-proxy"
+            }
+          },
+          "required": [
+            "kind",
+            "id"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "id": {
+              "type": "integer",
+              "format": "uint32",
+              "minimum": 0
+            },
+            "kind": {
+              "type": "string",
+              "const": "phenotype"
+            }
+          },
+          "required": [
+            "kind",
+            "id"
+          ]
+        }
+      ]
+    },
+    "PlantReimportConflictReasonDto": {
+      "description": "Why one manual semantic target cannot survive plant reimport.",
+      "type": "string",
+      "enum": [
+        "missing-source",
+        "missing-element"
+      ]
+    }
+  }
 }

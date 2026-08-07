@@ -58,7 +58,6 @@ export function PropertySection({
             variant="ghost"
             size="icon-xs"
             aria-label={`Reset ${title}`}
-            title={`Reset ${title}`}
             onClick={onReset}
           >
             <RotateCcw />

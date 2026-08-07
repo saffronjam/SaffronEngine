@@ -21,6 +21,16 @@ module mdf_brick;
 [[vk::binding(2, 0)]] Texture3D<uint> sdfIndirection[256];
 [[vk::binding(3, 0)]] Sampler3D sdfCoverage[256];
 
+// The Beer-Lambert extinction coefficient every aggregate march applies, in reciprocal
+// metres: fully dense porous matter transmits about 5% of the light entering one metre of it.
+// Must equal `saffron_material::AGGREGATE_EXTINCTION_PER_METER`, or brightness shifts at the
+// triangle-to-aggregate transition.
+public static const float AGGREGATE_EXTINCTION_PER_METER = 3.0;
+
+// The largest occupancy an aggregate may carry and still be marched through. `1.0` means solid
+// matter, which hardens the distance field instead; a porous aggregate stays strictly below it.
+public static const float AGGREGATE_MAX_OCCUPANCY = 0.9375;
+
 // Voxels per brick axis and the unique-voxel stride (the 8th voxel is the shared border).
 static const uint kBrickSize = 8u;
 static const float kBrickUseful = 7.0;
@@ -37,7 +47,7 @@ public struct SdfInstance
     public float4 worldMin;        // xyz = world AABB min (per-sample cull); w reserved
     public float4 worldMax;        // xyz = world AABB max; w reserved
     public float4 localMin;        // xyz = grid lower corner, local space; w reserved
-    public float4 localMax;        // xyz = grid upper corner, local space; w reserved
+    public float4 localMax;        // xyz = grid upper corner, local space; w = aggregate occupancy (1 = solid)
     public float4 params;          // x = bindless SDF slot, y = max-encode dist (local), z = world scale, w = atlas mip count
     public uint4 voxelDims;        // xyz = fine voxel dims; w reserved
     public uint4 indirDims;        // xyz = brick indirection dims; w reserved
@@ -50,6 +60,7 @@ public struct SdfSample
 {
     public float distance;   // distance to the nearest occluder (world); 1e30 when the sample is outside the field
     public float openness;   // [0,1] coverage ahead (1 = block fully open); 0 near a surface
+    public float occupancy;  // [0,1] porous aggregate density at the sample; 0 = open or solid matter
 };
 
 // Samples the brick atlas at one integer mip `level`. A brick holds 8 texels at mip 0 (7 useful
@@ -87,6 +98,7 @@ float sampleBrickLevel(uint slot, uint3 bc, uint3 ab, float3 inBrick, int level)
 public SdfSample sampleMdfBrick(SdfInstance inst, float3 wp, float footprint)
 {
     SdfSample s;
+    s.occupancy = 0.0;
     s.distance = 1e30;
     s.openness = 1.0;
     // World-AABB cull: skip an instance the sample is not inside (the field is only valid within

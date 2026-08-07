@@ -1,22 +1,47 @@
 //! The Jolt-free POD vocabulary the world surfaces.
-//!
-//! `MotionType` mirrors Jolt's `EMotionType` 1:1 and is the raw discriminant the bridge's
-//! `BodyCreate.motion` carries; `ObjectLayer` is the fixed v1 layer set whose raw discriminant
-//! keys the collision matrix. The result structs (`WorldStats`, `BodyInfo`, `RayHit`) are the
-//! read-only snapshots the control plane returns.
 
 use glam::Vec3;
 
 use saffron_animation::JointPose;
 use saffron_core::Uuid;
 
-/// The deterministic fixed substep the world advances by, matching SceneEdit's `PlayFixedStep`
-/// (`1/60`). The accumulator advances the sim in fixed increments so it is frame-rate independent
-/// and stays bit-exact under the cross-platform-deterministic build.
+/// The tagged world target a physics interaction resolves to. Every query, contact, and body
+/// snapshot names its subject through this one type, so nothing forges a uuid or truncates an id.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum WorldHitTarget {
+    /// A hecs scene entity, by its stable uuid.
+    SceneEntity(Uuid),
+    /// An authoritative macro plant, by its full 128-bit identity.
+    Vegetation(saffron_spatial::PlantId),
+}
+
+/// The deterministic fixed substep the world advances by, matching SceneEdit's `PlayFixedStep`. The
+/// accumulator advances in fixed increments, so the sim is frame-rate independent and stays bit-exact
+/// under the cross-platform-deterministic build.
 pub const FIXED_STEP: f32 = 1.0 / 60.0;
 
-/// How a body participates in the simulation. Mirrors Jolt `EMotionType` 1:1 and is the raw
-/// discriminant the bridge carries.
+/// One batched static/sensor body row created directly against a tagged world target, rather than
+/// derived from a scene entity's components. Analytic shapes only: Box half-extents in
+/// `half_extents`, Sphere radius in `.x`, Capsule radius `.x` plus cylinder half-height `.y`. A
+/// cooked-geometry shape row yields the invalid-id sentinel.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct StaticTargetBodyCreate {
+    /// The owner every query and contact on the body reports.
+    pub target: WorldHitTarget,
+    pub shape: saffron_scene::Shape,
+    /// Per-shape size, in the `Collider` convention.
+    pub half_extents: Vec3,
+    pub position: Vec3,
+    pub rotation: glam::Quat,
+    /// Overlap-only trigger body: queries and contact events report it, the solver never
+    /// pushes against it.
+    pub sensor: bool,
+    /// Surface friction.
+    pub friction: f32,
+}
+
+/// How a body participates in the simulation. Mirrors Jolt `EMotionType` 1:1, so the discriminant
+/// crosses the bridge raw.
 ///
 /// A [`Collider`](saffron_scene::Collider) without a [`Rigidbody`](saffron_scene::Rigidbody) is an
 /// implicit Static body; a present rigidbody's motion wins.
@@ -50,7 +75,7 @@ impl MotionType {
     }
 }
 
-/// The object-layer slots a body lives in. v1 is a fixed set; its raw discriminant keys
+/// The object-layer slots a body lives in — a fixed set whose raw discriminant keys
 /// [`layers_collide`].
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 #[repr(u8)]
@@ -76,9 +101,9 @@ impl ObjectLayer {
     }
 }
 
-/// Whether two object layers may collide. Symmetric — the whole v1 collision policy is this table.
-/// The same matrix lives in the shim; this copy is the orchestration-side reference (and lets a
-/// test pin the policy without the FFI).
+/// Whether two object layers may collide. Symmetric, and the whole collision policy. The shim holds
+/// the same matrix; this copy is the orchestration-side reference, and lets a test pin the policy
+/// without the FFI.
 #[must_use]
 pub fn layers_collide(a: ObjectLayer, b: ObjectLayer) -> bool {
     if a == ObjectLayer::Sensor || b == ObjectLayer::Sensor {
@@ -96,8 +121,7 @@ pub fn layers_collide(a: ObjectLayer, b: ObjectLayer) -> bool {
 /// A summary of the live world, surfaced over the control plane.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct WorldStats {
-    /// `true` while a world exists. Always `true` from a live [`World`](crate::World) (the
-    /// `Option<World>` lives in the host), kept so the wire DTO shape is unchanged.
+    /// `true` while a world exists; the `Option<World>` lives in the host.
     pub active: bool,
     /// The live body count (`PhysicsSystem::GetNumBodies`).
     pub body_count: i32,
@@ -108,37 +132,26 @@ pub struct WorldStats {
 /// One live body's read-only snapshot for the editor's physics panel.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct BodyInfo {
-    /// Owner entity uuid (`0` when the entity carried no id).
-    pub entity: Uuid,
-    /// The body's motion type.
+    /// The body's owner (`None` when the body carried no owner identity).
+    pub target: Option<WorldHitTarget>,
     pub motion: MotionType,
     /// Whether the body is awake.
     pub active: bool,
-    /// World-space position.
     pub position: Vec3,
 }
 
-/// One ray/shape query hit against the live world.
+/// One ray/shape query hit against the live world, with the struck body already mapped to its owner.
 ///
-/// Returned by [`World::raycast`](crate::World::raycast) and
-/// [`World::sphere_cast`](crate::World::sphere_cast) with the struck body already mapped to its
-/// owner entity uuid.
-///
-/// This is the source POD for the `sa.raycast` / `sa.spherecast` script seam. To keep
-/// `saffron-script` free of a `saffron-physics` dependency (it must not import this crate), the
-/// host owns the bridge: `saffron-script` declares a `raycast`/`sphere_cast` callback trait, and the
-/// host implements it over the live `Option<World>`, calling these two methods and flattening the
-/// result into the script-side POD. That conversion is a plain field copy — `hit`, `entity`,
-/// `point.x/y/z`, `normal.x/y/z`, `distance`; nothing here reorders or reinterprets.
+/// The source POD for the `sa.raycast` / `sa.spherecast` script seam. `saffron-script` must not
+/// import this crate, so it declares a callback trait the host implements over the live world,
+/// flattening this into the script-side POD by plain field copy.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct RayHit {
     /// Whether the ray hit anything.
     pub hit: bool,
-    /// Owner entity uuid of the hit body (`0` = none).
-    pub entity: Uuid,
-    /// World-space contact point.
+    /// The struck body's owner (`None` on a miss or an unowned body).
+    pub target: Option<WorldHitTarget>,
     pub point: Vec3,
-    /// World-space surface normal at the hit.
     pub normal: Vec3,
     /// Distance along the ray from the origin (fraction × max distance).
     pub distance: f32,
@@ -148,7 +161,7 @@ impl Default for RayHit {
     fn default() -> Self {
         Self {
             hit: false,
-            entity: Uuid(0),
+            target: None,
             point: Vec3::ZERO,
             normal: Vec3::ZERO,
             distance: 0.0,
@@ -161,8 +174,7 @@ impl Default for RayHit {
 /// [`ContactDrain::overflowed`].
 pub const CONTACT_RING_CAP: usize = 256;
 
-/// Whether a contact transition began or ended. Sensor overlaps and solid touches share the ring;
-/// [`ContactEvent::sensor`] distinguishes them.
+/// Whether a contact transition began or ended.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ContactKind {
     /// `OnContactAdded`: the bodies started touching/overlapping.
@@ -172,17 +184,16 @@ pub enum ContactKind {
 }
 
 /// One contact/overlap transition, seq-stamped and drained over a non-blocking cursor. Sensor
-/// overlaps and solid touches share one ring; [`sensor`](Self::sensor) distinguishes them.
+/// overlaps and solid touches share one ring, distinguished by [`sensor`](Self::sensor).
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct ContactEvent {
     /// The monotonic sequence number stamped when the event entered the ring (`1`-based).
     pub seq: u64,
-    /// Whether the contact began or ended.
     pub kind: ContactKind,
-    /// One body's owner-entity uuid (`Uuid(0)` when the body had no owning entity).
-    pub entity_a: Uuid,
-    /// The other body's owner-entity uuid (`Uuid(0)` when none).
-    pub entity_b: Uuid,
+    /// One body's owner (`None` when the body has no owner).
+    pub target_a: Option<WorldHitTarget>,
+    /// The other body's owner (`None` when none).
+    pub target_b: Option<WorldHitTarget>,
     /// Either body is a sensor — a trigger overlap, not a solid touch.
     pub sensor: bool,
     /// A representative world-space contact point; zero for an `End` event.
@@ -193,38 +204,33 @@ pub struct ContactEvent {
     pub tick: i64,
 }
 
-/// A rig's per-frame animation target: the post-IK local TRS pose the evaluator produced, indexed
-/// 1:1 with the rig's [`SkinnedMesh`](saffron_scene::SkinnedMesh) bones (the same order the ragdoll
-/// skeleton was built from). Keyed by the rig mesh entity uuid; drives an active ragdoll's motors
-/// toward the animation.
+/// A rig's per-frame animation target: the post-IK local TRS pose, indexed 1:1 with the rig's
+/// [`SkinnedMesh`](saffron_scene::SkinnedMesh) bones — the same order the ragdoll skeleton was built
+/// from. Drives an active ragdoll's motors toward the animation.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct PoseTarget {
-    /// The rig mesh entity's stable id (the lookup key against each ragdoll's rig).
+    /// The lookup key against each ragdoll's rig.
     pub rig: Uuid,
     /// The animated local TRS per joint, in bone-index order.
     pub local: Vec<JointPose>,
 }
 
-/// A rig's live ragdoll state: presence, the motor-active flag, the mean target weight across
-/// bones, and the bone count. All-default (absent) when the rig has no ragdoll.
+/// A rig's live ragdoll state; all-default when the rig has no ragdoll.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct RagdollState {
-    /// `true` when the rig has a live ragdoll instance this play session.
     pub present: bool,
-    /// `true` when the ragdoll's motors are driving toward the animation (active vs passive).
+    /// `true` when the motors are driving toward the animation, rather than going passive.
     pub active: bool,
     /// The mean per-bone target weight (`0` = pure animation, `1` = pure physics).
     pub body_weight: f32,
-    /// The ragdoll's bone count.
     pub bones: i32,
 }
 
-/// A snapshot of contact events with `seq > since` (non-blocking), plus cursor metadata that lets a
-/// stale cursor detect it missed evicted events — the same drain-cursor shape the alarms /
-/// script-errors rings use.
+/// Contact events with `seq > since`, plus the cursor metadata that lets a stale cursor detect it
+/// missed evicted events.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct ContactDrain {
-    /// The events newer than the cursor, in seq order.
+    /// Newer than the cursor, in seq order.
     pub events: Vec<ContactEvent>,
     /// The highest seq the ring has ever stamped (the cursor to pass next drain).
     pub high_water_seq: u64,

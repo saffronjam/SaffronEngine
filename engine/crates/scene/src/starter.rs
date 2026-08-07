@@ -58,7 +58,6 @@ mod tests {
         let mut scene = Scene::new();
         let camera = seed_starter_scene(&mut scene);
 
-        // Exactly the two starter entities: a Camera and a Sun.
         let mut cameras = Vec::new();
         scene.for_each::<&Camera, _>(|e, _| cameras.push(e));
         let mut suns = Vec::new();
@@ -67,7 +66,6 @@ mod tests {
         assert_eq!(suns.len(), 1);
         assert_ne!(suns[0], camera);
 
-        // The camera is framed on the origin: its transform looks from (3, 2.5, 4) back at 0.
         let transform = scene.component::<Transform>(camera).unwrap();
         assert_eq!(transform.translation, Vec3::new(3.0, 2.5, 4.0));
         let forward = (quat_from_euler_xyz(transform.rotation) * Vec3::NEG_Z).normalize();

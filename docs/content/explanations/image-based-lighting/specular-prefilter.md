@@ -59,8 +59,8 @@ float3 specularIBL = prefiltered * (F0 * ab.x + ab.y);
 |---|---|---|
 | GGX and filtered importance sampling | `engine/assets/shaders/ibl_prefilter.slang` | `importanceSampleGGX`, `distributionGGX`, `computeMain` |
 | EMA and row slicing | `engine/assets/shaders/ibl_prefilter.slang` | `Push`, `rowOffset`, `rowCount`, `blendAlpha` |
-| Capture schedule | `engine/crates/rendering/src/ibl.rs` | `Ibl::scheduled_prefilter_slices`, `prefilter_slice` |
-| Mip count and size | `engine/crates/rendering/src/ibl.rs` | `IBL_PREFILTER_MIPS`, `IBL_PREFILTER_SIZE` |
+| Capture schedule | `engine/crates/rendering/src/ibl/` | `Ibl::scheduled_prefilter_slices`, `prefilter_slice` |
+| Mip count and size | `engine/crates/rendering/src/ibl/` | `IBL_PREFILTER_MIPS`, `IBL_PREFILTER_SIZE` |
 | Specular consumer | `engine/assets/shaders/lighting.slang` | `prefilterLod`, `prefilteredMap` |
 
 ## Related

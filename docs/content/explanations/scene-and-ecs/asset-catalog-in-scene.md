@@ -73,8 +73,8 @@ This split gives each layer one job:
 | Optional scene handle | `engine/crates/scene/src/scene.rs` | `Scene::catalog` |
 | Live owner and resource caches | `engine/crates/assets/src/lib.rs` | `AssetServer` |
 | Project JSON shape | `engine/crates/assets/src/catalog.rs` | `catalog_to_json`, `catalog_from_json` |
-| Disk reconciliation and cache | `engine/crates/assets/src/scan.rs` | `reconcile_catalog_from_disk`, `resolve_catalog_from_disk` |
-| Editor-facing catalog commands | `engine/crates/control/src/commands_asset.rs` | `list-assets`, `rename-asset`, `move-asset` |
+| Disk reconciliation and cache | `engine/crates/assets/src/scan/` | `reconcile_catalog_from_disk`, `resolve_catalog_from_disk` |
+| Editor-facing catalog commands | `engine/crates/control/src/commands_asset/` | `list-assets`, `rename-asset`, `move-asset` |
 
 ## Related
 

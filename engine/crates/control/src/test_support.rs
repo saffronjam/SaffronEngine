@@ -29,9 +29,10 @@ impl GpuUploader for StubGpu {
     fn upload_mesh(
         &self,
         _mesh: &Mesh,
+        _hierarchy: &saffron_geometry::PortableVirtualHierarchy,
         _skin: &[VertexSkin],
         _morph: Option<&saffron_geometry::MorphData>,
-        _sdf_bake: Option<&saffron_rendering::SdfBake>,
+        _sdf: saffron_rendering::SdfSource<'_>,
     ) -> saffron_rendering::Result<Arc<GpuMesh>> {
         unreachable!("an empty catalog never reaches the stub uploader")
     }
@@ -71,6 +72,12 @@ fn resolved_tier(name: &str) -> Option<saffron_rendering::RenderQuality> {
 /// defaults `false`, matching a software device, so the RT-gated handlers take their
 /// unsupported branch unless a test flips it.
 pub struct StubRenderer {
+    /// Each view class's pinned hierarchy cut.
+    pub cut: [u32; saffron_rendering::SCENE_VIEW_CLASSES],
+    /// Missing-page requests one view class may raise per frame.
+    pub page_request_budget: u32,
+    /// The resident-population budgets the vegetation breach reporter measures against.
+    pub budgets: saffron_assets::VegetationBudgets,
     pub clustered: bool,
     pub depth_prepass: bool,
     pub shadows: bool,
@@ -95,6 +102,10 @@ pub struct StubRenderer {
     pub restir: bool,
     pub ssr: bool,
     pub rt_reflections: bool,
+    /// Whether the shaded executor runs through the mesh stage.
+    pub mesh_executor: bool,
+    /// What the GPU selection readback answers with.
+    pub selection_pick: Option<crate::SelectionPick>,
     pub view_mode: ViewMode,
     pub aa_samples: u32,
     pub aa_fxaa: bool,
@@ -147,6 +158,9 @@ pub struct StubRenderer {
 impl Default for StubRenderer {
     fn default() -> Self {
         Self {
+            budgets: saffron_assets::VegetationBudgets::default(),
+            cut: [saffron_rendering::SCENE_CUT_AUTO; saffron_rendering::SCENE_VIEW_CLASSES],
+            page_request_budget: saffron_rendering::PAGE_REQUEST_CAPACITY,
             clustered: true,
             depth_prepass: false,
             shadows: true,
@@ -168,6 +182,8 @@ impl Default for StubRenderer {
             restir: false,
             ssr: false,
             rt_reflections: false,
+            mesh_executor: false,
+            selection_pick: None,
             view_mode: ViewMode::Lit,
             aa_samples: 1,
             aa_fxaa: false,
@@ -229,6 +245,64 @@ impl ControlRenderer for StubRenderer {
             ..RenderStatsFull::default()
         }
     }
+
+    fn page_residency_stats(&self) -> saffron_rendering::PageResidencyStats {
+        saffron_rendering::PageResidencyStats::default()
+    }
+
+    fn vegetation_breakdown(&self) -> saffron_assets::VegetationRenderBreakdown {
+        saffron_assets::VegetationRenderBreakdown::default()
+    }
+
+    fn page_faults(&self) -> u64 {
+        0
+    }
+
+    fn visibility_counters(
+        &self,
+    ) -> [u32; saffron_rendering::SCENE_VISIBILITY_COUNTER_WORDS as usize] {
+        [0; saffron_rendering::SCENE_VISIBILITY_COUNTER_WORDS as usize]
+    }
+
+    fn gi_visibility_counters(
+        &self,
+    ) -> [u32; saffron_rendering::SCENE_VISIBILITY_COUNTER_WORDS as usize] {
+        [0; saffron_rendering::SCENE_VISIBILITY_COUNTER_WORDS as usize]
+    }
+
+    fn wind_interaction_resets(&self) -> u64 {
+        0
+    }
+
+    fn vegetation_budgets(&self) -> saffron_assets::VegetationBudgets {
+        self.budgets
+    }
+
+    fn set_vegetation_budgets(&mut self, budgets: saffron_assets::VegetationBudgets) {
+        self.budgets = budgets;
+    }
+
+    fn gpu_scene_mirror_stats(&self) -> saffron_assets::GpuSceneMirrorStats {
+        saffron_assets::GpuSceneMirrorStats::default()
+    }
+
+    fn capture_plant_wind_record(
+        &self,
+        _cell: saffron_spatial::WorldCellKey,
+        _plant: saffron_vegetation::PlantId,
+    ) -> std::result::Result<Option<crate::registry::PlantWindRecord>, String> {
+        Ok(None)
+    }
+
+    fn capture_interaction_field(
+        &self,
+        _cascade: u32,
+        _resolution: u32,
+    ) -> std::result::Result<Option<saffron_rendering::InteractionFieldCapture>, String> {
+        Ok(None)
+    }
+
+    fn submit_interaction_impulse(&mut self, _impulse: saffron_rendering::InteractionImpulse) {}
 
     fn clustered_enabled(&self) -> bool {
         self.clustered
@@ -412,7 +486,111 @@ impl ControlRenderer for StubRenderer {
     fn set_rt_reflections(&mut self, enabled: bool) {
         self.rt_reflections = enabled;
     }
+    fn mesh_shader_supported(&self) -> bool {
+        false
+    }
+    fn mesh_executor_active(&self) -> bool {
+        self.mesh_executor
+    }
+    fn mesh_executor_supported(&self) -> bool {
+        true
+    }
+    fn set_mesh_executor(&mut self, mesh: bool) -> bool {
+        self.mesh_executor = mesh;
+        mesh
+    }
+    fn async_compute_queue_supported(&self) -> bool {
+        false
+    }
+    fn pick_selection_id(
+        &mut self,
+        _u: f32,
+        _v: f32,
+    ) -> std::result::Result<Option<crate::SelectionPick>, String> {
+        Ok(self.selection_pick)
+    }
+    fn sdf_instances_dropped(&self) -> u32 {
+        0
+    }
+    fn rt_instances_culled(&self) -> u32 {
+        0
+    }
+    fn sdf_instances_culled(&self) -> u32 {
+        0
+    }
+    fn rt_omm_supported(&self) -> bool {
+        false
+    }
     fn rt_blas_count(&self) -> u32 {
+        0
+    }
+    fn rt_skinned_blas_count(&self) -> u32 {
+        0
+    }
+    fn rt_tessellated_blas_count(&self) -> u32 {
+        0
+    }
+    fn rt_wind_deformed(&self) -> u32 {
+        0
+    }
+    fn cluster_as_supported(&self) -> bool {
+        false
+    }
+    fn rt_cluster_blas_count(&self) -> u32 {
+        0
+    }
+    fn rt_clas_count(&self) -> u32 {
+        0
+    }
+    fn ptlas_supported(&self) -> bool {
+        false
+    }
+    fn rt_ptlas_ops(&self) -> (u32, u32, u32) {
+        (0, 0, 0)
+    }
+    fn view_history_invalidation(&self) -> &'static str {
+        "new-view"
+    }
+    fn vsm_page_budget(&self) -> u32 {
+        64
+    }
+    fn set_vsm_page_budget(&mut self, _pages: u32) {}
+    fn page_request_budget(&self) -> u32 {
+        self.page_request_budget
+    }
+    fn set_page_request_budget(&mut self, entries: u32) {
+        self.page_request_budget = entries.clamp(1, saffron_rendering::PAGE_REQUEST_CAPACITY);
+    }
+    fn rt_accel_build_us(&self) -> u64 {
+        0
+    }
+    fn cut_override(&self, view: saffron_rendering::SceneViewClass) -> u32 {
+        self.cut[view.ordinal() as usize]
+    }
+
+    fn set_cut_override(&mut self, view: saffron_rendering::SceneViewClass, cut: u32) {
+        self.cut[view.ordinal() as usize] = cut;
+    }
+
+    fn rt_omm_micromaps(&self) -> u32 {
+        0
+    }
+    fn rt_omm_classes(&self) -> (u64, u64, u64) {
+        (0, 0, 0)
+    }
+    fn rt_omm_derived(&self) -> (u64, u64, u64, u64) {
+        (0, 0, 0, 0)
+    }
+    fn rt_blas_bytes(&self) -> u64 {
+        0
+    }
+    fn rt_blas_built_bytes(&self) -> u64 {
+        0
+    }
+    fn rt_tlas_bytes(&self) -> u64 {
+        0
+    }
+    fn rt_scratch_bytes(&self) -> u64 {
         0
     }
 
@@ -677,21 +855,15 @@ impl ControlRenderer for StubRenderer {
     fn view_desired_size(&self, view: ViewId) -> (u32, u32) {
         self.view_sizes[view.index()]
     }
-    fn set_view_desired_size(
-        &mut self,
-        view: ViewId,
-        width: u32,
-        height: u32,
-    ) -> Result<(), String> {
+    fn set_view_desired_size(&mut self, view: ViewId, width: u32, height: u32) {
         if width == 0 || height == 0 {
-            return Ok(());
+            return;
         }
         self.view_sizes[view.index()] = (width, height);
         if view == self.active_view {
             self.width = width;
             self.height = height;
         }
-        Ok(())
     }
 
     fn capture_viewport(&mut self, _path: &Path) -> Result<(), String> {
@@ -710,16 +882,6 @@ impl ControlRenderer for StubRenderer {
         &self,
     ) -> Result<Option<crate::VegetationComputeExecutor>, String> {
         Ok(None)
-    }
-
-    fn render_material_preview_png(
-        &mut self,
-        _assets: &mut AssetServer,
-        _subject: crate::commands_asset::PreviewSubject,
-        _size: u32,
-    ) -> std::result::Result<Vec<u8>, String> {
-        // The stub renders no scene; a fixed non-empty byte string proves the seam is wired.
-        Ok(b"stub-preview-png".to_vec())
     }
 
     fn render_settings_to_json(&self) -> Value {
@@ -742,20 +904,44 @@ pub fn with_stub<T>(
     renderer: &mut StubRenderer,
     body: impl FnOnce(&mut EngineContext<'_>) -> T,
 ) -> T {
+    with_stub_world(renderer, None, body)
+}
+
+/// A stub context bound to a runtime vegetation world, for the commands that require one.
+pub fn with_stub_world<T>(
+    renderer: &mut StubRenderer,
+    world: Option<saffron_vegetation::VegetationWorld>,
+    body: impl FnOnce(&mut EngineContext<'_>) -> T,
+) -> T {
     let mut window = Window::headless();
     let mut scene_edit = SceneEditContext::new();
     let mut assets = AssetServer::new(std::env::temp_dir().join("saffron-control-test"));
     let mut spatial = saffron_spatial::ResidencyManager::new();
     let mut vegetation_jobs = crate::vegetation_jobs::VegetationEvaluationJobs::default();
+    let mut vegetation_cook_jobs = crate::vegetation_cook_jobs::VegetationCookJobs::default();
     let mut vegetation_compute = None;
+    let mut vegetation = world;
     let mut ctx = EngineContext {
         window: &mut window,
         renderer,
         scene_edit: &mut scene_edit,
         assets: &mut assets,
         spatial: &mut spatial,
+        vegetation_status: if vegetation.is_some() {
+            saffron_runtime::VegetationRuntimeBindingStatus::Available
+        } else {
+            saffron_runtime::VegetationRuntimeBindingStatus::default()
+        },
+        vegetation: &mut vegetation,
+        vegetation_regeneration_cells: Vec::new(),
+        vegetation_collision: None,
+        vegetation_promotion: None,
+        vegetation_navigation: None,
+        vegetation_ecology: None,
+        vegetation_telemetry: None,
         physics: None,
         vegetation_jobs: &mut vegetation_jobs,
+        vegetation_cook_jobs: &mut vegetation_cook_jobs,
         vegetation_compute: &mut vegetation_compute,
     };
     body(&mut ctx)

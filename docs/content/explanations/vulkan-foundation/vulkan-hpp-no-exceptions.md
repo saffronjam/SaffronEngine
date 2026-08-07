@@ -108,10 +108,10 @@ the complete handle set to one owner.
 | What | File | Symbols |
 |---|---|---|
 | Unsafe opt-in and typed errors | `engine/crates/rendering/src/lib.rs` | `#![allow(unsafe_code)]`, `Error`, `Error::Vk`, `Result`, `checked` |
-| Loader and device creation | `engine/crates/rendering/src/device.rs` | `load_entry`, `create_instance`, `create_logical_device` |
+| Loader and device creation | `engine/crates/rendering/src/device/` | `load_entry`, `create_instance`, `create_logical_device` |
 | Safe construction over unsafe calls | `engine/crates/rendering/src/present.rs` | `PresentSync::new`, `PresentSync::create_slot`, `record_present_blit` |
-| Recoverable swapchain statuses | `engine/crates/rendering/src/renderer.rs` | `Renderer::begin_present_frame`, `Renderer::render_frame`, `Renderer::present_active_view_to_swapchain` |
-| Handle ownership | `engine/crates/rendering/src/resources.rs` | `Buffer`, `Image`, `Pipeline`, `AccelerationStructure` |
+| Recoverable swapchain statuses | `engine/crates/rendering/src/renderer/` | `Renderer::begin_present_frame`, `Renderer::render_frame`, `Renderer::present_active_view_to_swapchain` |
+| Handle ownership | `engine/crates/rendering/src/resources/` | `Buffer`, `Image`, `Pipeline`, `AccelerationStructure` |
 
 ## Related
 

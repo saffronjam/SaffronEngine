@@ -40,7 +40,7 @@ pub struct MaterialParamsData {
 }
 ```
 
-The table is deduplicated by its 96 raw bytes for the current frame. `InstanceData.texture.w` selects a material-table entry, while the fragment shader samples its texture slots with `NonUniformResourceIndex`:
+The table is deduplicated by its 96 raw bytes for the current frame. A record's resolved material selects a material-table entry through its `parameterIndex`, while the fragment shader samples its texture slots with `NonUniformResourceIndex`:
 
 ```hlsl
 MaterialParams mat = materialParams[input.materialIndex];
@@ -79,11 +79,11 @@ Texture identity lives in material data rather than the draw-bucket key. Instanc
 
 | What | File | Symbols |
 |---|---|---|
-| Global arrays, flags, and allocators | `engine/crates/rendering/src/descriptors.rs` | `Descriptors`, `create_bindless_layout`, `SlotAllocator`, `MAX_BINDLESS_TEXTURES` |
-| Descriptor-indexing feature gate | `engine/crates/rendering/src/device.rs` | `evaluate_device`, `create_logical_device`, `runtime_descriptor_array` |
-| Texture upload and default seeding | `engine/crates/rendering/src/upload.rs` | `Uploader::upload_texture`, `Uploader::upload_default_white`, `mip_count` |
-| Slot-owning resources | `engine/crates/rendering/src/resources.rs` | `BindlessFreeList`, `GpuTexture`, `GpuSdf` |
-| Material and instance tables | `engine/crates/rendering/src/gpu_types.rs` · `instancing.rs` | `MaterialParamsData`, `InstanceData`, `build_instance_rows`, `resolve_material` |
+| Global arrays, flags, and allocators | `engine/crates/rendering/src/descriptors/` | `Descriptors`, `create_bindless_layout`, `SlotAllocator`, `MAX_BINDLESS_TEXTURES` |
+| Descriptor-indexing feature gate | `engine/crates/rendering/src/device/` | `evaluate_device`, `create_logical_device`, `runtime_descriptor_array` |
+| Texture upload and default seeding | `engine/crates/rendering/src/upload/` | `Uploader::upload_texture`, `Uploader::upload_default_white`, `mip_count` |
+| Slot-owning resources | `engine/crates/rendering/src/resources/` | `BindlessFreeList`, `GpuTexture`, `GpuSdf` |
+| Material parameter table | `engine/crates/rendering/src/gpu_types.rs` · `instancing.rs` | `MaterialParamsData`, `resolve_material_params` |
 | Shader sampling | `engine/assets/shaders/lighting.slang` · `mesh.slang` | `albedoTextures`, `MaterialParams`, `NonUniformResourceIndex` |
 
 ## Related

@@ -129,8 +129,8 @@ frame to the current pane while the new extent is being produced.
 
 | What | File | Symbols |
 |---|---|---|
-| View identity and target ownership | `engine/crates/rendering/src/renderer.rs` · `view_target.rs` | `ViewId`, `ViewTarget`, `set_active_view`, `reset_view_temporal` |
-| GPU readback pipeline | `engine/crates/rendering/src/renderer.rs` | `record_shm_copy`, `stage_pending_shm_publish`, `pending_shm_view` |
+| View identity and target ownership | `engine/crates/rendering/src/renderer/` · `view_target.rs` | `ViewId`, `ViewTarget`, `set_active_view`, `reset_view_temporal` |
+| GPU readback pipeline | `engine/crates/rendering/src/renderer/` | `record_shm_copy`, `stage_pending_shm_publish`, `pending_shm_view` |
 | Shared-memory ring producer | `engine/crates/rendering/src/shm_publish.rs` | `ShmPublish`, `SHM_HEADER_BYTES`, `SHM_RING_SLOTS`, `publish` |
 | Per-view host wiring | `engine/crates/host/src/viewport_shm.rs` · `layer.rs` | `ViewportShmPublisher`, `configs_from_env`, `publish_pipelined_view` |
 | Portable geometry and ring reader | `editor/shell/src/viewport.rs` | `Viewports`, `ViewportShared`, `open_shm`, `stat_shm` |

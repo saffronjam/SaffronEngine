@@ -1,18 +1,17 @@
 // Standalone golden-fixture generator (13-testing-and-verification phase 2).
 //
 // Emits the byte-exact reference artifacts the Rust snapshot harness diffs against:
-// `cube.smesh`, `cube.sanim`, `material.smat`, `cube.smodel`, the three std430 offset
-// maps, and the shm header layout. The writer logic here is transcribed verbatim from
-// the C++ engine's format owners (`engine-old/source/saffron/{geometry,assets,rendering}`)
-// so the bytes carry genuine C++ provenance without dragging in Vulkan/Jolt/SDL — the
-// disk formats are pure `#[repr(C)]`/JSON data, independent of the renderer.
+// `cube.smesh`, `cube.sanim`, `material.smat`, `cube.smodel`, the two std430 offset
+// maps, and the shm header layout. Disk-format writers reproduce the C++ reference owners; current
+// GPU ABI structs mirror their Rust/Slang owners directly. The generator needs no Vulkan/Jolt/SDL.
 //
 // Sources transcribed:
 //   .smesh   geometry.cppm encodeMeshImage / SMeshHeader (:386, :1400)
 //   .sanim   geometry.cppm saveAnimationToBuffer / SANimHeader / SANimTrackRecord (:406,:1619)
 //   .smodel  geometry.cppm writeContainer / SModelHeader / TocEntry (:296,:386)
 //   .smat    assets.cppm materialAssetToJson + dump(2) (:1488,:2137)
-//   std430   renderer_types.cppm InstanceData/MaterialParamsData/GpuLight (:1868,:1884,:2018)
+//   std430   renderer_types.cppm GpuLight (:2018) and the current
+//            gpu_types.rs/material_params.slang MaterialParamsData ABI
 //   shm      renderer_capture.cpp recreateShmSegment header (:129)
 //
 // Build/run in the saffron-build toolbox; see fixtures/golden/gen/PROVENANCE.md.
@@ -359,21 +358,9 @@ auto materialAssetToJson(const MaterialAsset& m) -> nlohmann::json {
         {"overrides", m.overrides.is_null() ? nlohmann::json::object() : m.overrides}};
 }
 
-// ---- std430 GPU structs (renderer_types.cppm) ----
+// ---- std430 GPU structs (canonical Rust/Slang ABI, plus C++ reference structs) ----
 
-struct Mat4 { f32 m[16]; };
 struct UVec4 { u32 x, y, z, w; };
-
-struct InstanceData {
-    Mat4 model;
-    Mat4 normalMatrix;
-    Mat4 prevModel;
-    Vec4 baseColor;
-    UVec4 texture;
-    Vec4 pbr;
-    Vec4 emissive;
-};
-static_assert(sizeof(InstanceData) == 256);
 
 struct MaterialParamsData {
     Vec4 baseColor;
@@ -382,8 +369,18 @@ struct MaterialParamsData {
     Vec4 uv;
     UVec4 tex0;
     UVec4 tex1;
+    Vec4 thinReflection;
+    Vec4 thinAbsorption;
+    Vec4 thinTransmission;
+    UVec4 coverage;
+    UVec4 coverageHash;
+    Vec4 aggregate0;
+    Vec4 aggregateAlbedo;
+    Vec4 aggregateTransmission;
+    Vec4 aggregateNormal0;
+    Vec4 aggregateNormal1;
 };
-static_assert(sizeof(MaterialParamsData) == 96);
+static_assert(sizeof(MaterialParamsData) == 256);
 
 struct GpuLight {
     Vec4 positionRange;
@@ -486,19 +483,6 @@ auto hexdump(const T& value) -> std::string {
     return hexdumpBytes(std::span<const u8>(reinterpret_cast<const u8*>(&value), sizeof(T)));
 }
 
-auto knownInstanceData() -> InstanceData {
-    InstanceData d{};
-    // model = a recognizable affine matrix (column-major, glm/std430)
-    d.model = Mat4{{1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 2, 3, 4, 1}};
-    d.normalMatrix = Mat4{{1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1}};
-    d.prevModel = Mat4{{1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 1, 1, 1, 1}};
-    d.baseColor = Vec4{0.8f, 0.4f, 0.2f, 1.0f};
-    d.texture = UVec4{3, 7, 11, 13};
-    d.pbr = Vec4{0.25f, 0.7f, 0.0f, 0.0f};
-    d.emissive = Vec4{0.1f, 0.0f, 0.0f, 0.0f};
-    return d;
-}
-
 auto knownMaterialParams() -> MaterialParamsData {
     MaterialParamsData d{};
     d.baseColor = Vec4{0.8f, 0.4f, 0.2f, 1.0f};
@@ -507,6 +491,16 @@ auto knownMaterialParams() -> MaterialParamsData {
     d.uv = Vec4{2.0f, 2.0f, 0.0f, 0.0f};
     d.tex0 = UVec4{3, 0, 5, 0};
     d.tex1 = UVec4{0, 0, 0, 7};
+    d.thinReflection = Vec4{0.4f, 0.3f, 0.6f, 0.001f};
+    d.thinAbsorption = Vec4{0.2f, 0.3f, 0.4f, 0.9f};
+    d.thinTransmission = Vec4{0.7f, 0.8f, 0.5f, 0.0f};
+    d.coverage = UVec4{11, 1, 1, 2};
+    d.coverageHash = UVec4{13, 17, 1024, 512};
+    d.aggregate0 = Vec4{0.5f, 0.7f, 0.002f, 0.0f};
+    d.aggregateAlbedo = Vec4{0.2f, 0.5f, 0.1f, 0.0f};
+    d.aggregateTransmission = Vec4{0.4f, 0.6f, 0.3f, 0.0f};
+    d.aggregateNormal0 = Vec4{0.5f, 0.4f, 0.3f, 0.1f};
+    d.aggregateNormal1 = Vec4{0.2f, 0.05f, 0.0f, 0.0f};
     return d;
 }
 
@@ -575,18 +569,14 @@ int main(int argc, char** argv) {
 
     // std430 offset maps: a header line per field offset, then a full known-valued hexdump.
     {
-        const InstanceData d = knownInstanceData();
-        std::string s = "struct InstanceData size=256 align=16\n";
-        s += "offset model 0\noffset normalMatrix 64\noffset prevModel 128\n";
-        s += "offset baseColor 192\noffset texture 208\noffset pbr 224\noffset emissive 240\n";
-        s += "hexdump:\n" + hexdump(d);
-        writeText(dir + "/instance_data.offsets", s);
-    }
-    {
         const MaterialParamsData d = knownMaterialParams();
-        std::string s = "struct MaterialParamsData size=96 align=16\n";
+        std::string s = "struct MaterialParamsData size=256 align=16\n";
         s += "offset baseColor 0\noffset pbr 16\noffset emissive 32\noffset uv 48\n";
         s += "offset tex0 64\noffset tex1 80\n";
+        s += "offset thinReflection 96\noffset thinAbsorption 112\noffset thinTransmission 128\n";
+        s += "offset coverage 144\noffset coverageHash 160\noffset aggregate0 176\n";
+        s += "offset aggregateAlbedo 192\noffset aggregateTransmission 208\n";
+        s += "offset aggregateNormal0 224\noffset aggregateNormal1 240\n";
         s += "hexdump:\n" + hexdump(d);
         writeText(dir + "/material_params_data.offsets", s);
     }

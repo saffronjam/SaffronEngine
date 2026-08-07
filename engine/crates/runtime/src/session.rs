@@ -1,14 +1,9 @@
-//! [`RuntimeSession`]: the shared play-mode simulation spine — build the Jolt world from a
-//! scene, then each frame advance animation, step physics, dispatch contacts, and tick
-//! scripts. One code path, consumed by both the editor host (its play mode) and the
-//! standalone `saffron-player`.
+//! [`RuntimeSession`]: build the Jolt world from a scene, then each frame advance animation, step
+//! physics, dispatch contacts, and tick scripts.
 //!
-//! The session owns the simulation subsystems (animation runtime, script VM, registry) and
-//! operates on a `&mut Scene` and `&mut AssetServer` handed in per call — it owns neither, so
-//! the host can drive its editor-owned play scene and the player its own scene through the
-//! same methods. The live Jolt [`World`] lives behind an `Rc<RefCell<Option<…>>>` cell shared
-//! with the script bridge (so an `sa.raycast` re-enters the world mid-tick); everything else
-//! is a plain owned field, so the borrow dance the editor seam once needed is gone.
+//! The live Jolt [`World`] sits behind an `Rc<RefCell<Option<…>>>` cell shared with the script
+//! bridge, which is what lets an `sa.raycast` re-enter the world mid-tick. Everything else is a
+//! plain owned field.
 
 use std::cell::RefCell;
 use std::path::Path;
@@ -24,9 +19,20 @@ use saffron_scene::{
     derive_script_input_edges, register_builtin_components,
 };
 use saffron_script::{ContactInfo, ScriptHost, ScriptHostBridge, ScriptRunError};
+use saffron_spatial::ResidencyManager;
 
 use crate::bridge::{
     RuntimeScriptBridge, ScriptLogLine, SharedPhysics, SharedScene, SharedScriptSink,
+    SharedVegetation, script_vegetation_event,
+};
+use crate::vegetation::VegetationRuntimeScheduler;
+use crate::vegetation_collision::{VegetationCollisionReport, VegetationCollisionResidency};
+use crate::vegetation_ecology::VegetationEcologyClock;
+use crate::vegetation_family::PlantFamilyCache;
+use crate::vegetation_navigation::VegetationNavigationSeam;
+use crate::vegetation_promotion::VegetationPromotion;
+use crate::{
+    VegetationRuntimeBindingStatus, VegetationRuntimeError, VegetationRuntimeUnavailableReason,
 };
 
 /// The shared play-mode simulation spine.
@@ -58,11 +64,30 @@ pub struct RuntimeSession {
     pose_targets: Vec<PoseTarget>,
     /// The per-tick contact → script dispatch high-water cursor.
     contact_cursor: u64,
+    /// The per-tick vegetation-transition → script dispatch high-water cursor. It resets with
+    /// the session and with the bound world, whose ring restarts its numbering at one.
+    vegetation_event_cursor: u64,
     /// Whether a script VM is live (set by [`start`](Self::start), cleared by [`stop`](Self::stop)).
     script_vm_active: bool,
     /// Whether the Jolt process globals are installed — set true the first time a world is built.
     /// They outlive every world, so teardown shuts them down once, after the last world drops.
     physics_init: bool,
+    /// The sole authoritative vegetation runtime, bound to one exact cooked manifest. Behind the
+    /// shared cell so a script's `sa.vegetation_*` call reaches the same world the host publishes.
+    vegetation: SharedVegetation,
+    vegetation_scheduler: VegetationRuntimeScheduler,
+    vegetation_status: VegetationRuntimeBindingStatus,
+    /// Generation-tagged batched Jolt proxies for physics-resident vegetation cells.
+    vegetation_collision: VegetationCollisionResidency,
+    /// The promotion authority owning every transient macro-plant entity view.
+    vegetation_promotion: VegetationPromotion,
+    /// Resolved `.splant` family assets shared by collision residency and promotion.
+    vegetation_families: PlantFamilyCache,
+    /// Published navigation contributions and the dirty world regions they moved.
+    vegetation_navigation: VegetationNavigationSeam,
+    /// The world simulation clock biology advances on, fed by the play step.
+    vegetation_ecology: VegetationEcologyClock,
+    vegetation_telemetry: crate::VegetationTelemetry,
 }
 
 impl Default for RuntimeSession {
@@ -83,9 +108,11 @@ impl RuntimeSession {
         // off-gate path; control/runtime-driven ragdoll enabling goes straight through the
         // world, so it stays empty here.
         let bridge_scene: SharedScene = Rc::new(RefCell::new(Scene::new()));
+        let vegetation: SharedVegetation = Rc::new(RefCell::new(None));
         let bridge: Rc<dyn ScriptHostBridge> = Rc::new(RuntimeScriptBridge::new(
             Rc::clone(&physics),
             bridge_scene,
+            Rc::clone(&vegetation),
             Rc::clone(&log_sink),
         ));
         Self {
@@ -98,8 +125,18 @@ impl RuntimeSession {
             error_sink: Vec::new(),
             pose_targets: Vec::new(),
             contact_cursor: 0,
+            vegetation_event_cursor: 0,
             script_vm_active: false,
             physics_init: false,
+            vegetation,
+            vegetation_scheduler: VegetationRuntimeScheduler::default(),
+            vegetation_status: VegetationRuntimeBindingStatus::default(),
+            vegetation_collision: VegetationCollisionResidency::default(),
+            vegetation_promotion: VegetationPromotion::default(),
+            vegetation_families: PlantFamilyCache::default(),
+            vegetation_navigation: VegetationNavigationSeam::default(),
+            vegetation_ecology: VegetationEcologyClock::default(),
+            vegetation_telemetry: crate::VegetationTelemetry::default(),
         }
     }
 
@@ -193,6 +230,11 @@ impl RuntimeSession {
     /// The world borrow is scoped and released before any script runs, so a contact /
     /// `on_update` handler may `sa.raycast` back into the world through the bridge.
     pub fn step(&mut self, scene: &mut Scene, dt: f32, input: &mut ScriptInputState) {
+        // The world simulation clock biology runs on: this step is what "the world advanced" means,
+        // so it is what earns ecology ticks. The ticks themselves execute at the vegetation
+        // synchronization point, where the bound world and its residency are in hand.
+        self.vegetation_ecology.accumulate(dt);
+
         // Snapshot this frame's animated poses for the ragdoll motors (cheap when no rig is
         // driven; meaningful only with a live VM + rigs).
         if self.script_vm_active {
@@ -235,8 +277,8 @@ impl RuntimeSession {
         // the same frame the contact fired.
         for event in events {
             let contact = ContactInfo {
-                entity_a: event.entity_a,
-                entity_b: event.entity_b,
+                target_a: event.target_a.map(crate::bridge::script_target),
+                target_b: event.target_b.map(crate::bridge::script_target),
                 begin: event.kind == ContactKind::Begin,
                 sensor: event.sensor,
                 point: event.point,
@@ -256,6 +298,25 @@ impl RuntimeSession {
             }
         }
 
+        // Then the vegetation transitions committed since the last tick. A reducer commit is the
+        // one place a vegetation change becomes observable, so scripts see it the frame it lands
+        // and in commit order. The world borrow is released before dispatch, so a handler may
+        // query or mutate vegetation back through the bridge.
+        for event in self.drain_vegetation_events() {
+            if let Some(err) =
+                self.script
+                    .dispatch_vegetation_event(scene, Arc::clone(&self.registry), &event)
+            {
+                tracing::error!(
+                    "script vegetation handler in '{}': {}",
+                    err.script,
+                    err.message
+                );
+                self.error_sink.push(err);
+                return;
+            }
+        }
+
         // Derive this tick's input edges, then run every instance's `on_update`.
         derive_script_input_edges(input);
         if let Some(err) =
@@ -265,6 +326,24 @@ impl RuntimeSession {
             tracing::error!("script error in '{}': {}", err.script, err.message);
             self.error_sink.push(err);
         }
+    }
+
+    /// Reads the committed vegetation transitions newer than the dispatch cursor and advances it.
+    /// A cursor left behind the ring's retained tail resyncs to the tail rather than replaying a
+    /// gap it cannot fill.
+    fn drain_vegetation_events(&mut self) -> Vec<saffron_script::VegetationEventInfo> {
+        let vegetation = self.vegetation.borrow();
+        let Some(world) = vegetation.as_ref() else {
+            return Vec::new();
+        };
+        let drain = world.drain_events(self.vegetation_event_cursor);
+        if drain.overflowed {
+            tracing::warn!(
+                "script vegetation events: the dispatch cursor fell behind the retained ring"
+            );
+        }
+        self.vegetation_event_cursor = drain.high_water_seq;
+        drain.events.iter().map(script_vegetation_event).collect()
     }
 
     /// Advances the world one frame in play: ticks animation in `Play` mode then steps the
@@ -289,10 +368,16 @@ impl RuntimeSession {
         self.script.stop_scripts();
         self.script_vm_active = false;
         *self.physics.borrow_mut() = None;
+        self.vegetation_collision.reset();
+        self.vegetation_promotion.reset();
+        self.vegetation_families.clear();
+        // Simulated time the ended session accumulated is not the next one's.
+        self.vegetation_ecology.rebind();
         self.pose_targets.clear();
         self.log_sink.borrow_mut().clear();
         self.error_sink.clear();
         self.contact_cursor = 0;
+        self.vegetation_event_cursor = 0;
     }
 
     /// Stops the script VM (a teardown step; it never touches the scene, so it tears down before
@@ -306,6 +391,8 @@ impl RuntimeSession {
     /// shut down).
     pub fn drop_physics_world(&mut self) {
         *self.physics.borrow_mut() = None;
+        self.vegetation_collision.reset();
+        self.vegetation_promotion.reset();
     }
 
     /// Shuts down the Jolt process globals — only after the last world is gone (a live world
@@ -342,6 +429,236 @@ impl RuntimeSession {
         Rc::clone(&self.physics)
     }
 
+    /// An owned clone of the shared vegetation cell. A consumer borrows it for the span it needs
+    /// the authority — the render mirror and the overlays for a read, the control plane for a
+    /// mutable drain. The clone is cheap (`Rc`) and borrowing it does not alias the session's
+    /// other state.
+    #[must_use]
+    pub fn vegetation_cell(&self) -> SharedVegetation {
+        Rc::clone(&self.vegetation)
+    }
+
+    /// The vegetation runtime's compact telemetry.
+    #[must_use]
+    pub fn vegetation_telemetry(&self) -> &crate::VegetationTelemetry {
+        &self.vegetation_telemetry
+    }
+
+    /// The vegetation runtime's telemetry, for the seams that record into it.
+    pub fn vegetation_telemetry_mut(&mut self) -> &mut crate::VegetationTelemetry {
+        &mut self.vegetation_telemetry
+    }
+
+    /// Reconciles the exact cooked generation, shared spatial demand, and bounded cell-load workers,
+    /// then synchronizes the collision facet: every physics-resident cell generation's batched Jolt
+    /// proxies are created and removed against the live play world at this one point.
+    pub fn synchronize_vegetation(
+        &mut self,
+        scene: &mut Scene,
+        assets: &AssetServer,
+        spatial: &ResidencyManager,
+    ) -> Result<(), VegetationRuntimeError> {
+        let vegetation_cell = Rc::clone(&self.vegetation);
+        let mut vegetation_ref = vegetation_cell.borrow_mut();
+        let bound_identity = vegetation_ref
+            .as_ref()
+            .map(|world| world.manifest_identity());
+        let scheduled = {
+            let scheduler = &mut self.vegetation_scheduler;
+            let vegetation = &mut vegetation_ref;
+            self.vegetation_telemetry
+                .stage(crate::VegetationStage::Residency, || {
+                    scheduler.advance(vegetation, scene, assets, spatial)
+                })
+        };
+        match scheduled {
+            Ok(status) => {
+                self.vegetation_status = status;
+                let bound_now = vegetation_ref
+                    .as_ref()
+                    .map(|world| world.manifest_identity());
+                if bound_now != bound_identity {
+                    // A different generation is bound, so the accumulated simulated time and the
+                    // ticks the last catch-up left owed belong to a world that is gone — and so
+                    // does the sequence the incoming ring restarts from.
+                    self.vegetation_ecology.rebind();
+                    self.vegetation_event_cursor = 0;
+                }
+                // Biology advances before the facets derive from it, so a tick's committed
+                // generation is the one collision, navigation, and promotion see this frame.
+                let mut ecology_fault = None;
+                if let Some(vegetation) = vegetation_ref.as_mut()
+                    && self
+                        .vegetation_ecology
+                        .wants_advance(vegetation.ecology_ground_revision())
+                {
+                    let clock = &mut self.vegetation_ecology;
+                    let telemetry = &mut self.vegetation_telemetry;
+                    match telemetry.stage(crate::VegetationStage::Ecology, || {
+                        clock.advance(vegetation)
+                    }) {
+                        Ok(report) => telemetry.record_ecology_ticks(report.ticks_run),
+                        Err(error) => ecology_fault = Some(error),
+                    }
+                }
+                let mut world_ref = self.physics.borrow_mut();
+                // A rebind replaced the bound generation, so any entity view describes plants of
+                // a world that no longer exists.
+                if bound_identity.is_some() && bound_now != bound_identity {
+                    self.vegetation_promotion.abandon(scene, world_ref.as_mut());
+                }
+                // The clock owns the declared influence, so the facets read region readiness at the
+                // same radius a tick reads its halo at.
+                let influence = self.vegetation_ecology.influence();
+                match (world_ref.as_mut(), vegetation_ref.as_mut()) {
+                    (mut world, Some(vegetation)) => {
+                        // Promotion commits first: the collision pass below then sees the
+                        // suppression it just applied, so a plant never has two owners.
+                        let promotion = &mut self.vegetation_promotion;
+                        let families = &mut self.vegetation_families;
+                        let telemetry = &mut self.vegetation_telemetry;
+                        telemetry.stage(crate::VegetationStage::Promotion, || {
+                            promotion.advance(
+                                vegetation,
+                                scene,
+                                assets,
+                                families,
+                                world.as_deref_mut(),
+                            );
+                        });
+                        if let Some(world) = world {
+                            let collision = &mut self.vegetation_collision;
+                            telemetry.stage(crate::VegetationStage::Collision, || {
+                                collision.advance(vegetation, world, assets, families, influence);
+                            });
+                        }
+                        // Navigation publishes from the same committed state, after promotion has
+                        // decided which plants are moving.
+                        let navigation = &mut self.vegetation_navigation;
+                        telemetry.stage(crate::VegetationStage::Navigation, || {
+                            navigation.advance(vegetation, assets, families, influence);
+                        });
+                    }
+                    (Some(world), None) => {
+                        self.vegetation_promotion.abandon(scene, Some(world));
+                        self.vegetation_collision.remove_all(world);
+                        self.vegetation_navigation.clear();
+                    }
+                    (None, None) => {
+                        self.vegetation_promotion.reset();
+                        self.vegetation_collision.reset();
+                        self.vegetation_navigation.clear();
+                    }
+                }
+                self.vegetation_telemetry.commit();
+                // The facets reconciled against the state that is committed; the fault surfaces
+                // after them so a stuck catch-up does not also strand collision bodies.
+                match ecology_fault {
+                    Some(error) => Err(VegetationRuntimeError::Vegetation(error)),
+                    None => Ok(()),
+                }
+            }
+            Err(error) => {
+                self.vegetation_status = VegetationRuntimeBindingStatus::Unavailable {
+                    reason: VegetationRuntimeUnavailableReason::Fault,
+                    detail: Some(error.to_string()),
+                };
+                self.vegetation_telemetry.commit();
+                Err(error)
+            }
+        }
+    }
+
+    /// The promotion authority, the navigation seam, the ecology clock, and the telemetry, borrowed
+    /// disjointly for one control-plane drain (a command may touch any of them). The vegetation
+    /// authority itself comes from [`vegetation_cell`](Self::vegetation_cell), so they all borrow
+    /// independently.
+    pub fn vegetation_control_authorities(
+        &mut self,
+    ) -> (
+        &mut VegetationPromotion,
+        &mut VegetationNavigationSeam,
+        &mut VegetationEcologyClock,
+        &mut crate::VegetationTelemetry,
+    ) {
+        (
+            &mut self.vegetation_promotion,
+            &mut self.vegetation_navigation,
+            &mut self.vegetation_ecology,
+            &mut self.vegetation_telemetry,
+        )
+    }
+
+    /// The world simulation clock biology advances on.
+    #[must_use]
+    pub fn vegetation_ecology_clock(&self) -> &VegetationEcologyClock {
+        &self.vegetation_ecology
+    }
+
+    /// Current collision-facet counters, present only while a live play world can carry the bodies.
+    #[must_use]
+    pub fn vegetation_collision_report(&self) -> Option<VegetationCollisionReport> {
+        self.physics.borrow().as_ref()?;
+        Some(self.vegetation_collision.report())
+    }
+
+    /// Clears vegetation authority and joins every pending cell-load worker. Every promoted
+    /// plant demotes first — with its state written back through the reducer while the authority
+    /// is still live — and a still-live play world then sheds every vegetation collision body.
+    pub fn clear_vegetation(&mut self, scene: &mut Scene) -> Result<(), VegetationRuntimeError> {
+        let mut world_ref = self.physics.borrow_mut();
+        let vegetation_cell = Rc::clone(&self.vegetation);
+        let mut vegetation_ref = vegetation_cell.borrow_mut();
+        if let Some(vegetation) = vegetation_ref.as_mut() {
+            self.vegetation_promotion
+                .demote_all(vegetation, scene, world_ref.as_mut());
+        } else {
+            self.vegetation_promotion.abandon(scene, world_ref.as_mut());
+        }
+        if let Some(world) = world_ref.as_mut() {
+            self.vegetation_collision.remove_all(world);
+        }
+        drop(world_ref);
+        self.vegetation_navigation.clear();
+        self.vegetation_families.clear();
+        self.vegetation_event_cursor = 0;
+        self.vegetation_scheduler.clear(&mut vegetation_ref)?;
+        self.vegetation_status = VegetationRuntimeBindingStatus::Unavailable {
+            reason: VegetationRuntimeUnavailableReason::NoProject,
+            detail: None,
+        };
+        Ok(())
+    }
+
+    /// Current closed binding state for control/UI inspection.
+    #[must_use]
+    pub fn vegetation_status(&self) -> &VegetationRuntimeBindingStatus {
+        &self.vegetation_status
+    }
+
+    /// Drains cells whose disposable CAS artifact must be regenerated through the shared cooker.
+    pub fn missing_vegetation_cells(&self) -> Vec<saffron_spatial::WorldCellKey> {
+        self.vegetation_scheduler.missing_cells()
+    }
+
+    /// Whether a deleted disposable cell artifact is being rebuilt through the shared cooker.
+    #[must_use]
+    pub fn vegetation_needs_regeneration(&self) -> bool {
+        self.vegetation_scheduler.needs_regeneration()
+    }
+
+    /// Advances missing-cell regeneration through the one staged cooker and atomic commit path.
+    pub fn regenerate_missing_vegetation(
+        &mut self,
+        assets: &mut AssetServer,
+        surface_providers: &[Arc<dyn saffron_spatial::SurfaceField>],
+    ) -> Result<(), VegetationRuntimeError> {
+        let vegetation_cell = Rc::clone(&self.vegetation);
+        let mut vegetation_ref = vegetation_cell.borrow_mut();
+        self.vegetation_scheduler
+            .regenerate_missing(&mut vegetation_ref, assets, surface_providers)
+    }
+
     /// Whether a live world is present.
     #[must_use]
     pub fn has_physics(&self) -> bool {
@@ -370,6 +687,12 @@ impl RuntimeSession {
     #[must_use]
     pub fn contact_cursor(&self) -> u64 {
         self.contact_cursor
+    }
+
+    /// The per-tick vegetation-transition dispatch high-water cursor.
+    #[must_use]
+    pub fn vegetation_event_cursor(&self) -> u64 {
+        self.vegetation_event_cursor
     }
 
     /// The animation runtime (for tests / the host's preview-prune assertions).

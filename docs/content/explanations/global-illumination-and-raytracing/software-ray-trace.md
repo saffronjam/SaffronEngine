@@ -77,8 +77,45 @@ L_\text{hit} = \rho\left(L_\text{sun} I_\text{sun} V_\text{sun}
 $$
 
 Here $\rho$ comes from the lite per-cell albedo cache. The sun term includes normal incidence and
-the secondary march's binary visibility. No sky ambient is added at a hit. A miss returns
+the secondary march's visibility. No sky ambient is added at a hit. A miss returns
 $L_\text{sky}$, so sky energy enters the probe volume only along rays that escape the distance field.
+
+## Porous aggregate matter
+
+Foliage-classed matter never hardens the distance field. Instead the composite splats its density
+into per-cascade occupancy volumes, and both marches accumulate
+[Beer–Lambert](https://en.wikipedia.org/wiki/Beer%E2%80%93Lambert_law) extinction through it via the
+shared `sdfExtinctionStep` (full density transmits about 5% per metre). A primary ray dims what it
+sees beyond a canopy, and a ray whose transmittance saturates inside dense matter records an
+aggregate hit: the cell's cached colour, an occupancy-gradient normal, and the sun dimmed by the
+canopy above.
+
+That density is **derived, not authored**. A plant seen close up is triangles; far away it is one
+aggregate voxel. Were the voxel's occupancy an independently authored number, it would transmit a
+different amount of light than the leaves it stands in for, and the plant would change brightness at
+the switch.
+
+So occupancy is solved from the surface's own optics: the density at which marching the sheet's mean
+thickness transmits the sheet's mean transmission. Both representations then describe one optical
+depth, and since the same extinction step serves indirect irradiance, sky visibility and the
+reflection cone, each inherits that continuity.
+
+The extinction coefficient is achromatic, so one density stands for three colour channels. The
+channel mean is the reduction used, because it preserves total transmitted energy rather than
+favouring a perceptual weighting the marches do not apply.
+
+Testing that continuity needs care. The cut follows projected appearance error, so reaching the
+aggregate form in a normal frame means moving the camera away — which shrinks the subject at the
+same moment it coarsens it, and the difference cannot separate the two.
+
+The cut is pinned instead. `SAFFRON_CUT_OVERRIDE` forces the traversal to stop refining or to refine
+fully, leaving camera, scene and lighting identical across two runs. The two cuts then render
+visibly different pictures carrying the same amount of light.
+
+The sun march multiplies its transmittance into $V_\text{sun}$, so surfaces under foliage receive
+dappled rather than absent sunlight. The
+[DFAO cones and the reflection cone](../distance-field-reflection-occlusion/) apply the same
+extinction step.
 
 Because a hit carries no direct sky term, enclosed probes do not receive analytic sky through
 blocked ray directions. Surfaces inside the probe cage use DDGI instead of analytic diffuse IBL;
@@ -104,12 +141,15 @@ second moments used for Chebyshev visibility.
 | What | File | Symbols |
 |---|---|---|
 | The trace | `ddgi_trace.slang` | `computeMain` |
-| The near/far field sample | `sdf.slang` | `sampleField` (near MDF → far GDF), `sdfSample`, `gdfDistance` |
+| The near/far field sample | `sdf.slang` | `sampleField` (near MDF → far GDF), `sdfSample`, `gdfDistanceOccupancy` |
 | Ray directions | `ddgi_trace.slang` | `sphericalFibonacci` |
 | Hit color + multi-bounce | `ddgi_trace.slang` | `sampleAlbedo`, `sampleProbeIrradiance` |
 | Probe world position (toroidal) | `ddgi_trace.slang` | `probeWorldPos`, `wrapMod` |
-| Round-robin constants | `rendering/src/ddgi.rs` | `DDGI_PROBE_BUDGET`, `DDGI_PROBE_CYCLE`, `Ddgi::trace_push` |
-| Trace graph pass | `rendering/src/renderer.rs` | `Renderer::add_ddgi_passes` |
+| Round-robin constants | `rendering/src/ddgi/` | `DDGI_PROBE_BUDGET`, `DDGI_PROBE_CYCLE`, `Ddgi::trace_push` |
+| Trace graph pass | `rendering/src/renderer/gi_passes.rs` | `Renderer::add_ddgi_passes` |
+| Occluder list production | `gi_occluder_scatter.slang`, `gi_occluder_micro.slang` | `computeMain`, `GiOccluderScatterPush`, `GiOccluderMicroPush` |
+| Occluder-list pressure | `rendering/src/renderer/` | `MAX_SDF_INSTANCES`, `sdf_instances_dropped` |
+| Occupancy parity | `material/src/lib.rs`, `assets/src/render_material.rs` | `parity_occupancy`, `aggregate_transmittance`, `AGGREGATE_EXTINCTION_PER_METER`, `derive_parity_occupancy` |
 | Updated-tile filter | `ddgi_blend_irradiance.slang`, `ddgi_blend_distance.slang` | `probeTraced` |
 
 ## Related

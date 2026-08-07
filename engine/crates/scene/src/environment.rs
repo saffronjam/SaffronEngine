@@ -1,10 +1,8 @@
 //! Scene-wide environment/sky state and the asset catalog.
 //!
-//! [`SceneEnvironment`] is global frame state (no transform, not picked, not in the
-//! hierarchy) so it lives on the [`crate::Scene`] rather than as an entity component.
-//! [`AssetCatalog`] maps imported assets by id; the asset layer constructs it and hands
-//! the scene a shared read-only handle. The catalog is never serialized with the scene
-//! (`Scene.catalog`).
+//! [`SceneEnvironment`] is global frame state, so it lives on the [`crate::Scene`] rather than as
+//! an entity component. [`AssetCatalog`] is built by the asset layer and handed to the scene as a
+//! shared read-only handle; it is never serialized with the scene.
 
 use std::collections::HashMap;
 
@@ -92,12 +90,12 @@ impl Default for AtmosphereSettings {
     }
 }
 
-/// The fog backend: the always-on analytic closed form, or the frustum-aligned froxel volumetric
-/// pipeline. In `Volumetric` the analytic height density is injected as the froxel base medium — it
-/// is never applied twice (the two backends share one transmittance ledger, no double-count).
+/// The fog backend: the analytic closed form, or the frustum-aligned froxel volumetric pipeline.
+/// In `Volumetric` the analytic height density is injected as the froxel base medium, so the two
+/// backends share one transmittance ledger and never double-count.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum FogMode {
-    /// The Phase-1 closed-form exponential height/distance integral (the default).
+    /// The closed-form exponential height/distance integral (the default).
     #[default]
     Analytic,
     /// The Wronski/Hillaire froxel inject → integrate → composite path (shadowed god-rays).
@@ -288,10 +286,40 @@ impl Default for CloudSettings {
 pub struct WindSettings {
     /// Horizontal direction in degrees, clockwise from world +Z.
     pub orientation: f32,
-    /// Mean advection speed in metres per second.
+    /// Mean advection speed in metres per second at the reference height.
     pub speed: f32,
-    /// Divergence-free turbulent warp amplitude.
+    /// Divergence-free turbulent warp amplitude (fraction of the mean speed).
     pub gust: f32,
+    /// Turbulence octave count (0 = mean advection only).
+    pub turbulence_octaves: u32,
+    /// Per-octave turbulence amplitude falloff in (0, 1].
+    pub turbulence_roughness: f32,
+    /// Gust-front passage frequency in hertz.
+    pub gust_frequency: f32,
+    /// Height in metres at which `speed` is authored.
+    pub reference_height: f32,
+    /// Power-law shear exponent for the height response (0 = uniform).
+    pub height_exponent: f32,
+    /// Deterministic seed for the turbulence phases.
+    pub seed: u32,
+}
+
+impl WindSettings {
+    /// The sampling profile these settings author (field-for-field).
+    #[must_use]
+    pub fn profile(&self) -> saffron_wind::WindProfile {
+        saffron_wind::WindProfile {
+            orientation: self.orientation,
+            speed: self.speed,
+            gust: self.gust,
+            turbulence_octaves: self.turbulence_octaves,
+            turbulence_roughness: self.turbulence_roughness,
+            gust_frequency: self.gust_frequency,
+            reference_height: self.reference_height,
+            height_exponent: self.height_exponent,
+            seed: self.seed,
+        }
+    }
 }
 
 impl Default for WindSettings {
@@ -300,6 +328,12 @@ impl Default for WindSettings {
             orientation: 0.0,
             speed: 10.0,
             gust: 0.25,
+            turbulence_octaves: 3,
+            turbulence_roughness: 0.55,
+            gust_frequency: 0.15,
+            reference_height: 10.0,
+            height_exponent: 0.2,
+            seed: 0,
         }
     }
 }
@@ -439,9 +473,6 @@ impl Default for SceneEnvironment {
 }
 
 /// A project asset's kind.
-///
-/// A model imported and baked to a mesh, a texture, an animation clip, a native authored asset,
-/// or a `.smodel` container.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum AssetType {
     /// A baked mesh (the default).
@@ -469,10 +500,8 @@ pub enum AssetType {
     VegetationMap,
 }
 
-/// How a texture's bytes are interpreted on upload.
-///
-/// Recovered from a container chunk flag (embedded) or a `.smeta` sidecar (standalone).
-/// `Auto` defers the choice to a heuristic at scan time.
+/// How a texture's bytes are interpreted on upload, recovered from a container chunk flag or a
+/// `.smeta` sidecar.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Colorspace {
     /// Defer to a scan-time heuristic (the default).
@@ -488,10 +517,9 @@ pub enum Colorspace {
 
 /// A texture's semantic role — what surface channel it feeds.
 ///
-/// Inferred from the filename at scan/import, or supplied authoritatively by an import
-/// connector (Poly Haven, ambientCG). Drives two things: the preview routing (which slot of the
-/// preview ball material a lone texture is shown through) and the colorspace policy for an
-/// imported/foreign file (color maps → sRGB, data maps → linear, HDR → float).
+/// Inferred from the filename at scan/import, or supplied by an import connector. Drives preview
+/// routing and the colorspace policy for a foreign file (color maps → sRGB, data maps → linear,
+/// HDR → float).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum TextureRole {
     /// Role not recognized (the default) — treated as a plain color map for display.
@@ -521,11 +549,8 @@ pub enum TextureRole {
     Hdri,
 }
 
-/// Where an imported asset came from and under what license.
-///
-/// Captured at import for assets pulled from an online store connector so the
-/// attribution travels with the asset (CC-BY / Sketchfab require it). Absent for
-/// hand-imported local assets.
+/// Where an imported asset came from and under what license, so the attribution travels with the
+/// asset. Absent for hand-imported local assets.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Attribution {
     /// Canonical license id (`cc0`, `cc-by`, `cc-by-sa`, …).
@@ -579,9 +604,8 @@ pub struct AssetEntry {
     pub role: TextureRole,
     /// Source/license, set when the asset was imported from an online store.
     pub attribution: Option<Attribution>,
-    /// FNV-1a hash of the asset's baked content, the content-addressed thumbnail cache
-    /// key; `0` when unknown (materials key on resolved state instead, and legacy rows
-    /// backfill lazily).
+    /// FNV-1a hash of the asset's baked content, the content-addressed thumbnail cache key; `0`
+    /// when unknown (materials key on resolved state instead).
     pub content_hash: u64,
 }
 
@@ -609,10 +633,6 @@ impl Default for AssetEntry {
 }
 
 /// The catalog of imported assets a scene draws from.
-///
-/// The asset layer constructs the real catalog and hands the scene a shared, read-only
-/// handle (`Option<Arc<AssetCatalog>>`); it is never serialized with the scene. `by_id`
-/// is an index map from id to position in `entries`, rebuilt by [`AssetCatalog::put`].
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct AssetCatalog {
     /// The catalog entries.
@@ -630,10 +650,7 @@ impl AssetCatalog {
         self.by_id.get(&id.value()).map(|&i| &self.entries[i])
     }
 
-    /// Inserts or replaces the entry for its id.
-    ///
-    /// An entry whose id already exists overwrites it in place; a new id appends and
-    /// records its position in `by_id`.
+    /// Inserts or replaces the entry for its id, preserving catalog order.
     pub fn put(&mut self, entry: AssetEntry) {
         if let Some(&i) = self.by_id.get(&entry.id.value()) {
             self.entries[i] = entry;
@@ -666,8 +683,6 @@ impl AssetCatalog {
     }
 
     /// Records the content hash on the entry for `id`, returning whether it existed.
-    /// Backfilled when a thumbnail lookup self-heals a legacy row that predates the
-    /// content-addressed cache.
     pub fn set_content_hash(&mut self, id: Uuid, content_hash: u64) -> bool {
         match self.by_id.get(&id.value()) {
             Some(&i) => {
@@ -689,10 +704,7 @@ impl AssetCatalog {
         }
     }
 
-    /// A name not already used by another entry.
-    ///
-    /// Appends `" (2)"`, `" (3)"`, … on collision, scanning suffixes upward until one
-    /// is free.
+    /// A name not already used by another entry, appending `" (2)"`, `" (3)"`, … on collision.
     #[must_use]
     pub fn unique_name(&self, base: &str) -> String {
         if !self.entries.iter().any(|e| e.name == base) {
@@ -868,12 +880,10 @@ mod tests {
         assert_eq!(catalog.find(Uuid(1024)).unwrap().name, "cube");
         assert_eq!(catalog.find(Uuid(2048)).unwrap().name, "sphere");
 
-        // A put with an existing id replaces in place, not append.
         catalog.put(named_entry(1024, "cube-v2"));
         assert_eq!(catalog.entries.len(), 2);
         assert_eq!(catalog.find(Uuid(1024)).unwrap().name, "cube-v2");
 
-        // An unknown id resolves to None.
         assert!(catalog.find(Uuid(9999)).is_none());
     }
 
@@ -883,28 +893,23 @@ mod tests {
         catalog.put(named_entry(1024, "old"));
         assert!(catalog.rename(Uuid(1024), "new"));
         assert_eq!(catalog.find(Uuid(1024)).unwrap().name, "new");
-        // Renaming an absent id is a no-op returning false.
         assert!(!catalog.rename(Uuid(7777), "ghost"));
     }
 
     #[test]
     fn unique_name_appends_collision_suffix() {
         let mut catalog = AssetCatalog::default();
-        // No collision: the base name is returned verbatim.
         assert_eq!(catalog.unique_name("mesh"), "mesh");
 
         catalog.put(named_entry(1024, "mesh"));
-        // First collision picks " (2)".
         assert_eq!(catalog.unique_name("mesh"), "mesh (2)");
 
         catalog.put(named_entry(2048, "mesh (2)"));
-        // With (2) taken, scan upward to " (3)".
         assert_eq!(catalog.unique_name("mesh"), "mesh (3)");
 
         catalog.put(named_entry(4096, "mesh (3)"));
         assert_eq!(catalog.unique_name("mesh"), "mesh (4)");
 
-        // A distinct base is unaffected by the collisions above.
         assert_eq!(catalog.unique_name("texture"), "texture");
     }
 }

@@ -120,11 +120,11 @@ flowchart LR
 
 | What | File | Symbols |
 |---|---|---|
-| Usage and barrier model | `engine/crates/rendering/src/render_graph.rs` | `RgUsage`, `usage_info`, `apply_access`, `derive_pass_barriers` |
-| Compute pass declaration | `engine/crates/rendering/src/render_graph.rs` | `RgPass::compute`, `RgPass::access`, `RgPass::body`, `RenderGraph::add_pass` |
-| Shared recording helper | `engine/crates/rendering/src/renderer.rs` | `Renderer::add_compute_pass` |
-| Separate-output example | `engine/crates/rendering/src/renderer.rs`, `engine/assets/shaders/fxaa.slang` | `add_fxaa_pass`, `computeMain` |
-| In-place example | `engine/crates/rendering/src/renderer.rs`, `engine/assets/shaders/tonemap.slang` | `add_tonemap_pass`, `computeMain` |
+| Usage and barrier model | `engine/crates/rendering/src/render_graph/` | `RgUsage`, `usage_info`, `apply_access`, `derive_pass_barriers` |
+| Compute pass declaration | `engine/crates/rendering/src/render_graph/` | `RgPass::compute`, `RgPass::access`, `RgPass::body`, `RenderGraph::add_pass` |
+| Shared recording helper | `engine/crates/rendering/src/renderer/` | `Renderer::add_compute_pass` |
+| Separate-output example | `engine/crates/rendering/src/renderer/`, `engine/assets/shaders/fxaa.slang` | `add_fxaa_pass`, `computeMain` |
+| In-place example | `engine/crates/rendering/src/renderer/`, `engine/assets/shaders/tonemap.slang` | `add_tonemap_pass`, `computeMain` |
 
 ## Related
 

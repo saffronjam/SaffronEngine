@@ -1,12 +1,7 @@
-//! Coverage of the coroutine scheduler (dt-driven `sa.wait`/`spawn_task` + a contained
-//! coroutine fault), inter-script messages (`entity:send` / `sa.broadcast` with payloads
-//! + sender, and the payload ref released across ticks), the input reads (held + derived
-//! edges + mouse, case-normalized) through a lent `ScriptInputState`, and the
-//! hierarchy/query bindings (`set_parent` / `parent` / `children` / `spawn` /
-//! `get_entity_by_name` / `find_by_uuid` / `primary_camera`).
-//!
-//! The scheduler/message cases drive real `.luau` fixtures through a real [`ScriptHost`]
-//! against a real [`Scene`]; the input/hierarchy cases drive a VM inside a session guard.
+//! The coroutine scheduler, inter-script messages, the input reads through a lent
+//! `ScriptInputState`, and the hierarchy/query bindings. The scheduler and message cases drive
+//! real `.luau` fixtures through a real `ScriptHost`; the rest drive a VM inside a session
+//! guard.
 
 use std::path::PathBuf;
 use std::sync::Arc;

@@ -1,21 +1,11 @@
-/// The outliner tree: the entity forest built client-side from the flat store slice
-/// (`buildTree` over `parentId`). Rows indent by
-/// depth, show a twisty only when they have something to expand (child entities, or —
-/// behind the header toggle — the selected row's read-only component subrows), select
-/// on click, rename inline on double-click, delete on the Delete key, and reparent
-/// by dragging one row onto another (`set-parent`); dropping onto self or a
-/// descendant is rejected before any
-/// round trip, and a root strip at the bottom unparents. Expand-state lives outside
-/// the version-gated poll, so a scene mutation never collapses the tree.
+/// The outliner tree: the entity forest built client-side from the flat store slice. Rows select,
+/// rename inline, delete, and reparent by drag; expand state lives outside the version-gated poll so
+/// a scene mutation never collapses the tree.
 ///
-/// Every row is a `memo`'d component subscribing to its OWN selected/expanded bits, so
-/// a selection change re-renders only the two affected rows; the whole tree shares ONE
-/// context menu (the row under the right-click is resolved from `data-entity-id`), not
-/// a Radix root per row. Component subrows live in their own child so the inspect poll
-/// re-renders one small node, not the tree.
-///
-/// Every drag affordance is in-flow sidebar DOM — no `setDragImage` layer, no portal'd
-/// indicator — because the reparented X11 viewport child paints over anything floating.
+/// Every row is a `memo`'d component subscribing to its OWN selected/expanded bits, and the whole
+/// tree shares ONE context menu resolved from `data-entity-id`, so a selection change re-renders two
+/// rows rather than the tree. Every drag affordance is in-flow sidebar DOM — the viewport surface
+/// paints over anything floating.
 import { memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { ChevronDown, ChevronRight } from "lucide-react";
 import { useEditorStore, buildTree, reanchorPastBones, type TreeNode } from "../state/store";

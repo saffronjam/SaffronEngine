@@ -24,6 +24,7 @@ component through the control plane also attempts to fit it to the entity's mesh
 | `linearDamping` | `0.05` | Per-second linear velocity decay |
 | `angularDamping` | `0.05` | Per-second angular velocity decay |
 | `gravityFactor` | `1.0` | Scale applied to world gravity |
+| `windFactor` | `0.0` | Aerodynamic coupling to the [wind field](../../scene-and-ecs/wind-field/) |
 | `lockPosition` | all false | Frozen translation axes for a dynamic body |
 | `lockRotation` | all false | Frozen rotation axes for a dynamic body |
 | `collisionLayer` | `0` | Moving-layer selection for non-static bodies |
@@ -36,6 +37,19 @@ The collision layer applies to non-static rigidbodies. Values `0`, `1`, and `2` 
 `Character`, and `Debris`; other values select `Moving`. A sensor collider selects the `Sensor`
 layer regardless of its rigidbody field. The [collision-layer page](../collision-layers-and-triggers/)
 defines the resulting pair matrix.
+
+## Wind coupling
+
+`windFactor` scales the collider's own cross-section into the quadratic drag the shared
+[wind field](../../scene-and-ecs/wind-field/) exerts on the body each substep. `1.0` means the body
+presents the cross-section its collider describes, higher values a sail, and the `0.0` default an
+object the air does not move.
+
+The coupling is authored rather than derived because a collision proxy is not an aerodynamic
+profile — a crate and the box that approximates a chandelier share a shape and share nothing else.
+It also carries a cost: the wind field evaluates `sin`/`cos`, so a coupled body is reproducible
+within one binary rather than bit-exact across targets, while an uncoupled one keeps the stronger
+guarantee that makes physics results portable.
 
 ## Building the live bodies
 
@@ -103,10 +117,10 @@ In Edit, the same command returns `physics=inactive  bodies=0  dynamic=0`.
 | What | File | Symbols |
 |---|---|---|
 | Scene components and serialization | `engine/crates/scene/src/component.rs`, `serde.rs` | `Collider`, `Rigidbody`, `Motion`, `PhysicsMaterial`, `SceneSerialize for Rigidbody` |
-| Body creation and stepping | `engine/crates/physics/src/world.rs` | `World::populate`, `body_create`, `allowed_dofs`, `World::step`, `BodyEntry` |
+| Body creation and stepping | `engine/crates/physics/src/world/` | `World::populate`, `body_create`, `allowed_dofs`, `World::step`, `BodyEntry` |
 | Physics vocabulary | `engine/crates/physics/src/types.rs` | `MotionType`, `MotionType::from_scene`, `ObjectLayer`, `FIXED_STEP` |
-| Runtime lifecycle and tick order | `engine/crates/runtime/src/session.rs`, `engine/crates/host/src/layer.rs` | `RuntimeSession::start`, `RuntimeSession::step`, `HostLayer::reconcile_play_edge` |
-| Shape fitting | `engine/crates/physics/src/world.rs` | `fit_collider_to_mesh` |
+| Runtime lifecycle and tick order | `engine/crates/runtime/src/session.rs`, `engine/crates/host/src/layer/` | `RuntimeSession::start`, `RuntimeSession::step`, `HostLayer::reconcile_play_edge` |
+| Shape fitting | `engine/crates/physics/src/world/` | `fit_collider_to_mesh` |
 | World inspection | `engine/crates/control/src/commands_physics.rs` | `register_physics_commands`, `PhysicsStateResult`, `PhysicsBodiesResult` |
 
 ## Related

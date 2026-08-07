@@ -1,21 +1,14 @@
 //! The runtime's [`ScriptHostBridge`] implementation: the concrete end of the POD seam
-//! `saffron-script` declares so the `sa.*` physics bindings and the `sa.log` sink reach
-//! the live world without `saffron-script` importing `saffron-physics`.
+//! `saffron-script` declares, so the `sa.*` physics bindings and the `sa.log` sink reach the live
+//! world without `saffron-script` importing `saffron-physics`.
 //!
-//! One [`RuntimeScriptBridge`] holds the handles the bindings reach — the live play world
-//! and the play scene (for the scene-reading `enable_ragdoll`) — as `Rc<RefCell<…>>` cells
-//! the [`RuntimeSession`](crate::RuntimeSession) shares with it, plus a [`SharedScriptSink`]
-//! log buffer.
+//! [`RuntimeScriptBridge`] holds the play world and scene as `Rc<RefCell<…>>` cells shared with the
+//! [`RuntimeSession`](crate::RuntimeSession) — `Rc` rather than a `Mutex` because the VM is `!Send`.
+//! Sharing the cells is what lets an installed callback see the live world, which is `None` before
+//! start and after stop.
 //!
-//! `Rc<RefCell>` is the single-thread shared-mutable idiom: the VM is `!Send`, so no `Mutex`
-//! is needed, and the bridge is an installed callback object, not one of the value-owned
-//! session fields. The session installs it onto the [`ScriptHost`](saffron_script::ScriptHost)
-//! on start and shares the same cells so the bridge sees the live world while it exists (a
-//! no-op `None` world before start / after stop).
-//!
-//! `sa.log` cannot write straight into the consumer's log ring while a script tick runs, so
-//! the line is appended to [`SharedScriptSink`] (a tiny cell) and the session drains it once
-//! each call batch returns ([`RuntimeSession::take_logs`](crate::RuntimeSession::take_logs)).
+//! `sa.log` cannot write into the consumer's log ring while a script tick runs, so the line lands in
+//! [`SharedScriptSink`] and the session drains it once the call batch returns.
 
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -25,13 +18,19 @@ use glam::Vec3;
 use saffron_core::Uuid;
 use saffron_physics::World;
 use saffron_scene::{MorphComponent, MorphWeightOverride, Scene};
-use saffron_script::{ScriptHostBridge, ScriptRagdollState, ScriptRayHit};
+use saffron_script::{
+    ScriptHostBridge, ScriptPlantFilter, ScriptPlantHit, ScriptRagdollState, ScriptRayHit,
+};
 
 /// The live play physics world, shared between the session and the bridge (`None` before
 /// start / after stop).
 pub type SharedPhysics = Rc<RefCell<Option<World>>>;
 /// The play scene, shared so the scene-reading `enable_ragdoll` resolves the rig entity.
 pub type SharedScene = Rc<RefCell<Scene>>;
+/// The bound vegetation authority, shared between the session and the bridge so a script's
+/// vegetation query or interaction reaches the same world the runtime publishes (`None` while no
+/// exact cooked generation is bound).
+pub type SharedVegetation = Rc<RefCell<Option<saffron_vegetation::VegetationWorld>>>;
 
 /// One buffered `sa.log` line: the sender uuid and its message, drained by the session into
 /// the consumer's log ring after the script call batch.
@@ -60,6 +59,8 @@ pub struct RuntimeScriptBridge {
     /// The play scene, shared so the scene-reading `enable_ragdoll` resolves the rig
     /// entity.
     scene: SharedScene,
+    /// The bound vegetation authority the vegetation queries and interactions read and mutate.
+    vegetation: SharedVegetation,
     /// The buffered `sa.log` lines the session drains into the consumer's log ring.
     sink: SharedScriptSink,
 }
@@ -67,11 +68,68 @@ pub struct RuntimeScriptBridge {
 impl RuntimeScriptBridge {
     /// Wires the bridge to the session's shared world / scene cells and the log sink.
     #[must_use]
-    pub fn new(physics: SharedPhysics, scene: SharedScene, sink: SharedScriptSink) -> Self {
+    pub fn new(
+        physics: SharedPhysics,
+        scene: SharedScene,
+        vegetation: SharedVegetation,
+        sink: SharedScriptSink,
+    ) -> Self {
         Self {
             physics,
             scene,
+            vegetation,
             sink,
+        }
+    }
+
+    /// Reduces one plant-addressed mutation through the bound authority, minting the header the
+    /// reducer requires: the cell the plant is resident in, that cell's current revision as the
+    /// optimistic precondition, and a transaction/operation key derived from the content plus that
+    /// revision. Two identical calls therefore commit twice (the revision advanced between them),
+    /// while a genuine replay of the same record against the same revision is idempotent.
+    fn mutate_plant(
+        &self,
+        plant: &str,
+        build: impl FnOnce(saffron_spatial::PlantId) -> saffron_vegetation::VegetationMutation,
+    ) -> bool {
+        let Ok(plant_id) = plant.parse::<saffron_spatial::PlantId>() else {
+            return false;
+        };
+        let mut world = self.vegetation.borrow_mut();
+        let Some(world) = world.as_mut() else {
+            return false;
+        };
+        let Ok(Some(snapshot)) = world.find_plant(plant_id) else {
+            return false;
+        };
+        let cell = snapshot.position.cell();
+        let base_revision = world
+            .persistent_state()
+            .cells()
+            .get(&cell)
+            .map_or(0, |state| state.revision);
+        let mutation = build(plant_id);
+        let mut digest = plant_id.bytes().to_vec();
+        digest.extend_from_slice(&base_revision.to_be_bytes());
+        digest.extend_from_slice(format!("{mutation:?}").as_bytes());
+        let key = leading_u128(saffron_vegetation::ContentHash::of(&digest).bytes());
+        let record = saffron_vegetation::VegetationMutationRecord {
+            header: saffron_vegetation::MutationHeader {
+                cell,
+                transaction: key,
+                authority: SCRIPT_AUTHORITY,
+                logical_tick: base_revision + 1,
+                idempotency_key: key,
+                base_revision: Some(base_revision),
+            },
+            mutation,
+        };
+        match world.apply_confirmed_mutations(&[record]) {
+            Ok(reduction) => !reduction.committed_transactions.is_empty(),
+            Err(error) => {
+                tracing::warn!("script vegetation mutation rejected: {error}");
+                false
+            }
         }
     }
 
@@ -80,12 +138,100 @@ impl RuntimeScriptBridge {
     fn flatten(hit: saffron_physics::RayHit) -> ScriptRayHit {
         ScriptRayHit {
             hit: hit.hit,
-            entity: hit.entity,
+            target: hit.target.map(script_target),
             point: hit.point,
             normal: hit.normal,
             distance: hit.distance,
         }
     }
+}
+
+/// Maps a physics tagged target into the script-side mirror (a plain re-tag; the two
+/// enums share the same vocabulary without a crate dependency between them).
+pub(crate) fn script_target(
+    target: saffron_physics::WorldHitTarget,
+) -> saffron_script::ScriptHitTarget {
+    match target {
+        saffron_physics::WorldHitTarget::SceneEntity(uuid) => {
+            saffron_script::ScriptHitTarget::SceneEntity(uuid)
+        }
+        saffron_physics::WorldHitTarget::Vegetation(plant) => {
+            saffron_script::ScriptHitTarget::Vegetation(plant)
+        }
+    }
+}
+
+/// Flattens one committed vegetation transition into the script-side POD, in the same kebab-case
+/// vocabulary the control plane reports so a handler and an `sa vegetation-drain-events` call name
+/// the same transition identically.
+pub(crate) fn script_vegetation_event(
+    event: &saffron_vegetation::VegetationEvent,
+) -> saffron_script::VegetationEventInfo {
+    use saffron_vegetation::VegetationTransitionKind as Kind;
+    let unit = |value: saffron_spatial::UnitInterval| value.to_f64() as f32;
+    let mut info = saffron_script::VegetationEventInfo {
+        seq: event.seq,
+        kind: "",
+        plant: event.transition.plant.map(|plant| plant.canonical_hex()),
+        cell: event.transition.cell.coordinates(),
+        cell_level: event.transition.cell.level(),
+        lifecycle: None,
+        previous_lifecycle: None,
+        phenotype: None,
+        amount: None,
+        health: None,
+        moisture: None,
+        fuel: None,
+        categories: None,
+    };
+    match event.transition.kind {
+        Kind::Damaged { amount, health } => {
+            info.kind = "damaged";
+            info.amount = Some(unit(amount));
+            info.health = Some(unit(health));
+        }
+        Kind::Harvested { phenotype } => {
+            info.kind = "harvested";
+            info.phenotype = Some(phenotype);
+        }
+        Kind::Burned {
+            phenotype,
+            remaining_fuel,
+        } => {
+            info.kind = "burned";
+            info.phenotype = Some(phenotype);
+            info.fuel = Some(unit(remaining_fuel));
+        }
+        Kind::Removed => info.kind = "removed",
+        Kind::Planted => info.kind = "planted",
+        Kind::Regrew {
+            lifecycle,
+            phenotype,
+        } => {
+            info.kind = "regrew";
+            info.lifecycle = Some(lifecycle_name(lifecycle));
+            info.phenotype = Some(phenotype);
+        }
+        Kind::LifecycleChanged { from, to } => {
+            info.kind = "lifecycle-changed";
+            info.previous_lifecycle = from.map(lifecycle_name);
+            info.lifecycle = Some(lifecycle_name(to));
+        }
+        Kind::Ignited => info.kind = "ignited",
+        Kind::Extinguished => info.kind = "extinguished",
+        Kind::Wetted { moisture, fuel } => {
+            info.kind = "wetted";
+            info.moisture = Some(unit(moisture));
+            info.fuel = Some(unit(fuel));
+        }
+        Kind::StateReplaced => info.kind = "state-replaced",
+        Kind::Moved => info.kind = "moved",
+        Kind::Disturbed { categories } => {
+            info.kind = "disturbed";
+            info.categories = Some(categories);
+        }
+    }
+    info
 }
 
 impl ScriptHostBridge for RuntimeScriptBridge {
@@ -206,11 +352,231 @@ impl ScriptHostBridge for RuntimeScriptBridge {
         }
     }
 
+    fn vegetation_raycast(
+        &self,
+        origin: Vec3,
+        dir: Vec3,
+        max_dist: f32,
+        filter: &ScriptPlantFilter,
+    ) -> Option<ScriptPlantHit> {
+        let world = self.vegetation.borrow();
+        let world = world.as_ref()?;
+        let filter = query_filter(filter)?;
+        let origin_position = render_relative_position(origin)?;
+        let ray = saffron_vegetation::VegetationQueryRay::new(
+            origin_position,
+            dir.as_dvec3(),
+            f64::from(max_dist),
+        )
+        .ok()?;
+        let hits = world.query_ray(ray, &filter).ok()?;
+        hits.first()
+            .map(|hit| plant_hit(&hit.plant, hit.distance_m))
+    }
+
+    fn vegetation_nearest(
+        &self,
+        position: Vec3,
+        radius: f32,
+        filter: &ScriptPlantFilter,
+    ) -> Option<ScriptPlantHit> {
+        let world = self.vegetation.borrow();
+        let world = world.as_ref()?;
+        let filter = query_filter(filter)?;
+        let center = render_relative_position(position)?;
+        world
+            .query_nearest(center, Some(f64::from(radius)), &filter)
+            .ok()
+            .flatten()
+            .map(|hit| plant_hit(&hit.plant, hit.distance_m))
+    }
+
+    fn vegetation_in_radius(
+        &self,
+        position: Vec3,
+        radius: f32,
+        limit: usize,
+        filter: &ScriptPlantFilter,
+    ) -> Vec<ScriptPlantHit> {
+        let world = self.vegetation.borrow();
+        let Some(world) = world.as_ref() else {
+            return Vec::new();
+        };
+        let Some(filter) = query_filter(filter) else {
+            return Vec::new();
+        };
+        let Some(center) = render_relative_position(position) else {
+            return Vec::new();
+        };
+        let origin = center.world_meters();
+        let Ok(plants) = world.query_radius(center, f64::from(radius), &filter) else {
+            return Vec::new();
+        };
+        let mut hits: Vec<ScriptPlantHit> = plants
+            .iter()
+            .map(|plant| {
+                let distance = (plant.position.world_meters() - origin).length();
+                plant_hit(plant, distance)
+            })
+            .collect();
+        hits.sort_by(|left, right| {
+            left.distance
+                .total_cmp(&right.distance)
+                .then_with(|| left.plant.cmp(&right.plant))
+        });
+        hits.truncate(limit);
+        hits
+    }
+
+    fn vegetation_damage(&self, plant: &str, amount: f32) -> bool {
+        let Ok(amount) = saffron_spatial::UnitInterval::from_f64(f64::from(amount.clamp(0.0, 1.0)))
+        else {
+            return false;
+        };
+        self.mutate_plant(plant, |plant| {
+            saffron_vegetation::VegetationMutation::Damage {
+                plant,
+                amount,
+                phenotype: None,
+            }
+        })
+    }
+
+    fn vegetation_harvest(&self, plant: &str, phenotype: u32) -> bool {
+        self.mutate_plant(plant, |plant| {
+            saffron_vegetation::VegetationMutation::Harvest { plant, phenotype }
+        })
+    }
+
     fn log_sink(&self, sender: Uuid, message: &str) {
         self.sink.borrow_mut().push(ScriptLogLine {
             sender: sender.0,
             message: message.to_owned(),
         });
+    }
+}
+
+/// The authority id every script-driven vegetation mutation is recorded under, distinct from the
+/// editor, the promotion write-back, and a future server.
+const SCRIPT_AUTHORITY: u128 = 0x5361_6666_726f_6e5f_5363_7269_7074_0001;
+
+/// The leading 16 bytes of a content hash as a non-zero transaction/operation key.
+fn leading_u128(bytes: [u8; 32]) -> u128 {
+    let mut leading = [0_u8; 16];
+    leading.copy_from_slice(&bytes[..16]);
+    u128::from_be_bytes(leading) | 1
+}
+
+/// Resolves the script-side text filter into the engine's closed macro-query filter. A name or id
+/// that resolves to nothing returns `None`, and the query answers as a miss rather than as a
+/// wider question than the script asked.
+fn query_filter(filter: &ScriptPlantFilter) -> Option<saffron_vegetation::VegetationQueryFilter> {
+    let families = filter
+        .families
+        .iter()
+        .map(|family| family.parse::<u64>().ok().map(saffron_core::Uuid))
+        .collect::<Option<Vec<_>>>()?;
+    let required_tags = filter
+        .required_tags
+        .iter()
+        .map(|tag| {
+            tag.parse::<u64>()
+                .ok()
+                .and_then(|value| saffron_vegetation::PlantTagId::new(value).ok())
+        })
+        .collect::<Option<_>>()?;
+    let lifecycles = filter
+        .lifecycles
+        .iter()
+        .map(|name| lifecycle_from_name(name))
+        .collect::<Option<_>>()?;
+    let interaction_policies = filter
+        .interaction_policies
+        .iter()
+        .map(|name| policy_from_name(name))
+        .collect::<Option<Vec<_>>>()?;
+    Some(saffron_vegetation::VegetationQueryFilter {
+        families,
+        required_tags,
+        lifecycles,
+        interaction_policies,
+    })
+}
+
+/// Quantizes a script-supplied render-relative position into the exact world vocabulary.
+fn render_relative_position(position: Vec3) -> Option<saffron_spatial::WorldPosition> {
+    saffron_spatial::WorldPosition::from_render_relative(
+        position,
+        saffron_spatial::WorldPosition::origin(),
+    )
+    .ok()
+}
+
+/// Flattens one macro-plant snapshot into the script-side POD.
+fn plant_hit(
+    plant: &saffron_vegetation::VegetationPlantSnapshot,
+    distance_m: f64,
+) -> ScriptPlantHit {
+    ScriptPlantHit {
+        plant: plant.plant.canonical_hex(),
+        position: plant
+            .position
+            .to_render_relative(saffron_spatial::WorldPosition::origin())
+            .unwrap_or(Vec3::ZERO),
+        distance: distance_m as f32,
+        lifecycle: lifecycle_name(plant.lifecycle).to_owned(),
+        health: plant.health.to_f64() as f32,
+        interaction_policy: policy_name(plant.interaction_policy).to_owned(),
+    }
+}
+
+fn lifecycle_name(lifecycle: saffron_vegetation::PlantLifecycle) -> &'static str {
+    use saffron_vegetation::PlantLifecycle as Lifecycle;
+    match lifecycle {
+        Lifecycle::Seed => "seed",
+        Lifecycle::Sprout => "sprout",
+        Lifecycle::Juvenile => "juvenile",
+        Lifecycle::Mature => "mature",
+        Lifecycle::Senescent => "senescent",
+        Lifecycle::Dead => "dead",
+        Lifecycle::Stump => "stump",
+        Lifecycle::Removed => "removed",
+    }
+}
+
+fn lifecycle_from_name(name: &str) -> Option<saffron_vegetation::PlantLifecycle> {
+    use saffron_vegetation::PlantLifecycle as Lifecycle;
+    match name {
+        "seed" => Some(Lifecycle::Seed),
+        "sprout" => Some(Lifecycle::Sprout),
+        "juvenile" => Some(Lifecycle::Juvenile),
+        "mature" => Some(Lifecycle::Mature),
+        "senescent" => Some(Lifecycle::Senescent),
+        "dead" => Some(Lifecycle::Dead),
+        "stump" => Some(Lifecycle::Stump),
+        "removed" => Some(Lifecycle::Removed),
+        _ => None,
+    }
+}
+
+fn policy_from_name(name: &str) -> Option<saffron_vegetation::InteractionPolicy> {
+    use saffron_vegetation::InteractionPolicy as Policy;
+    match name {
+        "decorative" => Some(Policy::Decorative),
+        "interactive" => Some(Policy::Interactive),
+        "harvestable" => Some(Policy::Harvestable),
+        "structural" => Some(Policy::Structural),
+        _ => None,
+    }
+}
+
+fn policy_name(policy: saffron_vegetation::InteractionPolicy) -> &'static str {
+    use saffron_vegetation::InteractionPolicy as Policy;
+    match policy {
+        Policy::Decorative => "decorative",
+        Policy::Interactive => "interactive",
+        Policy::Harvestable => "harvestable",
+        Policy::Structural => "structural",
     }
 }
 
@@ -221,10 +587,16 @@ mod tests {
     use saffron_scene::register_builtin_components;
     use std::sync::Arc;
 
-    fn cells() -> (SharedPhysics, SharedScene, SharedScriptSink) {
+    fn cells() -> (
+        SharedPhysics,
+        SharedScene,
+        SharedVegetation,
+        SharedScriptSink,
+    ) {
         (
             Rc::new(RefCell::new(None)),
             Rc::new(RefCell::new(Scene::new())),
+            Rc::new(RefCell::new(None)),
             Rc::new(RefCell::new(Vec::new())),
         )
     }
@@ -233,8 +605,8 @@ mod tests {
     /// zero velocity, a false ragdoll toggle.
     #[test]
     fn no_world_is_a_safe_noop() {
-        let (physics, scene, sink) = cells();
-        let bridge = RuntimeScriptBridge::new(physics, scene, sink);
+        let (physics, scene, vegetation, sink) = cells();
+        let bridge = RuntimeScriptBridge::new(physics, scene, vegetation, sink);
         assert_eq!(
             bridge.raycast(Vec3::ZERO, Vec3::Z, 100.0),
             ScriptRayHit::default()
@@ -253,13 +625,41 @@ mod tests {
     /// session drains it from there into the consumer's log ring after the tick.
     #[test]
     fn log_sink_buffers_the_line() {
-        let (physics, scene, sink) = cells();
-        let bridge = RuntimeScriptBridge::new(physics, scene, Rc::clone(&sink));
+        let (physics, scene, vegetation, sink) = cells();
+        let bridge = RuntimeScriptBridge::new(physics, scene, vegetation, Rc::clone(&sink));
         bridge.log_sink(Uuid(42), "hello");
         let lines = sink.borrow();
         assert_eq!(lines.len(), 1);
         assert_eq!(lines[0].sender, 42);
         assert_eq!(lines[0].message, "hello");
+    }
+
+    /// With no bound vegetation authority every vegetation call is a safe no-op: an empty query
+    /// and a refused mutation, never a panic.
+    #[test]
+    fn vegetation_calls_without_an_authority_are_safe_no_ops() {
+        let (physics, scene, vegetation, sink) = cells();
+        let bridge = RuntimeScriptBridge::new(physics, scene, vegetation, sink);
+        let filter = ScriptPlantFilter::default();
+        assert!(
+            bridge
+                .vegetation_raycast(Vec3::ZERO, Vec3::Z, 50.0, &filter)
+                .is_none()
+        );
+        assert!(
+            bridge
+                .vegetation_nearest(Vec3::ZERO, 10.0, &filter)
+                .is_none()
+        );
+        assert!(
+            bridge
+                .vegetation_in_radius(Vec3::ZERO, 10.0, 8, &filter)
+                .is_empty()
+        );
+        // A malformed identity is refused before the authority is even consulted.
+        assert!(!bridge.vegetation_damage("not-a-plant-id", 0.5));
+        assert!(!bridge.vegetation_damage("40aabbccddeeff00112233445566778899", 0.5));
+        assert!(!bridge.vegetation_harvest("40aabbccddeeff00112233445566778899", 2));
     }
 
     /// The physics calls route to the live world: a velocity set + read-back round-trips
@@ -277,8 +677,9 @@ mod tests {
         };
         let physics = Rc::new(RefCell::new(Some(world)));
         let scene = Rc::new(RefCell::new(Scene::new()));
+        let vegetation = Rc::new(RefCell::new(None));
         let sink = Rc::new(RefCell::new(Vec::new()));
-        let bridge = RuntimeScriptBridge::new(physics, Rc::clone(&scene), sink);
+        let bridge = RuntimeScriptBridge::new(physics, Rc::clone(&scene), vegetation, sink);
 
         // No mapped body for this uuid → velocity read is zero, and the impulse/force/
         // velocity sets are no-ops (warned) rather than panics, on a live world.

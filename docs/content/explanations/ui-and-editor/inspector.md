@@ -104,7 +104,7 @@ Section dragging uses a 4-pixel threshold and updates only a visual preview unti
 | Rig editors | `editor/src/components/FootChainsEditor.tsx`, `BoneMaskField.tsx`, `BonePhysicsEditor.tsx` | `FootChainsEditor`, `BoneMaskField`, `BonePhysicsEditor` |
 | Optimistic store state | `editor/src/state/store.ts` | `applyOptimisticComponent`, `dragActive`, `pushEdit` |
 | Component registry | `engine/crates/scene/src/registry.rs` | `register_builtin_components`, `ComponentRegistry::component_order`, `ComponentRegistry::set_component_order` |
-| Scene edit commands | `engine/crates/control/src/commands_scene.rs` | `register_scene_commands`, `set-component`, `set-transform`, `set-component-field`, `set-component-order`, `add-component`, `remove-component` |
+| Scene edit commands | `engine/crates/control/src/commands_scene/` | `register_scene_commands`, `set-component`, `set-transform`, `set-component-field`, `set-component-order`, `add-component`, `remove-component` |
 
 ## Related
 

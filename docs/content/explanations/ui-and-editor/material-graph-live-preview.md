@@ -55,9 +55,9 @@ The Preview pane is transparent so the native presented surface remains visible 
 
 | What | File | Symbols |
 |---|---|---|
-| Material preview scene | `engine/crates/control/src/commands_asset.rs` | `enter_material_preview`, `build_preview_scene`, `furnish_preview_scene` |
-| Graph storage and lowering | `engine/crates/control/src/commands_asset.rs` | `material-set-graph`, `lower_graph_to_params`, `material-compile-graph` |
-| Material rewrite and cache invalidation | `engine/crates/assets/src/material.rs`, `engine/crates/assets/src/lib.rs` | `update_material_asset`, `AssetServer::invalidate_material_caches` |
+| Material preview scene | `engine/crates/control/src/commands_asset/` | `enter_material_preview`, `build_preview_scene`, `furnish_preview_scene` |
+| Graph storage and lowering | `engine/crates/control/src/commands_asset/` | `material-set-graph`, `lower_graph_to_params`, `material-compile-graph` |
+| Material rewrite and cache invalidation | `engine/crates/assets/src/material/`, `engine/crates/assets/src/lib.rs` | `update_material_asset`, `AssetServer::invalidate_material_caches` |
 | Graph workspace and live pane | `editor/src/panels/MaterialGraphEditor.tsx` | `GraphCanvas`, `graphsEqual`, `compile` |
 | Graph conversion | `editor/src/materials/graph.ts` | `flowToGraph`, `graphToFlow`, `NODE_SPECS` |
 | Snapshot undo and redo | `editor/src/lib/useTabSnapshotHistory.ts` | `useTabSnapshotHistory` |

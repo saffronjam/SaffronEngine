@@ -1,6 +1,6 @@
 fixture: cube.smesh
-bytes: 992
-sha256: dca7e11807945961393ba3bb3aa3cc524cc7c76b11cefea9a2c6fa46b1bea8db
+bytes: 38352
+sha256: b7ac6a717b9c5a9071a3f773078203e52c7f8e72a6f3274ded3c6a817e304b48
 source: C++ engine-old geometry.cppm encodeMeshImage / SMeshHeader (:386,:1400)
 generator: fixtures/golden/gen/gen_golden.cpp
 commit: d8b4cea

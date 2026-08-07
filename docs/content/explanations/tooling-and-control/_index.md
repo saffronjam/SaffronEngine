@@ -51,4 +51,4 @@ set of commands needed for liveness, progress, cancellation, and viewport readin
 | Typed dispatch | `control/src/registry.rs` | `CommandRegistry`, `register_builtin_commands`, `EngineContext` |
 | Wire DTOs | `protocol/src/dto.rs` | command parameter and result types |
 | Command inventory | `protocol/src/command.rs` | `COMMANDS`, `CommandSpec` |
-| Protocol generator | `xtask/src/protocol/` | `emit`, `emit_openrpc`, `emit_manifest` |
+| Protocol generator | `xtask/src/protocol/` | `emit`, `emit_envelope_schema`, `emit_openrpc`, `emit_manifest` |

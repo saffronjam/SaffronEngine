@@ -1,29 +1,15 @@
-//! The OS window wrapper: a thin facade over `winit` 0.30 that publishes the
-//! engine's input and lifecycle events as typed [`SubscriberList`] signals
-//! (`on_resize`, `on_key_pressed`, `on_key_released`, `on_close`,
-//! `on_file_dropped`) downstream code subscribes to.
+//! The OS window wrapper: a facade over `winit` that publishes input and lifecycle
+//! events as typed [`SubscriberList`] signals, plus the `raw-window-handle` pair
+//! `ash-window` consumes for surface creation.
 //!
-//! Built on `winit` + `raw-window-handle` 0.6, with five typed signals. Two
-//! construction modes exist:
+//! [`Window::new`] builds a real winit window; [`Window::headless`] builds the
+//! windowless facade the editor host takes, where the signals stay usable but the
+//! handle accessors report [`HandleError::NotSupported`] rather than a sentinel, so
+//! no Vulkan surface is ever built on that path.
 //!
-//! - [`Window::new`] builds a real winit window (the standalone present-only
-//!   host) and hands out a `raw-window-handle` / `raw-display-handle` pair that
-//!   `ash-window` (in `saffron-rendering`) consumes for surface creation;
-//! - [`Window::headless`] is the windowless mode the editor host takes — the
-//!   signal facade and the public type exist with no OS window behind them, and
-//!   no surface handle is produced, so `ash-window` is never invoked.
-//!
-//! Windowed and headless are a real distinction here, not a nullable handle: the
-//! handle accessors return `None` (or a [`HandleError`]) in headless mode, never
-//! a sentinel.
-//!
-//! The `winit` `ApplicationHandler` event loop that *drives*
-//! `poll → on_update → … → present` is owned by `saffron-host`; this crate
-//! provides the signals that loop publishes into and the translation from a
-//! winit [`WindowEvent`] to those signals ([`Window::dispatch_window_event`]),
-//! not the loop itself.
-//!
-//! DAG: depends on `saffron-core`, `saffron-signal`.
+//! The event loop that drives `poll → on_update → … → present` is owned by
+//! `saffron-host`; this crate provides the signals it publishes into and the
+//! translation from a winit [`WindowEvent`] ([`Window::dispatch_window_event`]).
 
 #![deny(unsafe_code)]
 
@@ -41,10 +27,8 @@ pub use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 pub use winit::keyboard;
 pub use winit::window::WindowId;
 
-/// The keycode carried by [`Window::on_key_pressed`] / [`Window::on_key_released`].
-///
-/// This is winit's location-stable physical key identity, exhaustively matchable
-/// downstream (`PhysicalKey::Code(KeyCode::Escape)`).
+/// The keycode carried by [`Window::on_key_pressed`] / [`Window::on_key_released`]:
+/// winit's location-stable physical key identity.
 pub type KeyCode = PhysicalKey;
 
 /// Errors from windowed construction.
@@ -59,8 +43,6 @@ pub enum Error {
 pub type Result<T> = std::result::Result<T, Error>;
 
 /// The window creation parameters.
-///
-/// The [`Default`] field values are `"Saffron"`, 1600×900, not hidden.
 #[derive(Debug, Clone)]
 pub struct WindowConfig {
     /// The window title bar text.
@@ -85,15 +67,6 @@ impl Default for WindowConfig {
 }
 
 /// The OS window and its typed event signals.
-///
-/// Holds the five typed [`SubscriberList`] signals downstream code subscribes
-/// to, a raw-event signal forwarding every winit event, the current pixel size,
-/// the `should_close` latch, and — when windowed — the winit window whose
-/// `raw-window-handle` pair is exposed for surface creation.
-///
-/// In headless mode the winit window is absent: the signals are fully usable but
-/// the handle accessors yield `None` / an error, so no Vulkan surface is built on
-/// that path.
 pub struct Window {
     handle: Option<WinitWindow>,
     width: u32,
@@ -110,18 +83,12 @@ pub struct Window {
     pub on_key_released: SubscriberList<KeyCode>,
     /// Fires on a dropped file with its path.
     pub on_file_dropped: SubscriberList<std::path::PathBuf>,
-    /// Fires for every raw winit [`WindowEvent`] before typed dispatch — the
-    /// host feeds this into the gizmo + fly-camera input.
+    /// Fires for every raw winit [`WindowEvent`] before typed dispatch.
     pub on_raw_event: SubscriberList<WindowEvent>,
 }
 
 impl Window {
-    /// Creates a real OS window on `event_loop` from `config`.
-    ///
-    /// This is the standalone present-only host path; the editor host uses
-    /// [`Window::headless`] instead. `event_loop` is the winit
-    /// [`ActiveEventLoop`] the host owns (winit 0.30 only creates windows from an
-    /// active event loop); this crate accepts it and does not own the loop.
+    /// Creates a real OS window on the [`ActiveEventLoop`] the host owns.
     pub fn new(event_loop: &ActiveEventLoop, config: &WindowConfig) -> Result<Self> {
         let attributes = WindowAttributes::default()
             .with_title(config.title.clone())
@@ -133,11 +100,8 @@ impl Window {
         Ok(Self::with_handle(Some(handle), size.width, size.height))
     }
 
-    /// Creates the windowless facade the editor host takes.
-    ///
-    /// No winit window is built, so the signals are usable but the handle
-    /// accessors yield `None` / a [`HandleError`] and no Vulkan surface is
-    /// produced. The initial size is `0×0` until a resize event arrives.
+    /// Creates the windowless facade the editor host takes. The initial size is
+    /// `0×0` until a resize event arrives.
     pub fn headless() -> Self {
         Self::with_handle(None, 0, 0)
     }
@@ -178,36 +142,17 @@ impl Window {
     }
 
     /// Latches the close request programmatically.
-    ///
-    /// The host sets this from the Escape-key subscription in the standalone windowed
-    /// path; the editor/headless path has no window and exits via the parent-death watch
-    /// or a control `quit`.
     pub fn request_close(&mut self) {
         self.should_close = true;
     }
 
-    /// Borrows the underlying winit window, if windowed.
-    ///
-    /// The handle the host needs to drive `request_redraw` and the like; headless
-    /// mode returns `None`.
+    /// Borrows the underlying winit window; `None` when headless.
     pub fn winit_window(&self) -> Option<&WinitWindow> {
         self.handle.as_ref()
     }
 
-    /// Translates a winit [`WindowEvent`] into the typed signals.
-    ///
-    /// This is the pure translation table the host's event loop feeds; it
-    /// publishes the raw event to [`on_raw_event`](Self::on_raw_event) first,
-    /// then maps:
-    ///
-    /// - [`WindowEvent::CloseRequested`] → latch `should_close` + `on_close`;
-    /// - [`WindowEvent::Resized`] → update size + `on_resize(w, h)`;
-    /// - [`WindowEvent::KeyboardInput`] pressed → `on_key_pressed(keycode, repeat)`;
-    /// - [`WindowEvent::KeyboardInput`] released → `on_key_released(keycode)`;
-    /// - [`WindowEvent::DroppedFile`] → `on_file_dropped(path)`.
-    ///
-    /// It runs without a live winit event loop (a synthesized event is enough),
-    /// so it is testable headless.
+    /// Translates a winit [`WindowEvent`] into the typed signals, publishing to
+    /// [`on_raw_event`](Self::on_raw_event) first.
     pub fn dispatch_window_event(&mut self, event: &WindowEvent) {
         self.on_raw_event.publish(event.clone());
 
@@ -231,13 +176,9 @@ impl Window {
         }
     }
 
-    /// Publishes a keyboard transition to the typed key signals.
-    ///
-    /// A `Pressed` state publishes `on_key_pressed(keycode, is_repeat)`; a
-    /// `Released` state publishes `on_key_released(keycode)`. Split out of the
-    /// [`WindowEvent::KeyboardInput`] arm because winit's `KeyEvent` carries a
-    /// private field and so cannot be synthesized — this takes the three fields
-    /// the translation actually reads, which keeps the key path testable.
+    /// Publishes a keyboard transition to the typed key signals. It takes the three
+    /// fields the translation reads rather than a `KeyEvent`, which carries a private
+    /// field and so cannot be synthesized in a test.
     fn dispatch_key(&self, physical_key: KeyCode, state: ElementState, repeat: bool) {
         match state {
             ElementState::Pressed => {
@@ -250,10 +191,6 @@ impl Window {
     }
 }
 
-/// Exposes the raw window handle `ash-window` consumes for surface creation.
-///
-/// Forwards to the underlying winit window when windowed; headless mode reports
-/// [`HandleError::NotSupported`] so no surface is built on that path.
 impl HasWindowHandle for Window {
     fn window_handle(&self) -> std::result::Result<WindowHandle<'_>, HandleError> {
         match &self.handle {
@@ -263,11 +200,6 @@ impl HasWindowHandle for Window {
     }
 }
 
-/// Exposes the raw display handle `ash-window` consumes for instance-extension
-/// enumeration and surface creation.
-///
-/// Forwards to the underlying winit window when windowed; headless mode reports
-/// [`HandleError::NotSupported`].
 impl HasDisplayHandle for Window {
     fn display_handle(&self) -> std::result::Result<DisplayHandle<'_>, HandleError> {
         match &self.handle {
@@ -287,7 +219,7 @@ mod tests {
     use winit::keyboard::{KeyCode as WinitKeyCode, PhysicalKey};
 
     #[test]
-    fn config_default_matches_cpp() {
+    fn config_default_is_saffron_1600_by_900() {
         let config = WindowConfig::default();
         assert_eq!(config.title, "Saffron");
         assert_eq!(config.width, 1600);

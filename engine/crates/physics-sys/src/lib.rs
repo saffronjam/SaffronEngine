@@ -1,18 +1,14 @@
-//! FFI seam: vendored Jolt 5.3.0 + the C++ shim (the `unsafe` Jolt boundary).
+//! The Jolt FFI seam: vendored Jolt 5.3.0 plus the C++ shim.
 //!
-//! One of the three FFI crates that opt back into `unsafe` (the foundations lints policy; every
-//! other crate keeps `#![deny(unsafe_code)]`). The seam named here is the Jolt FFI: `build.rs`
-//! compiles every Jolt TU and the shim with the determinism flag set
+//! `build.rs` compiles every Jolt TU and the shim with the determinism flag set
 //! (`JPH_CROSS_PLATFORM_DETERMINISTIC`, single precision, `-ffp-model=precise`,
-//! `-ffp-contract=off`, confined `-mavx2`), and links the static archive into this crate. The
-//! flags are confined here so the rest of the workspace is never recompiled with arch flags that
+//! `-ffp-contract=off`, confined `-mavx2`) and links the static archive here. Those flags are
+//! confined to this crate so the rest of the workspace never recompiles with arch flags that
 //! would change its float results.
 //!
-//! The FFI ABI is the `cxx` bridge in [`bridge::ffi`]: POD-only across the wire (scalars and the
-//! shared `PendingContact` struct), with the opaque `JoltWorld` holding the `PhysicsSystem` plus
-//! the four virtual shim classes `cxx` cannot synthesize (the three layer filters and the
-//! `ContactListener`). This crate re-exports a thin safe surface so `saffron-physics` never names
-//! the `unsafe` bridge module directly.
+//! The ABI is the `cxx` bridge in [`bridge::ffi`]: POD only across the wire, with the opaque
+//! `JoltWorld` holding the `PhysicsSystem` plus the four virtual shim classes `cxx` cannot
+//! synthesize (the three layer filters and the `ContactListener`).
 #![allow(unsafe_code)]
 
 mod bridge;
@@ -25,9 +21,7 @@ pub use bridge::ffi::{BodyCreate, BonePart, CharacterCreate, JoltWorld, PendingC
 /// The safe layer treats it as "no body" rather than tracking it.
 pub const INVALID_BODY_ID: u32 = u32::MAX;
 
-/// The deterministic fixed substep — the step the safe layer's accumulator advances by. Kept
-/// here so the bridge-level step test uses the real cadence; the safe `saffron-physics` layer
-/// owns the accumulator.
+/// The deterministic fixed substep; the safe layer owns the accumulator that advances by it.
 pub const FIXED_STEP: f32 = 1.0 / 60.0;
 
 /// Initialize the Jolt globals: the default allocator, trace/assert hooks, the type `Factory`,
@@ -49,34 +43,33 @@ pub fn shutdown() {
     bridge::ffi::jolt_shutdown();
 }
 
-/// The compiled-in Jolt version, encoded as `(major << 16) | (minor << 8) | patch`. A non-zero
-/// value proves the Jolt static archive linked.
+/// The compiled-in Jolt version as `(major << 16) | (minor << 8) | patch`. Non-zero proves the
+/// static archive linked.
 pub fn jolt_version() -> u32 {
     bridge::ffi::jolt_version()
 }
 
-/// `true` if the shim TU was compiled with `JPH_CROSS_PLATFORM_DETERMINISTIC`. Guaranteed by a
-/// build-time `#error` guard, surfaced so a test can assert the contract end-to-end.
+/// `true` if the shim TU compiled with `JPH_CROSS_PLATFORM_DETERMINISTIC`. A build-time `#error`
+/// guard already enforces it; this lets a test assert the contract end to end.
 pub fn is_deterministic() -> bool {
     bridge::ffi::jolt_is_deterministic()
 }
 
-/// `true` if the shim TU was compiled in single precision (`JPH_DOUBLE_PRECISION` not defined).
-/// Guaranteed by a build-time `#error` guard, surfaced so a test can assert the contract.
+/// `true` if the shim TU compiled in single precision (`JPH_DOUBLE_PRECISION` undefined), also
+/// enforced by a build-time `#error` guard.
 pub fn is_single_precision() -> bool {
     bridge::ffi::jolt_is_single_precision()
 }
 
-/// Whether two object layers may collide, by the fixed v1 collision matrix implemented in the C++
-/// shim. `a` and `b` are `ObjectLayer` raw discriminants (`Static=0`, `Moving=1`, `Character=2`,
-/// `Debris=3`, `Sensor=4`). Symmetric. Surfaced so a test can assert the matrix.
+/// Whether two object layers may collide, by the collision matrix in the C++ shim. `a` and `b`
+/// are `ObjectLayer` raw discriminants (`Static=0`, `Moving=1`, `Character=2`, `Debris=3`,
+/// `Sensor=4`); the relation is symmetric.
 pub fn layers_collide(a: u8, b: u8) -> bool {
     bridge::ffi::jolt_layers_collide(a, b)
 }
 
-/// Allocate a fresh, uninitialized [`JoltWorld`] — the `TempAllocator`, the `JobSystem`, the four
-/// shim instances, and a bare `PhysicsSystem`. Call [`world_init`] before use. Returns `None` if
-/// the C++ side handed back a null pointer (an allocation failure).
+/// Allocates an uninitialized [`JoltWorld`]: the `TempAllocator`, the `JobSystem`, the four shim
+/// instances, and a bare `PhysicsSystem`. Call [`world_init`] before use. `None` on a null return.
 pub fn world_new() -> Option<UniquePtr<JoltWorld>> {
     let world = bridge::ffi::jolt_world_new();
     if world.is_null() { None } else { Some(world) }
@@ -88,13 +81,12 @@ pub fn world_init(world: &mut UniquePtr<JoltWorld>) {
     bridge::ffi::jolt_world_init(world.pin_mut());
 }
 
-/// The live body count (`PhysicsSystem::GetNumBodies`).
+/// `PhysicsSystem::GetNumBodies`.
 pub fn world_body_count(world: &UniquePtr<JoltWorld>) -> u32 {
     bridge::ffi::jolt_world_body_count(world)
 }
 
-/// Advance the world by one substep of `dt` with `collision_steps` solver iterations. The safe
-/// layer's fixed-step accumulator drives this; exposed here so the bridge round-trips a step.
+/// Advances the world by one substep of `dt` with `collision_steps` solver iterations.
 pub fn world_step(world: &mut UniquePtr<JoltWorld>, dt: f32, collision_steps: i32) {
     bridge::ffi::jolt_world_step(world.pin_mut(), dt, collision_steps);
 }
@@ -105,12 +97,11 @@ pub fn drain_contacts(world: &mut UniquePtr<JoltWorld>) -> Vec<PendingContact> {
     bridge::ffi::jolt_drain_contacts(world.pin_mut())
 }
 
-/// Build the body `create.shape` selects and add it to the world, returning its raw `BodyID`.
-/// Analytic shapes (Box/Sphere/Capsule) ignore the geometry slices; ConvexHull builds from
-/// `hull_points` (flattened `xyz`, index order) and Mesh from `mesh_vertices` (flattened `xyz`) +
-/// `mesh_indices` (flat triangle list). Returns [`INVALID_BODY_ID`] when the shape or body create
-/// failed (an empty cook, a degenerate hull). Mesh-on-Dynamic is rejected on the safe side, so the
-/// shim never sees it.
+/// Builds the body `create.shape` selects and adds it to the world, returning its raw `BodyID`.
+/// Analytic shapes ignore the geometry slices; ConvexHull reads `hull_points` (flattened `xyz` in
+/// index order) and Mesh reads `mesh_vertices` plus `mesh_indices` (a flat triangle list).
+/// [`INVALID_BODY_ID`] when the shape or body create failed. Mesh-on-Dynamic is rejected on the
+/// safe side, so the shim never sees it.
 pub fn create_body(
     world: &mut UniquePtr<JoltWorld>,
     create: &BodyCreate,
@@ -127,8 +118,20 @@ pub fn create_body(
     )
 }
 
-/// A body's world position (`xyz`) and rotation (`xyzw`), read each step for the dynamic
-/// transform write-back.
+/// Create every body in `creates` (analytic shapes only) and insert them through Jolt's batched
+/// broadphase path (`AddBodiesPrepare` + `AddBodiesFinalize`, kept asleep). Returns one raw
+/// `BodyID` per input row, position-aligned; a failed create yields [`INVALID_BODY_ID`] in its
+/// slot while the rest of the batch still lands.
+pub fn create_static_batch(world: &mut UniquePtr<JoltWorld>, creates: &[BodyCreate]) -> Vec<u32> {
+    bridge::ffi::jolt_create_static_batch(world.pin_mut(), creates)
+}
+
+/// Remove and destroy every listed body in one batch. [`INVALID_BODY_ID`] sentinels are skipped.
+pub fn remove_bodies(world: &mut UniquePtr<JoltWorld>, ids: &[u32]) {
+    bridge::ffi::jolt_remove_bodies(world.pin_mut(), ids);
+}
+
+/// A body's world position (`xyz`) and rotation (`xyzw`).
 pub fn body_position_rotation(world: &UniquePtr<JoltWorld>, id: u32) -> ([f32; 3], [f32; 4]) {
     let mut position = [0.0f32; 3];
     let mut rotation = [0.0f32; 4];
@@ -136,19 +139,24 @@ pub fn body_position_rotation(world: &UniquePtr<JoltWorld>, id: u32) -> ([f32; 3
     (position, rotation)
 }
 
-/// A body's world position (`xyz`), for the read-only body list.
+/// A body's world position (`xyz`).
 pub fn body_position(world: &UniquePtr<JoltWorld>, id: u32) -> [f32; 3] {
     bridge::ffi::jolt_body_position(world, id)
 }
 
-/// Whether a body is awake, for the read-only body list.
+/// Whether a body is awake.
 pub fn body_is_active(world: &UniquePtr<JoltWorld>, id: u32) -> bool {
     bridge::ffi::jolt_body_is_active(world, id)
 }
 
-/// A body's current linear velocity (`xyz`).
+/// A body's linear velocity (`xyz`).
 pub fn body_linear_velocity(world: &UniquePtr<JoltWorld>, id: u32) -> [f32; 3] {
     bridge::ffi::jolt_body_linear_velocity(world, id)
+}
+
+/// A body's angular velocity (`xyz`, radians per second about each world axis).
+pub fn body_angular_velocity(world: &UniquePtr<JoltWorld>, id: u32) -> [f32; 3] {
+    bridge::ffi::jolt_body_angular_velocity(world, id)
 }
 
 /// Activate the body and apply a center-of-mass impulse (`xyz`).
@@ -166,10 +174,16 @@ pub fn body_set_linear_velocity(world: &mut UniquePtr<JoltWorld>, id: u32, veloc
     bridge::ffi::jolt_body_set_linear_velocity(world.pin_mut(), id, &velocity);
 }
 
-/// Move a Kinematic body toward `position` (`xyz`) / `rotation` (`xyzw`) over `dt` via
-/// `BodyInterface::MoveKinematic` — the swept motion imparts contact velocity to the dynamics it
-/// hits (never a teleport). `dt` must be the fixed substep that feeds the step so the derived
-/// velocity matches it. `id` is a raw `BodyID`; Kinematic-only at the call site.
+/// Activate the body and set its angular velocity (`xyz`, radians per second about each world
+/// axis).
+pub fn body_set_angular_velocity(world: &mut UniquePtr<JoltWorld>, id: u32, velocity: [f32; 3]) {
+    bridge::ffi::jolt_body_set_angular_velocity(world.pin_mut(), id, &velocity);
+}
+
+/// Moves a Kinematic body toward `position` (`xyz`) / `rotation` (`xyzw`) over `dt` through
+/// `BodyInterface::MoveKinematic`, so the swept motion imparts contact velocity rather than
+/// teleporting. `dt` must be the fixed substep that feeds the step, or the derived velocity will
+/// not match it. Kinematic bodies only.
 pub fn move_kinematic(
     world: &mut UniquePtr<JoltWorld>,
     id: u32,
@@ -180,10 +194,9 @@ pub fn move_kinematic(
     bridge::ffi::jolt_move_kinematic(world.pin_mut(), id, &position, &rotation, dt);
 }
 
-/// Create a `CharacterVirtual` from a capsule + slope angle and store it in the world, returning
-/// its index. Returns [`INVALID_BODY_ID`] if the capsule shape create failed. The controller
-/// logic (gravity integration, speed clamp) is the safe layer's; the shim owns only the sweep
-/// object.
+/// Creates a `CharacterVirtual` from a capsule plus slope angle and stores it in the world,
+/// returning its index ([`INVALID_BODY_ID`] if the capsule shape create failed). The shim owns
+/// only the sweep object; gravity integration and the speed clamp are the safe layer's.
 pub fn add_character(world: &mut UniquePtr<JoltWorld>, create: &CharacterCreate) -> u32 {
     bridge::ffi::jolt_add_character(world.pin_mut(), create)
 }
@@ -197,9 +210,8 @@ pub fn character_set_linear_velocity(
     bridge::ffi::jolt_character_set_linear_velocity(world.pin_mut(), index, &velocity);
 }
 
-/// Advance one character by `dt` (`CharacterVirtual::ExtendedUpdate`) with the Character-layer
-/// filters, the supplied applied `gravity` (`xyz`, already scaled by the gravity factor), and a
-/// `step_up` walk-stairs height. `index` is a character slot.
+/// `CharacterVirtual::ExtendedUpdate` for one character slot, with the Character-layer filters,
+/// an applied `gravity` already scaled by the gravity factor, and a `step_up` stairs height.
 pub fn character_extended_update(
     world: &mut UniquePtr<JoltWorld>,
     index: u32,
@@ -220,15 +232,14 @@ pub fn character_position(world: &UniquePtr<JoltWorld>, index: u32) -> [f32; 3] 
     bridge::ffi::jolt_character_position(world, index)
 }
 
-/// The world's gravity vector (`xyz`). The safe layer integrates the controller's vertical
-/// velocity against this each substep (`PhysicsSystem::GetGravity`).
+/// `PhysicsSystem::GetGravity` (`xyz`).
 pub fn world_gravity(world: &UniquePtr<JoltWorld>) -> [f32; 3] {
     bridge::ffi::jolt_world_gravity(world)
 }
 
-/// Build a passive SwingTwist ragdoll from the per-bone `parts` (skeleton + capsule parts + the
-/// four constraint kinds), add it to the world, and return its index. Returns [`INVALID_BODY_ID`]
-/// if `CreateRagdoll` failed. Built motors-off; setting the motor state drives it.
+/// Builds a ragdoll from the per-bone `parts` and adds it to the world, returning its index
+/// ([`INVALID_BODY_ID`] if `CreateRagdoll` failed). Built motors-off; setting the motor state
+/// drives it.
 pub fn add_ragdoll(world: &mut UniquePtr<JoltWorld>, rig_uuid: u64, parts: &[BonePart]) -> u32 {
     bridge::ffi::jolt_add_ragdoll(world.pin_mut(), rig_uuid, parts)
 }
@@ -239,14 +250,12 @@ pub fn remove_ragdoll(world: &mut UniquePtr<JoltWorld>, index: u32) {
     bridge::ffi::jolt_remove_ragdoll(world.pin_mut(), index);
 }
 
-/// The number of parts (bodies) in a ragdoll; `0` for an out-of-range slot
-/// (`Ragdoll::GetBodyCount`).
+/// `Ragdoll::GetBodyCount`, or `0` for an out-of-range slot.
 pub fn ragdoll_body_count(world: &UniquePtr<JoltWorld>, index: u32) -> u32 {
     bridge::ffi::jolt_ragdoll_body_count(world, index)
 }
 
-/// A ragdoll part's world transform: translation (`xyz`) + rotation (`xyzw`), for the per-bone
-/// pose write-back.
+/// A ragdoll part's world translation (`xyz`) and rotation (`xyzw`).
 pub fn ragdoll_part_transform(
     world: &UniquePtr<JoltWorld>,
     index: u32,
@@ -277,10 +286,9 @@ pub fn ragdoll_set_swing_twist_motor(
     bridge::ffi::jolt_ragdoll_set_swing_twist_motor(world.pin_mut(), index, part, active, &target);
 }
 
-/// Cast a ray `origin + dir * max_dist` through the narrow-phase query and return the closest
-/// [`RayHit`]: world-space point/normal, the distance, and the struck body's raw `BodyID`
-/// (`u32::MAX` / [`INVALID_BODY_ID`] on a miss). Read-only — it takes `&world`, never perturbing
-/// the deterministic step. The safe layer maps `RayHit::body` back to its owner entity.
+/// Casts `origin + dir * max_dist` through the narrow phase and returns the closest [`RayHit`],
+/// whose `body` is [`INVALID_BODY_ID`] on a miss. Takes `&world`, so a query never perturbs the
+/// deterministic step.
 pub fn raycast(
     world: &UniquePtr<JoltWorld>,
     origin: [f32; 3],
@@ -290,9 +298,8 @@ pub fn raycast(
     bridge::ffi::jolt_raycast(world, &origin, &dir, max_dist)
 }
 
-/// Sweep a sphere of `radius` along `origin + dir * max_dist` (a thicker probe than a ray) and
-/// return the closest [`RayHit`]. Read-only (`&world`). Returns a miss when the sweep clears
-/// everything or the query sphere could not be built.
+/// Sweeps a sphere of `radius` along `origin + dir * max_dist` and returns the closest
+/// [`RayHit`], a miss when the sweep clears everything or the query sphere could not be built.
 pub fn sphere_cast(
     world: &UniquePtr<JoltWorld>,
     origin: [f32; 3],
@@ -303,9 +310,8 @@ pub fn sphere_cast(
     bridge::ffi::jolt_sphere_cast(world, &origin, &dir, radius, max_dist)
 }
 
-// The Jolt determinism flag set lives in one file shared with `build.rs` (which `include!`s it).
-// It is build-only data with no runtime use, so it is compiled only for the tests that assert
-// the determinism contract.
+// Build-only data, shared with `build.rs` by `include!`, so it compiles only for the tests that
+// assert the determinism contract.
 #[cfg(test)]
 mod jolt_build_flags;
 
@@ -318,8 +324,7 @@ mod tests {
     // concurrently against it. Serialize them through one lock.
     static JOLT_GLOBAL: Mutex<()> = Mutex::new(());
 
-    // The object-layer raw discriminants, mirroring the shim's enum. Used by
-    // `layer_matrix_matches` to assert the matrix has not drifted.
+    // The object-layer raw discriminants, mirroring the shim's enum.
     const LAYER_STATIC: u8 = 0;
     const LAYER_MOVING: u8 = 1;
     const LAYER_CHARACTER: u8 = 2;
@@ -327,8 +332,7 @@ mod tests {
     const LAYER_SENSOR: u8 = 4;
     const LAYER_COUNT: u8 = 5;
 
-    // The reference matrix, transcribed directly in Rust so the C++ shim and the expectation are
-    // independently authored — a drift in either fails.
+    // The reference matrix, transcribed independently of the C++ shim so a drift in either fails.
     fn expected_layers_collide(a: u8, b: u8) -> bool {
         if a == LAYER_SENSOR || b == LAYER_SENSOR {
             return !(a == LAYER_SENSOR && b == LAYER_SENSOR);
@@ -353,8 +357,6 @@ mod tests {
         };
         let flags = JoltBuildFlags::for_arch(target_arch);
 
-        // The determinism define is present and single precision is the *absence* of
-        // JPH_DOUBLE_PRECISION (it must never be defined here). This holds on every arch.
         assert!(
             flags
                 .defines
@@ -380,7 +382,6 @@ mod tests {
             "-mfma must be absent under cross-platform determinism"
         );
 
-        // The determinism FP pairing is present on every arch.
         for expected in ["-ffp-model=precise", "-ffp-contract=off"] {
             assert!(
                 flags.arch_fp_flags.contains(&expected),
@@ -407,10 +408,8 @@ mod tests {
             ),
         }
 
-        // Jolt's own `-Werror` is overridden for its TUs.
         assert!(flags.warning_flags.contains(&"-Wno-error"));
 
-        // Threads link at link time (the C++ `-pthread`, link-only).
         assert!(flags.link_threads);
     }
 
@@ -426,7 +425,6 @@ mod tests {
 
     #[test]
     fn jolt_links_at_version_5_3_0() {
-        // A non-zero version proves the Jolt static archive linked and its headers compiled.
         let version = super::jolt_version();
         let major = version >> 16;
         let minor = (version >> 8) & 0xff;
@@ -440,8 +438,6 @@ mod tests {
 
     #[test]
     fn shim_compiled_deterministic_single_precision() {
-        // End-to-end: the shim TU itself saw the determinism + single-precision defines (the
-        // `#error` guards in `jolt_bridge.cpp` would have failed the build otherwise).
         assert!(super::is_deterministic());
         assert!(super::is_single_precision());
     }
@@ -450,22 +446,17 @@ mod tests {
     fn init_shutdown_idempotent() {
         let _guard = JOLT_GLOBAL.lock().unwrap();
 
-        // Init then shutdown twice, both succeed.
         assert!(super::init().is_ok());
-        assert!(super::init().is_ok()); // idempotent
+        assert!(super::init().is_ok());
         super::shutdown();
-        super::shutdown(); // idempotent
+        super::shutdown();
 
-        // And it can come back up after a full teardown.
         assert!(super::init().is_ok());
         super::shutdown();
     }
 
     #[test]
     fn layer_matrix_matches() {
-        // The v1 collision matrix is load-bearing for the contact/trigger model. Assert the C++
-        // shim agrees with the independently-transcribed reference for every layer pair, and that
-        // it is symmetric.
         for a in 0..LAYER_COUNT {
             for b in 0..LAYER_COUNT {
                 let got = super::layers_collide(a, b);
@@ -482,9 +473,8 @@ mod tests {
             }
         }
 
-        // The load-bearing rows spelled out by name, so the matrix's intent — not just its
-        // self-consistency with the transcription above — is pinned: a sensor overlaps solids but
-        // never another sensor; static-vs-static and debris-vs-debris are off; everything else on.
+        // The load-bearing rows by name, so the matrix's intent is pinned, not just its
+        // agreement with the transcription above.
         assert!(super::layers_collide(LAYER_SENSOR, LAYER_STATIC));
         assert!(super::layers_collide(LAYER_SENSOR, LAYER_MOVING));
         assert!(super::layers_collide(LAYER_SENSOR, LAYER_CHARACTER));
@@ -502,8 +492,6 @@ mod tests {
     fn create_empty_world() {
         let _guard = JOLT_GLOBAL.lock().unwrap();
 
-        // Init globals → new world → init world → assert non-null and zero bodies → drop cleanly
-        // → shutdown.
         assert!(super::init().is_ok());
         {
             let mut world = super::world_new().expect("world allocation must succeed");
@@ -513,7 +501,7 @@ mod tests {
                 0,
                 "a freshly created world should hold no bodies"
             );
-        } // world dropped here — frees the Jolt objects before shutdown
+        } // the world must drop before shutdown frees the Jolt globals
         super::shutdown();
     }
 
@@ -521,8 +509,6 @@ mod tests {
     fn drain_empty() {
         let _guard = JOLT_GLOBAL.lock().unwrap();
 
-        // A stepped-zero empty world fires no contacts, so the drain returns an empty Vec — and
-        // the call itself proves the C++ buffer ↔ Rust `Vec` round-trip works.
         assert!(super::init().is_ok());
         {
             let mut world = super::world_new().expect("world allocation must succeed");
