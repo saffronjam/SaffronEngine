@@ -93,19 +93,43 @@ pub fn engine_asset_path(relative: &str) -> PathBuf {
     PathBuf::from(relative)
 }
 
+/// One unit of the project loader's residency prefetch: the GPU state one scene reference
+/// warms ahead of the draw path.
+#[derive(Clone, Debug, PartialEq)]
+pub enum WarmItem {
+    /// A `Mesh.mesh` reference: the GPU mesh (with its SDF sidecar).
+    Mesh(Uuid),
+    /// A directly referenced texture (the environment sky panorama).
+    Texture(Uuid),
+    /// One `MaterialSet` slot: the resolved `.smat` (overrides applied) and every texture it
+    /// binds, each through its canonical role (plain / height pyramid / coverage mips).
+    MaterialSlot {
+        /// The referenced `.smat` id (`0` = the built-in default).
+        material: Uuid,
+        /// The slot's sparse parameter overrides.
+        overrides: saffron_json::Value,
+    },
+}
+
 impl AssetServer {
-    /// Warms one catalog asset into its GPU cache (mesh or texture), for the project loader's
-    /// residency prefetch. A no-op for other kinds. Idempotent (cache-hit fast path), so the
-    /// loader can call it once per residency step without re-uploading.
-    pub fn warm_asset(&mut self, gpu: &dyn GpuUploader, id: Uuid) {
-        match self.catalog.find(id).map(|entry| entry.asset_type) {
-            Some(AssetType::Mesh) => {
-                self.load_mesh_asset(gpu, id);
+    /// Warms one residency item into its GPU caches, for the project loader's prefetch.
+    /// Idempotent (cache-hit fast path), so the loader can call it once per residency step
+    /// without re-uploading.
+    pub fn warm(&mut self, gpu: &dyn GpuUploader, item: &WarmItem) {
+        match item {
+            WarmItem::Mesh(id) => {
+                self.load_mesh_asset(gpu, *id);
             }
-            Some(AssetType::Texture) => {
-                self.load_texture_asset(gpu, id);
+            WarmItem::Texture(id) => {
+                self.load_texture_asset(gpu, *id);
             }
-            _ => {}
+            WarmItem::MaterialSlot {
+                material,
+                overrides,
+            } => {
+                let resolved = self.resolve_slot_material(*material, overrides);
+                self.resolve_material_asset(gpu, &resolved);
+            }
         }
     }
 

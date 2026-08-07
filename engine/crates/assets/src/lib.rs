@@ -81,7 +81,7 @@ pub use journal::{
     AssetCatalogSnapshot, AssetInvalidations, AssetJournalCursor, AssetJournalRead, AssetMutation,
     AssetMutationKind, AssetMutationTarget, AssetRevision,
 };
-pub use load::engine_asset_path;
+pub use load::{WarmItem, engine_asset_path};
 pub use manage::{
     CleanCandidate, CleanCategory, CleanReportData, DeleteUnusedData, DependencyGraph,
     MaterialImportResult, RefEdge, RefEdgeKind, RefNode, ReimportDelta, analyze_clean, asset_bytes,

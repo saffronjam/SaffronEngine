@@ -12,10 +12,10 @@ use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 
 use saffron_assets::{
-    AssetServer, LoadInput, LoadedDoc, NewProject, ProjectDocWorker, ProjectSidecar,
+    AssetServer, LoadInput, LoadedDoc, NewProject, ProjectDocWorker, ProjectSidecar, WarmItem,
 };
 use saffron_core::Uuid;
-use saffron_scene::{Entity, Mesh, Scene, ScriptInputState, seed_starter_scene};
+use saffron_scene::{Entity, MaterialSet, Mesh, Scene, ScriptInputState, seed_starter_scene};
 use saffron_sceneedit::{
     BootStage, ProjectLoadRequest, ProjectPhase, SceneEditContext, debug_overlays_from_json,
 };
@@ -29,12 +29,13 @@ use crate::registry::ControlRenderer;
 /// bar one asset at a time — so `Loading assets n/m` moves smoothly instead of jumping in blocks.
 const RESIDENCY_FRAME_BUDGET: Duration = Duration::from_millis(6);
 
-/// The GPU residency prefetch: the scene-referenced mesh/texture ids to warm, and the running
-/// resident count for the determinate `Assets` progress.
+/// The GPU residency prefetch: the scene-referenced warm items, and the running resident
+/// count for the determinate `Assets` progress.
 struct Residency {
-    queue: VecDeque<Uuid>,
+    queue: VecDeque<WarmItem>,
     total: u32,
     done: u32,
+    started: Instant,
 }
 
 /// The loader's state. `Idle` waits for an inbox request; `Parsing` runs the off-thread doc
@@ -48,12 +49,14 @@ enum LoaderState {
 /// The once-per-frame project loader, owned by the [`ControlContext`](crate::ControlContext).
 pub struct ProjectLoader {
     state: LoaderState,
+    load_started: Option<Instant>,
 }
 
 impl Default for ProjectLoader {
     fn default() -> Self {
         Self {
             state: LoaderState::Idle,
+            load_started: None,
         }
     }
 }
@@ -100,6 +103,7 @@ impl ProjectLoader {
         scene_edit.project_phase = ProjectPhase::Loading;
         set_stage(scene_edit, BootStage::Manifest, 0, 0, "Reading project", "");
         let defs = renderer.sa_lua_defs();
+        self.load_started = Some(Instant::now());
         self.state = LoaderState::Parsing(ProjectDocWorker::spawn(input, defs));
         true
     }
@@ -165,13 +169,10 @@ impl ProjectLoader {
         let start = Instant::now();
         let mut current = String::new();
         renderer.with_gpu_uploader(&mut |gpu| {
-            while let Some(id) = res.queue.pop_front() {
-                assets.warm_asset(gpu, id);
+            while let Some(item) = res.queue.pop_front() {
+                assets.warm(gpu, &item);
                 res.done += 1;
-                current = assets
-                    .catalog()
-                    .find(id)
-                    .map_or_else(String::new, |entry| entry.name.clone());
+                current = warm_item_name(assets, &item);
                 if start.elapsed() >= RESIDENCY_FRAME_BUDGET {
                     break;
                 }
@@ -180,6 +181,13 @@ impl ProjectLoader {
 
         if res.queue.is_empty() {
             let total = res.total;
+            tracing::info!(
+                "project ready — {total} assets resident in {} ms (load total {} ms)",
+                res.started.elapsed().as_millis(),
+                self.load_started
+                    .take()
+                    .map_or(0, |t| t.elapsed().as_millis())
+            );
             // The load's slow first renders are about to happen; drop the load-transition frames
             // from the perf HUD so it grades steady state, not the cold-pipeline warm-up.
             renderer.reset_frame_telemetry();
@@ -268,10 +276,12 @@ fn install_doc(
 
     // Idle-before-clear: the GPU must be quiet before the caches' `Arc`s drop (an in-flight frame
     // may still read one) — the load-order UAF guard.
+    let idle_started = Instant::now();
     renderer.wait_gpu_idle();
     assets.clear_asset_caches();
     assets.replace_catalog(doc.catalog);
     assets.set_asset_root(&doc.asset_root);
+    let idle_ms = idle_started.elapsed().as_millis();
 
     set_stage(
         scene_edit,
@@ -286,6 +296,7 @@ fn install_doc(
     // versionless object — the save below persists the seed into the new project. An opened
     // project's saved scene block always carries a version and is deserialized as-is, so a
     // deliberately-emptied project is never re-seeded.
+    let scene_started = Instant::now();
     let mut scene = Scene::default();
     if doc
         .scene_json
@@ -299,6 +310,10 @@ fn install_doc(
         seed_starter_scene(&mut scene);
     }
     scene_edit.scene = scene;
+    tracing::info!(
+        "project installed — gpu idle + cache swap {idle_ms} ms, scene {} ms",
+        scene_started.elapsed().as_millis()
+    );
 
     if let Some(settings) = &doc.render_settings {
         renderer.apply_render_settings(settings);
@@ -348,7 +363,7 @@ fn install_doc(
         }
     }
 
-    let queue = scene_residency_ids(&mut scene_edit.scene);
+    let queue = scene_residency_items(&mut scene_edit.scene);
     let total = queue.len() as u32;
     set_stage(
         scene_edit,
@@ -362,21 +377,54 @@ fn install_doc(
         queue: queue.into_iter().collect(),
         total,
         done: 0,
+        started: Instant::now(),
     }
 }
 
-/// The distinct mesh + texture asset ids the scene references directly (the residency prefetch
-/// set): every `Mesh.mesh` and the environment sky panorama. `MaterialSet` slots reference `.smat`
-/// materials, whose params and nested textures resolve lazily on the draw path.
-fn scene_residency_ids(scene: &mut Scene) -> Vec<Uuid> {
-    let mut ids: Vec<Uuid> = Vec::new();
-    let push = |ids: &mut Vec<Uuid>, id: Uuid| {
-        if id.value() != 0 && !ids.contains(&id) {
-            ids.push(id);
+/// The distinct warm items the scene references (the residency prefetch set): every
+/// `Mesh.mesh`, every `MaterialSet` slot (whose resolve loads the `.smat` and each texture it
+/// binds through its canonical role), and the environment sky panorama — so the draw path
+/// after `Ready` finds every scene-referenced resource already resident.
+fn scene_residency_items(scene: &mut Scene) -> Vec<WarmItem> {
+    let mut items: Vec<WarmItem> = Vec::new();
+    let mut push = |item: WarmItem| {
+        if !items.contains(&item) {
+            items.push(item);
         }
     };
-    scene.for_each::<&Mesh, _>(|_, mesh| push(&mut ids, mesh.mesh));
+    scene.for_each::<&Mesh, _>(|_, mesh| {
+        if mesh.mesh.value() != 0 {
+            push(WarmItem::Mesh(mesh.mesh));
+        }
+    });
+    scene.for_each::<&MaterialSet, _>(|_, set| {
+        for slot in &set.slots {
+            // A default-material slot with no overrides binds no textures.
+            let overridden = slot.overrides.as_object().is_some_and(|o| !o.is_empty());
+            if slot.material.value() != 0 || overridden {
+                push(WarmItem::MaterialSlot {
+                    material: slot.material,
+                    overrides: slot.overrides.clone(),
+                });
+            }
+        }
+    });
     let sky = scene.environment.sky_texture;
-    push(&mut ids, sky);
-    ids
+    if sky.value() != 0 {
+        push(WarmItem::Texture(sky));
+    }
+    items
+}
+
+/// The progress `current_item` label for a warm item: the catalog name of the mesh, texture,
+/// or referenced material.
+fn warm_item_name(assets: &AssetServer, item: &WarmItem) -> String {
+    let id = match item {
+        WarmItem::Mesh(id) | WarmItem::Texture(id) => *id,
+        WarmItem::MaterialSlot { material, .. } => *material,
+    };
+    assets
+        .catalog()
+        .find(id)
+        .map_or_else(String::new, |entry| entry.name.clone())
 }
