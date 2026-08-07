@@ -326,9 +326,9 @@ export function startReconcile(client: Client): () => void {
     }
     watchdogInFlight = true;
     void client
-      .engineAlive()
-      .then((alive) => {
-        if (!alive && !stopped) {
+      .sessionStatus()
+      .then(({ running }) => {
+        if (!running && !stopped) {
           useEditorStore.getState().setPhase("error", "Engine process exited.");
         }
       })

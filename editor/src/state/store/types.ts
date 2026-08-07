@@ -411,6 +411,16 @@ export interface TelemetrySlice {
   setUiFrameStats(frameRateHz: number, frameMs: number): void;
 }
 
+/// An unrequested host exit, surfaced by the launcher's crash card until dismissed.
+export interface SessionCrash {
+  /// The host exit code (`-1` for a signal-terminated child).
+  code: number;
+  /// The tail of the host log the shell captured before the exit.
+  logTail: string[];
+  /// The crashed session's project path, for the restart action; `null` when none was loaded.
+  projectPath: string | null;
+}
+
 /// The two independent lifecycle axes: the host process and project loading.
 export interface ProjectSlice {
   project: ProjectInfo | null;
@@ -419,6 +429,8 @@ export interface ProjectSlice {
   /// The user hit Cancel on the loading screen. A fast load can already have reached `ready` by the
   /// time the click lands, so the poll refuses to complete a cancelled load.
   projectLoadCancelling: boolean;
+  /// The last unrequested session exit, or `null`; set from the `session-exited` shell event.
+  sessionCrash: SessionCrash | null;
 
   setProject(project: ProjectInfo | null): void;
   /// Merge a project-load progress patch, identity-stable and deduped on the DTO `version`.
@@ -432,6 +444,7 @@ export interface ProjectSlice {
   resetSceneState(): void;
   setEngineStatus(patch: Partial<EngineStatus>): void;
   setPhase(phase: EnginePhase, error?: string): void;
+  setSessionCrash(sessionCrash: SessionCrash | null): void;
 }
 
 /// Editor-local chrome: overlays, view preferences, and the keybinding overrides.
@@ -441,7 +454,10 @@ export interface UiSlice {
   /// True while a native OS file dialog is showing. These are not window-modal, so this is the
   /// app-side lock that stops a second dialog from opening.
   nativeDialogOpen: boolean;
-  projectModalOpen: boolean;
+  /// The launcher view is explicitly requested (menu "New Project…", load-failure "Back"). The
+  /// launcher also shows itself whenever no project is loaded, a load is in flight, or a session
+  /// crashed — this flag only forces it over a live project.
+  launcherOpen: boolean;
   exportModalOpen: boolean;
   /// Show the selected entity's components as read-only leaf subrows in the hierarchy, sourced from
   /// `componentsBySelected` (never an extra inspect).
@@ -458,7 +474,7 @@ export interface UiSlice {
 
   setViewportHidden(viewportHidden: boolean): void;
   setNativeDialogOpen(nativeDialogOpen: boolean): void;
-  setProjectModalOpen(projectModalOpen: boolean): void;
+  setLauncherOpen(launcherOpen: boolean): void;
   setExportModalOpen(exportModalOpen: boolean): void;
   toggleComponentSubrows(): void;
   toggleHideBones(): void;

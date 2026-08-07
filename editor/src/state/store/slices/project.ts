@@ -20,6 +20,7 @@ export function createProjectSlice(set: SetEditorState, get: GetEditorState): Pr
       finalizing: false,
     },
     projectLoadCancelling: false,
+    sessionCrash: null,
 
     setProject: (project) =>
       set({
@@ -59,7 +60,24 @@ export function createProjectSlice(set: SetEditorState, get: GetEditorState): Pr
         finalizing: false,
       });
       try {
-        if (request.kind === "open") {
+        // With no live session the pick is the session's boot intent: the shell spawns the host
+        // with the project in its environment and the host loads it itself — no wire call. With a
+        // session running (a menu-initiated switch/reload) the lifecycle commands drive the load.
+        const { running } = await client.sessionStatus().catch(() => ({ running: false }));
+        if (!running) {
+          if (request.kind === "open") {
+            await client.sessionStart({ path: request.path ?? "" });
+          } else if (request.kind === "new") {
+            await client.sessionStart({
+              create: { name: request.name ?? "", displayName: request.displayName ?? "" },
+            });
+          } else {
+            await client.sessionStart({});
+          }
+          // The child exists now, so the crash watchdog can engage and the attach probe takes
+          // over (`attaching → ready`). Before this the phase stays `idle`: no session, no probe.
+          get().setPhase("attaching");
+        } else if (request.kind === "open") {
           await client.openProject(request.path ?? "");
         } else if (request.kind === "new") {
           await client.newProject(request.name ?? "", request.displayName ?? "");
@@ -102,6 +120,7 @@ export function createProjectSlice(set: SetEditorState, get: GetEditorState): Pr
         catalogDrag: null,
       });
     },
+    setSessionCrash: (sessionCrash) => set({ sessionCrash }),
     setEngineStatus: (patch) => set((s) => ({ engineStatus: { ...s.engineStatus, ...patch } })),
     setPhase: (phase, error) =>
       set((s) => ({

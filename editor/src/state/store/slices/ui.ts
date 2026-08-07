@@ -22,7 +22,7 @@ export function createUiSlice(set: SetEditorState): UiSlice {
   return {
     viewportHidden: false,
     nativeDialogOpen: false,
-    projectModalOpen: false,
+    launcherOpen: false,
     exportModalOpen: false,
     showComponentSubrows: loadShowSubrows(),
     hideBones: loadHideBones(),
@@ -32,7 +32,7 @@ export function createUiSlice(set: SetEditorState): UiSlice {
 
     setViewportHidden: (viewportHidden) => set({ viewportHidden }),
     setNativeDialogOpen: (nativeDialogOpen) => set({ nativeDialogOpen }),
-    setProjectModalOpen: (projectModalOpen) => set({ projectModalOpen }),
+    setLauncherOpen: (launcherOpen) => set({ launcherOpen }),
     setExportModalOpen: (exportModalOpen) => set({ exportModalOpen }),
     toggleComponentSubrows: () =>
       set((s) => {
