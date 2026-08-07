@@ -8,7 +8,7 @@ use crate::control::{ControlError, control_request_with_params};
 use crate::engine;
 use crate::geometry::{app_data_dir, ensure_app_dirs, userdata_dir};
 use crate::settings;
-use crate::state::{ResizeEdge, ShellRequest, ShellState, WindowAction};
+use crate::state::{FlyRequest, ResizeEdge, ShellRequest, ShellState, WindowAction};
 use crate::viewport;
 use serde::Serialize;
 use serde_json::{Value, json};
@@ -30,15 +30,34 @@ pub fn dispatch(
             let params = args.get("params").cloned().unwrap_or(Value::Null);
             control_request_with_params(&state.socket_path, &cmd, params)
         }
-        "start_engine" => {
-            engine::start_engine(state).map_err(|err| err.to_string())?;
+        "session_start" => {
+            let path = args
+                .get("path")
+                .and_then(Value::as_str)
+                .filter(|s| !s.is_empty())
+                .map(str::to_owned);
+            let create = match args.get("create") {
+                Some(spec) => Some((
+                    spec.get("name")
+                        .and_then(Value::as_str)
+                        .ok_or_else(|| ControlError::bridge("create.name required"))?
+                        .to_owned(),
+                    spec.get("displayName")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_owned(),
+                )),
+                None => None,
+            };
+            engine::start_session(state, engine::SessionIntent { path, create })
+                .map_err(|err| err.to_string())?;
             Ok(Value::Null)
         }
-        "engine_alive" => Ok(Value::Bool(engine::child_alive(&state.engine))),
-        "quit_engine" => {
-            engine::teardown(state);
+        "session_stop" => {
+            engine::stop_session(state);
             Ok(Value::Null)
         }
+        "session_status" => Ok(engine::session_status(state)),
         "write_file" => {
             let path = str_arg(&args, "path")?;
             let bytes = bytes_arg(&args, "bytes")?;
@@ -92,9 +111,19 @@ pub fn dispatch(
             state.post(ShellRequest::Window(WindowAction::StartResize(edge)));
             Ok(Value::Null)
         }
-        "set_pointer_lock" => {
-            let locked = args.get("locked").and_then(Value::as_bool).unwrap_or(false);
-            state.post(ShellRequest::Window(WindowAction::SetPointerLock(locked)));
+        "fly_stream_start" => {
+            state.post(ShellRequest::Fly(FlyRequest::Start {
+                forward: str_arg(&args, "forward")?,
+                back: str_arg(&args, "back")?,
+                left: str_arg(&args, "left")?,
+                right: str_arg(&args, "right")?,
+                up: str_arg(&args, "up")?,
+                down: str_arg(&args, "down")?,
+            }));
+            Ok(Value::Null)
+        }
+        "fly_stream_stop" => {
+            state.post(ShellRequest::Fly(FlyRequest::Stop));
             Ok(Value::Null)
         }
         "window_show" => {
@@ -195,6 +224,34 @@ pub fn dispatch(
             settings::write_recents(&recents)?;
             to_value(&recents)
         }
+        "remove_recent_project" => {
+            ensure_app_dirs().map_err(|err| err.to_string())?;
+            let path = str_arg(&args, "path")?;
+            let mut recents = settings::read_recents();
+            settings::remove_recent(&mut recents, &path);
+            settings::write_recents(&recents)?;
+            to_value(&recents)
+        }
+        "delete_project" => {
+            ensure_app_dirs().map_err(|err| err.to_string())?;
+            let path = str_arg(&args, "path")?;
+            let target =
+                resolve_project_delete_target(std::path::Path::new(&path), &userdata_dir())?;
+            std::fs::remove_dir_all(&target)
+                .map_err(|err| format!("delete '{}': {err}", target.display()))?;
+            let mut recents = settings::read_recents();
+            settings::remove_recent(&mut recents, &path);
+            settings::write_recents(&recents)?;
+            to_value(&recents)
+        }
+        "project_name_available" => {
+            ensure_app_dirs().map_err(|err| err.to_string())?;
+            let name = str_arg(&args, "name")?;
+            if name.is_empty() || name.contains(['/', '\\']) {
+                return Ok(Value::Bool(false));
+            }
+            Ok(Value::Bool(!userdata_dir().join(&name).exists()))
+        }
         "dialog_open" => crate::dialog::open(&args),
         "dialog_save" => crate::dialog::save(&args),
         other if other.starts_with("store_") || other.starts_with("connector_") => {
@@ -206,6 +263,44 @@ pub fn dispatch(
 
 fn to_value<T: Serialize>(value: &T) -> Result<Value, ControlError> {
     serde_json::to_value(value).map_err(|err| ControlError::from(format!("encode reply: {err}")))
+}
+
+/// Resolve + fence a project-delete request: the selection (a project dir or its `project.json`)
+/// must canonicalize to a directory strictly under `userdata_root` that contains `project.json`.
+/// Projects elsewhere on disk are never deleted through the editor — the picker offers them
+/// Hide only.
+fn resolve_project_delete_target(
+    selection: &std::path::Path,
+    userdata_root: &std::path::Path,
+) -> Result<std::path::PathBuf, String> {
+    let dir = if selection
+        .file_name()
+        .is_some_and(|name| name == "project.json")
+    {
+        selection.parent().unwrap_or(selection)
+    } else {
+        selection
+    };
+    let dir = dir
+        .canonicalize()
+        .map_err(|err| format!("delete '{}': {err}", dir.display()))?;
+    let root = userdata_root
+        .canonicalize()
+        .map_err(|err| format!("delete: userdata root: {err}"))?;
+    if !dir.starts_with(&root) || dir == root {
+        return Err(format!(
+            "refusing to delete '{}': not a project under '{}'",
+            dir.display(),
+            root.display()
+        ));
+    }
+    if !dir.join("project.json").exists() {
+        return Err(format!(
+            "refusing to delete '{}': no project.json inside",
+            dir.display()
+        ));
+    }
+    Ok(dir)
 }
 
 /// Resolve a wire view token (`scene` / `assetPreview`) to a `View`, rejecting anything else.
@@ -234,6 +329,66 @@ mod tests {
 
     fn state() -> Arc<ShellState> {
         Arc::new(ShellState::default())
+    }
+
+    #[test]
+    fn delete_target_is_fenced_to_userdata_with_a_project_inside() {
+        let root = std::env::temp_dir().join(format!("anima-delete-fence-{}", std::process::id()));
+        let userdata = root.join("userdata");
+        let project = userdata.join("scratch");
+        std::fs::create_dir_all(&project).unwrap();
+
+        // No project.json yet: refused even under the root.
+        assert!(resolve_project_delete_target(&project, &userdata).is_err());
+        std::fs::write(project.join("project.json"), "{}").unwrap();
+
+        // The dir and its project.json both resolve to the dir.
+        let via_dir = resolve_project_delete_target(&project, &userdata).unwrap();
+        let via_json =
+            resolve_project_delete_target(&project.join("project.json"), &userdata).unwrap();
+        assert_eq!(via_dir, via_json);
+        assert!(via_dir.ends_with("scratch"));
+
+        // Outside the root (even with a project.json), and the root itself: refused.
+        let outside = root.join("elsewhere");
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(outside.join("project.json"), "{}").unwrap();
+        assert!(resolve_project_delete_target(&outside, &userdata).is_err());
+        assert!(resolve_project_delete_target(&userdata, &userdata).is_err());
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn remove_recent_drops_exactly_the_matching_row() {
+        let row = |path: &str| settings::RecentProject {
+            path: path.to_owned(),
+            name: "p".to_owned(),
+            display_name: "P".to_owned(),
+            last_opened_at: String::new(),
+        };
+        let mut recents = settings::RecentProjects {
+            projects: vec![row("/a"), row("/b"), row("/c")],
+        };
+        assert!(settings::remove_recent(&mut recents, "/b"));
+        assert_eq!(recents.projects.len(), 2);
+        assert!(!settings::remove_recent(&mut recents, "/b"));
+        assert_eq!(recents.projects[0].path, "/a");
+        assert_eq!(recents.projects[1].path, "/c");
+    }
+
+    #[test]
+    fn session_status_reports_no_session_on_a_fresh_shell() {
+        let out = dispatch(&state(), "session_status", json!({})).unwrap();
+        assert_eq!(out.get("running"), Some(&Value::Bool(false)));
+        assert_eq!(out.get("path").and_then(Value::as_str), Some(""));
+    }
+
+    #[test]
+    fn session_start_requires_a_create_name() {
+        // Fails arg validation before any spawn is attempted.
+        let err = dispatch(&state(), "session_start", json!({ "create": {} })).unwrap_err();
+        assert!(err.failure().message().contains("create.name"));
     }
 
     #[test]

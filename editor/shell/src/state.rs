@@ -3,10 +3,11 @@
 
 use crate::geometry::WindowStateTracker;
 use serde_json::Value;
+use std::collections::VecDeque;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::process::Child;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 
@@ -19,6 +20,25 @@ pub enum ShellRequest {
     /// Push an event to the frontend by executing `window.__saffronShellEvent(event, payload)` in
     /// the main frame; `payload` is a ready JSON literal.
     Emit { event: String, payload: String },
+    /// Start/stop the RMB fly-cam input stream (the main thread owns the pointer lock, the key
+    /// tracking, and the engine connection).
+    Fly(FlyRequest),
+}
+
+/// A fly-stream control marshaled from the frontend to the main thread.
+pub enum FlyRequest {
+    /// Lock the pointer and stream `fly-input` to the engine; the fields are the six move
+    /// bindings as DOM `KeyboardEvent.code` strings.
+    Start {
+        forward: String,
+        back: String,
+        left: String,
+        right: String,
+        up: String,
+        down: String,
+    },
+    /// Release the pointer and send the final inactive sample.
+    Stop,
 }
 
 /// A window control marshaled from the frontend's `getCurrentWindow()` to the main thread.
@@ -27,9 +47,6 @@ pub enum WindowAction {
     ToggleMaximize,
     /// Begin an interactive resize from the grabbed edge/corner (the frontend's window-frame strips).
     StartResize(ResizeEdge),
-    /// Grab/release the pointer for the RMB fly-cam (native cursor lock + hide; CEF OSR can't do DOM
-    /// pointer lock). `true` locks, `false` releases.
-    SetPointerLock(bool),
     Show,
 }
 
@@ -63,11 +80,27 @@ impl ResizeEdge {
     }
 }
 
-/// The per-shell state: the engine slot, socket, and trace server, the shared window-geometry
+/// The project a live session was started for (what `session_status` reports).
+pub struct SessionMeta {
+    /// The boot intent's selection: a path or userdata name, empty for an env-resolved boot.
+    pub label: String,
+}
+
+/// The per-shell state: the session slot, socket, and trace server, the shared window-geometry
 /// tracker, the main-thread request inbox, and the exit flag `window_close` raises.
 pub struct ShellState {
-    /// Empty until `start_engine` spawns the host.
+    /// Empty until `session_start` spawns the host.
     pub engine: Mutex<Option<Child>>,
+    /// Bumped on every session start/stop; a session watcher whose captured generation no longer
+    /// matches is retired and emits nothing.
+    pub session_gen: AtomicU64,
+    /// Raised by `session_stop` before teardown so an exit observed by the watcher reports
+    /// `expected: true`.
+    pub session_expected_stop: AtomicBool,
+    /// The live session's boot intent, `None` between sessions.
+    pub session_meta: Mutex<Option<SessionMeta>>,
+    /// The tail ring of host stdout/stderr lines the log tee keeps for the crash report.
+    pub host_log_tail: Mutex<VecDeque<String>>,
     pub socket_path: String,
     /// The latest profiler-trace bytes, served on the loopback port below so Perfetto fetches them
     /// itself (`?url=`). Replaced on each "Open in Perfetto"; `None` until the first.
@@ -93,6 +126,10 @@ impl Default for ShellState {
         let trace_port = start_trace_server(Arc::clone(&trace));
         Self {
             engine: Mutex::new(None),
+            session_gen: AtomicU64::new(0),
+            session_expected_stop: AtomicBool::new(false),
+            session_meta: Mutex::new(None),
+            host_log_tail: Mutex::new(VecDeque::new()),
             socket_path: socket_path(),
             trace,
             trace_port,

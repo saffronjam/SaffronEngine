@@ -12,6 +12,7 @@ mod control;
 mod dialog;
 mod dnd;
 mod engine;
+mod fly;
 mod geometry;
 mod handlers;
 mod ipc;
@@ -190,14 +191,8 @@ fn main() -> std::process::ExitCode {
 
     tracing::info!(target: "shell", "event loop up; CEF self-driven, pacing to monitor refresh");
 
-    // Auto-start the engine at launch (at launch): spawn + watchdog phase events.
-    // Skipped for the shell-only OSR smoke (`SAFFRON_SHELL_NO_ENGINE`), which never needs the host.
-    if std::env::var_os("SAFFRON_SHELL_NO_ENGINE").is_none()
-        && let Err(err) = engine::auto_start(&state)
-    {
-        tracing::error!(target: "shell", "engine auto-start failed: {err}");
-    }
-
+    // No host is spawned here: the frontend starts a project session (`session_start`) when a
+    // project is picked or when the environment names one.
     let start = Instant::now();
     let mut next_frame = Instant::now();
     let mut last_report = Instant::now();
@@ -235,6 +230,7 @@ fn main() -> std::process::ExitCode {
             match request {
                 ShellRequest::Window(action) => shell.apply_window_action(action),
                 ShellRequest::Emit { event, payload } => shell.emit_to_js(&event, &payload),
+                ShellRequest::Fly(request) => shell.apply_fly(request, &state.socket_path),
             }
         }
 
@@ -251,12 +247,15 @@ fn main() -> std::process::ExitCode {
             shell.emit_dnd(ev);
         }
 
-        // Stream accumulated fly-cam look motion (from locked-pointer `DeviceEvent::MouseMotion`) to the
-        // frontend as one `fly-look` per iteration. Frame-paced, and only while the pointer is locked.
-        if shell.pointer_locked && shell.look_accum != (0.0, 0.0) {
-            let (dx, dy) = shell.look_accum;
-            shell.look_accum = (0.0, 0.0);
-            shell.emit_to_js("fly-look", &format!("{{\"dx\":{dx},\"dy\":{dy}}}"));
+        // Stream the fly-cam sample (accumulated locked-pointer motion + key state) straight to
+        // the engine: one `fly-input` per iteration, so the stream is paced at the monitor
+        // refresh with no CEF hop.
+        if let Some(fly) = shell.fly.as_mut() {
+            let look = std::mem::take(&mut shell.look_accum);
+            if !fly.send_sample(look, true) {
+                tracing::warn!(target: "shell", "fly stream connection lost");
+                shell.fly = None;
+            }
         }
 
         // Pace to the monitor's refresh: pick it up once the surface maps, and follow a move to a
