@@ -150,6 +150,10 @@ impl ControlServer {
     /// for each complete line calls `handle(line) -> reply`, flushing the reply plus a trailing
     /// `\n` back through the short-write loop. Closed clients are dropped at the end.
     ///
+    /// Every complete line runs, including lines that arrived ahead of the peer's EOF: a
+    /// fire-and-forget client may write its final request and close without reading the reply,
+    /// and that request must still execute. The reply flush no-ops for a dead peer.
+    ///
     /// `handle` is the request-to-reply seam. Threading dispatch through a closure keeps the socket
     /// machinery independent of the subsystems, so the framing and flush are unit-testable alone.
     pub fn drain(&mut self, mut handle: impl FnMut(&str) -> String) {
@@ -158,10 +162,7 @@ impl ControlServer {
         for client in &mut self.clients {
             read_into(client);
 
-            while !client.dead {
-                let Some(newline) = client.inbuf.iter().position(|&b| b == b'\n') else {
-                    break;
-                };
+            while let Some(newline) = client.inbuf.iter().position(|&b| b == b'\n') {
                 let line: Vec<u8> = client.inbuf.drain(..=newline).collect();
                 let request = String::from_utf8_lossy(&line[..line.len() - 1]);
 
@@ -237,7 +238,28 @@ fn flush_reply(client: &mut Client, out: &[u8]) {
 
 #[cfg(test)]
 mod tests {
-    use super::resolve_socket_path;
+    use super::{resolve_socket_path, start_control_server};
+
+    #[test]
+    fn drain_runs_requests_written_before_the_peer_closed() {
+        let path = format!(
+            "{}/saffron-eof-test-{}.sock",
+            std::env::temp_dir().display(),
+            std::process::id()
+        );
+        let mut server = start_control_server(path.clone()).unwrap();
+        let mut client = std::os::unix::net::UnixStream::connect(&path).unwrap();
+        std::io::Write::write_all(&mut client, b"final-request\n").unwrap();
+        // Fire-and-forget: the peer closes before any drain ran; the request must still execute.
+        drop(client);
+
+        let mut seen = Vec::new();
+        server.drain(|request| {
+            seen.push(request.to_owned());
+            String::from("ok")
+        });
+        assert_eq!(seen, vec!["final-request".to_string()]);
+    }
 
     #[test]
     fn path_resolution_honors_override_then_runtime_then_tmp() {
